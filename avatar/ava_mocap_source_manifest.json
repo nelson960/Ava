@@ -1,0 +1,99 @@
+{
+  "schemaVersion": 1,
+  "sources": [
+    {
+      "id": "mixamo_talking",
+      "path": "motion_sources/mixamo/Talking.fbx",
+      "sha256": "0718670eb9ecd148298f530bb72b7e128e7fafaf4f5691eb93278ad2d61b0c99",
+      "framesPerSecond": 60,
+      "referenceFrame": 1,
+      "provider": "Adobe Mixamo"
+    },
+    {
+      "id": "mixamo_standing_arguing",
+      "path": "motion_sources/mixamo/Standing Arguing.fbx",
+      "sha256": "e39eedf22d782883363835886728ceab721c8e550e11f62689940873c14740a5",
+      "framesPerSecond": 60,
+      "referenceFrame": 1,
+      "provider": "Adobe Mixamo"
+    }
+  ],
+  "boneProfiles": {
+    "calmConversation": {
+      "hips": 0.2,
+      "spine": 0.3,
+      "chest": 0.36,
+      "upperChest": 0.42,
+      "neck": 0.2,
+      "head": 0.16,
+      "shoulder": 0.28,
+      "upperArm": 0.32,
+      "lowerArm": 0.35,
+      "hand": 0.3,
+      "finger": 0.24
+    },
+    "restrainedEmphasis": {
+      "hips": 0.18,
+      "spine": 0.28,
+      "chest": 0.34,
+      "upperChest": 0.4,
+      "neck": 0.18,
+      "head": 0.15,
+      "shoulder": 0.24,
+      "upperArm": 0.27,
+      "lowerArm": 0.3,
+      "hand": 0.27,
+      "finger": 0.23
+    }
+  },
+  "clips": [
+    {
+      "id": "acknowledge_01",
+      "actionName": "AvaMocap_acknowledge_01",
+      "sourceId": "mixamo_standing_arguing",
+      "sourceFrameRange": {
+        "startFrame": 210,
+        "endFrame": 300,
+        "stride": 2
+      },
+      "outputFramesPerSecond": 30,
+      "entryFrames": 8,
+      "exitFrames": 9,
+      "amplitude": 0.68,
+      "boneProfile": "restrainedEmphasis",
+      "footPolicy": "idleLocked"
+    },
+    {
+      "id": "explain_small_right_01",
+      "actionName": "AvaMocap_explain_small_right_01",
+      "sourceId": "mixamo_talking",
+      "sourceFrameRange": {
+        "startFrame": 31,
+        "endFrame": 121,
+        "stride": 2
+      },
+      "outputFramesPerSecond": 30,
+      "entryFrames": 8,
+      "exitFrames": 9,
+      "amplitude": 0.7,
+      "boneProfile": "calmConversation",
+      "footPolicy": "idleLocked"
+    },
+    {
+      "id": "compare_two_ideas_01",
+      "actionName": "AvaMocap_compare_two_ideas_01",
+      "sourceId": "mixamo_talking",
+      "sourceFrameRange": {
+        "startFrame": 151,
+        "endFrame": 271,
+        "stride": 2
+      },
+      "outputFramesPerSecond": 30,
+      "entryFrames": 10,
+      "exitFrames": 12,
+      "amplitude": 0.68,
+      "boneProfile": "calmConversation",
+      "footPolicy": "idleLocked"
+    }
+  ]
+}

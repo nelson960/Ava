@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "activities": [
+    {
+      "id": "build_three_quarters",
+      "eyebrow": "Fractions",
+      "title": "Build three quarters",
+      "instruction": "Fill the circle until three of its four equal parts are pink.",
+      "domain": "math",
+      "tone": "coral",
+      "targetValue": 3,
+      "diagram": {
+        "kind": "fractionCircle",
+        "title": "Make 3/4",
+        "totalParts": 4,
+        "highlightedParts": 0
+      }
+    },
+    {
+      "id": "build_two_fifths",
+      "eyebrow": "Fractions",
+      "title": "Build two fifths",
+      "instruction": "Fill two of the five equal pieces in the fraction bar.",
+      "domain": "math",
+      "tone": "blue",
+      "targetValue": 2,
+      "diagram": {
+        "kind": "fractionBar",
+        "title": "Make 2/5",
+        "totalParts": 5,
+        "highlightedParts": 0
+      }
+    },
+    {
+      "id": "find_six",
+      "eyebrow": "Number sense",
+      "title": "Find six",
+      "instruction": "Move the marker along the number line until it reaches the gold star.",
+      "domain": "math",
+      "tone": "gold",
+      "targetValue": 6,
+      "diagram": {
+        "kind": "numberLine",
+        "title": "Where is 6?",
+        "minimum": 0,
+        "maximum": 10,
+        "step": 1,
+        "start": 0,
+        "target": 6
+      }
+    }
+  ]
+}

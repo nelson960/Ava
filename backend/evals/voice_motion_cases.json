@@ -1,0 +1,127 @@
+{
+  "schemaVersion": 1,
+  "suiteId": "ava_voice_motion_v1",
+  "voiceStyleVersion": "ava-voice-v1",
+  "humanReviewCriteria": [
+    "Ava sounds warm and engaging without imitating a child or becoming cartoonish.",
+    "The same recognizable voice identity is preserved across every delivery.",
+    "Pacing is clear enough for a child and does not sound slow, robotic or singsong.",
+    "Emphasis and pauses create usable co-speech motion beats without overacting.",
+    "Generated body motion has a clear semantic purpose and is not symmetric arm flapping.",
+    "The torso, gaze, head and hands support one another while feet remain planted.",
+    "Motion begins from and returns to Ava's relaxed living idle without a snap.",
+    "Repeated semantic intentions still produce plausible variation rather than duplication."
+  ],
+  "cases": [
+    {
+      "id": "warm_greeting",
+      "text": "Hi! I'm Ava. It's really nice to see you.",
+      "delivery": "warm",
+      "gesture": "acknowledge",
+      "durationSeconds": {"minimum": 1.5, "maximum": 7.0},
+      "motionReviewFocus": [
+        "Small welcoming acknowledgement rather than a large wave.",
+        "Soft forward attention followed by a clean return to neutral."
+      ]
+    },
+    {
+      "id": "casual_curiosity",
+      "text": "That sounds fun. What was the best part?",
+      "delivery": "playful",
+      "gesture": "acknowledge",
+      "durationSeconds": {"minimum": 1.5, "maximum": 7.0},
+      "motionReviewFocus": [
+        "Curious head and gaze behavior supports the question.",
+        "No unnecessary two-handed explanatory gesture."
+      ]
+    },
+    {
+      "id": "thoughtful_answer",
+      "text": "Hmm, let me think. I believe the smaller one will fit.",
+      "delivery": "thoughtful",
+      "gesture": "explainSmall",
+      "durationSeconds": {"minimum": 2.0, "maximum": 8.0},
+      "motionReviewFocus": [
+        "Reflection and answer are visibly different phases.",
+        "Thinking-away gaze resolves back to eye contact."
+      ]
+    },
+    {
+      "id": "simple_explanation",
+      "text": "Plants lean toward light because their growing cells respond to where the light is coming from.",
+      "delivery": "neutral",
+      "gesture": "explainSmall",
+      "durationSeconds": {"minimum": 3.0, "maximum": 12.0},
+      "motionReviewFocus": [
+        "One asymmetric explanatory gesture follows sentence emphasis.",
+        "Torso support is subtle and the arms never float without purpose."
+      ]
+    },
+    {
+      "id": "count_together",
+      "text": "Let's count them together: one, two, three, and four.",
+      "delivery": "warm",
+      "gesture": "count",
+      "durationSeconds": {"minimum": 2.0, "maximum": 9.0},
+      "motionReviewFocus": [
+        "Counting beats align clearly with the four spoken numbers.",
+        "Finger or hand accents stay readable without becoming rigid."
+      ]
+    },
+    {
+      "id": "compare_ideas",
+      "text": "This shape is taller, but this one is wider. They are different in two useful ways.",
+      "delivery": "neutral",
+      "gesture": "compare",
+      "durationSeconds": {"minimum": 3.0, "maximum": 12.0},
+      "motionReviewFocus": [
+        "Left and right ideas are distinct without mirrored arm flapping.",
+        "Gaze and torso handoffs make the comparison easy to follow."
+      ]
+    },
+    {
+      "id": "present_diagram",
+      "text": "Look at the picture below. The highlighted piece is one part out of four equal parts.",
+      "delivery": "neutral",
+      "gesture": "pointAtDashboard",
+      "durationSeconds": {"minimum": 3.0, "maximum": 12.0},
+      "motionReviewFocus": [
+        "Ava presents the lower dashboard rather than pointing at empty space.",
+        "She returns eye contact after introducing the visual."
+      ]
+    },
+    {
+      "id": "gentle_encouragement",
+      "text": "You were very close. Try that last step once more; I know you can do it.",
+      "delivery": "encouraging",
+      "gesture": "reassure",
+      "durationSeconds": {"minimum": 3.0, "maximum": 11.0},
+      "motionReviewFocus": [
+        "Supportive openness stays restrained and sincere.",
+        "No cheering pose or repetitive upward hand pumping."
+      ]
+    },
+    {
+      "id": "calm_reassurance",
+      "text": "It's okay to feel stuck. We can slow down and work through it together.",
+      "delivery": "concerned",
+      "gesture": "reassure",
+      "durationSeconds": {"minimum": 2.5, "maximum": 10.0},
+      "motionReviewFocus": [
+        "Concern reads as attentive calm rather than sadness or alarm.",
+        "Body motion remains open, safe and non-intrusive."
+      ]
+    },
+    {
+      "id": "small_celebration",
+      "text": "Yes, that's it! You found the pattern.",
+      "delivery": "playful",
+      "gesture": "celebrateSmall",
+      "durationSeconds": {"minimum": 1.5, "maximum": 7.0},
+      "motionReviewFocus": [
+        "Celebration is bright but small enough to transition naturally.",
+        "Hands, face and upper body peak together without foot sliding."
+      ]
+    }
+  ]
+}

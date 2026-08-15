@@ -1,0 +1,178 @@
+{
+  "schemaVersion": 1,
+  "referencePose": {
+    "actionName": "AvaIdle",
+    "frame": 1
+  },
+  "transitionPolicy": {
+    "kind": "poseVelocityMatchedCrossfade",
+    "weightCurve": "smootherStep",
+    "blendFrameSource": "outgoingHandoff",
+    "incomingEntryAlignment": "endPose",
+    "incomingVelocityLeadFrames": 3,
+    "preserveUnclaimedChannels": true,
+    "requireExactReferenceExit": true
+  },
+  "clips": [
+    {
+      "id": "acknowledge_01",
+      "actionName": "AvaMocap_acknowledge_01",
+      "fps": 30,
+      "frameRange": {
+        "startFrame": 1,
+        "endFrame": 46
+      },
+      "markers": {
+        "entry": {
+          "startFrame": 1,
+          "endFrame": 8
+        },
+        "mainBeats": [
+          20
+        ],
+        "handoff": {
+          "startFrame": 26,
+          "endFrame": 36
+        },
+        "settle": {
+          "startFrame": 36,
+          "endFrame": 41
+        },
+        "exit": {
+          "startFrame": 41,
+          "endFrame": 46
+        }
+      },
+      "reviewFrames": [
+        1,
+        8,
+        14,
+        20,
+        26,
+        36,
+        41,
+        46
+      ],
+      "claims": {
+        "faceExpression": "additive",
+        "gaze": "override",
+        "head": "additive",
+        "leftArm": "override",
+        "leftFingers": "override",
+        "leftHand": "override",
+        "posture": "additive",
+        "rightArm": "override",
+        "rightFingers": "override",
+        "rightHand": "override"
+      },
+      "returnsToReferencePose": true,
+      "allowsSelfTransition": true
+    },
+    {
+      "id": "explain_small_right_01",
+      "actionName": "AvaMocap_explain_small_right_01",
+      "fps": 30,
+      "frameRange": {
+        "startFrame": 1,
+        "endFrame": 46
+      },
+      "markers": {
+        "entry": {
+          "startFrame": 1,
+          "endFrame": 8
+        },
+        "mainBeats": [
+          20
+        ],
+        "handoff": {
+          "startFrame": 26,
+          "endFrame": 36
+        },
+        "settle": {
+          "startFrame": 36,
+          "endFrame": 41
+        },
+        "exit": {
+          "startFrame": 41,
+          "endFrame": 46
+        }
+      },
+      "reviewFrames": [
+        1,
+        8,
+        14,
+        20,
+        26,
+        36,
+        41,
+        46
+      ],
+      "claims": {
+        "faceExpression": "additive",
+        "gaze": "override",
+        "head": "additive",
+        "posture": "additive",
+        "rightArm": "override",
+        "rightFingers": "override",
+        "rightHand": "override"
+      },
+      "returnsToReferencePose": true,
+      "allowsSelfTransition": true
+    },
+    {
+      "id": "compare_two_ideas_01",
+      "actionName": "AvaMocap_compare_two_ideas_01",
+      "fps": 30,
+      "frameRange": {
+        "startFrame": 1,
+        "endFrame": 61
+      },
+      "markers": {
+        "entry": {
+          "startFrame": 1,
+          "endFrame": 10
+        },
+        "mainBeats": [
+          24,
+          36
+        ],
+        "handoff": {
+          "startFrame": 42,
+          "endFrame": 51
+        },
+        "settle": {
+          "startFrame": 51,
+          "endFrame": 56
+        },
+        "exit": {
+          "startFrame": 56,
+          "endFrame": 61
+        }
+      },
+      "reviewFrames": [
+        1,
+        10,
+        18,
+        24,
+        36,
+        42,
+        51,
+        61
+      ],
+      "claims": {
+        "faceExpression": "additive",
+        "gaze": "override",
+        "head": "additive",
+        "leftArm": "override",
+        "leftFingers": "override",
+        "leftHand": "override",
+        "posture": "additive",
+        "rightArm": "override",
+        "rightFingers": "override",
+        "rightHand": "override"
+      },
+      "returnsToReferencePose": true,
+      "allowsSelfTransition": true
+    }
+  ]
+}

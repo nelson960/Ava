@@ -1,0 +1,23 @@
+{
+  "grammarVersion": 3,
+  "logicalWidth": 1000.0,
+  "logicalHeight": 600.0,
+  "nodeKinds": ["group", "text", "line", "arrow", "circle", "ellipse", "rect", "polygon", "polyline", "path"],
+  "operations": ["create", "update", "delete", "reveal", "focus", "animate", "clear"],
+  "interactions": ["explore", "toggleVisibility", "select", "reveal", "dragWithin", "toggleState", "setScalar", "setEnum", "reset", "submitOutcome"],
+  "animationProperties": ["opacity", "translateX", "translateY", "rotationDegrees", "scale"],
+  "colorTokens": ["ink", "muted", "accent", "accentSoft", "positive", "warning", "paper", "transparent"],
+  "limits": {
+    "maxNodes": 96,
+    "maxOperationsPerTransaction": 64,
+    "maxBindingsPerTransaction": 24,
+    "maxStateVariables": 16,
+    "maxPathCharacters": 2000,
+    "maxPathCommands": 128,
+    "maxPathNumbers": 512,
+    "maxPointsPerNode": 64,
+    "maxTextCharacters": 240,
+    "maxTextLines": 4,
+    "maxHierarchyDepth": 8
+  }
+}

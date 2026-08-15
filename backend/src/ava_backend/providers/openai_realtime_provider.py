@@ -1,0 +1,1843 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from collections import deque
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from dataclasses import dataclass
+from time import monotonic
+from typing import Protocol
+from urllib.parse import quote, urlsplit
+
+import httpx
+from pydantic import ValidationError
+from websockets.asyncio.client import connect as connect_websocket
+
+from ..realtime.harness import RealtimeHarness
+from ..realtime.provider_session import (
+    MAX_SDP_BYTES,
+    NegotiatedRealtimeCall,
+    RealtimeNegotiationResponseError,
+    RealtimeNegotiationUnavailableError,
+    RealtimeProviderTurnEvent,
+    validate_sdp,
+)
+from ..realtime.tool_contract import (
+    INTERACTIVE_CANVAS_TOOL_NAME,
+    InteractiveCanvasRequest,
+    InteractiveCanvasToolOutput,
+    RealtimeCanvasToolCall,
+    RealtimeRejectedCanvasToolCall,
+    RealtimeSpeechTextDelta,
+)
+from ..realtime.turn_parser import StreamingSpeechParser, StreamingTurnParseError
+
+LOGGER = logging.getLogger("ava_backend.openai_realtime")
+
+DEFAULT_OPENAI_API_ORIGIN = "https://api.openai.com"
+DEFAULT_OPENAI_REALTIME_WEBSOCKET = "wss://api.openai.com/v1/realtime"
+MAX_PROVIDER_EVENT_BYTES = 512 * 1024
+MAX_PROVIDER_EVENTS_PER_TURN = 4096
+MAX_FUNCTION_ARGUMENT_BYTES = 256 * 1024
+MAX_PROVIDER_ERROR_BYTES = 64 * 1024
+
+
+class OpenAIRealtimeProviderError(RuntimeError):
+    """Base error for an invalid or unavailable OpenAI Realtime session."""
+
+
+class OpenAIRealtimeProtocolError(OpenAIRealtimeProviderError):
+    """OpenAI emitted an event sequence that Ava cannot safely consume."""
+
+
+class OpenAIRealtimeUnavailableError(OpenAIRealtimeProviderError):
+    """The OpenAI Realtime connection could not complete the requested turn."""
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAIRealtimeUsage:
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cached_input_tokens: int | None
+    input_text_tokens: int | None
+    input_audio_tokens: int | None
+    output_text_tokens: int | None
+    output_audio_tokens: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAIRealtimeValidationIssue:
+    path: tuple[str | int, ...]
+    code: str
+
+
+class OpenAIRealtimeOutputValidationError(OpenAIRealtimeProtocolError):
+    """A billed live response failed Ava's speech/tool boundary."""
+
+    def __init__(
+        self,
+        *,
+        usage: OpenAIRealtimeUsage,
+        response_id: str,
+        validation_issue_count: int,
+        validation_issues: tuple[OpenAIRealtimeValidationIssue, ...],
+    ) -> None:
+        super().__init__("OpenAI live probe output failed Ava's speech/tool validation")
+        self.usage = usage
+        self.response_id = response_id
+        self.validation_issue_count = validation_issue_count
+        self.validation_issues = validation_issues
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAIRealtimeProbeResult:
+    speech: str
+    canvas_request: InteractiveCanvasRequest | None
+    canvas_selected: bool
+    canvas_rejection: str | None
+    model: str
+    prompt_version: str
+    response_id: str
+    first_delta_ms: float
+    completed_ms: float
+    usage: OpenAIRealtimeUsage
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAIRealtimeProbeFailureResult:
+    turn_id: str
+    response_id: str
+    usage: OpenAIRealtimeUsage
+    validation_issues: tuple[OpenAIRealtimeValidationIssue, ...]
+
+
+type OpenAIRealtimeProbeOutcome = (
+    OpenAIRealtimeProbeResult | OpenAIRealtimeProbeFailureResult
+)
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAIRealtimeProbeRequest:
+    turn_id: str
+    text_input: str
+    max_output_tokens: int
+
+    def __post_init__(self) -> None:
+        if not self.turn_id.strip():
+            raise ValueError("probe turn_id cannot be empty")
+        if not 1 <= len(self.text_input.strip()) <= 2_000:
+            raise ValueError("probe text_input must contain 1-2000 characters")
+        if not 256 <= self.max_output_tokens <= 4_096:
+            raise ValueError("probe max_output_tokens must be between 256 and 4096")
+
+
+class RealtimeWebSocket(Protocol):
+    async def send(self, message: str) -> None: ...
+
+    async def recv(self) -> str | bytes: ...
+
+    async def close(self, code: int = 1000, reason: str = "") -> None: ...
+
+
+RealtimeWebSocketConnector = Callable[
+    [str, Mapping[str, str], float, int],
+    Awaitable[RealtimeWebSocket],
+]
+
+
+async def _default_websocket_connector(
+    url: str,
+    headers: Mapping[str, str],
+    timeout_seconds: float,
+    max_event_bytes: int,
+) -> RealtimeWebSocket:
+    return await connect_websocket(
+        url,
+        additional_headers=headers,
+        open_timeout=timeout_seconds,
+        close_timeout=min(timeout_seconds, 10),
+        ping_interval=20,
+        ping_timeout=20,
+        max_size=max_event_bytes,
+        max_queue=32,
+        compression=None,
+    )
+
+
+class _OpenAIRealtimeEventChannel:
+    def __init__(
+        self,
+        socket: RealtimeWebSocket,
+        *,
+        model: str,
+        max_output_tokens: int,
+        turn_timeout_seconds: float,
+        max_event_bytes: int = MAX_PROVIDER_EVENT_BYTES,
+        max_events_per_turn: int = MAX_PROVIDER_EVENTS_PER_TURN,
+        max_argument_bytes: int = MAX_FUNCTION_ARGUMENT_BYTES,
+        noise_reduction: str = "near_field",
+        vad_threshold: float = 0.45,
+        vad_prefix_padding_ms: int = 500,
+        vad_silence_duration_ms: int = 450,
+    ) -> None:
+        self._socket = socket
+        self._model = model
+        self._max_output_tokens = max_output_tokens
+        self._turn_timeout_seconds = turn_timeout_seconds
+        self._max_event_bytes = max_event_bytes
+        self._max_events_per_turn = max_events_per_turn
+        self._max_argument_bytes = max_argument_bytes
+        self._noise_reduction = _validated_noise_reduction(noise_reduction)
+        self._vad_threshold = _validated_vad_threshold(vad_threshold)
+        self._vad_prefix_padding_ms = _validated_vad_prefix_padding_ms(
+            vad_prefix_padding_ms
+        )
+        self._vad_silence_duration_ms = _validated_vad_silence_duration_ms(
+            vad_silence_duration_ms
+        )
+        self._received_event_count = 0
+        self._pending_events: deque[dict[str, object]] = deque()
+        self._closed = False
+        self._active_turn_id: str | None = None
+        self._active_response_id: str | None = None
+        self._late_cancel_error_expected = False
+        self._prepared_session_update: str | None = None
+        self._cancelled_turn_ids: set[str] = set()
+        self._pending_canvas_call_id: str | None = None
+        self._completed_canvas_call_ids: set[str] = set()
+        self.last_usage: OpenAIRealtimeUsage | None = None
+        self.last_response_id: str | None = None
+        self.last_first_delta_ms: float | None = None
+        self.last_completed_ms: float | None = None
+
+    async def expect_session_created(self) -> None:
+        event = await self._receive_event(
+            timeout_seconds=self._turn_timeout_seconds,
+        )
+        if event.get("type") != "session.created":
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI Realtime did not begin with session.created"
+            )
+
+    async def stream_turn(
+        self,
+        *,
+        harness: RealtimeHarness,
+        turn_id: str,
+        text_input: str | None = None,
+        response_max_output_tokens: int | None = None,
+    ) -> AsyncIterator[RealtimeProviderTurnEvent]:
+        if self._closed:
+            raise OpenAIRealtimeProtocolError(
+                "cannot start a turn on a closed OpenAI Realtime channel"
+            )
+        if self._active_turn_id is not None:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI Realtime channel already owns an active turn"
+            )
+        if not turn_id.strip():
+            raise ValueError("turn_id cannot be empty")
+        if response_max_output_tokens is not None and not (
+            256 <= response_max_output_tokens <= self._max_output_tokens
+        ):
+            raise ValueError(
+                "response_max_output_tokens must be between 256 and the "
+                "configured Realtime maximum"
+            )
+        normalized_text = None
+        if text_input is not None:
+            normalized_text = text_input.strip()
+            if not 1 <= len(normalized_text) <= 2_000:
+                raise ValueError("live probe input must contain 1-2000 characters")
+
+        self._active_turn_id = turn_id
+        self._active_response_id = None
+        self.last_usage = None
+        self.last_response_id = None
+        self.last_first_delta_ms = None
+        self.last_completed_ms = None
+        self._received_event_count = 0
+
+        response_completed = False
+        try:
+            await self.prepare(harness=harness)
+
+            trigger_started = monotonic()
+            if normalized_text is not None:
+                await self._send_json(
+                    {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": normalized_text,
+                                }
+                            ],
+                        },
+                    }
+                )
+                await self._send_json(
+                    {
+                        "type": "response.create",
+                        "response": {
+                            "output_modalities": ["text"],
+                            "tool_choice": harness.tool_choice,
+                            "parallel_tool_calls": False,
+                            "max_output_tokens": (
+                                response_max_output_tokens or self._max_output_tokens
+                            ),
+                        },
+                    }
+                )
+
+            async for event in self._stream_semantic_turn(
+                trigger_started=trigger_started,
+                response_expected=normalized_text is not None,
+            ):
+                yield event
+            response_completed = True
+        finally:
+            # An interrupted/erroring async generator deliberately retains the
+            # turn boundary until cancel() drains the provider response. In
+            # particular, response.created may already be queued on the wire
+            # even when we have not observed its response ID yet.
+            if response_completed:
+                self._active_turn_id = None
+                self._active_response_id = None
+
+    async def complete_canvas_tool(
+        self,
+        *,
+        turn_id: str,
+        call_id: str,
+        output: InteractiveCanvasToolOutput,
+    ) -> None:
+        if self._closed:
+            raise OpenAIRealtimeProtocolError(
+                "cannot complete a tool on a closed Realtime channel"
+            )
+        if turn_id != self._active_turn_id:
+            raise OpenAIRealtimeProtocolError(
+                "canvas tool completion does not match the active turn"
+            )
+        if call_id in self._completed_canvas_call_ids:
+            raise OpenAIRealtimeProtocolError("canvas tool call was completed twice")
+        if call_id != self._pending_canvas_call_id:
+            raise OpenAIRealtimeProtocolError(
+                "canvas tool completion does not match the pending call"
+            )
+        await self._send_json(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": output.model_dump_json(by_alias=True, exclude_none=True),
+                },
+            }
+        )
+        await self._send_json(
+            {
+                "type": "response.create",
+                "response": {
+                    "output_modalities": ["text"],
+                    "tool_choice": "none",
+                    "max_output_tokens": self._max_output_tokens,
+                },
+            }
+        )
+        self._completed_canvas_call_ids.add(call_id)
+        self._pending_canvas_call_id = None
+
+    async def prepare(self, *, harness: RealtimeHarness) -> None:
+        """Prepare the sideband before Flutter is told to unmute the mic."""
+
+        payload = _session_update(
+            harness,
+            self._model,
+            self._max_output_tokens,
+            noise_reduction=self._noise_reduction,
+            vad_threshold=self._vad_threshold,
+            vad_prefix_padding_ms=self._vad_prefix_padding_ms,
+            vad_silence_duration_ms=self._vad_silence_duration_ms,
+        )
+        serialized = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if serialized == self._prepared_session_update:
+            return
+        initial_prepare = self._prepared_session_update is None
+        await self._send_json(payload)
+        # The first update must be acknowledged before Flutter is allowed to
+        # unmute. On later turns, the live WebRTC input can already have queued
+        # VAD/conversation events. Waiting for session.updated here would
+        # consume one of those events outside the turn reader and previously
+        # killed the persistent session after a single utterance. The next
+        # stream_turn owns the queue and validates session.updated or an error
+        # in order with the rest of the provider events.
+        if initial_prepare:
+            await self._wait_for_session_updated()
+        self._prepared_session_update = serialized
+        LOGGER.info(
+            "openai_realtime_prompt_installed prompt_version=%s "
+            "tool_contract_version=%s acknowledged=%s",
+            harness.prompt_version,
+            harness.tool_contract_version,
+            initial_prepare,
+            extra={
+                "ava_context": {
+                    "promptVersion": harness.prompt_version,
+                    "toolContractVersion": harness.tool_contract_version,
+                    "providerAcknowledged": initial_prepare,
+                }
+            },
+        )
+
+    async def cancel(self, *, turn_id: str) -> None:
+        if not turn_id.strip():
+            raise ValueError("turn_id cannot be empty")
+        if turn_id in self._cancelled_turn_ids:
+            return
+        cancelled_pending_canvas = (
+            not self._closed
+            and self._active_turn_id == turn_id
+            and self._pending_canvas_call_id is not None
+        )
+        if cancelled_pending_canvas:
+            call_id = self._pending_canvas_call_id
+            await self._send_json(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": InteractiveCanvasToolOutput.model_validate(
+                            {
+                                "status": "rejected",
+                                "reason": (
+                                    "The child interrupted this visual request."
+                                ),
+                            }
+                        ).model_dump_json(by_alias=True, exclude_none=True),
+                    },
+                }
+            )
+            self._pending_canvas_call_id = None
+            # The function-call response has already reached response.done and
+            # no continuation is created for an interrupted visual request.
+            self._active_response_id = None
+            self._active_turn_id = None
+            self._cancelled_turn_ids.add(turn_id)
+            return
+        if self._closed or self._active_turn_id != turn_id:
+            self._cancelled_turn_ids.add(turn_id)
+            return
+        await self._cancel_and_drain_active_response()
+        self._cancelled_turn_ids.add(turn_id)
+
+    async def _cancel_and_drain_active_response(self) -> None:
+        """Restore the persistent socket to an exact response boundary."""
+
+        response_id = self._active_response_id
+        await self._send_json({"type": "response.cancel"})
+        deferred_events: list[dict[str, object]] = []
+        while True:
+            event = await self._receive_event(
+                timeout_seconds=self._turn_timeout_seconds,
+            )
+            event_type = _event_type(event)
+            if event_type == "error":
+                if _provider_error_code(event) == "response_cancel_not_active":
+                    LOGGER.info(
+                        "openai_realtime_cancel_already_settled turn_id=%s "
+                        "response_id=%s",
+                        self._active_turn_id,
+                        response_id,
+                    )
+                    self._active_response_id = None
+                    self._active_turn_id = None
+                    return
+                raise _provider_error(event)
+            if event_type == "response.created":
+                candidate = _nested_string(event, "response", "id")
+                if response_id is not None and candidate != response_id:
+                    raise OpenAIRealtimeProtocolError(
+                        "OpenAI created a different response while cancelling"
+                    )
+                response_id = candidate
+                self._active_response_id = candidate
+                continue
+            if event_type == "response.done":
+                completed_response_id = _nested_string(event, "response", "id")
+                if response_id is not None and completed_response_id != response_id:
+                    raise OpenAIRealtimeProtocolError(
+                        "OpenAI completed a different response while cancelling"
+                    )
+                status = _nested_string(event, "response", "status")
+                LOGGER.info(
+                    "openai_realtime_response_drained turn_id=%s response_id=%s "
+                    "status=%s",
+                    self._active_turn_id,
+                    completed_response_id,
+                    status,
+                )
+                self._pending_events.extend(deferred_events)
+                # If the response completed before the cancel was processed,
+                # OpenAI may next report response_cancel_not_active. That
+                # documented no-op error belongs to this cancel, not the next
+                # child turn.
+                self._late_cancel_error_expected = status == "completed"
+                self._active_response_id = None
+                self._active_turn_id = None
+                return
+            event_response_id = event.get("response_id")
+            if event_response_id is not None:
+                if not isinstance(event_response_id, str) or not event_response_id:
+                    raise OpenAIRealtimeProtocolError(
+                        "OpenAI emitted an invalid response ID while cancelling"
+                    )
+                if response_id is not None and event_response_id != response_id:
+                    raise OpenAIRealtimeProtocolError(
+                        "OpenAI emitted a different response while cancelling"
+                    )
+                response_id = event_response_id
+                self._active_response_id = event_response_id
+            if event_type in _PRE_RESPONSE_EVENT_TYPES:
+                deferred_events.append(event)
+                continue
+            if (
+                event_type not in _IN_TURN_IGNORED_EVENT_TYPES
+                and not event_type.startswith("response.")
+            ):
+                raise OpenAIRealtimeProtocolError(
+                    f"unexpected OpenAI event while cancelling: {event_type}"
+                )
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        await self._socket.close(code=1000, reason="Ava session closed")
+
+    async def _wait_for_session_updated(self) -> None:
+        while True:
+            event = await self._receive_event(
+                timeout_seconds=self._turn_timeout_seconds,
+            )
+            event_type = _event_type(event)
+            if event_type == "session.updated":
+                return
+            if event_type == "error":
+                raise _provider_error(event)
+            if event_type not in _PRE_RESPONSE_EVENT_TYPES:
+                raise OpenAIRealtimeProtocolError(
+                    f"unexpected OpenAI event before session.updated: {event_type}"
+                )
+
+    async def _stream_semantic_turn(
+        self,
+        *,
+        trigger_started: float,
+        response_expected: bool,
+    ) -> AsyncIterator[RealtimeProviderTurnEvent]:
+        continuation = False
+        canvas_called = False
+        accumulated_usage: OpenAIRealtimeUsage | None = None
+
+        while True:
+            response_id: str | None = None
+            call_id: str | None = None
+            function_name: str | None = None
+            argument_parts: list[str] = []
+            final_arguments: str | None = None
+            function_item_count = 0
+
+            while True:
+                event = await self._receive_event(
+                    timeout_seconds=(
+                        self._turn_timeout_seconds if response_expected else None
+                    )
+                )
+                event_type = _event_type(event)
+                if event_type == "error":
+                    if (
+                        self._late_cancel_error_expected
+                        and _provider_error_code(event) == "response_cancel_not_active"
+                    ):
+                        self._late_cancel_error_expected = False
+                        LOGGER.info(
+                            "openai_realtime_late_cancel_error_consumed turn_id=%s",
+                            self._active_turn_id,
+                        )
+                        continue
+                    raise _provider_error(event)
+
+                if event_type == "response.created":
+                    if not response_expected:
+                        trigger_started = monotonic()
+                    response_expected = True
+                    self._late_cancel_error_expected = False
+                    candidate = _nested_string(event, "response", "id")
+                    if response_id is not None and candidate != response_id:
+                        raise OpenAIRealtimeProtocolError(
+                            "OpenAI response ID changed after response.created"
+                        )
+                    response_id = candidate
+                    self._active_response_id = candidate
+                    continue
+
+                if event_type == "response.output_text.delta":
+                    candidate_response_id = _required_string(event, "response_id")
+                    if response_id is not None and candidate_response_id != response_id:
+                        raise OpenAIRealtimeProtocolError(
+                            "OpenAI response ID changed while streaming speech"
+                        )
+                    response_id = candidate_response_id
+                    self._active_response_id = candidate_response_id
+                    delta = _required_string(event, "delta", allow_empty=True)
+                    if delta:
+                        if self.last_first_delta_ms is None:
+                            self.last_first_delta_ms = (
+                                monotonic() - trigger_started
+                            ) * 1000
+                        yield RealtimeSpeechTextDelta(delta=delta)
+                    continue
+
+                if event_type == "response.output_item.added":
+                    item = _mapping(event.get("item"), "response output item")
+                    if item.get("type") != "function_call":
+                        continue
+                    function_item_count += 1
+                    if function_item_count > 1 or continuation or canvas_called:
+                        raise OpenAIRealtimeProtocolError(
+                            "OpenAI emitted an unexpected additional function call"
+                        )
+                    function_name = _required_string(item, "name")
+                    if function_name != INTERACTIVE_CANVAS_TOOL_NAME:
+                        raise OpenAIRealtimeProtocolError(
+                            "OpenAI selected an unavailable function"
+                        )
+                    call_id = _required_string(item, "call_id")
+                    continue
+
+                if event_type == "response.function_call_arguments.delta":
+                    delta = _required_string(event, "delta", allow_empty=True)
+                    candidate_call_id = _required_string(event, "call_id")
+                    candidate_response_id = _required_string(event, "response_id")
+                    if call_id is not None and candidate_call_id != call_id:
+                        raise OpenAIRealtimeProtocolError(
+                            "OpenAI function-call ID changed while streaming"
+                        )
+                    if response_id is not None and candidate_response_id != response_id:
+                        raise OpenAIRealtimeProtocolError(
+                            "OpenAI response ID changed while streaming tool arguments"
+                        )
+                    call_id = candidate_call_id
+                    response_id = candidate_response_id
+                    self._active_response_id = candidate_response_id
+                    argument_parts.append(delta)
+                    if (
+                        len("".join(argument_parts).encode("utf-8"))
+                        > self._max_argument_bytes
+                    ):
+                        raise OpenAIRealtimeProtocolError(
+                            "OpenAI function arguments exceeded Ava's byte limit"
+                        )
+                    if self.last_first_delta_ms is None and delta:
+                        self.last_first_delta_ms = (
+                            monotonic() - trigger_started
+                        ) * 1000
+                    continue
+
+                if event_type == "response.function_call_arguments.done":
+                    candidate_name = _required_string(event, "name")
+                    candidate_call_id = _required_string(event, "call_id")
+                    candidate_response_id = _required_string(event, "response_id")
+                    candidate_arguments = _required_string(event, "arguments")
+                    if candidate_name != INTERACTIVE_CANVAS_TOOL_NAME:
+                        raise OpenAIRealtimeProtocolError(
+                            "OpenAI completed an unavailable function"
+                        )
+                    if call_id is not None and candidate_call_id != call_id:
+                        raise OpenAIRealtimeProtocolError(
+                            "OpenAI function-call ID changed at completion"
+                        )
+                    if response_id is not None and candidate_response_id != response_id:
+                        raise OpenAIRealtimeProtocolError(
+                            "OpenAI response ID changed at tool completion"
+                        )
+                    streamed = "".join(argument_parts)
+                    if streamed and streamed != candidate_arguments:
+                        raise OpenAIRealtimeProtocolError(
+                            "OpenAI final function arguments differ from streamed deltas"
+                        )
+                    call_id = candidate_call_id
+                    response_id = candidate_response_id
+                    function_name = candidate_name
+                    final_arguments = candidate_arguments
+                    continue
+
+                if event_type == "response.done":
+                    response, completed_response_id = _validate_semantic_response_done(
+                        event,
+                        expected_response_id=response_id,
+                    )
+                    usage = _parse_usage(event)
+                    accumulated_usage = _merge_usage(accumulated_usage, usage)
+                    self._active_response_id = None
+
+                    function_items = [
+                        _mapping(item, "response output item")
+                        for item in _response_output(response)
+                        if isinstance(item, dict)
+                        and item.get("type") == "function_call"
+                    ]
+                    if len(function_items) > 1:
+                        raise OpenAIRealtimeProtocolError(
+                            "OpenAI response contains multiple function calls"
+                        )
+                    if function_items:
+                        if continuation or canvas_called:
+                            raise OpenAIRealtimeProtocolError(
+                                "OpenAI continuation attempted another canvas call"
+                            )
+                        item = function_items[0]
+                        completed_name = _required_string(item, "name")
+                        completed_call_id = _required_string(item, "call_id")
+                        completed_arguments = _required_string(item, "arguments")
+                        if completed_name != INTERACTIVE_CANVAS_TOOL_NAME:
+                            raise OpenAIRealtimeProtocolError(
+                                "OpenAI response completed an unavailable function"
+                            )
+                        if (
+                            function_name is not None
+                            and completed_name != function_name
+                        ):
+                            raise OpenAIRealtimeProtocolError(
+                                "OpenAI function name changed at response completion"
+                            )
+                        if call_id is not None and completed_call_id != call_id:
+                            raise OpenAIRealtimeProtocolError(
+                                "OpenAI function-call ID changed at response completion"
+                            )
+                        streamed = "".join(argument_parts)
+                        expected_arguments = final_arguments or streamed
+                        if (
+                            expected_arguments
+                            and expected_arguments != completed_arguments
+                        ):
+                            raise OpenAIRealtimeProtocolError(
+                                "OpenAI response arguments differ from streamed arguments"
+                            )
+                        try:
+                            request = InteractiveCanvasRequest.model_validate_json(
+                                completed_arguments
+                            )
+                        except ValidationError as error:
+                            LOGGER.warning(
+                                "openai_canvas_arguments_rejected call_id=%s "
+                                "validation_issue_count=%d",
+                                completed_call_id,
+                                error.error_count(),
+                            )
+                            self._pending_canvas_call_id = completed_call_id
+                            canvas_called = True
+                            yield RealtimeRejectedCanvasToolCall(
+                                call_id=completed_call_id,
+                                reason=(
+                                    "The canvas request exceeded Ava's bounded "
+                                    "tool contract."
+                                ),
+                            )
+                            if completed_call_id not in self._completed_canvas_call_ids:
+                                raise OpenAIRealtimeProtocolError(
+                                    "Ava did not return the rejected canvas "
+                                    "function output"
+                                )
+                            self._completed_canvas_call_ids.discard(completed_call_id)
+                            continuation = True
+                            break
+                        self._pending_canvas_call_id = completed_call_id
+                        canvas_called = True
+                        yield RealtimeCanvasToolCall(
+                            call_id=completed_call_id,
+                            request=request,
+                        )
+                        if completed_call_id not in self._completed_canvas_call_ids:
+                            raise OpenAIRealtimeProtocolError(
+                                "Ava did not return the canvas function output"
+                            )
+                        self._completed_canvas_call_ids.discard(completed_call_id)
+                        continuation = True
+                        break
+
+                    if (
+                        function_item_count
+                        or function_name is not None
+                        or call_id is not None
+                        or final_arguments is not None
+                        or argument_parts
+                    ):
+                        raise OpenAIRealtimeProtocolError(
+                            "OpenAI streamed a function call that was absent from "
+                            "the completed response"
+                        )
+
+                    self.last_response_id = completed_response_id
+                    self.last_usage = accumulated_usage
+                    self.last_completed_ms = (monotonic() - trigger_started) * 1000
+                    return
+
+                if event_type in _RESPONSE_TRIGGER_EVENT_TYPES:
+                    response_expected = True
+                    trigger_started = monotonic()
+                    continue
+
+                if event_type not in _IN_TURN_IGNORED_EVENT_TYPES:
+                    raise OpenAIRealtimeProtocolError(
+                        f"unexpected OpenAI event during Ava turn: {event_type}"
+                    )
+
+    async def _send_json(self, payload: Mapping[str, object]) -> None:
+        if self._closed:
+            raise OpenAIRealtimeProtocolError(
+                "cannot send to a closed OpenAI Realtime channel"
+            )
+        serialized = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if len(serialized.encode("utf-8")) > self._max_event_bytes:
+            raise OpenAIRealtimeProtocolError(
+                "Ava's OpenAI client event exceeded the provider event limit"
+            )
+        try:
+            await self._socket.send(serialized)
+        except Exception as error:
+            raise OpenAIRealtimeUnavailableError(
+                "OpenAI Realtime send failed"
+            ) from error
+
+    async def _receive_event(
+        self,
+        *,
+        timeout_seconds: float | None,
+    ) -> dict[str, object]:
+        self._received_event_count += 1
+        if self._received_event_count > self._max_events_per_turn:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI Realtime exceeded Ava's event-count limit"
+            )
+        if self._pending_events:
+            return self._pending_events.popleft()
+        try:
+            if timeout_seconds is None:
+                raw = await self._socket.recv()
+            else:
+                async with asyncio.timeout(timeout_seconds):
+                    raw = await self._socket.recv()
+        except TimeoutError as error:
+            raise OpenAIRealtimeUnavailableError(
+                "OpenAI Realtime active-response event receive timed out"
+            ) from error
+        except Exception as error:
+            raise OpenAIRealtimeUnavailableError(
+                "OpenAI Realtime connection closed unexpectedly"
+            ) from error
+        if isinstance(raw, bytes):
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI Realtime sideband emitted an unexpected binary event"
+            )
+        if len(raw.encode("utf-8")) > self._max_event_bytes:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI Realtime event exceeded Ava's byte limit"
+            )
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI Realtime emitted malformed JSON"
+            ) from error
+        if not isinstance(decoded, dict):
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI Realtime event must be a JSON object"
+            )
+        return decoded
+
+
+class OpenAIRealtimeProviderSession:
+    """Production WebRTC negotiation and server-side sideband implementation."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        safety_identifier: str,
+        connect_timeout_seconds: float,
+        turn_timeout_seconds: float,
+        max_output_tokens: int,
+        noise_reduction: str = "near_field",
+        vad_threshold: float = 0.45,
+        vad_prefix_padding_ms: int = 500,
+        vad_silence_duration_ms: int = 450,
+        http_client: httpx.AsyncClient | None = None,
+        websocket_connector: RealtimeWebSocketConnector = (
+            _default_websocket_connector
+        ),
+        api_origin: str = DEFAULT_OPENAI_API_ORIGIN,
+        realtime_websocket_url: str = DEFAULT_OPENAI_REALTIME_WEBSOCKET,
+    ) -> None:
+        self._api_key = _required_secret(api_key, "OpenAI API key")
+        self._model = _required_name(model, "OpenAI Realtime model")
+        self._safety_identifier = _required_safety_identifier(safety_identifier)
+        if not 3 <= connect_timeout_seconds <= 60:
+            raise ValueError("connect_timeout_seconds must be between 3 and 60")
+        if not 5 <= turn_timeout_seconds <= 180:
+            raise ValueError("turn_timeout_seconds must be between 5 and 180")
+        if not 256 <= max_output_tokens <= 4096:
+            raise ValueError("max_output_tokens must be between 256 and 4096")
+        self._connect_timeout_seconds = connect_timeout_seconds
+        self._turn_timeout_seconds = turn_timeout_seconds
+        self._max_output_tokens = max_output_tokens
+        self._noise_reduction = _validated_noise_reduction(noise_reduction)
+        self._vad_threshold = _validated_vad_threshold(vad_threshold)
+        self._vad_prefix_padding_ms = _validated_vad_prefix_padding_ms(
+            vad_prefix_padding_ms
+        )
+        self._vad_silence_duration_ms = _validated_vad_silence_duration_ms(
+            vad_silence_duration_ms
+        )
+        self._api_origin = _validated_origin(api_origin, scheme="https")
+        self._realtime_websocket_url = _validated_websocket_url(realtime_websocket_url)
+        self._http_client = http_client or httpx.AsyncClient(
+            timeout=httpx.Timeout(connect_timeout_seconds),
+            follow_redirects=False,
+        )
+        self._owns_http_client = http_client is None
+        self._websocket_connector = websocket_connector
+        self._call_id: str | None = None
+        self._channel: _OpenAIRealtimeEventChannel | None = None
+        self._closed = False
+
+    @property
+    def last_usage(self) -> OpenAIRealtimeUsage | None:
+        return self._channel.last_usage if self._channel is not None else None
+
+    @property
+    def last_response_id(self) -> str | None:
+        return self._channel.last_response_id if self._channel is not None else None
+
+    async def negotiate(self, *, offer_sdp: str) -> NegotiatedRealtimeCall:
+        if self._closed:
+            raise RealtimeNegotiationResponseError(
+                "cannot negotiate a closed OpenAI Realtime provider session"
+            )
+        if self._call_id is not None:
+            raise RealtimeNegotiationResponseError(
+                "OpenAI Realtime provider session may negotiate only once"
+            )
+        validate_sdp(offer_sdp, description="offer")
+        session = {
+            "type": "realtime",
+            "model": self._model,
+            "output_modalities": ["text"],
+            "max_output_tokens": self._max_output_tokens,
+        }
+        headers = self._headers(accept="application/sdp")
+        files = {
+            "sdp": (None, offer_sdp, "application/sdp"),
+            "session": (
+                None,
+                json.dumps(session, separators=(",", ":")),
+                "application/json",
+            ),
+        }
+        sdp_started = monotonic()
+        try:
+            async with self._http_client.stream(
+                "POST",
+                f"{self._api_origin}/v1/realtime/calls",
+                headers=headers,
+                files=files,
+                timeout=self._connect_timeout_seconds,
+            ) as response:
+                if response.status_code != 201:
+                    error_body = await _read_bounded_error_response(response)
+                    error_code, error_parameter = _provider_http_error_details(
+                        error_body
+                    )
+                    raise RealtimeNegotiationResponseError(
+                        "OpenAI Realtime negotiation failed with HTTP status "
+                        f"{response.status_code}",
+                        provider_status_code=response.status_code,
+                        provider_error_code=error_code,
+                        provider_error_parameter=error_parameter,
+                        provider_request_id=response.headers.get("x-request-id"),
+                    )
+                location = response.headers.get("location")
+                if location is None:
+                    raise RealtimeNegotiationResponseError(
+                        "OpenAI Realtime negotiation omitted the Location header"
+                    )
+                content_type = response.headers.get("content-type", "")
+                media_type = content_type.split(";", maxsplit=1)[0].strip().lower()
+                if media_type not in {"application/sdp", "text/plain"}:
+                    raise RealtimeNegotiationResponseError(
+                        "OpenAI Realtime negotiation returned a non-SDP response"
+                    )
+                answer_sdp = (
+                    await _read_bounded_response(response, MAX_SDP_BYTES)
+                ).decode("utf-8")
+                call_id = _call_id_from_location(location)
+        except RealtimeNegotiationResponseError:
+            raise
+        except (UnicodeDecodeError, httpx.HTTPError, OSError) as error:
+            raise RealtimeNegotiationUnavailableError(
+                "OpenAI Realtime negotiation could not reach the provider",
+                stage="sdp",
+                error_type=type(error).__name__,
+            ) from error
+        LOGGER.info(
+            "openai_realtime_stage stage=sdp call_id=%s elapsed_ms=%.2f",
+            call_id,
+            (monotonic() - sdp_started) * 1000,
+        )
+
+        sideband_started = monotonic()
+        try:
+            socket = await self._websocket_connector(
+                f"{self._realtime_websocket_url}?call_id={quote(call_id)}",
+                self._sideband_headers(),
+                self._connect_timeout_seconds,
+                MAX_PROVIDER_EVENT_BYTES,
+            )
+            channel = _OpenAIRealtimeEventChannel(
+                socket,
+                model=self._model,
+                max_output_tokens=self._max_output_tokens,
+                turn_timeout_seconds=self._turn_timeout_seconds,
+                noise_reduction=self._noise_reduction,
+                vad_threshold=self._vad_threshold,
+                vad_prefix_padding_ms=self._vad_prefix_padding_ms,
+                vad_silence_duration_ms=self._vad_silence_duration_ms,
+            )
+        except Exception as error:
+            status_code, request_id = _websocket_handshake_error_metadata(error)
+            LOGGER.warning(
+                "openai_realtime_sideband_attachment_failed call_id=%s "
+                "error_type=%s provider_status_code=%s provider_request_id=%s",
+                call_id,
+                type(error).__name__,
+                status_code,
+                request_id,
+            )
+            await self._hangup_after_failed_attachment(call_id)
+            if isinstance(error, OpenAIRealtimeProviderError):
+                raise RealtimeNegotiationResponseError(
+                    "OpenAI Realtime sideband returned an invalid session"
+                ) from error
+            raise RealtimeNegotiationUnavailableError(
+                "OpenAI Realtime sideband could not be attached",
+                stage="sideband",
+                error_type=type(error).__name__,
+                provider_status_code=status_code,
+                provider_request_id=request_id,
+            ) from error
+        LOGGER.info(
+            "openai_realtime_stage stage=sideband call_id=%s elapsed_ms=%.2f",
+            call_id,
+            (monotonic() - sideband_started) * 1000,
+        )
+
+        negotiated = NegotiatedRealtimeCall(
+            answer_sdp=answer_sdp,
+            provider_call_id=call_id,
+        )
+        self._call_id = call_id
+        self._channel = channel
+        return negotiated
+
+    def turn_events(
+        self,
+        *,
+        harness: RealtimeHarness,
+        turn_id: str,
+    ) -> AsyncIterator[RealtimeProviderTurnEvent]:
+        return self._require_channel().stream_turn(
+            harness=harness,
+            turn_id=turn_id,
+        )
+
+    async def prepare(self, *, harness: RealtimeHarness) -> None:
+        await self._require_channel().prepare(harness=harness)
+
+    async def complete_canvas_tool(
+        self,
+        *,
+        turn_id: str,
+        call_id: str,
+        output: InteractiveCanvasToolOutput,
+    ) -> None:
+        await self._require_channel().complete_canvas_tool(
+            turn_id=turn_id,
+            call_id=call_id,
+            output=output,
+        )
+
+    async def child_transcript(self, *, turn_id: str) -> str | None:
+        if not turn_id.strip():
+            raise ValueError("turn_id cannot be empty")
+        return None
+
+    async def cancel(self, *, turn_id: str) -> None:
+        if not turn_id.strip():
+            raise ValueError("turn_id cannot be empty")
+        if self._closed:
+            return
+        channel = self._channel
+        if channel is None:
+            # A bootstrap can expire before Flutter completes SDP negotiation.
+            # There is no provider response to cancel in that lifecycle state.
+            return
+        await channel.cancel(turn_id=turn_id)
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        errors: list[Exception] = []
+        if self._call_id is not None:
+            try:
+                await self._hangup(self._call_id)
+            except Exception as error:
+                errors.append(error)
+        if self._channel is not None:
+            try:
+                await self._channel.close()
+            except Exception as error:
+                errors.append(error)
+        if self._owns_http_client:
+            try:
+                await self._http_client.aclose()
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            raise OpenAIRealtimeUnavailableError(
+                "OpenAI Realtime session cleanup did not complete"
+            ) from errors[0]
+
+    def _require_channel(self) -> _OpenAIRealtimeEventChannel:
+        if self._closed:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI Realtime provider session is closed"
+            )
+        if self._channel is None:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI Realtime media must be negotiated before the turn starts"
+            )
+        return self._channel
+
+    def _headers(self, *, accept: str | None = None) -> dict[str, str]:
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "OpenAI-Safety-Identifier": self._safety_identifier,
+        }
+        if accept is not None:
+            headers["Accept"] = accept
+        return headers
+
+    def _sideband_headers(self) -> dict[str, str]:
+        # The safety identifier is bound when /v1/realtime/calls creates the
+        # session. OpenAI's sideband contract authenticates the attachment
+        # socket with the standard bearer key only.
+        return {"Authorization": f"Bearer {self._api_key}"}
+
+    async def _hangup_after_failed_attachment(self, call_id: str) -> None:
+        try:
+            await self._hangup(call_id)
+        except Exception:
+            LOGGER.exception(
+                "openai_realtime_attachment_cleanup_failed call_id=%s",
+                call_id,
+            )
+
+    async def _hangup(self, call_id: str) -> None:
+        try:
+            response = await self._http_client.post(
+                f"{self._api_origin}/v1/realtime/calls/{quote(call_id)}/hangup",
+                headers=self._headers(accept="*/*"),
+                timeout=self._connect_timeout_seconds,
+            )
+        except (httpx.HTTPError, OSError) as error:
+            raise OpenAIRealtimeUnavailableError(
+                "OpenAI Realtime hangup request failed"
+            ) from error
+        if response.status_code not in {200, 404}:
+            raise OpenAIRealtimeProtocolError(
+                f"OpenAI Realtime hangup failed with HTTP status {response.status_code}"
+            )
+
+
+class OpenAIRealtimeLiveProbe:
+    """One explicitly authorized, server-to-server text probe of the live model."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        safety_identifier: str,
+        connect_timeout_seconds: float,
+        turn_timeout_seconds: float,
+        max_output_tokens: int,
+        websocket_connector: RealtimeWebSocketConnector = (
+            _default_websocket_connector
+        ),
+        realtime_websocket_url: str = DEFAULT_OPENAI_REALTIME_WEBSOCKET,
+    ) -> None:
+        self._api_key = _required_secret(api_key, "OpenAI API key")
+        self._model = _required_name(model, "OpenAI Realtime model")
+        self._safety_identifier = _required_safety_identifier(safety_identifier)
+        if not 3 <= connect_timeout_seconds <= 60:
+            raise ValueError("connect_timeout_seconds must be between 3 and 60")
+        if not 5 <= turn_timeout_seconds <= 180:
+            raise ValueError("turn_timeout_seconds must be between 5 and 180")
+        if not 256 <= max_output_tokens <= 4096:
+            raise ValueError("max_output_tokens must be between 256 and 4096")
+        self._connect_timeout_seconds = connect_timeout_seconds
+        self._turn_timeout_seconds = turn_timeout_seconds
+        self._max_output_tokens = max_output_tokens
+        self._websocket_connector = websocket_connector
+        self._realtime_websocket_url = _validated_websocket_url(realtime_websocket_url)
+
+    async def run(
+        self,
+        *,
+        harness: RealtimeHarness,
+        turn_id: str,
+        text_input: str,
+        response_max_output_tokens: int,
+    ) -> OpenAIRealtimeProbeResult:
+        outcome = (
+            await self.run_many(
+                harness=harness,
+                requests=(
+                    OpenAIRealtimeProbeRequest(
+                        turn_id=turn_id,
+                        text_input=text_input,
+                        max_output_tokens=response_max_output_tokens,
+                    ),
+                ),
+            )
+        )[0]
+        if isinstance(outcome, OpenAIRealtimeProbeFailureResult):
+            raise OpenAIRealtimeOutputValidationError(
+                usage=outcome.usage,
+                response_id=outcome.response_id,
+                validation_issue_count=len(outcome.validation_issues),
+                validation_issues=outcome.validation_issues,
+            )
+        return outcome
+
+    async def run_many(
+        self,
+        *,
+        harness: RealtimeHarness,
+        requests: tuple[OpenAIRealtimeProbeRequest, ...],
+    ) -> tuple[OpenAIRealtimeProbeOutcome, ...]:
+        """Run a bounded semantic matrix in one persistent Realtime session."""
+
+        if not 1 <= len(requests) <= 8:
+            raise ValueError("live semantic matrix must contain 1-8 requests")
+        if len({request.turn_id for request in requests}) != len(requests):
+            raise ValueError("live semantic matrix turn IDs must be unique")
+        url = f"{self._realtime_websocket_url}?model={quote(self._model)}"
+        socket = await self._websocket_connector(
+            url,
+            {
+                "Authorization": f"Bearer {self._api_key}",
+                "OpenAI-Safety-Identifier": self._safety_identifier,
+            },
+            self._connect_timeout_seconds,
+            MAX_PROVIDER_EVENT_BYTES,
+        )
+        channel = _OpenAIRealtimeEventChannel(
+            socket,
+            model=self._model,
+            max_output_tokens=self._max_output_tokens,
+            turn_timeout_seconds=self._turn_timeout_seconds,
+        )
+        try:
+            await channel.expect_session_created()
+            outcomes: list[OpenAIRealtimeProbeOutcome] = []
+            for request in requests:
+                try:
+                    outcome: OpenAIRealtimeProbeOutcome = await self._run_request(
+                        channel=channel,
+                        harness=harness,
+                        request=request,
+                    )
+                except OpenAIRealtimeOutputValidationError as error:
+                    outcome = OpenAIRealtimeProbeFailureResult(
+                        turn_id=request.turn_id,
+                        response_id=error.response_id,
+                        usage=error.usage,
+                        validation_issues=error.validation_issues,
+                    )
+                outcomes.append(outcome)
+            return tuple(outcomes)
+        finally:
+            await channel.close()
+
+    async def _run_request(
+        self,
+        *,
+        channel: _OpenAIRealtimeEventChannel,
+        harness: RealtimeHarness,
+        request: OpenAIRealtimeProbeRequest,
+    ) -> OpenAIRealtimeProbeResult:
+        parser = StreamingSpeechParser()
+        canvas_request: InteractiveCanvasRequest | None = None
+        canvas_selected = False
+        canvas_rejection: str | None = None
+        async for event in channel.stream_turn(
+            harness=harness,
+            turn_id=request.turn_id,
+            text_input=request.text_input,
+            response_max_output_tokens=request.max_output_tokens,
+        ):
+            if isinstance(event, RealtimeSpeechTextDelta):
+                parser.feed(event.delta)
+                continue
+            if isinstance(event, RealtimeCanvasToolCall):
+                parser.finish_response_chunk()
+                if canvas_selected:
+                    raise OpenAIRealtimeProtocolError(
+                        "OpenAI live probe requested multiple canvases"
+                    )
+                canvas_selected = True
+                canvas_request = event.request
+                await channel.complete_canvas_tool(
+                    turn_id=request.turn_id,
+                    call_id=event.call_id,
+                    output=InteractiveCanvasToolOutput.model_validate(
+                        {
+                            "status": "rejected",
+                            "reason": (
+                                "Live semantic-selection probe does not render a scene."
+                            ),
+                        }
+                    ),
+                )
+                continue
+            if isinstance(event, RealtimeRejectedCanvasToolCall):
+                parser.finish_response_chunk()
+                if canvas_selected:
+                    raise OpenAIRealtimeProtocolError(
+                        "OpenAI live probe requested multiple canvases"
+                    )
+                canvas_selected = True
+                canvas_rejection = event.reason
+                await channel.complete_canvas_tool(
+                    turn_id=request.turn_id,
+                    call_id=event.call_id,
+                    output=InteractiveCanvasToolOutput.model_validate(
+                        {
+                            "status": "rejected",
+                            "reason": event.reason,
+                        }
+                    ),
+                )
+                continue
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI live probe received an unsupported event"
+            )
+        try:
+            parser.finish()
+        except StreamingTurnParseError as error:
+            if channel.last_usage is None or channel.last_response_id is None:
+                raise OpenAIRealtimeProtocolError(
+                    "OpenAI live probe failed speech validation without "
+                    "billed response metadata"
+                ) from error
+            raise OpenAIRealtimeOutputValidationError(
+                usage=channel.last_usage,
+                response_id=channel.last_response_id,
+                validation_issue_count=1,
+                validation_issues=(
+                    OpenAIRealtimeValidationIssue(path=(), code="streaming_contract"),
+                ),
+            ) from error
+        if (
+            channel.last_usage is None
+            or channel.last_response_id is None
+            or channel.last_first_delta_ms is None
+            or channel.last_completed_ms is None
+        ):
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI live probe completed without usage or timing metadata"
+            )
+        return OpenAIRealtimeProbeResult(
+            speech=" ".join(segment.speech for segment in parser.emitted_segments),
+            canvas_request=canvas_request,
+            canvas_selected=canvas_selected,
+            canvas_rejection=canvas_rejection,
+            model=self._model,
+            prompt_version=harness.prompt_version,
+            response_id=channel.last_response_id,
+            first_delta_ms=channel.last_first_delta_ms,
+            completed_ms=channel.last_completed_ms,
+            usage=channel.last_usage,
+        )
+
+
+def _session_update(
+    harness: RealtimeHarness,
+    model: str,
+    max_output_tokens: int,
+    *,
+    noise_reduction: str = "near_field",
+    vad_threshold: float = 0.45,
+    vad_prefix_padding_ms: int = 500,
+    vad_silence_duration_ms: int = 450,
+) -> dict[str, object]:
+    provider_neutral = harness.session_update()
+    raw_session = provider_neutral.get("session")
+    if not isinstance(raw_session, dict):
+        raise OpenAIRealtimeProtocolError(
+            "Realtime harness produced an invalid session update"
+        )
+    session = dict(raw_session)
+    session.update(
+        {
+            "type": "realtime",
+            "model": model,
+            "output_modalities": ["text"],
+            "max_output_tokens": max_output_tokens,
+            "parallel_tool_calls": False,
+            "reasoning": {"effort": harness.reasoning_effort},
+            "audio": {
+                "input": {
+                    "noise_reduction": {
+                        "type": _validated_noise_reduction(noise_reduction)
+                    },
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": _validated_vad_threshold(vad_threshold),
+                        "prefix_padding_ms": _validated_vad_prefix_padding_ms(
+                            vad_prefix_padding_ms
+                        ),
+                        "silence_duration_ms": _validated_vad_silence_duration_ms(
+                            vad_silence_duration_ms
+                        ),
+                        "create_response": True,
+                        "interrupt_response": True,
+                    },
+                }
+            },
+        }
+    )
+    return {"type": "session.update", "session": session}
+
+
+def _validated_noise_reduction(value: str) -> str:
+    if value not in {"near_field", "far_field"}:
+        raise ValueError("noise_reduction must be near_field or far_field")
+    return value
+
+
+def _validated_vad_threshold(value: float) -> float:
+    if isinstance(value, bool) or not 0 <= value <= 1:
+        raise ValueError("vad_threshold must be between 0 and 1")
+    return float(value)
+
+
+def _validated_vad_prefix_padding_ms(value: int) -> int:
+    if isinstance(value, bool) or not 0 <= value <= 5_000:
+        raise ValueError("vad_prefix_padding_ms must be between 0 and 5000")
+    return value
+
+
+def _validated_vad_silence_duration_ms(value: int) -> int:
+    if isinstance(value, bool) or not 100 <= value <= 2_000:
+        raise ValueError("vad_silence_duration_ms must be between 100 and 2000")
+    return value
+
+
+def _validate_semantic_response_done(
+    event: Mapping[str, object],
+    *,
+    expected_response_id: str | None,
+) -> tuple[dict[str, object], str]:
+    response = _mapping(event.get("response"), "response.done response")
+    response_id = _required_string(response, "id")
+    if expected_response_id is not None and response_id != expected_response_id:
+        raise OpenAIRealtimeProtocolError(
+            "OpenAI response ID changed at response completion"
+        )
+    if response.get("status") != "completed":
+        raise OpenAIRealtimeUnavailableError(
+            "OpenAI Realtime response did not complete successfully"
+        )
+    _response_output(response)
+    return response, response_id
+
+
+def _response_output(response: Mapping[str, object]) -> list[object]:
+    output = response.get("output")
+    if not isinstance(output, list):
+        raise OpenAIRealtimeProtocolError(
+            "OpenAI Realtime response omitted its output items"
+        )
+    return output
+
+
+def _merge_usage(
+    accumulated: OpenAIRealtimeUsage | None,
+    current: OpenAIRealtimeUsage,
+) -> OpenAIRealtimeUsage:
+    if accumulated is None:
+        return current
+
+    def optional_sum(left: int | None, right: int | None) -> int | None:
+        if left is None or right is None:
+            return None
+        return left + right
+
+    return OpenAIRealtimeUsage(
+        input_tokens=accumulated.input_tokens + current.input_tokens,
+        output_tokens=accumulated.output_tokens + current.output_tokens,
+        total_tokens=accumulated.total_tokens + current.total_tokens,
+        cached_input_tokens=optional_sum(
+            accumulated.cached_input_tokens,
+            current.cached_input_tokens,
+        ),
+        input_text_tokens=optional_sum(
+            accumulated.input_text_tokens,
+            current.input_text_tokens,
+        ),
+        input_audio_tokens=optional_sum(
+            accumulated.input_audio_tokens,
+            current.input_audio_tokens,
+        ),
+        output_text_tokens=optional_sum(
+            accumulated.output_text_tokens,
+            current.output_text_tokens,
+        ),
+        output_audio_tokens=optional_sum(
+            accumulated.output_audio_tokens,
+            current.output_audio_tokens,
+        ),
+    )
+
+
+def _parse_usage(event: Mapping[str, object]) -> OpenAIRealtimeUsage:
+    response = _mapping(event.get("response"), "response.done response")
+    usage = _mapping(response.get("usage"), "response usage")
+    input_details = _optional_mapping(usage.get("input_token_details"))
+    output_details = _optional_mapping(usage.get("output_token_details"))
+    input_tokens = _non_negative_integer(usage, "input_tokens")
+    output_tokens = _non_negative_integer(usage, "output_tokens")
+    total_tokens = _non_negative_integer(usage, "total_tokens")
+    if input_tokens + output_tokens != total_tokens:
+        raise OpenAIRealtimeProtocolError(
+            "OpenAI Realtime usage total does not match input plus output"
+        )
+    return OpenAIRealtimeUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        cached_input_tokens=_optional_non_negative_integer(
+            input_details,
+            "cached_tokens",
+        ),
+        input_text_tokens=_optional_non_negative_integer(
+            input_details,
+            "text_tokens",
+        ),
+        input_audio_tokens=_optional_non_negative_integer(
+            input_details,
+            "audio_tokens",
+        ),
+        output_text_tokens=_optional_non_negative_integer(
+            output_details,
+            "text_tokens",
+        ),
+        output_audio_tokens=_optional_non_negative_integer(
+            output_details,
+            "audio_tokens",
+        ),
+    )
+
+
+def _provider_error(event: Mapping[str, object]) -> OpenAIRealtimeProviderError:
+    normalized_code = _provider_error_code(event)
+    return OpenAIRealtimeUnavailableError(
+        f"OpenAI Realtime emitted provider error code={normalized_code}"
+    )
+
+
+def _provider_error_code(event: Mapping[str, object]) -> str:
+    error = _optional_mapping(event.get("error"))
+    code = error.get("code")
+    return code if isinstance(code, str) and code else "unknown"
+
+
+async def _read_bounded_response(
+    response: httpx.Response,
+    max_bytes: int,
+) -> bytes:
+    chunks: list[bytes] = []
+    byte_count = 0
+    async for chunk in response.aiter_bytes():
+        byte_count += len(chunk)
+        if byte_count > max_bytes:
+            raise RealtimeNegotiationResponseError(
+                "OpenAI Realtime SDP answer exceeded Ava's byte limit"
+            )
+        chunks.append(chunk)
+    if byte_count == 0:
+        raise RealtimeNegotiationResponseError("OpenAI Realtime SDP answer was empty")
+    return b"".join(chunks)
+
+
+async def _read_bounded_error_response(response: httpx.Response) -> bytes:
+    chunks: list[bytes] = []
+    byte_count = 0
+    async for chunk in response.aiter_bytes():
+        byte_count += len(chunk)
+        if byte_count > MAX_PROVIDER_ERROR_BYTES:
+            raise RealtimeNegotiationResponseError(
+                "OpenAI Realtime error response exceeded Ava's byte limit",
+                provider_status_code=response.status_code,
+                provider_request_id=response.headers.get("x-request-id"),
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _provider_http_error_details(body: bytes) -> tuple[str | None, str | None]:
+    try:
+        decoded = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, None
+    if not isinstance(decoded, dict):
+        return None, None
+    candidate = decoded.get("error", decoded)
+    if not isinstance(candidate, dict):
+        return None, None
+    raw_code = candidate.get("code") or candidate.get("type")
+    code = (
+        raw_code.strip()[:120]
+        if isinstance(raw_code, str) and raw_code.strip()
+        else None
+    )
+    raw_parameter = candidate.get("param")
+    parameter = (
+        raw_parameter.strip()[:120]
+        if isinstance(raw_parameter, str) and raw_parameter.strip()
+        else None
+    )
+    return code, parameter
+
+
+def _call_id_from_location(location: str) -> str:
+    parsed = urlsplit(location)
+    if parsed.username is not None or parsed.password is not None:
+        raise RealtimeNegotiationResponseError(
+            "OpenAI Realtime Location cannot contain credentials"
+        )
+    if parsed.query or parsed.fragment:
+        raise RealtimeNegotiationResponseError(
+            "OpenAI Realtime Location cannot contain query or fragment data"
+        )
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) != 4 or parts[:3] != ["v1", "realtime", "calls"]:
+        raise RealtimeNegotiationResponseError(
+            "OpenAI Realtime Location has an invalid call path"
+        )
+    return parts[-1]
+
+
+def _websocket_handshake_error_metadata(
+    error: Exception,
+) -> tuple[int | None, str | None]:
+    """Extract non-sensitive diagnostics from a WebSocket handshake failure."""
+
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if not isinstance(status_code, int):
+        status_code = None
+    headers = getattr(response, "headers", None)
+    request_id: str | None = None
+    if headers is not None:
+        candidate = headers.get("x-request-id")
+        if isinstance(candidate, str) and candidate.strip():
+            request_id = candidate.strip()[:256]
+    return status_code, request_id
+
+
+def _event_type(event: Mapping[str, object]) -> str:
+    return _required_string(event, "type")
+
+
+def _required_string(
+    value: Mapping[str, object],
+    key: str,
+    *,
+    allow_empty: bool = False,
+) -> str:
+    candidate = value.get(key)
+    if not isinstance(candidate, str) or (not allow_empty and not candidate):
+        raise OpenAIRealtimeProtocolError(f"OpenAI Realtime event has invalid {key}")
+    return candidate
+
+
+def _nested_string(
+    value: Mapping[str, object],
+    parent: str,
+    child: str,
+) -> str:
+    return _required_string(_mapping(value.get(parent), parent), child)
+
+
+def _mapping(value: object, description: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise OpenAIRealtimeProtocolError(
+            f"OpenAI Realtime {description} must be an object"
+        )
+    return value
+
+
+def _optional_mapping(value: object) -> dict[str, object]:
+    if value is None:
+        return {}
+    return _mapping(value, "usage details")
+
+
+def _non_negative_integer(value: Mapping[str, object], key: str) -> int:
+    candidate = value.get(key)
+    if type(candidate) is not int or candidate < 0:
+        raise OpenAIRealtimeProtocolError(f"OpenAI Realtime usage has invalid {key}")
+    return candidate
+
+
+def _optional_non_negative_integer(
+    value: Mapping[str, object],
+    key: str,
+) -> int | None:
+    candidate = value.get(key)
+    if candidate is None:
+        return None
+    if type(candidate) is not int or candidate < 0:
+        raise OpenAIRealtimeProtocolError(f"OpenAI Realtime usage has invalid {key}")
+    return candidate
+
+
+def _required_secret(value: str, description: str) -> str:
+    normalized = value.strip()
+    if not normalized or normalized.lower() in {
+        "replace-me",
+        "changeme",
+        "your-api-key",
+    }:
+        raise ValueError(f"{description} is missing or still a placeholder")
+    return normalized
+
+
+def _required_name(value: str, description: str) -> str:
+    normalized = value.strip()
+    if not normalized or len(normalized) > 128:
+        raise ValueError(f"{description} must contain 1-128 characters")
+    if any(
+        character
+        not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-"
+        for character in normalized
+    ):
+        raise ValueError(f"{description} contains unsupported characters")
+    return normalized
+
+
+def _required_safety_identifier(value: str) -> str:
+    normalized = value.strip()
+    if not 8 <= len(normalized) <= 128 or any(
+        character
+        not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+        for character in normalized
+    ):
+        raise ValueError("safety_identifier has an invalid format")
+    return normalized
+
+
+def _validated_origin(value: str, *, scheme: str) -> str:
+    normalized = value.strip().rstrip("/")
+    parsed = urlsplit(normalized)
+    if (
+        parsed.scheme != scheme
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(f"provider origin must be an absolute {scheme} origin")
+    return normalized
+
+
+def _validated_websocket_url(value: str) -> str:
+    normalized = value.strip()
+    parsed = urlsplit(normalized)
+    if (
+        parsed.scheme != "wss"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("Realtime WebSocket URL must be an absolute WSS URL")
+    return normalized
+
+
+_PRE_RESPONSE_EVENT_TYPES = frozenset(
+    {
+        "conversation.created",
+        "rate_limits.updated",
+    }
+)
+
+_IN_TURN_IGNORED_EVENT_TYPES = frozenset(
+    {
+        "conversation.created",
+        "conversation.item.added",
+        "conversation.item.created",
+        "conversation.item.done",
+        "input_audio_buffer.committed",
+        "input_audio_buffer.speech_started",
+        "input_audio_buffer.speech_stopped",
+        "rate_limits.updated",
+        "response.content_part.added",
+        "response.content_part.done",
+        "response.output_item.done",
+        "response.output_text.done",
+        "session.updated",
+    }
+)
+
+_RESPONSE_TRIGGER_EVENT_TYPES = frozenset(
+    {
+        "input_audio_buffer.committed",
+        "input_audio_buffer.speech_stopped",
+    }
+)

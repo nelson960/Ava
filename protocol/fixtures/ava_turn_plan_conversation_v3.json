@@ -1,0 +1,19 @@
+{
+  "segments": [
+    {
+      "id": "reply",
+      "speech": "That sounds like a lovely idea. Tell me what you like most about it.",
+      "delivery": "warm",
+      "expression": "warmSmile",
+      "gaze": "child",
+      "motionIntent": "none",
+      "canvasCues": []
+    }
+  ],
+  "memoryProposal": null,
+  "childTurnSummary": "The child shared an idea they enjoy.",
+  "canvasDecision": {
+    "complexity": "none",
+    "specialistBrief": null
+  }
+}

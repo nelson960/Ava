@@ -1,0 +1,178 @@
+{
+  "segments": [
+    {
+      "id": "answer",
+      "speech": "A plant cell is a tiny living system with different parts doing different jobs.",
+      "delivery": "warm",
+      "expression": "curious",
+      "gaze": "child",
+      "motionIntent": "acknowledge",
+      "canvasCues": []
+    },
+    {
+      "id": "visual",
+      "speech": "Let me draw a little plant cell so we can look inside it.",
+      "delivery": "encouraging",
+      "expression": "encouraging",
+      "gaze": "canvas",
+      "motionIntent": "presentCanvas",
+      "canvasCues": [
+        {
+          "id": "show_cell",
+          "anchor": {
+            "phrase": "plant cell",
+            "occurrence": 0
+          },
+          "transaction": {
+            "id": "cell_scene_start",
+            "sceneId": "plant_cell_scene",
+            "baseRevision": 0,
+            "revision": 1,
+            "operations": [
+              {
+                "operation": "create",
+                "node": {
+                  "id": "cell",
+                  "parentId": null,
+                  "label": "Plant cell boundary",
+                  "visible": true,
+                  "transform": {
+                    "translateX": 0.0,
+                    "translateY": 0.0,
+                    "scale": 1.0,
+                    "rotationDegrees": 0.0
+                  },
+                  "style": {
+                    "fill": "accentSoft",
+                    "stroke": "ink",
+                    "strokeWidth": 4.0,
+                    "opacity": 1.0,
+                    "strokeCap": "round"
+                  },
+                  "kind": "ellipse",
+                  "center": {
+                    "x": 500.0,
+                    "y": 300.0
+                  },
+                  "radiusX": 310.0,
+                  "radiusY": 210.0
+                }
+              },
+              {
+                "operation": "create",
+                "node": {
+                  "id": "nucleus",
+                  "parentId": null,
+                  "label": "Cell nucleus",
+                  "visible": true,
+                  "transform": {
+                    "translateX": 0.0,
+                    "translateY": 0.0,
+                    "scale": 1.0,
+                    "rotationDegrees": 0.0
+                  },
+                  "style": {
+                    "fill": "accent",
+                    "stroke": "ink",
+                    "strokeWidth": 3.0,
+                    "opacity": 1.0,
+                    "strokeCap": "round"
+                  },
+                  "kind": "circle",
+                  "center": {
+                    "x": 430.0,
+                    "y": 300.0
+                  },
+                  "radius": 72.0
+                }
+              },
+              {
+                "operation": "create",
+                "node": {
+                  "id": "nucleus_label",
+                  "parentId": null,
+                  "label": "Nucleus label",
+                  "visible": true,
+                  "transform": {
+                    "translateX": 0.0,
+                    "translateY": 0.0,
+                    "scale": 1.0,
+                    "rotationDegrees": 0.0
+                  },
+                  "style": {
+                    "fill": "ink",
+                    "stroke": "transparent",
+                    "strokeWidth": 0.0,
+                    "opacity": 1.0,
+                    "strokeCap": "round"
+                  },
+                  "kind": "text",
+                  "x": 690.0,
+                  "y": 180.0,
+                  "text": "Nucleus",
+                  "fontSize": 34.0,
+                  "fontWeight": "bold",
+                  "textAnchor": "middle"
+                }
+              },
+              {
+                "operation": "create",
+                "node": {
+                  "id": "nucleus_arrow",
+                  "parentId": null,
+                  "label": "Arrow from label to nucleus",
+                  "visible": true,
+                  "transform": {
+                    "translateX": 0.0,
+                    "translateY": 0.0,
+                    "scale": 1.0,
+                    "rotationDegrees": 0.0
+                  },
+                  "style": {
+                    "fill": "transparent",
+                    "stroke": "ink",
+                    "strokeWidth": 4.0,
+                    "opacity": 1.0,
+                    "strokeCap": "round"
+                  },
+                  "kind": "arrow",
+                  "start": {
+                    "x": 650.0,
+                    "y": 195.0
+                  },
+                  "end": {
+                    "x": 485.0,
+                    "y": 260.0
+                  }
+                }
+              }
+            ],
+            "stateVariables": [],
+            "bindings": [
+              {
+                "id": "toggle_nucleus",
+                "nodeId": "nucleus",
+                "event": "tap",
+                "action": {
+                  "kind": "toggleVisibility",
+                  "targetNodeId": "nucleus_label"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "memoryProposal": {
+    "kind": "interest",
+    "summary": "The child is curious about plant cells.",
+    "evidence": "The child asked how a plant cell works.",
+    "confidence": 0.82
+  },
+  "childTurnSummary": "Asked for a simple explanation of a plant cell.",
+  "canvasDecision": {
+    "complexity": "normal",
+    "specialistBrief": null
+  }
+}

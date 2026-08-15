@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ava-backend"
+version = "0.1.0"
+description = "Production orchestration backend for the Ava interactive character"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "openai[realtime]>=2.43,<3",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "psycopg[binary,pool]>=3.2,<4",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.13,<2",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.24,<1",
+  "ruff>=0.11,<1",
+]
+
+[project.scripts]
+ava-evaluate-personality-v3 = "ava_backend.realtime.eval_cli:main"
+ava-live-realtime-probe = "ava_backend.realtime.live_probe:main"
+ava-live-realtime-semantic-matrix = "ava_backend.realtime.live_semantic_matrix:main"
+ava-live-canvas-probe = "ava_backend.canvas.live_probe:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ava_backend"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["src"]
+testpaths = ["tests"]

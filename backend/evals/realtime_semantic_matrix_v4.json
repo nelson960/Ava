@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "promptVersion": "ava-realtime-v4.1",
+  "cases": [
+    {
+      "id": "ordinary_greeting",
+      "input": "Hi Ava. How are you today?",
+      "expectCanvas": false
+    },
+    {
+      "id": "explicit_water_cycle_visual",
+      "input": "Explain the water cycle simply and show me a clear interactive visual.",
+      "expectCanvas": true
+    },
+    {
+      "id": "drawing_word_without_visual",
+      "input": "Tell me a tiny story about a child drawing with chalk, but do not show a visual.",
+      "expectCanvas": false
+    },
+    {
+      "id": "spatial_comparison_visual",
+      "input": "Compare a seed and a flower in a simple visual so I can see how they are related.",
+      "expectCanvas": true
+    }
+  ]
+}

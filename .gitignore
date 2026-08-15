@@ -1,0 +1,110 @@
+# ==============================================================================
+# OS & Scratch Files
+# ==============================================================================
+.DS_Store
+**/.DS_Store
+*.swp
+*.log
+/temp/
+
+# ==============================================================================
+# Secrets & Environment Variables (Keeps .env.example tracked)
+# ==============================================================================
+*.env
+*.env.*
+!*.env.example
+
+# ==============================================================================
+# IDEs & Developer Workspace
+# ==============================================================================
+.idea/
+*.iml
+*.ipr
+*.iws
+**/*.xcuserdata/
+**/*.xcuserstate
+#.vscode/
+
+# ==============================================================================
+# 3D Avatar Workspace, ML Experiments & Heavy Assets (~450MB)
+# ==============================================================================
+avatar/motion_learning/
+avatar/renders/
+avatar/backups/
+avatar/motion_sources/
+avatar/reference/
+avatar/research/
+avatar/reviews/
+avatar/sounds/
+avatar/tools/
+avatar/system-info.txt
+avatar/*.blend
+avatar/*.blend1
+avatar/*.vrm
+
+# ==============================================================================
+# Flutter / Dart
+# ==============================================================================
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+/coverage/
+**/doc/api/
+
+# Flutter Test Artifacts & Diff Images
+test/failures/
+test/**/failures/
+
+# ==============================================================================
+# iOS & macOS (Xcode / CocoaPods)
+# ==============================================================================
+**/ios/Pods/
+**/macos/Pods/
+**/ios/Flutter/.last_build_id
+**/ios/Flutter/Generated.xcconfig
+**/macos/Flutter/ephemeral/
+**/DerivedData/
+*.swiftpm/
+
+# ==============================================================================
+# Android
+# ==============================================================================
+android/.gradle/
+android/local.properties
+android/key.properties
+/android/app/debug/
+/android/app/profile/
+/android/app/release/
+
+# ==============================================================================
+# Desktop & Web Ephemeral Files
+# ==============================================================================
+linux/flutter/ephemeral/
+windows/flutter/ephemeral/
+
+# ==============================================================================
+# Python Backend & Test Caches
+# ==============================================================================
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+**/.venv/
+venv/
+backend/.logs/
+backend/evals/workspace/
+.coverage
+htmlcov/
+*.sqlite3
+*.db
+
+# ==============================================================================
+# Symbolication & Obfuscation
+# ==============================================================================
+app.*.symbols
+app.*.map.json

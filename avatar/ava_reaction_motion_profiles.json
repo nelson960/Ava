@@ -1,0 +1,119 @@
+{
+  "schemaVersion": 1,
+  "intensityDurationScales": {
+    "subtle": 0.86,
+    "normal": 1.0,
+    "repeated": 1.16
+  },
+  "profiles": {
+    "hair": {
+      "actions": [
+        {"kind":"recoil","claims":{"head":"override","hair":"additive"},"durationMs":620,"blendInMs":55,"blendOutMs":180,"minimumHoldMs":120,"interruption":"afterMinimumHold","retarget":"afterMinimumHold","retargetGroup":"touch:head"},
+        {"kind":"lookAt","claims":{"gaze":"override","neck":"additive"},"durationMs":520,"blendInMs":45,"blendOutMs":140,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:gaze"},
+        {"kind":"expression","claims":{"faceExpression":"additive"},"durationMs":480,"blendInMs":35,"blendOutMs":160,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:expression"}
+      ]
+    },
+    "head": {
+      "actions": [
+        {"kind":"recoil","claims":{"head":"override","neck":"additive"},"durationMs":650,"blendInMs":55,"blendOutMs":190,"minimumHoldMs":130,"interruption":"afterMinimumHold","retarget":"afterMinimumHold","retargetGroup":"touch:head"},
+        {"kind":"lookAt","claims":{"gaze":"override"},"durationMs":520,"blendInMs":40,"blendOutMs":130,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:gaze"},
+        {"kind":"expression","claims":{"faceExpression":"additive"},"durationMs":500,"blendInMs":35,"blendOutMs":160,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:expression"}
+      ]
+    },
+    "face": {
+      "actions": [
+        {"kind":"recoil","claims":{"head":"override","neck":"additive"},"durationMs":600,"blendInMs":50,"blendOutMs":190,"minimumHoldMs":120,"interruption":"afterMinimumHold","retarget":"afterMinimumHold","retargetGroup":"touch:face"},
+        {"kind":"lookAt","claims":{"gaze":"override"},"durationMs":500,"blendInMs":35,"blendOutMs":120,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:gaze"},
+        {"kind":"expression","claims":{"faceExpression":"additive"},"durationMs":560,"blendInMs":30,"blendOutMs":170,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:expression"}
+      ]
+    },
+    "leftArm": {
+      "actions": [
+        {"kind":"recoil","claims":{"leftArm":"override","leftHand":"additive","posture":"additive"},"durationMs":720,"blendInMs":65,"blendOutMs":210,"minimumHoldMs":150,"interruption":"afterMinimumHold","retarget":"afterMinimumHold","retargetGroup":"touch:leftArm"},
+        {"kind":"lookAt","claims":{"gaze":"override","neck":"additive","head":"additive"},"durationMs":610,"blendInMs":45,"blendOutMs":150,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:gaze"},
+        {"kind":"expression","claims":{"faceExpression":"additive"},"durationMs":480,"blendInMs":35,"blendOutMs":150,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:expression"}
+      ]
+    },
+    "rightArm": {
+      "actions": [
+        {"kind":"recoil","claims":{"rightArm":"override","rightHand":"additive","posture":"additive"},"durationMs":720,"blendInMs":65,"blendOutMs":210,"minimumHoldMs":150,"interruption":"afterMinimumHold","retarget":"afterMinimumHold","retargetGroup":"touch:rightArm"},
+        {"kind":"lookAt","claims":{"gaze":"override","neck":"additive","head":"additive"},"durationMs":610,"blendInMs":45,"blendOutMs":150,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:gaze"},
+        {"kind":"expression","claims":{"faceExpression":"additive"},"durationMs":480,"blendInMs":35,"blendOutMs":150,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:expression"}
+      ]
+    },
+    "leftHand": {
+      "actions": [
+        {"kind":"handPose","claims":{"leftHand":"override","leftFingers":"override","leftArm":"additive"},"durationMs":760,"blendInMs":55,"blendOutMs":220,"minimumHoldMs":140,"interruption":"afterMinimumHold","retarget":"afterMinimumHold","retargetGroup":"touch:leftHand"},
+        {"kind":"lookAt","claims":{"gaze":"override","neck":"additive","head":"additive"},"durationMs":600,"blendInMs":45,"blendOutMs":150,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:gaze"},
+        {"kind":"expression","claims":{"faceExpression":"additive"},"durationMs":480,"blendInMs":35,"blendOutMs":150,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:expression"}
+      ]
+    },
+    "rightHand": {
+      "actions": [
+        {"kind":"handPose","claims":{"rightHand":"override","rightFingers":"override","rightArm":"additive"},"durationMs":760,"blendInMs":55,"blendOutMs":220,"minimumHoldMs":140,"interruption":"afterMinimumHold","retarget":"afterMinimumHold","retargetGroup":"touch:rightHand"},
+        {"kind":"lookAt","claims":{"gaze":"override","neck":"additive","head":"additive"},"durationMs":600,"blendInMs":45,"blendOutMs":150,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:gaze"},
+        {"kind":"expression","claims":{"faceExpression":"additive"},"durationMs":480,"blendInMs":35,"blendOutMs":150,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:expression"}
+      ]
+    },
+    "torso": {
+      "actions": [
+        {"kind":"protectiveRedirect","claims":{"posture":"additive","spine":"override"},"durationMs":760,"blendInMs":90,"blendOutMs":220,"minimumHoldMs":180,"interruption":"afterMinimumHold","retarget":"afterMinimumHold","retargetGroup":"touch:torso"},
+        {"kind":"lookAt","claims":{"gaze":"override","head":"additive","neck":"additive"},"durationMs":620,"blendInMs":45,"blendOutMs":160,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:gaze"},
+        {"kind":"expression","claims":{"faceExpression":"additive"},"durationMs":560,"blendInMs":35,"blendOutMs":180,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:expression"}
+      ]
+    },
+    "leftLeg": {
+      "actions": [
+        {"kind":"recoil","claims":{"leftLeg":"override","posture":"override"},"durationMs":900,"blendInMs":70,"blendOutMs":260,"minimumHoldMs":300,"interruption":"afterMinimumHold","retarget":"afterMinimumHold","retargetGroup":"touch:leftLeg"},
+        {"kind":"lookAt","claims":{"gaze":"override","head":"additive","neck":"additive"},"durationMs":650,"blendInMs":45,"blendOutMs":170,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:gaze"},
+        {"kind":"expression","claims":{"faceExpression":"additive"},"durationMs":520,"blendInMs":35,"blendOutMs":170,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:expression"}
+      ]
+    },
+    "rightLeg": {
+      "actions": [
+        {"kind":"recoil","claims":{"rightLeg":"override","posture":"override"},"durationMs":900,"blendInMs":70,"blendOutMs":260,"minimumHoldMs":300,"interruption":"afterMinimumHold","retarget":"afterMinimumHold","retargetGroup":"touch:rightLeg"},
+        {"kind":"lookAt","claims":{"gaze":"override","head":"additive","neck":"additive"},"durationMs":650,"blendInMs":45,"blendOutMs":170,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:gaze"},
+        {"kind":"expression","claims":{"faceExpression":"additive"},"durationMs":520,"blendInMs":35,"blendOutMs":170,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:expression"}
+      ]
+    },
+    "leftFoot": {
+      "actions": [
+        {"kind":"weightShift","claims":{"leftFoot":"override","leftLeg":"override","posture":"override"},"durationMs":980,"blendInMs":75,"blendOutMs":280,"minimumHoldMs":340,"interruption":"afterMinimumHold","retarget":"afterMinimumHold","retargetGroup":"touch:leftLeg"},
+        {"kind":"lookAt","claims":{"gaze":"override","head":"additive","neck":"additive"},"durationMs":680,"blendInMs":45,"blendOutMs":180,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:gaze"},
+        {"kind":"expression","claims":{"faceExpression":"additive"},"durationMs":520,"blendInMs":35,"blendOutMs":170,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:expression"}
+      ]
+    },
+    "rightFoot": {
+      "actions": [
+        {"kind":"weightShift","claims":{"rightFoot":"override","rightLeg":"override","posture":"override"},"durationMs":980,"blendInMs":75,"blendOutMs":280,"minimumHoldMs":340,"interruption":"afterMinimumHold","retarget":"afterMinimumHold","retargetGroup":"touch:rightLeg"},
+        {"kind":"lookAt","claims":{"gaze":"override","head":"additive","neck":"additive"},"durationMs":680,"blendInMs":45,"blendOutMs":180,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:gaze"},
+        {"kind":"expression","claims":{"faceExpression":"additive"},"durationMs":520,"blendInMs":35,"blendOutMs":170,"minimumHoldMs":0,"interruption":"interruptible","retarget":"immediate","retargetGroup":"touch:expression"}
+      ]
+    }
+  },
+  "regions": {
+    "hair":"hair",
+    "head":"head",
+    "face":"face",
+    "leftCheek":"face",
+    "rightCheek":"face",
+    "leftShoulder":"leftArm",
+    "rightShoulder":"rightArm",
+    "leftUpperArm":"leftArm",
+    "rightUpperArm":"rightArm",
+    "leftLowerArm":"leftArm",
+    "rightLowerArm":"rightArm",
+    "leftHand":"leftHand",
+    "rightHand":"rightHand",
+    "chest":"torso",
+    "waist":"torso",
+    "leftThigh":"leftLeg",
+    "rightThigh":"rightLeg",
+    "leftKnee":"leftLeg",
+    "rightKnee":"rightLeg",
+    "leftLowerLeg":"leftLeg",
+    "rightLowerLeg":"rightLeg",
+    "leftShoe":"leftFoot",
+    "rightShoe":"rightFoot"
+  }
+}

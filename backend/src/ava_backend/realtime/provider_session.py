@@ -1,0 +1,124 @@
+from __future__ import annotations
+
+import re
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from typing import Protocol
+
+from .harness import RealtimeHarness
+from .tool_contract import InteractiveCanvasToolOutput, RealtimeTurnEvent
+
+
+MAX_SDP_BYTES = 256 * 1024
+_PROVIDER_CALL_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{7,127}$")
+
+
+class RealtimeNegotiationError(RuntimeError):
+    """Base error for a failed provider WebRTC negotiation."""
+
+
+class RealtimeNegotiationUnavailableError(RealtimeNegotiationError):
+    """The provider could not be reached or could not accept a new call."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: str | None = None,
+        error_type: str | None = None,
+        provider_status_code: int | None = None,
+        provider_request_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.error_type = error_type
+        self.provider_status_code = provider_status_code
+        self.provider_request_id = provider_request_id
+
+
+class RealtimeNegotiationResponseError(RealtimeNegotiationError):
+    """The provider returned an invalid or unsuccessful SDP response."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider_status_code: int | None = None,
+        provider_error_code: str | None = None,
+        provider_error_parameter: str | None = None,
+        provider_request_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.provider_status_code = provider_status_code
+        self.provider_error_code = provider_error_code
+        self.provider_error_parameter = provider_error_parameter
+        self.provider_request_id = provider_request_id
+
+
+@dataclass(frozen=True, slots=True)
+class NegotiatedRealtimeCall:
+    answer_sdp: str
+    provider_call_id: str
+
+    def __post_init__(self) -> None:
+        validate_sdp(self.answer_sdp, description="answer")
+        if not _PROVIDER_CALL_ID.fullmatch(self.provider_call_id):
+            raise ValueError("provider_call_id has an invalid format")
+
+
+type RealtimeProviderTurnEvent = RealtimeTurnEvent
+
+
+class RealtimeProviderSession(Protocol):
+    """One OpenAI Realtime media/sideband session owned by Ava's backend."""
+
+    async def negotiate(self, *, offer_sdp: str) -> NegotiatedRealtimeCall: ...
+
+    async def prepare(self, *, harness: RealtimeHarness) -> None:
+        """Install Ava's server-owned instructions and optional tools."""
+        ...
+
+    def turn_events(
+        self,
+        *,
+        harness: RealtimeHarness,
+        turn_id: str,
+    ) -> AsyncIterator[RealtimeProviderTurnEvent]: ...
+
+    async def complete_canvas_tool(
+        self,
+        *,
+        turn_id: str,
+        call_id: str,
+        output: InteractiveCanvasToolOutput,
+    ) -> None: ...
+
+    async def child_transcript(self, *, turn_id: str) -> str | None: ...
+
+    async def cancel(self, *, turn_id: str) -> None: ...
+
+    async def close(self) -> None: ...
+
+
+def validate_sdp(value: str, *, description: str) -> str:
+    """Validate a bounded audio SDP without attempting to parse every RFC field."""
+
+    if not isinstance(value, str):
+        raise TypeError(f"{description} SDP must be text")
+    if not value or len(value.encode("utf-8")) > MAX_SDP_BYTES:
+        raise ValueError(
+            f"{description} SDP must contain between 1 and {MAX_SDP_BYTES} bytes"
+        )
+    if "\x00" in value:
+        raise ValueError(f"{description} SDP cannot contain NUL bytes")
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+    lines = normalized.splitlines()
+    if not lines or lines[0].strip() != "v=0":
+        raise ValueError(f"{description} SDP must begin with v=0")
+    if not any(line.startswith("m=audio ") for line in lines):
+        raise ValueError(f"{description} SDP must contain an audio media section")
+    if not any(line.startswith("m=application ") for line in lines):
+        raise ValueError(
+            f"{description} SDP must contain a Realtime data-channel section"
+        )
+    return value

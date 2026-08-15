@@ -1,0 +1,56 @@
+[
+  {
+    "protocolVersion": 3,
+    "event": "clientReady",
+    "sessionId": "session-1234",
+    "sequence": 0
+  },
+  {
+    "protocolVersion": 3,
+    "event": "playbackStarted",
+    "sessionId": "session-1234",
+    "sequence": 1,
+    "turnId": "turn-1234",
+    "streamId": "stream-1234",
+    "renderedSampleCount": 0
+  },
+  {
+    "protocolVersion": 3,
+    "event": "playbackProgress",
+    "sessionId": "session-1234",
+    "sequence": 2,
+    "turnId": "turn-1234",
+    "streamId": "stream-1234",
+    "renderedSampleCount": 4,
+    "bufferedSampleCount": 4
+  },
+  {
+    "protocolVersion": 3,
+    "event": "canvasInteraction",
+    "sessionId": "session-1234",
+    "sequence": 3,
+    "sceneId": "plant_cell_scene",
+    "sceneRevision": 1,
+    "interactionRevision": 2,
+    "bindingId": "select_nucleus"
+  },
+  {
+    "protocolVersion": 3,
+    "event": "playbackStopped",
+    "sessionId": "session-1234",
+    "sequence": 4,
+    "turnId": "turn-1234",
+    "streamId": "stream-1234",
+    "renderedSampleCount": 4,
+    "reason": "childStartedSpeaking"
+  },
+  {
+    "protocolVersion": 3,
+    "event": "cancelTurn",
+    "sessionId": "session-1234",
+    "sequence": 5,
+    "turnId": "turn-1234",
+    "requestId": "cancel-1234",
+    "reason": "childStartedSpeaking"
+  }
+]

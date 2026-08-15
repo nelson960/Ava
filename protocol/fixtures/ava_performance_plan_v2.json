@@ -1,0 +1,33 @@
+{
+  "protocolVersion": 2,
+  "performance": {
+    "segments": [
+      {
+        "id": "intro",
+        "speech": "A quarter means one of four equal parts.",
+        "delivery": "encouraging",
+        "expression": "encouraging",
+        "gaze": "child",
+        "gesture": "explainSmall",
+        "diagramCue": null
+      },
+      {
+        "id": "diagram",
+        "speech": "Here, one of the four pieces is highlighted.",
+        "delivery": "warm",
+        "expression": "warmSmile",
+        "gaze": "diagram",
+        "gesture": "pointAtDashboard",
+        "diagramCue": {
+          "action": "show",
+          "diagram": {
+            "kind": "fractionCircle",
+            "title": "One quarter",
+            "totalParts": 4,
+            "highlightedParts": 1
+          }
+        }
+      }
+    ]
+  }
+}

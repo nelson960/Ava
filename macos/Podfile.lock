@@ -1,0 +1,52 @@
+PODS:
+  - flutter_inappwebview_macos (0.0.1):
+    - FlutterMacOS
+    - OrderedSet (~> 6.0.3)
+  - flutter_webrtc (1.4.0):
+    - FlutterMacOS
+    - WebRTC-SDK (= 144.7559.09)
+  - FlutterMacOS (1.0.0)
+  - objective_c (0.0.1):
+    - FlutterMacOS
+  - OrderedSet (6.0.3)
+  - thermion_flutter (0.0.1):
+    - Flutter
+    - FlutterMacOS
+  - WebRTC-SDK (144.7559.09)
+
+DEPENDENCIES:
+  - flutter_inappwebview_macos (from `Flutter/ephemeral/.symlinks/plugins/flutter_inappwebview_macos/macos`)
+  - flutter_webrtc (from `Flutter/ephemeral/.symlinks/plugins/flutter_webrtc/macos`)
+  - FlutterMacOS (from `Flutter/ephemeral`)
+  - objective_c (from `Flutter/ephemeral/.symlinks/plugins/objective_c/macos`)
+  - thermion_flutter (from `Flutter/ephemeral/.symlinks/plugins/thermion_flutter/darwin`)
+
+SPEC REPOS:
+  trunk:
+    - OrderedSet
+    - WebRTC-SDK
+
+EXTERNAL SOURCES:
+  flutter_inappwebview_macos:
+    :path: Flutter/ephemeral/.symlinks/plugins/flutter_inappwebview_macos/macos
+  flutter_webrtc:
+    :path: Flutter/ephemeral/.symlinks/plugins/flutter_webrtc/macos
+  FlutterMacOS:
+    :path: Flutter/ephemeral
+  objective_c:
+    :path: Flutter/ephemeral/.symlinks/plugins/objective_c/macos
+  thermion_flutter:
+    :path: Flutter/ephemeral/.symlinks/plugins/thermion_flutter/darwin
+
+SPEC CHECKSUMS:
+  flutter_inappwebview_macos: c2d68649f9f8f1831bfcd98d73fd6256366d9d1d
+  flutter_webrtc: fec3dc9284a1f6d21ec2caa91c90bb4c1824eb04
+  FlutterMacOS: d0db08ddef1a9af05a5ec4b724367152bb0500b1
+  objective_c: ec13431e45ba099cb734eb2829a5c1cd37986cba
+  OrderedSet: e539b66b644ff081c73a262d24ad552a69be3a94
+  thermion_flutter: ba41c1b6232890a4fd49d63e82b6d1679d8c2c26
+  WebRTC-SDK: e6006119cd730d6315d875e4a421b6cc8bb88833
+
+PODFILE CHECKSUM: 89c84cf5c2351c1e554c6dea18d31a879fc3a19e
+
+COCOAPODS: 1.17.0

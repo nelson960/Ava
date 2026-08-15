@@ -1,0 +1,56 @@
+PODS:
+  - Flutter (1.0.0)
+  - flutter_inappwebview_ios (0.0.1):
+    - Flutter
+    - flutter_inappwebview_ios/Core (= 0.0.1)
+    - OrderedSet (~> 6.0.3)
+  - flutter_inappwebview_ios/Core (0.0.1):
+    - Flutter
+    - OrderedSet (~> 6.0.3)
+  - flutter_webrtc (1.4.0):
+    - Flutter
+    - WebRTC-SDK (= 144.7559.09)
+  - objective_c (0.0.1):
+    - Flutter
+  - OrderedSet (6.0.3)
+  - thermion_flutter (0.0.1):
+    - Flutter
+    - FlutterMacOS
+  - WebRTC-SDK (144.7559.09)
+
+DEPENDENCIES:
+  - Flutter (from `Flutter`)
+  - flutter_inappwebview_ios (from `.symlinks/plugins/flutter_inappwebview_ios/ios`)
+  - flutter_webrtc (from `.symlinks/plugins/flutter_webrtc/ios`)
+  - objective_c (from `.symlinks/plugins/objective_c/ios`)
+  - thermion_flutter (from `.symlinks/plugins/thermion_flutter/darwin`)
+
+SPEC REPOS:
+  trunk:
+    - OrderedSet
+    - WebRTC-SDK
+
+EXTERNAL SOURCES:
+  Flutter:
+    :path: Flutter
+  flutter_inappwebview_ios:
+    :path: ".symlinks/plugins/flutter_inappwebview_ios/ios"
+  flutter_webrtc:
+    :path: ".symlinks/plugins/flutter_webrtc/ios"
+  objective_c:
+    :path: ".symlinks/plugins/objective_c/ios"
+  thermion_flutter:
+    :path: ".symlinks/plugins/thermion_flutter/darwin"
+
+SPEC CHECKSUMS:
+  Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
+  flutter_inappwebview_ios: b89ba3482b96fb25e00c967aae065701b66e9b99
+  flutter_webrtc: 3ee86aa10e0313c38c93fdb215dd86e77014f96a
+  objective_c: 89e720c30d716b036faf9c9684022048eee1eee2
+  OrderedSet: e539b66b644ff081c73a262d24ad552a69be3a94
+  thermion_flutter: ba41c1b6232890a4fd49d63e82b6d1679d8c2c26
+  WebRTC-SDK: e6006119cd730d6315d875e4a421b6cc8bb88833
+
+PODFILE CHECKSUM: 287b9338babb1c8a0bf692a9ddd93a6b7e39fe6f
+
+COCOAPODS: 1.17.0
