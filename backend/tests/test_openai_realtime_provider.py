@@ -120,6 +120,20 @@ class _ClosingRealtimeSocket(_FakeRealtimeSocket):
         raise ConnectionClosedError(Close(1011, "keepalive ping timeout"), None)
 
 
+class _ControlledClosingRealtimeSocket(_FakeRealtimeSocket):
+    def __init__(self, events: list[dict[str, object]]) -> None:
+        super().__init__(events)
+        self.receiver_waiting = asyncio.Event()
+        self.terminate_receiver = asyncio.Event()
+
+    async def recv(self) -> str:
+        if self.events:
+            return await super().recv()
+        self.receiver_waiting.set()
+        await self.terminate_receiver.wait()
+        raise ConnectionClosedError(Close(1011, "controlled receiver close"), None)
+
+
 def _harness():  # type: ignore[no-untyped-def]
     return build_realtime_harness(
         AuthoritativeMemorySnapshot.model_validate(
@@ -833,6 +847,67 @@ async def test_owned_transcription_terminal_wakes_deferred_memory_waiter() -> No
     assert await channel.wait_for_child_transcript_for_turn("turn-memory") == (
         "Please remember this question."
     )
+
+
+@pytest.mark.asyncio
+async def test_owned_transcription_wait_after_receiver_terminal_does_not_hang() -> (
+    None
+):
+    socket = _ControlledClosingRealtimeSocket(
+        [{"type": "input_audio_buffer.committed", "item_id": "item-terminal"}]
+    )
+    channel = _OpenAIRealtimeEventChannel(
+        socket,
+        model="gpt-realtime-test",
+        max_output_tokens=800,
+        turn_timeout_seconds=5,
+    )
+    _TEST_CHANNELS.add(channel)
+    await channel.start_receiver()
+    await socket.wait_received(1)
+    await channel.admit_pending_input_items(turn_id="turn-terminal")
+    assert channel.input_item_owner(item_id="item-terminal") == "turn-terminal"
+
+    await socket.receiver_waiting.wait()
+    socket.terminate_receiver.set()
+    assert channel._receiver_task is not None
+    await channel._receiver_task
+
+    with pytest.raises(OpenAIRealtimeConnectionClosedError):
+        await asyncio.wait_for(
+            channel.wait_for_child_transcript_for_turn("turn-terminal"),
+            timeout=0.05,
+        )
+
+
+@pytest.mark.asyncio
+async def test_receiver_terminal_immediately_after_wait_registration_wakes_waiter() -> (
+    None
+):
+    socket = _ControlledClosingRealtimeSocket(
+        [{"type": "input_audio_buffer.committed", "item_id": "item-racing"}]
+    )
+    channel = _OpenAIRealtimeEventChannel(
+        socket,
+        model="gpt-realtime-test",
+        max_output_tokens=800,
+        turn_timeout_seconds=5,
+    )
+    _TEST_CHANNELS.add(channel)
+    await channel.start_receiver()
+    await socket.wait_received(1)
+    await channel.admit_pending_input_items(turn_id="turn-racing")
+    await socket.receiver_waiting.wait()
+
+    waiter = asyncio.create_task(
+        channel.wait_for_child_transcript_for_turn("turn-racing")
+    )
+    await asyncio.sleep(0)
+    assert "turn-racing" in channel._child_transcription_events_by_turn
+    socket.terminate_receiver.set()
+
+    with pytest.raises(OpenAIRealtimeConnectionClosedError):
+        await waiter
 
 
 @pytest.mark.asyncio

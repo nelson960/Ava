@@ -877,6 +877,13 @@ class _OpenAIRealtimeEventChannel:
             turn_id,
             asyncio.Event(),
         )
+        # Receiver termination is a one-time broadcast. If it happened before
+        # this turn registered its waiter, make that already-terminal state
+        # observable here. If termination races after registration,
+        # _put_receiver_terminal() owns the wake instead.
+        receiver_task = self._receiver_task
+        if receiver_task is not None and receiver_task.done():
+            terminal.set()
         try:
             await terminal.wait()
         finally:

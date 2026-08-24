@@ -205,8 +205,13 @@ class PostgresAuthoritativeMemoryStore:
         turn: DeliveredConversationTurn,
         proposal: AvaMemoryProposal | None,
         memory_id: str | None,
+        occurred_at: datetime | None = None,
     ) -> MemoryProposalDecision:
         normalized_subject = _validate_subject(subject)
+        normalized_occurred_at = _validate_aware_datetime(
+            occurred_at or datetime.now(UTC),
+            field_name="occurred_at",
+        )
         validated_turn = DeliveredConversationTurn.model_validate(
             turn.model_dump(mode="json", by_alias=True)
         )
@@ -236,8 +241,8 @@ class PostgresAuthoritativeMemoryStore:
                         insert into ava_private.delivered_turns (
                           subject, turn_id, child_text, child_text_source,
                           ava_delivered_text, delivered_sample_count,
-                          child_turn_summary, terminal
-                        ) values (%s, %s, %s, %s, %s, %s, %s, %s)
+                          child_turn_summary, terminal, occurred_at
+                        ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
                             normalized_subject,
@@ -248,18 +253,20 @@ class PostgresAuthoritativeMemoryStore:
                             validated_turn.delivered_sample_count,
                             validated_turn.child_turn_summary,
                             str(validated_turn.terminal),
+                            normalized_occurred_at,
                         ),
                     )
                     await connection.execute(
                         """
                         insert into ava_private.weekly_records
-                          (subject, turn_id, summary)
-                        values (%s, %s, %s)
+                          (subject, turn_id, summary, occurred_at)
+                        values (%s, %s, %s, %s)
                         """,
                         (
                             normalized_subject,
                             validated_turn.turn_id,
                             weekly_summary,
+                            normalized_occurred_at,
                         ),
                     )
                     decision = await self._store_memory_decision(

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable
+from builtins import anext
+from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -133,6 +135,7 @@ def _coordinator(
     memory: DevelopmentAuthoritativeMemoryStore | None = None,
     persistent: bool = False,
     unexpected_rearm: bool = False,
+    occurrence_time_factory: Callable[[], datetime] | None = None,
 ) -> tuple[
     DeterministicRealtimeSessionCoordinator,
     DeterministicRealtimePlanProvider | object,
@@ -170,6 +173,9 @@ def _coordinator(
         turn_id_factory=next_id if persistent else None,
         request_id_factory=(lambda: "request-coordinator-2") if persistent else None,
         stream_id_factory=(lambda: "stream-coordinator-2") if persistent else None,
+        occurrence_time_factory=(
+            occurrence_time_factory or (lambda: datetime.now(UTC))
+        ),
     )
     return coordinator, resolved_realtime, speech, resolved_memory
 
@@ -394,13 +400,22 @@ class _ObservedMemoryStore(DevelopmentAuthoritativeMemoryStore):
         super().__init__()
         self.committed = asyncio.Event()
         self.committed_turn_ids: list[str] = []
+        self.committed_by_turn: dict[str, asyncio.Event] = {}
 
     async def commit_delivered_turn(self, **kwargs: object):  # type: ignore[no-untyped-def]
         turn = kwargs["turn"]
         result = await super().commit_delivered_turn(**kwargs)  # type: ignore[arg-type]
         self.committed_turn_ids.append(turn.turn_id)  # type: ignore[union-attr]
+        self.committed_by_turn.setdefault(  # type: ignore[union-attr]
+            turn.turn_id,  # type: ignore[union-attr]
+            asyncio.Event(),
+        ).set()
         self.committed.set()
         return result
+
+    async def wait_for_turn(self, turn_id: str) -> None:
+        event = self.committed_by_turn.setdefault(turn_id, asyncio.Event())
+        await event.wait()
 
 
 class _LateTranscriptRealtimeProvider(DeterministicRealtimePlanProvider):
@@ -434,6 +449,47 @@ class _LateTranscriptRealtimeProvider(DeterministicRealtimePlanProvider):
             return
         self._completed_transcript = self._late_transcript
         self._transcription_terminal.set()
+
+
+class _CrossTurnTranscriptRealtimeProvider(DeterministicRealtimePlanProvider):
+    def __init__(self, plan: AvaTurnPlan) -> None:
+        super().__init__(plan, child_text=None)
+        self.turn_a = TURN_ID
+        self.turn_b = "turn-coordinator-2"
+        self.item_a = "item-chronology-a"
+        self.item_b = "item-chronology-b"
+        self.child_a = "First, tell me about the moon."
+        self.child_b = "Then, tell me about the stars."
+        self._input_item_turn_ids.update(
+            {self.item_a: self.turn_a, self.item_b: self.turn_b}
+        )
+        self._transcript_a: str | None = None
+        self._transcription_a_terminal = asyncio.Event()
+
+    async def child_transcript(self, *, turn_id: str) -> str | None:
+        if turn_id == self.turn_a:
+            return self._transcript_a
+        if turn_id == self.turn_b:
+            return self.child_b
+        raise AssertionError(f"unexpected turn transcript request: {turn_id}")
+
+    def wait_for_child_transcript(
+        self,
+        *,
+        turn_id: str,
+    ) -> Awaitable[str | None]:
+        assert turn_id == self.turn_a
+        assert self.input_item_owner(item_id=self.item_a) == turn_id
+
+        async def wait_for_terminal() -> str | None:
+            await self._transcription_a_terminal.wait()
+            return self._transcript_a
+
+        return wait_for_terminal()
+
+    def complete_turn_a_transcription(self) -> None:
+        self._transcript_a = self.child_a
+        self._transcription_a_terminal.set()
 
 
 async def _complete_delivered_turn(
@@ -552,6 +608,102 @@ async def test_committed_turn_is_loaded_into_fresh_session_harness() -> None:
     assert plan.speech in context
     assert coordinator_b.harness.context.included_delivered_turns == 1
     await coordinator_b.close()
+
+
+async def test_late_turn_a_commit_preserves_cross_turn_memory_chronology() -> None:
+    plan = _plan()
+    provider = _CrossTurnTranscriptRealtimeProvider(plan)
+    memory = _ObservedMemoryStore()
+    occurrence_times = iter(
+        (
+            datetime(2026, 8, 25, 10, 0, 0, tzinfo=UTC),
+            datetime(2026, 8, 25, 10, 0, 1, tzinfo=UTC),
+        )
+    )
+    coordinator, _, _, _ = _coordinator(
+        plan=plan,
+        realtime=provider,
+        memory=memory,
+        persistent=True,
+        occurrence_time_factory=lambda: next(occurrence_times),
+    )
+    await _ready(coordinator)
+
+    frames = coordinator.frames()
+    client_sequence = 1
+    active_stream_id: str | None = None
+    completed_turn_ids: list[str] = []
+    while len(completed_turn_ids) < 2:
+        frame = await anext(frames)
+        if not isinstance(frame, AvaServerControlFrameV4):
+            continue
+        event = frame.event
+        if isinstance(event, AudioMetadataEventV4):
+            active_stream_id = event.stream_id
+            await coordinator.receive(
+                _client(
+                    {
+                        "event": "playbackStarted",
+                        "sequence": client_sequence,
+                        "turnId": event.turn_id,
+                        "streamId": event.stream_id,
+                        "renderedSampleCount": 0,
+                    }
+                )
+            )
+            client_sequence += 1
+        if (
+            isinstance(event, TurnPhaseChangedEventV4)
+            and event.phase == SpeechPhase.SPEAKING
+        ):
+            assert active_stream_id is not None
+            await coordinator.receive(
+                _client(
+                    {
+                        "event": "playbackProgress",
+                        "sequence": client_sequence,
+                        "turnId": event.turn_id,
+                        "streamId": active_stream_id,
+                        "renderedSampleCount": coordinator.received_sample_count,
+                        "bufferedSampleCount": 0,
+                    }
+                )
+            )
+            client_sequence += 1
+        if isinstance(event, TurnCompletedEventV4):
+            completed_turn_ids.append(event.turn_id)
+
+    assert completed_turn_ids == [provider.turn_a, provider.turn_b]
+    assert memory.committed_turn_ids == [provider.turn_b]
+
+    provider.complete_turn_a_transcription()
+    await memory.wait_for_turn(provider.turn_a)
+    assert memory.committed_turn_ids == [provider.turn_b, provider.turn_a]
+    await frames.aclose()
+    await coordinator.close()
+
+    fresh_provider = DeterministicRealtimePlanProvider(
+        plan,
+        child_text="Start a fresh conversation.",
+    )
+    fresh, _, _, _ = _coordinator(
+        plan=plan,
+        realtime=fresh_provider,
+        memory=memory,
+    )
+    await _ready(fresh)
+
+    snapshot = await memory.load_snapshot(
+        subject="child:coordinator",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+    )
+    assert [turn.turn_id for turn in snapshot.delivered_turns] == [
+        provider.turn_a,
+        provider.turn_b,
+    ]
+    context = fresh.harness.context.content
+    assert context.index(provider.child_a) < context.index(provider.child_b)
+    await fresh.close()
 
 
 async def test_memory_failure_warns_then_speech_completes() -> None:

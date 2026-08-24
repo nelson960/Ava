@@ -5,6 +5,7 @@ import logging
 from builtins import anext
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from time import monotonic
 from typing import TypeAlias, cast
 
@@ -87,6 +88,11 @@ class CoordinatorStateError(RuntimeError):
 
 
 IdentifierFactory: TypeAlias = Callable[[], str]
+OccurrenceTimeFactory: TypeAlias = Callable[[], datetime]
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 @dataclass(slots=True)
@@ -130,6 +136,7 @@ class DeterministicRealtimeSessionCoordinator:
         request_id_factory: IdentifierFactory | None = None,
         stream_id_factory: IdentifierFactory | None = None,
         failure_id_factory: IdentifierFactory = new_failure_id,
+        occurrence_time_factory: OccurrenceTimeFactory = _utc_now,
     ) -> None:
         if not 2_048 <= max_audio_chunk_bytes <= 192_000:
             raise ValueError("max_audio_chunk_bytes must be between 2048 and 192000")
@@ -153,6 +160,7 @@ class DeterministicRealtimeSessionCoordinator:
         self._request_id_factory = request_id_factory
         self._stream_id_factory = stream_id_factory
         self._failure_id_factory = failure_id_factory
+        self._occurrence_time_factory = occurrence_time_factory
         if persistent and (
             turn_id_factory is None
             or request_id_factory is None
@@ -195,6 +203,7 @@ class DeterministicRealtimeSessionCoordinator:
         self._last_failure_component: str | None = None
         self._pending_memory_refresh_warning: tuple[str, str] | None = None
         self._memory_commit_tasks: dict[str, asyncio.Task[None]] = {}
+        self._turn_occurred_at: datetime | None = None
         self._last_error: Exception | None = None
         self._active_planning_task: asyncio.Task[_TurnResult | None] | None = None
         self._active_provider_input_task: (
@@ -639,6 +648,10 @@ class DeterministicRealtimeSessionCoordinator:
         ledger: DeliveredTextLedger,
     ) -> AsyncIterator[AvaServerOutboundFrameV4]:
         turn_started = monotonic()
+        occurred_at = self._occurrence_time_factory()
+        if occurred_at.tzinfo is None:
+            raise CoordinatorStateError("turn occurrence time must be timezone-aware")
+        self._turn_occurred_at = occurred_at
         yield self._turn_created_frame()
         yield self._phase_frame(SpeechPhase.CONNECTING)
 
@@ -1105,6 +1118,7 @@ class DeterministicRealtimeSessionCoordinator:
         self._stream_id = stream_id_factory()
         self._child_text = None
         self._child_text_source = None
+        self._turn_occurred_at = None
         self._machine = RealtimeTurnStateMachine()
         self._harness = harness
         self._revision = 0
@@ -1626,6 +1640,7 @@ class DeterministicRealtimeSessionCoordinator:
         delivered_text: str,
         terminal: DeliveredTurnTerminal,
     ) -> None:
+        occurred_at = self._require_turn_occurred_at()
         if self._child_text is None or self._child_text_source is None:
             child_transcript = await self._realtime.child_transcript(
                 turn_id=turn_id
@@ -1654,6 +1669,7 @@ class DeterministicRealtimeSessionCoordinator:
                         delivered_sample_count=delivered_sample_count,
                         delivered_text=delivered_text,
                         terminal=terminal,
+                        occurred_at=occurred_at,
                         transcript_waiter=transcript_waiter,
                     ),
                     name=f"ava-memory-commit-{turn_id}",
@@ -1675,6 +1691,7 @@ class DeterministicRealtimeSessionCoordinator:
             delivered_sample_count=delivered_sample_count,
             delivered_text=delivered_text,
             terminal=terminal,
+            occurred_at=occurred_at,
         )
 
     async def _commit_memory_after_transcription(
@@ -1685,6 +1702,7 @@ class DeterministicRealtimeSessionCoordinator:
         delivered_sample_count: int,
         delivered_text: str,
         terminal: DeliveredTurnTerminal,
+        occurred_at: datetime,
         transcript_waiter: Awaitable[str | None],
     ) -> None:
         try:
@@ -1706,6 +1724,7 @@ class DeterministicRealtimeSessionCoordinator:
                 delivered_sample_count=delivered_sample_count,
                 delivered_text=delivered_text,
                 terminal=terminal,
+                occurred_at=occurred_at,
             )
         except asyncio.CancelledError:
             raise
@@ -1746,6 +1765,7 @@ class DeterministicRealtimeSessionCoordinator:
         delivered_sample_count: int,
         delivered_text: str,
         terminal: DeliveredTurnTerminal,
+        occurred_at: datetime,
     ) -> None:
         turn = DeliveredConversationTurn.model_validate(
             {
@@ -1763,6 +1783,7 @@ class DeterministicRealtimeSessionCoordinator:
             turn=turn,
             proposal=None,
             memory_id=None,
+            occurred_at=occurred_at,
         )
 
     async def _interrupt_canvas_turn(self) -> None:
@@ -1781,6 +1802,11 @@ class DeterministicRealtimeSessionCoordinator:
                 "provider child text source is unavailable for memory commit"
             )
         return self._child_text_source
+
+    def _require_turn_occurred_at(self) -> datetime:
+        if self._turn_occurred_at is None:
+            raise CoordinatorStateError("turn occurrence time is unavailable")
+        return self._turn_occurred_at
 
     def _turn_created_frame(self) -> AvaServerControlFrameV4:
         return self._control_frame(

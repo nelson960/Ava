@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections import defaultdict, deque
+from collections import defaultdict
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
@@ -170,6 +170,7 @@ class AuthoritativeMemoryStore(Protocol):
         turn: DeliveredConversationTurn,
         proposal: AvaMemoryProposal | None,
         memory_id: str | None,
+        occurred_at: datetime | None = None,
     ) -> MemoryProposalDecision: ...
 
     async def set_session_summary(
@@ -207,15 +208,17 @@ class DevelopmentAuthoritativeMemoryStore:
             raise ValueError("max_turns_per_subject must be between 1 and 8")
         if not 1 <= max_memories_per_subject <= MAX_STABLE_MEMORIES:
             raise ValueError("max_memories_per_subject must be between 1 and 12")
-        self._turns: defaultdict[str, deque[DeliveredConversationTurn]] = defaultdict(
-            deque
+        self._turns: defaultdict[
+            str, list[tuple[datetime, DeliveredConversationTurn]]
+        ] = defaultdict(
+            list
         )
         self._memories: defaultdict[str, dict[str, StableMemoryRecord]] = defaultdict(
             dict
         )
         self._summaries: dict[str, str] = {}
-        self._weekly_records: defaultdict[str, deque[WeeklyConversationRecord]] = (
-            defaultdict(lambda: deque(maxlen=MAX_WEEKLY_RECORDS))
+        self._weekly_records: defaultdict[str, list[WeeklyConversationRecord]] = (
+            defaultdict(list)
         )
         self._committed_turn_ids: defaultdict[str, set[str]] = defaultdict(set)
         self._reset_revisions: defaultdict[str, int] = defaultdict(int)
@@ -246,7 +249,7 @@ class DevelopmentAuthoritativeMemoryStore:
                     "currentSessionSummary": self._summaries.get(normalized_subject),
                     "deliveredTurns": [
                         turn.model_dump(mode="json", by_alias=True)
-                        for turn in self._turns.get(normalized_subject, ())
+                        for _, turn in self._turns.get(normalized_subject, ())
                     ],
                     "stableMemories": [
                         memory.model_dump(mode="json", by_alias=True)
@@ -264,8 +267,13 @@ class DevelopmentAuthoritativeMemoryStore:
         turn: DeliveredConversationTurn,
         proposal: AvaMemoryProposal | None,
         memory_id: str | None,
+        occurred_at: datetime | None = None,
     ) -> MemoryProposalDecision:
         normalized_subject = _validate_subject(subject)
+        normalized_occurred_at = _validate_aware_datetime(
+            occurred_at or datetime.now(UTC),
+            field_name="occurred_at",
+        )
         validated_turn = DeliveredConversationTurn.model_validate(
             turn.model_dump(mode="json", by_alias=True)
         )
@@ -308,23 +316,28 @@ class DevelopmentAuthoritativeMemoryStore:
                 else:
                     memories[record.id] = record
             turns = self._turns[normalized_subject]
-            if len(turns) >= self._max_turns_per_subject:
-                evicted = turns.popleft()
+            turns.append((normalized_occurred_at, validated_turn))
+            turns.sort(key=lambda item: (item[0], item[1].turn_id))
+            if len(turns) > self._max_turns_per_subject:
+                _, evicted = turns.pop(0)
                 self._summaries[normalized_subject] = compact_session_summary(
                     self._summaries.get(normalized_subject),
                     (evicted.child_turn_summary,),
                 )
-            turns.append(validated_turn)
             self._committed_turn_ids[normalized_subject].add(validated_turn.turn_id)
-            self._weekly_records[normalized_subject].append(
+            weekly_records = self._weekly_records[normalized_subject]
+            weekly_records.append(
                 WeeklyConversationRecord.model_validate(
                     {
                         "turnId": validated_turn.turn_id,
                         "summary": weekly_summary,
-                        "occurredAt": datetime.now(UTC),
+                        "occurredAt": normalized_occurred_at,
                     }
                 )
             )
+            weekly_records.sort(key=lambda record: (record.occurred_at, record.turn_id))
+            if len(weekly_records) > MAX_WEEKLY_RECORDS:
+                del weekly_records[:-MAX_WEEKLY_RECORDS]
         return decision
 
     async def set_session_summary(
