@@ -5,8 +5,12 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Protocol, TypeAlias
 
-from .events import AvaAlignmentSpan
-from .plan import AvaPhraseAnchor, AvaTurnSegment
+from .speech_contract import (
+    MAX_SPEECH_ALIGNMENT_SPANS,
+    SpeechAlignment,
+    SpeechPhrase,
+    SpeechPhraseAnchor,
+)
 
 
 class SpeechDeliveryError(RuntimeError):
@@ -32,12 +36,12 @@ class SynthesizedAudioChunk:
 class SynthesizedAlignmentBatch:
     """Segment-relative text/sample alignment supplied by streaming TTS."""
 
-    spans: tuple[AvaAlignmentSpan, ...]
+    spans: tuple[SpeechAlignment, ...]
 
     def __post_init__(self) -> None:
         if not self.spans:
             raise ValueError("synthesized alignment batch cannot be empty")
-        if len(self.spans) > 512:
+        if len(self.spans) > MAX_SPEECH_ALIGNMENT_SPANS:
             raise ValueError("synthesized alignment batch cannot exceed 512 spans")
         for previous, current in zip(self.spans, self.spans[1:], strict=False):
             if current.sample_start < previous.sample_start:
@@ -58,7 +62,9 @@ class StreamingSpeechSynthesizer(Protocol):
 
     def synthesize(
         self,
-        segment: AvaTurnSegment,
+        segment: SpeechPhrase,
+        *,
+        turn_id: str,
     ) -> AsyncIterator[SynthesizedSpeechItem]: ...
 
     async def cancel(self, *, turn_id: str) -> None: ...
@@ -70,15 +76,15 @@ class DeliveredTextLedger:
     """Maps the rendered PCM sample clock to the text the child actually heard."""
 
     def __init__(self) -> None:
-        self._segments: list[AvaTurnSegment] = []
-        self._segment_by_id: dict[str, AvaTurnSegment] = {}
-        self._spans: defaultdict[str, list[AvaAlignmentSpan]] = defaultdict(list)
+        self._segments: list[SpeechPhrase] = []
+        self._segment_by_id: dict[str, SpeechPhrase] = {}
+        self._spans: defaultdict[str, list[SpeechAlignment]] = defaultdict(list)
 
     @property
     def segment_count(self) -> int:
         return len(self._segments)
 
-    def register_segment(self, segment: AvaTurnSegment) -> None:
+    def register_segment(self, segment: SpeechPhrase) -> None:
         if segment.id in self._segment_by_id:
             raise SpeechDeliveryError(
                 f"delivery segment {segment.id!r} was registered twice"
@@ -88,7 +94,7 @@ class DeliveredTextLedger:
 
     def add_alignment_spans(
         self,
-        spans: tuple[AvaAlignmentSpan, ...],
+        spans: tuple[SpeechAlignment, ...],
     ) -> None:
         if not spans:
             raise SpeechDeliveryError("alignment batch cannot be empty")
@@ -160,7 +166,7 @@ class DeliveredTextLedger:
         self,
         *,
         segment_id: str,
-        anchor: AvaPhraseAnchor,
+        anchor: SpeechPhraseAnchor,
     ) -> int:
         segment = self._segment_by_id.get(segment_id)
         if segment is None:

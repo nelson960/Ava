@@ -4,7 +4,7 @@ from collections import defaultdict
 from enum import StrEnum
 from typing import Annotated
 
-from pydantic import Field, StringConstraints, model_validator
+from pydantic import Field, StringConstraints, field_validator, model_validator
 
 from ..canvas.protocol import (
     CANVAS_MAX_NODES_PER_TURN,
@@ -13,41 +13,25 @@ from ..canvas.protocol import (
     CanvasCreateOperation,
 )
 from .common import NodeIdentifier, NonEmptyText, RealtimeProtocolModel
+from .memory import AvaMemoryProposal
+from .speech_contract import (
+    MAX_SPEECH_PHRASES,
+    MAX_SPEECH_RESPONSE_CHARACTERS,
+    SpeechDelivery,
+    SpeechExpressionIntent,
+    SpeechGazeIntent,
+    SpeechMotionIntent,
+    SpeechPhrase,
+    SpeechPhraseAnchor,
+    SpeechPhraseIdentifier,
+)
 
 
-MAX_REALTIME_SPEECH_SEGMENTS = 12
-
-
-class AvaDelivery(StrEnum):
-    NEUTRAL = "neutral"
-    WARM = "warm"
-    PLAYFUL = "playful"
-    THOUGHTFUL = "thoughtful"
-    ENCOURAGING = "encouraging"
-    CONCERNED = "concerned"
-
-
-class AvaExpressionIntent(StrEnum):
-    NEUTRAL = "neutral"
-    WARM_SMILE = "warmSmile"
-    CURIOUS = "curious"
-    THINKING = "thinking"
-    ENCOURAGING = "encouraging"
-    CONCERNED = "concerned"
-    SERIOUS = "serious"
-
-
-class AvaGazeIntent(StrEnum):
-    CHILD = "child"
-    THINKING_AWAY = "thinkingAway"
-    CANVAS = "canvas"
-
-
-class AvaMotionIntent(StrEnum):
-    NONE = "none"
-    ACKNOWLEDGE = "acknowledge"
-    PRESENT_CANVAS = "presentCanvas"
-    ENCOURAGE = "encourage"
+MAX_REALTIME_SPEECH_SEGMENTS = MAX_SPEECH_PHRASES
+AvaDelivery = SpeechDelivery
+AvaExpressionIntent = SpeechExpressionIntent
+AvaGazeIntent = SpeechGazeIntent
+AvaMotionIntent = SpeechMotionIntent
 
 
 class CanvasComplexity(StrEnum):
@@ -56,25 +40,8 @@ class CanvasComplexity(StrEnum):
     SPECIALIST_REQUIRED = "specialistRequired"
 
 
-class MemoryProposalKind(StrEnum):
-    INTEREST = "interest"
-    PREFERENCE = "preference"
-
-
-SegmentIdentifier = Annotated[
-    str,
-    StringConstraints(
-        strip_whitespace=True,
-        min_length=1,
-        max_length=40,
-        pattern=r"^[a-z][a-z0-9_]*$",
-    ),
-]
-
-
-class AvaPhraseAnchor(RealtimeProtocolModel):
-    phrase: Annotated[NonEmptyText, StringConstraints(max_length=120)]
-    occurrence: int = Field(ge=0, le=3)
+SegmentIdentifier = SpeechPhraseIdentifier
+AvaPhraseAnchor = SpeechPhraseAnchor
 
 
 class AvaCanvasCue(RealtimeProtocolModel):
@@ -83,13 +50,7 @@ class AvaCanvasCue(RealtimeProtocolModel):
     transaction: AvaCanvasTransaction
 
 
-class AvaTurnSegment(RealtimeProtocolModel):
-    id: SegmentIdentifier
-    speech: Annotated[NonEmptyText, StringConstraints(max_length=600)]
-    delivery: AvaDelivery
-    expression: AvaExpressionIntent
-    gaze: AvaGazeIntent
-    motion_intent: AvaMotionIntent
+class AvaTurnSegment(SpeechPhrase):
     canvas_cues: list[AvaCanvasCue] = Field(
         max_length=4,
         description=(
@@ -97,6 +58,13 @@ class AvaTurnSegment(RealtimeProtocolModel):
             "initial nodes and bindings in one transaction's operations."
         ),
     )
+
+    @field_validator("canvas_cues", mode="before")
+    @classmethod
+    def legacy_canvas_cues_are_empty(cls, value: object) -> object:
+        # V3 deliberately overrides SpeechPhrase's empty-only compatibility
+        # boundary while its typed canvas runtime remains in service.
+        return value
 
     @model_validator(mode="after")
     def semantic_cues_are_coherent(self) -> AvaTurnSegment:
@@ -122,11 +90,10 @@ class AvaTurnSegment(RealtimeProtocolModel):
         return self
 
 
-class AvaMemoryProposal(RealtimeProtocolModel):
-    kind: MemoryProposalKind
-    summary: Annotated[NonEmptyText, StringConstraints(max_length=160)]
-    evidence: Annotated[NonEmptyText, StringConstraints(max_length=160)]
-    confidence: float = Field(ge=0, le=1, allow_inf_nan=False)
+LegacyCompatibleSpeechPhrase = Annotated[
+    SpeechPhrase | AvaTurnSegment,
+    Field(union_mode="left_to_right"),
+]
 
 
 class AvaCanvasDecision(RealtimeProtocolModel):
@@ -148,7 +115,7 @@ class AvaTurnPlan(RealtimeProtocolModel):
     sample-clock, canvas, and memory boundaries coherent inside Ava.
     """
 
-    segments: list[AvaTurnSegment] = Field(
+    segments: list[LegacyCompatibleSpeechPhrase] = Field(
         min_length=1,
         max_length=MAX_REALTIME_SPEECH_SEGMENTS,
     )
@@ -163,7 +130,7 @@ class AvaTurnPlan(RealtimeProtocolModel):
             raise ValueError("turn segment ids must be unique")
 
         joined_speech = " ".join(segment.speech for segment in self.segments)
-        if len(joined_speech) > 1_800:
+        if len(joined_speech) > MAX_SPEECH_RESPONSE_CHARACTERS:
             raise ValueError("turn speech exceeds the 1800-character limit")
 
         cues = [cue for segment in self.segments for cue in segment.canvas_cues]

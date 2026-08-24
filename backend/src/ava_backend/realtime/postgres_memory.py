@@ -13,6 +13,7 @@ from .memory import (
     MAX_DELIVERED_TURNS,
     MAX_STABLE_MEMORIES,
     MAX_WEEKLY_RECORDS,
+    AvaMemoryProposal,
     AuthoritativeMemorySnapshot,
     ChildTurnTextSource,
     ConversationResetReceipt,
@@ -27,7 +28,6 @@ from .memory import (
     evaluate_memory_proposal,
     _validate_optional_summary,
 )
-from .plan import AvaMemoryProposal
 
 
 class PostgresMemoryStoreError(RuntimeError):

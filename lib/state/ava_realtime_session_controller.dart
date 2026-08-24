@@ -4,7 +4,7 @@ import 'dart:developer' as developer;
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../canvas/ava_canvas_engine.dart';
+import '../canvas/ava_svg_canvas_session_host.dart';
 import '../models/ava_realtime_protocol.dart';
 import '../services/ava_realtime_presentation.dart';
 import '../services/ava_realtime_runtime_factory.dart';
@@ -20,15 +20,15 @@ import 'ava_session_state.dart';
 final class AvaRealtimeSessionController
     extends StateNotifier<AvaSessionState> {
   AvaRealtimeSessionController({
-    required AvaRealtimeRuntimeFactory runtimeFactory,
+    required AvaRealtimeRuntimeBuilder runtimeFactory,
     required AvaRealtimePresentationController presentation,
-    required AvaCanvasEngine canvasEngine,
+    required AvaSvgCanvasSessionHost canvasHost,
     required AvaRealtimeAgeBand Function() ageBand,
     required double Function() volume,
     Duration warmRetention = const Duration(minutes: 2),
   })  : _runtimeFactory = runtimeFactory,
         _presentation = presentation,
-        _canvasEngine = canvasEngine,
+        _canvasHost = canvasHost,
         _ageBand = ageBand,
         _volume = volume,
         _warmRetention = warmRetention,
@@ -43,12 +43,12 @@ final class AvaRealtimeSessionController
       );
     }
     _presentation.addListener(_handlePresentationChanged);
-    _canvasEngine.addListener(_handleCanvasChanged);
+    _canvasHost.addListener(_handleCanvasChanged);
   }
 
-  final AvaRealtimeRuntimeFactory _runtimeFactory;
+  final AvaRealtimeRuntimeBuilder _runtimeFactory;
   final AvaRealtimePresentationController _presentation;
-  final AvaCanvasEngine _canvasEngine;
+  final AvaSvgCanvasSessionHost _canvasHost;
   final AvaRealtimeAgeBand Function() _ageBand;
   final double Function() _volume;
   final Duration _warmRetention;
@@ -94,10 +94,16 @@ final class AvaRealtimeSessionController
     _warmExpiry?.cancel();
     _warmExpiry = null;
 
+    final previousPhase = state.turnState;
+    final nextPhase = switch (previousPhase) {
+      AvaSessionPhase.listening when !active => AvaSessionPhase.idle,
+      AvaSessionPhase.idle when active => AvaSessionPhase.listening,
+      _ => previousPhase,
+    };
+
     state = state.copyWith(
-      turnState: active ? AvaSessionPhase.listening : AvaSessionPhase.idle,
+      turnState: nextPhase,
       userMicIntent: active,
-      clearActiveSegment: !active,
       clearError: true,
     );
 
@@ -105,7 +111,7 @@ final class AvaRealtimeSessionController
       final runtime = _runtime;
       if (runtime == null) return;
       try {
-        await runtime.pauseConversation(reason: 'userMutedMicrophone');
+        await runtime.setMicrophoneEnabled(false);
       } catch (error, stackTrace) {
         await _failConnection(
           runtime: runtime,
@@ -135,7 +141,7 @@ final class AvaRealtimeSessionController
           'Ava conversation preparation completed without a runtime.',
         );
       }
-      await runtime.resumeConversation();
+      await runtime.setMicrophoneEnabled(true);
       developer.log(
         'microphone_unmuted epoch=$_connectionEpoch',
         name: 'ava.realtime',
@@ -162,10 +168,6 @@ final class AvaRealtimeSessionController
       if (!presentationState.isActive && presentationState.turnId != null) {
         _presentation.reset();
       }
-      // Canvas lifetime matches the newly-created realtime session. A fresh
-      // WebRTC/session bootstrap must not display or submit bindings from the
-      // previous canonical server scene.
-      _canvasEngine.clear();
       runtime = await _runtimeFactory.create(
         ageBand: _ageBand(),
         volume: _volume(),
@@ -395,23 +397,6 @@ final class AvaRealtimeSessionController
     if (preparation != null) await preparation;
   }
 
-  Future<bool> reportCanvasInteraction(
-    AvaCanvasInteractionOutcome outcome,
-  ) async {
-    final runtime = _runtime;
-    if (runtime == null) {
-      if (outcome.action == 'explore' ||
-          outcome.action == 'select' ||
-          outcome.action == 'submitOutcome') {
-        throw StateError(
-          'A semantic canvas interaction requires an active Ava session.',
-        );
-      }
-      return false;
-    }
-    return runtime.reportCanvasInteraction(outcome);
-  }
-
   void clearError() {
     if (state.errorMessage == null) return;
     state = state.copyWith(
@@ -454,13 +439,7 @@ final class AvaRealtimeSessionController
       activeSegmentId: presentation.currentSegment?.id,
       errorMessage: presentation.failureMessage,
       clearError: presentation.failureMessage == null,
-      canvasState: presentation.canvasRejected
-          ? AvaCanvasSessionState.rejected
-          : presentation.phase == AvaRealtimeTurnPhase.created
-              ? _canvasEngine.panelVisible
-                  ? AvaCanvasSessionState.visible
-                  : AvaCanvasSessionState.hidden
-              : state.canvasState,
+      canvasState: _canvasState,
       memoryState: presentation.memoryWarning == null
           ? state.memoryState
           : AvaMemorySessionState.retryRequired,
@@ -493,13 +472,16 @@ final class AvaRealtimeSessionController
 
   void _handleCanvasChanged() {
     if (_disposed) return;
-    state = state.copyWith(
-      canvasState: _canvasEngine.panelVisible
-          ? AvaCanvasSessionState.visible
-          : state.canvasState == AvaCanvasSessionState.rejected
-              ? AvaCanvasSessionState.rejected
-              : AvaCanvasSessionState.hidden,
-    );
+    state = state.copyWith(canvasState: _canvasState);
+  }
+
+  AvaCanvasSessionState get _canvasState {
+    if (_canvasHost.controller?.lastIssue != null) {
+      return AvaCanvasSessionState.rejected;
+    }
+    return _canvasHost.panelVisible
+        ? AvaCanvasSessionState.visible
+        : AvaCanvasSessionState.hidden;
   }
 
   bool _isStale(int epoch) => _disposed || epoch != _connectionEpoch;
@@ -525,7 +507,7 @@ final class AvaRealtimeSessionController
     _warmExpiry?.cancel();
     _warmExpiry = null;
     _presentation.removeListener(_handlePresentationChanged);
-    _canvasEngine.removeListener(_handleCanvasChanged);
+    _canvasHost.removeListener(_handleCanvasChanged);
     final runtime = _runtime;
     _runtime = null;
     _runFuture = null;

@@ -1,40 +1,33 @@
 import 'dart:async';
 
-import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../canvas/ava_canvas_engine.dart';
+import '../canvas/ava_svg_canvas_session_host.dart';
 import '../config/ava_backend_configuration.dart';
-import '../models/lesson_response.dart';
-import '../models/local_learning_activity.dart';
-import '../models/learning_progress.dart';
 import '../models/ava_realtime_protocol.dart';
 import '../services/ava_memory_control_service.dart';
-import '../services/learning_progress_service.dart';
 import '../services/memory_service.dart';
 import '../services/pcm_speech_output_service.dart';
 import '../services/ava_realtime_presentation.dart';
 import '../services/ava_realtime_bootstrap_service.dart';
 import '../services/ava_realtime_runtime_factory.dart';
-import '../services/ava_realtime_session.dart';
+import '../services/ava_realtime_runtime_factory_v4.dart';
+import '../services/ava_realtime_session_v4.dart';
 import '../services/ava_realtime_webrtc.dart';
+import '../services/ava_svg_document_service.dart';
 import 'ava_realtime_session_controller.dart';
 import 'ava_session_state.dart';
 
 final volumeProvider = StateProvider<double>((ref) => 0.8);
-
-final avaCanvasEngineProvider = ChangeNotifierProvider<AvaCanvasEngine>((ref) {
-  return AvaCanvasEngine();
-});
 
 final avaRealtimePresentationProvider =
     ChangeNotifierProvider<AvaRealtimePresentationController>((ref) {
   return AvaRealtimePresentationController();
 });
 
-final localLearningActivityCatalogProvider =
-    FutureProvider<LocalLearningActivityCatalog>((ref) {
-  return LocalLearningActivityCatalog.load(rootBundle);
+final avaSvgCanvasSessionHostProvider =
+    ChangeNotifierProvider<AvaSvgCanvasSessionHost>((ref) {
+  return AvaSvgCanvasSessionHost();
 });
 
 final databaseProvider = Provider<AppDatabase>((ref) {
@@ -77,11 +70,6 @@ final avaRealtimeBootstrapServiceProvider =
   );
 });
 
-final avaRealtimeTransportConnectorProvider =
-    Provider<AvaRealtimeTransportConnector>((ref) {
-  return (bootstrap) => IoAvaRealtimeTransport.connect(bootstrap);
-});
-
 final avaRealtimeSdpTransportProvider =
     Provider<AvaRealtimeSdpTransport>((ref) {
   final transport = IoAvaRealtimeSdpTransport();
@@ -96,22 +84,35 @@ final avaRealtimeSdpServiceProvider = Provider<AvaRealtimeSdpService>((ref) {
   );
 });
 
-final avaRealtimeMediaConnectorProvider =
-    Provider<AvaRealtimeMediaConnector>((ref) {
-  return createAvaRealtimeMediaConnector(
+final avaRealtimeRawTransportConnectorV4Provider =
+    Provider<AvaRealtimeRawTransportConnectorV4>((ref) {
+  return (bootstrap) => IoAvaRealtimeRawTransportV4.connect(bootstrap);
+});
+
+final avaRealtimeMediaConnectorV4Provider =
+    Provider<AvaRealtimeMediaConnectorV4>((ref) {
+  return createAvaRealtimeMediaConnectorV4(
     mediaSessionFactory: FlutterAvaRealtimeMediaSession.create,
     sdpService: ref.watch(avaRealtimeSdpServiceProvider),
   );
 });
 
 final avaRealtimeRuntimeFactoryProvider =
-    Provider<AvaRealtimeRuntimeFactory>((ref) {
-  final factory = AvaRealtimeRuntimeFactory(
+    Provider<AvaRealtimeRuntimeBuilder>((ref) {
+  final configuration = ref.watch(avaBackendConfigurationProvider);
+  final factory = AvaRealtimeRuntimeFactoryV4(
     bootstrapService: ref.watch(avaRealtimeBootstrapServiceProvider),
-    mediaConnector: ref.watch(avaRealtimeMediaConnectorProvider),
-    transportConnector: ref.watch(avaRealtimeTransportConnectorProvider),
+    mediaConnector: ref.watch(avaRealtimeMediaConnectorV4Provider),
+    transportConnector: ref.watch(avaRealtimeRawTransportConnectorV4Provider),
+    documentLoaderFactory: (bootstrap, telemetry) => AvaSvgDocumentService(
+      documentBaseUrl: Uri.parse(bootstrap.canvasDocumentBaseUrl),
+      canvasToken: bootstrap.canvasToken,
+      timeout: configuration.requestTimeout,
+      transport: IoAvaSvgDocumentTransport(),
+      telemetry: telemetry,
+    ),
+    canvasHost: ref.watch(avaSvgCanvasSessionHostProvider.notifier),
     speechOutput: ref.watch(pcmSpeechOutputServiceProvider),
-    canvasEngine: ref.watch(avaCanvasEngineProvider.notifier),
     presentation: ref.watch(avaRealtimePresentationProvider.notifier),
     cancelRequestIdFactory: createSecureAvaCancelRequestId,
   );
@@ -121,19 +122,6 @@ final avaRealtimeRuntimeFactoryProvider =
 
 final pcmSpeechOutputServiceProvider = Provider<PcmSpeechOutputService>((ref) {
   return const ApplePcmSpeechOutputService();
-});
-
-final learningProgressServiceProvider =
-    Provider<LearningProgressService>((ref) {
-  return LearningProgressService(
-    ref.watch(databaseProvider),
-    profileId: StudentStateNotifier.profileId,
-  );
-});
-
-final learningProgressSummaryProvider =
-    StreamProvider<LearningProgressSummary>((ref) {
-  return ref.watch(learningProgressServiceProvider).watchSummary();
 });
 
 class StudentState {
@@ -281,34 +269,6 @@ class StudentStateNotifier extends StateNotifier<StudentState> {
     );
   }
 
-  Future<void> recordLesson(LearningDomain domain) async {
-    final nextMathScore =
-        domain == LearningDomain.math ? state.mathScore + 1 : state.mathScore;
-    final nextScienceScore = domain == LearningDomain.science
-        ? state.scienceScore + 1
-        : state.scienceScore;
-
-    final profile = StudentProfile(
-      id: profileId,
-      name: state.name,
-      dateOfBirth: state.dateOfBirth,
-      captionsEnabled: state.captionsEnabled,
-      mathScore: nextMathScore,
-      scienceScore: nextScienceScore,
-      lastActive: DateTime.now(),
-    );
-    await _database.insertOrUpdateProfile(profile);
-    state = state.copyWith(
-      mathScore: nextMathScore,
-      scienceScore: nextScienceScore,
-      clearError: true,
-    );
-  }
-
-  Future<void> incrementMathScore() => recordLesson(LearningDomain.math);
-
-  Future<void> incrementScienceScore() => recordLesson(LearningDomain.science);
-
   Future<void> clearConversationHistory() =>
       _database.clearConversationHistory();
 
@@ -341,7 +301,7 @@ final avaSessionProvider =
   return AvaRealtimeSessionController(
     runtimeFactory: ref.watch(avaRealtimeRuntimeFactoryProvider),
     presentation: ref.watch(avaRealtimePresentationProvider.notifier),
-    canvasEngine: ref.watch(avaCanvasEngineProvider.notifier),
+    canvasHost: ref.watch(avaSvgCanvasSessionHostProvider.notifier),
     ageBand: () => ref.read(avaRealtimeAgeBandProvider),
     volume: () => ref.read(volumeProvider),
   );

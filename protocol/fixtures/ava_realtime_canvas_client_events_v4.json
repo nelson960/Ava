@@ -1,0 +1,60 @@
+[
+  {
+    "protocolVersion": 4,
+    "event": "clientReady",
+    "sessionId": "session-1234",
+    "sequence": 0,
+    "rendererCapabilityVersion": "ava-svg-renderer-v1",
+    "validatorVersion": "ava-svg-validator-v1"
+  },
+  {
+    "protocolVersion": 4,
+    "event": "canvasDocumentPrepared",
+    "sessionId": "session-1234",
+    "sequence": 5,
+    "generationId": "generation-1234",
+    "sceneId": "scene-1234",
+    "sceneRevision": 1,
+    "svgSha256": "32972b9caf71c3cda6b6b3c7582558e4eaa4c9fe4428e1082ea9c33a4e768aca",
+    "manifestSha256": "b0870e34f26d7226659d2a3b806e16d4ae2292cdf257e8c08518b82dc1e08d20",
+    "rendererCapabilityVersion": "ava-svg-renderer-v1",
+    "validatorVersion": "ava-svg-validator-v1"
+  },
+  {
+    "protocolVersion": 4,
+    "event": "canvasPresented",
+    "sessionId": "session-1234",
+    "sequence": 6,
+    "generationId": "generation-1234",
+    "sceneId": "scene-1234",
+    "sceneRevision": 1,
+    "svgSha256": "32972b9caf71c3cda6b6b3c7582558e4eaa4c9fe4428e1082ea9c33a4e768aca",
+    "manifestSha256": "b0870e34f26d7226659d2a3b806e16d4ae2292cdf257e8c08518b82dc1e08d20",
+    "firstRenderedSample": 4812
+  },
+  {
+    "protocolVersion": 4,
+    "event": "canvasInteraction",
+    "sessionId": "session-1234",
+    "sequence": 9,
+    "sceneId": "scene-1234",
+    "sceneRevision": 1,
+    "interactionRevision": 1,
+    "svgSha256": "32972b9caf71c3cda6b6b3c7582558e4eaa4c9fe4428e1082ea9c33a4e768aca",
+    "manifestSha256": "b0870e34f26d7226659d2a3b806e16d4ae2292cdf257e8c08518b82dc1e08d20",
+    "bindingId": "select-cloud"
+  },
+  {
+    "protocolVersion": 4,
+    "event": "canvasPreparationFailed",
+    "sessionId": "session-1234",
+    "sequence": 10,
+    "generationId": "generation-1234",
+    "sceneId": "scene-1234",
+    "sceneRevision": 1,
+    "svgSha256": "32972b9caf71c3cda6b6b3c7582558e4eaa4c9fe4428e1082ea9c33a4e768aca",
+    "manifestSha256": "b0870e34f26d7226659d2a3b806e16d4ae2292cdf257e8c08518b82dc1e08d20",
+    "failureCode": "rendererRejected",
+    "message": "The SVG renderer rejected the prepared document."
+  }
+]

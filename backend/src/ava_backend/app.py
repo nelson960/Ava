@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, date, datetime, timedelta
-from typing import cast
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from fastapi import FastAPI, Header, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 from .auth import DevelopmentLoopbackAuthenticator, RequestAuthenticator
 from .config import (
@@ -18,37 +17,39 @@ from .config import (
     RealtimeDeliveryMode,
     Settings,
 )
-from .canvas.specialist import CANVAS_SPECIALIST_PROMPT_VERSION
+from .canvas.svg_delivery import (
+    SvgCanvasDocumentStore,
+    SvgDocumentNotFoundError,
+)
+from .canvas.svg_document import (
+    SVG_MANIFEST_VERSION,
+    SVG_RENDERER_CAPABILITY_VERSION,
+    SVG_VALIDATOR_VERSION,
+)
+from .canvas.svg_specialist import SVG_CANVAS_SPECIALIST_PROMPT_VERSION
 from .diagnostics import (
     RuntimeDiagnostics,
     configure_persistent_development_logging,
-    new_failure_id,
 )
 from .errors import AvaBackendError
-from .memory import (
-    ConversationMemoryStore,
-    SupabaseConversationMemoryStore,
-)
-from .orchestration import AvaOrchestrator, AvaPerformanceOrchestrator
-from .performance_stream import AvaPerformanceStream
 from .protocol import (
     AgeBand,
     ErrorCode,
     ErrorDetail,
     ErrorEnvelope,
-    LessonTurnEnvelope,
-    PerformanceTurnEnvelope,
 )
-from .providers.base import AvaModel, AvaPerformanceModel, AvaTimedSpeech
-from .providers.elevenlabs_speech_provider import ElevenLabsAvaSpeech
-from .providers.openai_provider import OpenAIAvaModel
-from .realtime.events import PROTOCOL_V3, AvaSessionBootstrap, AvaSessionLimits
+from .providers.openai_realtime_provider import OpenAIRealtimeProviderError
+from .realtime.events_v4 import (
+    PROTOCOL_V4,
+    AvaSessionBootstrapV4,
+    AvaSessionLimitsV4,
+)
 from .realtime.harness import (
     REALTIME_PROMPT_VERSION,
     REALTIME_TOOL_CONTRACT_VERSION,
 )
 from .realtime.memory import AuthoritativeMemoryStore
-from .realtime.live_factory import LiveRealtimeCoordinatorFactory
+from .realtime.live_factory_v4 import LiveRealtimeCoordinatorFactoryV4
 from .realtime.postgres_memory import (
     PostgresAuthoritativeMemoryStore,
     PostgresMemoryStoreError,
@@ -60,8 +61,7 @@ from .realtime.provider_session import (
     validate_sdp,
 )
 from .realtime.session import (
-    AvaSessionCreateRequest,
-    RealtimeCoordinatorFactory,
+    AvaSessionCreateRequestV4,
     RealtimeSessionAuthenticationError,
     RealtimeSessionAuthFailure,
     RealtimeSessionCapacityError,
@@ -69,10 +69,11 @@ from .realtime.session import (
     RealtimeSessionTokenCodec,
     ephemeral_development_token_secret,
 )
-from .realtime.websocket import (
-    AvaRealtimeWebSocketBridge,
-    RealtimeWebSocketProtocolError,
-    RealtimeWebSocketSessionTimeout,
+from .realtime.websocket_v4 import (
+    AvaRealtimeWebSocketBridgeV4,
+    RealtimeCoordinatorFactoryV4,
+    RealtimeWebSocketProtocolErrorV4,
+    RealtimeWebSocketSessionTimeoutV4,
 )
 
 LOGGER = logging.getLogger("ava_backend")
@@ -83,23 +84,20 @@ def _readiness_diagnostics(
 ) -> dict[str, object]:
     return {
         "build": runtime.readiness_build(),
-        "protocolVersion": PROTOCOL_V3,
+        "protocolVersion": 3,
         "promptVersion": REALTIME_PROMPT_VERSION,
         "toolContractVersion": REALTIME_TOOL_CONTRACT_VERSION,
-        "canvasSpecialistVersion": CANVAS_SPECIALIST_PROMPT_VERSION,
+        "canvasSpecialistVersion": SVG_CANVAS_SPECIALIST_PROMPT_VERSION,
     }
 
 
 def create_app(
     settings: Settings | None = None,
     *,
-    ava_model: AvaModel | None = None,
-    ava_performance_model: AvaPerformanceModel | None = None,
-    ava_timed_speech: AvaTimedSpeech | None = None,
-    conversation_memory: ConversationMemoryStore | None = None,
     authoritative_memory: AuthoritativeMemoryStore | None = None,
     authenticator: RequestAuthenticator | None = None,
-    realtime_coordinator_factory: RealtimeCoordinatorFactory | None = None,
+    realtime_v4_coordinator_factory: RealtimeCoordinatorFactoryV4 | None = None,
+    svg_document_store: SvgCanvasDocumentStore | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings()
     runtime_diagnostics = RuntimeDiagnostics.capture()
@@ -117,49 +115,6 @@ def create_app(
             resolved_settings.allowed_development_hosts
         )
 
-    resolved_model = ava_model or OpenAIAvaModel(resolved_settings)
-    orchestrator = AvaOrchestrator(resolved_model, resolved_settings)
-    resolved_performance_model = ava_performance_model or cast(
-        AvaPerformanceModel,
-        resolved_model,
-    )
-    performance_orchestrator = AvaPerformanceOrchestrator(
-        resolved_performance_model,
-        resolved_settings,
-    )
-    resolved_timed_speech = ava_timed_speech
-    if (
-        resolved_timed_speech is None
-        and resolved_settings.elevenlabs_api_key is not None
-    ):
-        resolved_timed_speech = ElevenLabsAvaSpeech(resolved_settings)
-    resolved_memory = conversation_memory
-    if resolved_memory is None and (
-        resolved_settings.supabase_url is not None
-        or resolved_settings.supabase_service_role_key is not None
-    ):
-        resolved_memory = SupabaseConversationMemoryStore(resolved_settings)
-    if (
-        resolved_settings.environment is AvaEnvironment.PRODUCTION
-        and resolved_timed_speech is not None
-        and resolved_memory is None
-    ):
-        raise BackendConfigurationError(
-            "Production performance turns require a durable ConversationMemoryStore"
-        )
-    performance_stream = (
-        AvaPerformanceStream(
-            performance_orchestrator,
-            resolved_timed_speech,
-            memory=resolved_memory,
-            memory_turn_limit=min(
-                8,
-                resolved_settings.context_history_max_messages // 2,
-            ),
-        )
-        if resolved_timed_speech is not None
-        else None
-    )
     app = FastAPI(
         title="Ava Backend",
         version="0.1.0",
@@ -172,8 +127,6 @@ def create_app(
     app.state.runtime_diagnostics = runtime_diagnostics
     app.state.development_log_path = development_log_path
     app.state.authenticator = authenticator
-    app.state.orchestrator = orchestrator
-    app.state.performance_stream = performance_stream
     resolved_authoritative_memory = authoritative_memory
     if resolved_authoritative_memory is None and resolved_settings.database_url:
         resolved_authoritative_memory = PostgresAuthoritativeMemoryStore(
@@ -183,49 +136,73 @@ def create_app(
             pool_timeout_seconds=resolved_settings.memory_pool_timeout_seconds,
             weekly_retention_days=resolved_settings.memory_weekly_retention_days,
         )
+    elif (
+        resolved_authoritative_memory is None
+        and resolved_settings.environment is AvaEnvironment.DEVELOPMENT
+    ):
+        from .realtime.memory import DevelopmentAuthoritativeMemoryStore
+
+        resolved_authoritative_memory = DevelopmentAuthoritativeMemoryStore()
+
     if (
         resolved_settings.environment is AvaEnvironment.PRODUCTION
         and resolved_authoritative_memory is None
     ):
         raise BackendConfigurationError(
-            "Production protocol-v3 requires AVA_DATABASE_URL for durable memory"
+            "Production realtime requires AVA_DATABASE_URL for durable memory"
         )
     app.state.authoritative_memory = resolved_authoritative_memory
     if resolved_authoritative_memory is not None:
         app.router.add_event_handler("startup", resolved_authoritative_memory.open)
         app.router.add_event_handler("shutdown", resolved_authoritative_memory.close)
     if (
-        realtime_coordinator_factory is None
+        resolved_settings.openai_api_key is not None
+        and resolved_settings.realtime_delivery_mode is RealtimeDeliveryMode.DISABLED
+        and resolved_settings.environment is AvaEnvironment.DEVELOPMENT
+    ):
+        resolved_settings = resolved_settings.model_copy(
+            update={"realtime_delivery_mode": RealtimeDeliveryMode.CAPTION_PREVIEW}
+        )
+    resolved_svg_documents = svg_document_store or SvgCanvasDocumentStore(
+        max_documents=min(
+            10_000,
+            max(1, resolved_settings.realtime_max_sessions * 2),
+        ),
+    )
+    if (
+        realtime_v4_coordinator_factory is None
+        and resolved_settings.openai_api_key is not None
         and resolved_settings.realtime_delivery_mode
         is not RealtimeDeliveryMode.DISABLED
     ):
         if resolved_authoritative_memory is None:
             raise BackendConfigurationError(
-                "Protocol-v3 live sessions require AVA_DATABASE_URL"
+                "Protocol-v4 live sessions require authoritative memory"
             )
-        realtime_coordinator_factory = LiveRealtimeCoordinatorFactory(
+        realtime_v4_coordinator_factory = LiveRealtimeCoordinatorFactoryV4(
             settings=resolved_settings,
             memory=resolved_authoritative_memory,
+            documents=resolved_svg_documents,
         )
-
-    realtime_sessions: RealtimeSessionRegistry | None = None
-    if realtime_coordinator_factory is not None:
+    realtime_v4_sessions: RealtimeSessionRegistry | None = None
+    if realtime_v4_coordinator_factory is not None:
         configured_token_secret = resolved_settings.realtime_session_token_secret
         token_secret = (
             configured_token_secret.get_secret_value()
             if configured_token_secret is not None
             else ephemeral_development_token_secret()
         )
-        realtime_sessions = RealtimeSessionRegistry(
-            coordinator_factory=realtime_coordinator_factory,
+        realtime_v4_sessions = RealtimeSessionRegistry(
+            coordinator_factory=realtime_v4_coordinator_factory,
             token_codec=RealtimeSessionTokenCodec(token_secret),
             ttl=timedelta(seconds=resolved_settings.realtime_session_ttl_seconds),
             max_sessions=resolved_settings.realtime_max_sessions,
         )
-        app.router.add_event_handler("shutdown", realtime_sessions.close)
-    app.state.realtime_sessions = realtime_sessions
-    app.state.realtime_websocket_bridge = AvaRealtimeWebSocketBridge(
-        turn_timeout_seconds=resolved_settings.realtime_max_session_seconds,
+        app.router.add_event_handler("shutdown", realtime_v4_sessions.close)
+    app.state.realtime_v4_sessions = realtime_v4_sessions
+    app.state.svg_canvas_documents = resolved_svg_documents
+    app.state.realtime_websocket_bridge_v4 = AvaRealtimeWebSocketBridgeV4(
+        session_timeout_seconds=resolved_settings.realtime_max_session_seconds,
     )
 
     LOGGER.info(
@@ -237,7 +214,7 @@ def create_app(
         runtime_diagnostics.source_revision,
         REALTIME_PROMPT_VERSION,
         REALTIME_TOOL_CONTRACT_VERSION,
-        CANVAS_SPECIALIST_PROMPT_VERSION,
+        SVG_CANVAS_SPECIALIST_PROMPT_VERSION,
         str(development_log_path) if development_log_path is not None else None,
         extra={
             "ava_context": {
@@ -245,7 +222,7 @@ def create_app(
                 "sourceRevision": runtime_diagnostics.source_revision,
                 "promptVersion": REALTIME_PROMPT_VERSION,
                 "toolContractVersion": REALTIME_TOOL_CONTRACT_VERSION,
-                "canvasPromptVersion": CANVAS_SPECIALIST_PROMPT_VERSION,
+                "canvasPromptVersion": SVG_CANVAS_SPECIALIST_PROMPT_VERSION,
             }
         },
     )
@@ -284,142 +261,21 @@ def create_app(
             headers={"Cache-Control": "no-store"},
         )
 
-    @app.post("/v1/lesson-turns")
-    async def create_lesson_turn(
+    @app.post("/v4/realtime/sessions")
+    async def create_realtime_session_v4(
         request: Request,
-        envelope: LessonTurnEnvelope,
+        envelope: AvaSessionCreateRequestV4,
         protocol_header: str | None = Header(
             default=None,
             alias="X-Ava-Protocol-Version",
         ),
     ) -> JSONResponse:
-        if protocol_header != "1":
+        if protocol_header != "4":
             return _error_response(
                 request,
                 status_code=409,
                 code=ErrorCode.PROTOCOL_MISMATCH,
-                message="X-Ava-Protocol-Version must be exactly 1.",
-            )
-
-        try:
-            client = await app.state.authenticator.authenticate(request)
-        except PermissionError:
-            return _error_response(
-                request,
-                status_code=401,
-                code=ErrorCode.UNAUTHORIZED,
-                message="A valid Ava client session is required.",
-            )
-
-        turn_request = envelope.request
-        if turn_request.client_instance_id is None:
-            turn_request = turn_request.model_copy(
-                update={"client_instance_id": client.subject}
-            )
-        outcome = await app.state.orchestrator.create_turn(turn_request)
-        LOGGER.info(
-            "lesson_turn_completed request_id=%s provider_request_id=%s input_tokens=%s output_tokens=%s context_included=%s context_omitted=%s",
-            request.state.request_id,
-            outcome.provider_request_id,
-            outcome.input_tokens,
-            outcome.output_tokens,
-            outcome.included_history_messages,
-            outcome.omitted_history_messages,
-        )
-        return JSONResponse(
-            status_code=200,
-            content=outcome.response.model_dump(
-                mode="json",
-                by_alias=True,
-                exclude_none=True,
-            ),
-            headers={"X-Request-ID": request.state.request_id},
-        )
-
-    @app.post("/v2/performance-turns")
-    async def create_performance_turn(
-        request: Request,
-        envelope: PerformanceTurnEnvelope,
-        protocol_header: str | None = Header(
-            default=None,
-            alias="X-Ava-Protocol-Version",
-        ),
-    ) -> Response:
-        if protocol_header != "2":
-            return _error_response(
-                request,
-                status_code=409,
-                code=ErrorCode.PROTOCOL_MISMATCH,
-                message="X-Ava-Protocol-Version must be exactly 2.",
-            )
-
-        try:
-            client = await app.state.authenticator.authenticate(request)
-        except PermissionError:
-            return _error_response(
-                request,
-                status_code=401,
-                code=ErrorCode.UNAUTHORIZED,
-                message="A valid Ava client session is required.",
-            )
-
-        streamer: AvaPerformanceStream | None = app.state.performance_stream
-        if streamer is None:
-            return _error_response(
-                request,
-                status_code=503,
-                code=ErrorCode.PROVIDER_UNAVAILABLE,
-                message=("Ava's selected timed-speech provider is not configured."),
-            )
-
-        turn_request = envelope.request
-        if turn_request.client_instance_id is None:
-            turn_request = turn_request.model_copy(
-                update={"client_instance_id": client.subject}
-            )
-        turn_id = f"turn-{uuid4()}"
-
-        async def event_lines() -> AsyncIterator[str]:
-            async for event in streamer.stream(
-                request=turn_request,
-                turn_id=turn_id,
-                request_id=request.state.request_id,
-                subject=client.subject,
-            ):
-                yield (
-                    event.model_dump_json(
-                        by_alias=True,
-                        exclude_none=True,
-                    )
-                    + "\n"
-                )
-
-        return StreamingResponse(
-            event_lines(),
-            status_code=200,
-            media_type="application/x-ndjson",
-            headers={
-                "X-Request-ID": request.state.request_id,
-                "X-Ava-Protocol-Version": "2",
-                "Cache-Control": "no-store",
-            },
-        )
-
-    @app.post("/v3/realtime/sessions")
-    async def create_realtime_session(
-        request: Request,
-        envelope: AvaSessionCreateRequest,
-        protocol_header: str | None = Header(
-            default=None,
-            alias="X-Ava-Protocol-Version",
-        ),
-    ) -> JSONResponse:
-        if protocol_header != "3":
-            return _error_response(
-                request,
-                status_code=409,
-                code=ErrorCode.PROTOCOL_MISMATCH,
-                message="X-Ava-Protocol-Version must be exactly 3.",
+                message="X-Ava-Protocol-Version must be exactly 4.",
             )
         try:
             client = await app.state.authenticator.authenticate(request)
@@ -430,13 +286,13 @@ def create_app(
                 code=ErrorCode.UNAUTHORIZED,
                 message="A valid Ava client session is required.",
             )
-        registry: RealtimeSessionRegistry | None = app.state.realtime_sessions
+        registry: RealtimeSessionRegistry | None = app.state.realtime_v4_sessions
         if registry is None:
             return _error_response(
                 request,
                 status_code=503,
                 code=ErrorCode.PROVIDER_UNAVAILABLE,
-                message="Ava realtime sessions are not configured.",
+                message="Ava protocol-v4 realtime sessions are not configured.",
             )
         try:
             created = await registry.create(
@@ -453,19 +309,22 @@ def create_app(
             )
         event_path = str(
             app.url_path_for(
-                "realtime_session_events",
+                "realtime_session_events_v4",
                 session_id=created.session_id,
             )
         )
         webrtc_path = str(
             app.url_path_for(
-                "negotiate_realtime_webrtc",
+                "negotiate_realtime_webrtc_v4",
                 session_id=created.session_id,
             )
         )
-        bootstrap = AvaSessionBootstrap.model_validate(
+        canvas_base_path = (
+            f"/v4/realtime/sessions/{created.session_id}/canvas-documents"
+        )
+        bootstrap = AvaSessionBootstrapV4.model_validate(
             {
-                "protocolVersion": 3,
+                "protocolVersion": PROTOCOL_V4,
                 "sessionId": created.session_id,
                 "eventUrl": _realtime_event_url(
                     request=request,
@@ -477,14 +336,24 @@ def create_app(
                     settings=resolved_settings,
                     path=webrtc_path,
                 ),
+                "canvasDocumentBaseUrl": _realtime_http_url(
+                    request=request,
+                    settings=resolved_settings,
+                    path=canvas_base_path,
+                ),
                 "sessionToken": created.token,
                 "webrtcToken": created.webrtc_token,
+                "canvasToken": created.canvas_token,
                 "expiresAt": created.expires_at.isoformat().replace("+00:00", "Z"),
-                "limits": AvaSessionLimits.model_validate(
+                "rendererCapabilityVersion": SVG_RENDERER_CAPABILITY_VERSION,
+                "validatorVersion": SVG_VALIDATOR_VERSION,
+                "manifestVersion": SVG_MANIFEST_VERSION,
+                "limits": AvaSessionLimitsV4.model_validate(
                     {
-                        "maxTurnSeconds": (resolved_settings.realtime_max_turn_seconds),
+                        "maxTurnSeconds": resolved_settings.realtime_max_turn_seconds,
                         "maxResponseCharacters": 1_800,
-                        "maxCanvasNodes": 96,
+                        "maxSvgBytes": 262_144,
+                        "maxManifestBytes": 65_536,
                         "maxAudioChunkBytes": 192_000,
                         "playbackProgressIntervalMs": (
                             resolved_settings.realtime_playback_progress_interval_ms
@@ -495,20 +364,16 @@ def create_app(
             context={
                 "allow_insecure_loopback": (
                     resolved_settings.realtime_allow_insecure_loopback
+                    or resolved_settings.environment is AvaEnvironment.DEVELOPMENT
                 )
             },
-        )
-        LOGGER.info(
-            "realtime_session_created request_id=%s session_id=%s",
-            request.state.request_id,
-            created.session_id,
         )
         return JSONResponse(
             status_code=201,
             content=bootstrap.model_dump(mode="json", by_alias=True),
             headers={
                 "Cache-Control": "no-store",
-                "X-Ava-Protocol-Version": "3",
+                "X-Ava-Protocol-Version": "4",
             },
         )
 
@@ -630,10 +495,10 @@ def create_app(
         )
 
     @app.post(
-        "/v3/realtime/sessions/{session_id}/webrtc",
-        name="negotiate_realtime_webrtc",
+        "/v4/realtime/sessions/{session_id}/webrtc",
+        name="negotiate_realtime_webrtc_v4",
     )
-    async def negotiate_realtime_webrtc(
+    async def negotiate_realtime_webrtc_v4(
         request: Request,
         session_id: str,
         protocol_header: str | None = Header(
@@ -641,15 +506,17 @@ def create_app(
             alias="X-Ava-Protocol-Version",
         ),
     ) -> Response:
-        if protocol_header != "3":
+        if protocol_header != "4":
             return _error_response(
                 request,
                 status_code=409,
                 code=ErrorCode.PROTOCOL_MISMATCH,
-                message="X-Ava-Protocol-Version must be exactly 3.",
+                message="X-Ava-Protocol-Version must be exactly 4.",
             )
-        content_type = request.headers.get("content-type", "")
-        if content_type.split(";", maxsplit=1)[0].strip() != "application/sdp":
+        if (
+            request.headers.get("content-type", "").split(";", maxsplit=1)[0].strip()
+            != "application/sdp"
+        ):
             return _error_response(
                 request,
                 status_code=415,
@@ -666,20 +533,21 @@ def create_app(
                 message="A valid Ava client session is required.",
             )
         token = _bearer_token(request.headers.get("authorization"))
-        if token is None:
+        registry: RealtimeSessionRegistry | None = app.state.realtime_v4_sessions
+        if token is None or registry is None:
             return _error_response(
                 request,
-                status_code=401,
-                code=ErrorCode.UNAUTHORIZED,
-                message="A valid realtime session token is required.",
-            )
-        registry: RealtimeSessionRegistry | None = app.state.realtime_sessions
-        if registry is None:
-            return _error_response(
-                request,
-                status_code=503,
-                code=ErrorCode.PROVIDER_UNAVAILABLE,
-                message="Ava realtime sessions are not configured.",
+                status_code=(401 if token is None else 503),
+                code=(
+                    ErrorCode.UNAUTHORIZED
+                    if token is None
+                    else ErrorCode.PROVIDER_UNAVAILABLE
+                ),
+                message=(
+                    "A valid realtime session token is required."
+                    if token is None
+                    else "Ava protocol-v4 realtime sessions are not configured."
+                ),
             )
         try:
             raw_offer = await _read_bounded_request_body(request, MAX_SDP_BYTES)
@@ -706,87 +574,177 @@ def create_app(
                 code=ErrorCode.UNAUTHORIZED,
                 message="The realtime session cannot be negotiated.",
             )
-        except RealtimeNegotiationUnavailableError as error:
-            LOGGER.warning(
-                "realtime_media_negotiation_unavailable request_id=%s session_id=%s "
-                "stage=%s error_type=%s provider_status_code=%s "
-                "provider_request_id=%s",
-                request.state.request_id,
-                session_id,
-                error.stage,
-                error.error_type,
-                error.provider_status_code,
-                error.provider_request_id,
-            )
+        except RealtimeNegotiationUnavailableError:
             return _error_response(
                 request,
                 status_code=503,
                 code=ErrorCode.PROVIDER_UNAVAILABLE,
                 message="Realtime media negotiation is temporarily unavailable.",
             )
-        except RealtimeNegotiationResponseError as error:
-            LOGGER.warning(
-                "realtime_media_negotiation_invalid request_id=%s session_id=%s "
-                "reason=%s "
-                "provider_status_code=%s provider_error_code=%s "
-                "provider_error_parameter=%s provider_request_id=%s",
-                request.state.request_id,
-                session_id,
-                str(error),
-                error.provider_status_code,
-                error.provider_error_code,
-                error.provider_error_parameter,
-                error.provider_request_id,
-            )
+        except (
+            RealtimeNegotiationResponseError,
+            OpenAIRealtimeProviderError,
+            ValueError,
+        ):
             return _error_response(
                 request,
                 status_code=502,
                 code=ErrorCode.PROVIDER_INVALID_RESPONSE,
                 message="Realtime media negotiation returned an invalid answer.",
             )
-        except ValueError:
-            LOGGER.warning(
-                "realtime_media_negotiation_invalid_sdp request_id=%s session_id=%s",
-                request.state.request_id,
-                session_id,
-            )
-            return _error_response(
-                request,
-                status_code=502,
-                code=ErrorCode.PROVIDER_INVALID_RESPONSE,
-                message="Realtime media negotiation returned an invalid answer.",
-            )
-
-        LOGGER.info(
-            "realtime_media_negotiated request_id=%s session_id=%s provider_call_id=%s",
-            request.state.request_id,
-            session_id,
-            negotiated.provider_call_id,
-        )
         return Response(
             content=negotiated.answer_sdp,
             status_code=200,
             media_type="application/sdp",
             headers={
                 "Cache-Control": "no-store",
-                "X-Ava-Protocol-Version": "3",
+                "X-Ava-Protocol-Version": "4",
             },
         )
 
-    @app.websocket(
-        "/v3/realtime/sessions/{session_id}/events",
-        name="realtime_session_events",
+    async def serve_svg_canvas_document(
+        request: Request,
+        *,
+        session_id: str,
+        generation_id: str,
+        kind: str,
+        canvas_token: str | None,
+        protocol_header: str | None,
+    ) -> Response:
+        if protocol_header != "4":
+            return _error_response(
+                request,
+                status_code=409,
+                code=ErrorCode.PROTOCOL_MISMATCH,
+                message="X-Ava-Protocol-Version must be exactly 4.",
+            )
+        try:
+            client = await app.state.authenticator.authenticate(request)
+        except PermissionError:
+            return _error_response(
+                request,
+                status_code=401,
+                code=ErrorCode.UNAUTHORIZED,
+                message="A valid Ava client session is required.",
+            )
+        registry: RealtimeSessionRegistry | None = app.state.realtime_v4_sessions
+        if registry is None or canvas_token is None:
+            return _error_response(
+                request,
+                status_code=401 if canvas_token is None else 503,
+                code=(
+                    ErrorCode.UNAUTHORIZED
+                    if canvas_token is None
+                    else ErrorCode.PROVIDER_UNAVAILABLE
+                ),
+                message="Canvas document authorization is unavailable.",
+            )
+        try:
+            await registry.authorize_canvas_document(
+                session_id=session_id,
+                token=canvas_token,
+                subject=client.subject,
+            )
+        except RealtimeSessionAuthenticationError:
+            return _error_response(
+                request,
+                status_code=401,
+                code=ErrorCode.UNAUTHORIZED,
+                message="The canvas document token is invalid.",
+            )
+        store: SvgCanvasDocumentStore = app.state.svg_canvas_documents
+        try:
+            stored = await store.get(
+                session_id=session_id,
+                generation_id=generation_id,
+            )
+        except (SvgDocumentNotFoundError, ValueError):
+            return _error_response(
+                request,
+                status_code=404,
+                code=ErrorCode.INVALID_REQUEST,
+                message="The canvas document does not exist.",
+            )
+        if kind == "svg":
+            content = stored.document.svg_bytes
+            content_hash = stored.document.svg_sha256
+            media_type = "image/svg+xml"
+        elif kind == "manifest":
+            content = stored.document.manifest_bytes
+            content_hash = stored.document.manifest_sha256
+            media_type = "application/json"
+        else:  # pragma: no cover - route invariant
+            raise RuntimeError("unsupported SVG canvas document kind")
+        return Response(
+            content=content,
+            status_code=200,
+            media_type=media_type,
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Security-Policy": "default-src 'none'",
+                "ETag": f'"sha256:{content_hash}"',
+                "X-Ava-Protocol-Version": "4",
+                "X-Ava-Renderer-Capability-Version": (SVG_RENDERER_CAPABILITY_VERSION),
+                "X-Ava-Validator-Version": SVG_VALIDATOR_VERSION,
+                "X-Content-SHA256": content_hash,
+            },
+        )
+
+    @app.get("/v4/realtime/sessions/{session_id}/canvas-documents/{generation_id}/svg")
+    async def get_svg_canvas_document(
+        request: Request,
+        session_id: str,
+        generation_id: str,
+        canvas_token: str | None = Header(default=None, alias="X-Ava-Canvas-Token"),
+        protocol_header: str | None = Header(
+            default=None,
+            alias="X-Ava-Protocol-Version",
+        ),
+    ) -> Response:
+        return await serve_svg_canvas_document(
+            request,
+            session_id=session_id,
+            generation_id=generation_id,
+            kind="svg",
+            canvas_token=canvas_token,
+            protocol_header=protocol_header,
+        )
+
+    @app.get(
+        "/v4/realtime/sessions/{session_id}/canvas-documents/{generation_id}/manifest"
     )
-    async def realtime_session_events(
+    async def get_svg_canvas_manifest(
+        request: Request,
+        session_id: str,
+        generation_id: str,
+        canvas_token: str | None = Header(default=None, alias="X-Ava-Canvas-Token"),
+        protocol_header: str | None = Header(
+            default=None,
+            alias="X-Ava-Protocol-Version",
+        ),
+    ) -> Response:
+        return await serve_svg_canvas_document(
+            request,
+            session_id=session_id,
+            generation_id=generation_id,
+            kind="manifest",
+            canvas_token=canvas_token,
+            protocol_header=protocol_header,
+        )
+
+    @app.websocket(
+        "/v4/realtime/sessions/{session_id}/events",
+        name="realtime_session_events_v4",
+    )
+    async def realtime_session_events_v4(
         websocket: WebSocket,
         session_id: str,
     ) -> None:
-        connection_id = str(uuid4())
-        registry: RealtimeSessionRegistry | None = app.state.realtime_sessions
+        registry: RealtimeSessionRegistry | None = app.state.realtime_v4_sessions
         if registry is None:
             await _close_websocket(websocket, code=1013)
             return
-        if websocket.headers.get("x-ava-protocol-version") != "3":
+        if websocket.headers.get("x-ava-protocol-version") != "4":
             await _close_websocket(websocket, code=4406)
             return
         token = _bearer_token(websocket.headers.get("authorization"))
@@ -794,121 +752,37 @@ def create_app(
             await _close_websocket(websocket, code=4401)
             return
         try:
-            coordinator = await registry.claim(
-                session_id=session_id,
-                token=token,
-            )
+            coordinator = await registry.claim(session_id=session_id, token=token)
         except RealtimeSessionAuthenticationError as error:
             await _close_websocket(
                 websocket,
                 code=_websocket_auth_close_code(error.failure),
             )
             return
-
         await websocket.accept()
-        LOGGER.info(
-            "realtime_socket_connected connection_id=%s session_id=%s",
-            connection_id,
-            session_id,
-        )
         try:
-            bridge: AvaRealtimeWebSocketBridge = app.state.realtime_websocket_bridge
+            bridge: AvaRealtimeWebSocketBridgeV4 = (
+                app.state.realtime_websocket_bridge_v4
+            )
             await bridge.serve(
                 websocket=websocket,
                 coordinator=coordinator,
                 session_id=session_id,
             )
             await _close_websocket(websocket, code=1000)
-        except WebSocketDisconnect as error:
-            LOGGER.info(
-                "realtime_socket_disconnected connection_id=%s session_id=%s "
-                "close_code=%s",
-                connection_id,
-                session_id,
-                error.code,
-            )
-        except RealtimeWebSocketProtocolError as error:
-            failure_id = new_failure_id()
-            turn_id = coordinator.turn_id
-            cause = error.__cause__
-            LOGGER.warning(
-                "realtime_socket_protocol_error failure_id=%s "
-                "connection_id=%s session_id=%s turn_id=%s "
-                "reason=%s cause_type=%s",
-                failure_id,
-                connection_id,
-                session_id,
-                turn_id,
-                str(error),
-                type(cause).__name__ if cause is not None else None,
-                extra={
-                    "ava_context": {
-                        "failureId": failure_id,
-                        "component": "protocol",
-                        "connectionId": connection_id,
-                        "sessionId": session_id,
-                        "turnId": turn_id,
-                    }
-                },
-            )
-            await _close_websocket(
-                websocket,
-                code=1002,
-                reason=f"protocolError:protocol:{failure_id}",
-            )
-        except RealtimeWebSocketSessionTimeout as error:
-            failure_id = new_failure_id()
-            turn_id = coordinator.turn_id
-            LOGGER.warning(
-                "realtime_socket_timeout failure_id=%s connection_id=%s "
-                "session_id=%s turn_id=%s reason=%s",
-                failure_id,
-                connection_id,
-                session_id,
-                turn_id,
-                str(error),
-                extra={
-                    "ava_context": {
-                        "failureId": failure_id,
-                        "component": "coordinator",
-                        "connectionId": connection_id,
-                        "sessionId": session_id,
-                        "turnId": turn_id,
-                    }
-                },
-            )
-            await _close_websocket(
-                websocket,
-                code=1013,
-                reason=f"sessionTimeout:coordinator:{failure_id}",
-            )
+        except WebSocketDisconnect:
+            pass
+        except RealtimeWebSocketProtocolErrorV4:
+            await _close_websocket(websocket, code=1002)
+        except RealtimeWebSocketSessionTimeoutV4:
+            await _close_websocket(websocket, code=1013)
         except Exception:
-            failure_id = new_failure_id()
-            turn_id = coordinator.turn_id
-            LOGGER.exception(
-                "realtime_socket_failed failure_id=%s connection_id=%s "
-                "session_id=%s turn_id=%s",
-                failure_id,
-                connection_id,
-                session_id,
-                turn_id,
-                extra={
-                    "ava_context": {
-                        "failureId": failure_id,
-                        "component": "coordinator",
-                        "connectionId": connection_id,
-                        "sessionId": session_id,
-                        "turnId": turn_id,
-                    }
-                },
-            )
-            await _close_websocket(
-                websocket,
-                code=1011,
-                reason=f"serverError:coordinator:{failure_id}",
-            )
+            LOGGER.exception("realtime_v4_socket_failed session_id=%s", session_id)
+            await _close_websocket(websocket, code=1011)
         finally:
             await registry.release(session_id)
+            store: SvgCanvasDocumentStore = app.state.svg_canvas_documents
+            await store.release_session(session_id=session_id)
 
     return app
 
@@ -1026,7 +900,10 @@ def _realtime_event_url(
             "Ava could not derive a realtime event origin from the request"
         )
     insecure_loopback = (
-        settings.realtime_allow_insecure_loopback
+        (
+            settings.realtime_allow_insecure_loopback
+            or settings.environment is AvaEnvironment.DEVELOPMENT
+        )
         and parsed.scheme == "http"
         and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
     )
@@ -1047,7 +924,10 @@ def _realtime_http_url(
         return urlunsplit(("https", parsed.netloc, path, "", ""))
     parsed = urlsplit(str(request.base_url))
     insecure_loopback = (
-        settings.realtime_allow_insecure_loopback
+        (
+            settings.realtime_allow_insecure_loopback
+            or settings.environment is AvaEnvironment.DEVELOPMENT
+        )
         and parsed.scheme == "http"
         and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
     )

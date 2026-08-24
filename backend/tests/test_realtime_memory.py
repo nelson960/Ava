@@ -11,7 +11,7 @@ from ava_backend.realtime.memory import (
     DevelopmentAuthoritativeMemoryStore,
     evaluate_memory_proposal,
 )
-from ava_backend.realtime.plan import AvaMemoryProposal
+from ava_backend.realtime.memory import AvaMemoryProposal
 
 
 def _turn(

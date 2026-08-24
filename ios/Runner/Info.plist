@@ -28,8 +28,6 @@
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Ava uses the microphone only while the child is asking a question.</string>
-	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>Ava converts the child's spoken question into text for the lesson.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

@@ -1,23 +1,23 @@
 import 'dart:async';
-import 'dart:convert';
-import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:ava/canvas/ava_canvas_engine.dart';
-import 'package:ava/config/ava_backend_configuration.dart';
+import 'package:ava/canvas/ava_svg_canvas_session_host.dart';
 import 'package:ava/models/ava_realtime_protocol.dart';
-import 'package:ava/services/ava_realtime_bootstrap_service.dart';
+import 'package:ava/models/ava_realtime_protocol_v4.dart';
+import 'package:ava/models/ava_svg_canvas_protocol.dart';
 import 'package:ava/services/ava_realtime_presentation.dart';
 import 'package:ava/services/ava_realtime_runtime_factory.dart';
-import 'package:ava/services/ava_realtime_session.dart';
+import 'package:ava/services/ava_realtime_session_v4.dart';
+import 'package:ava/services/ava_realtime_turn_runtime.dart';
 import 'package:ava/services/ava_realtime_webrtc.dart';
+import 'package:ava/services/ava_svg_document_service.dart';
 import 'package:ava/services/pcm_speech_output_service.dart';
 import 'package:ava/state/ava_realtime_session_controller.dart';
 import 'package:ava/state/ava_session_state.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-const _sessionId = 'session-persistent-controller';
-const _turnId = 'turn-persistent-controller';
+const _sessionId = 'session-controller-v4';
+const _turnId = 'turn-controller-v4';
 const _offerSdp = 'v=0\r\n'
     'o=- 1000 2 IN IP4 127.0.0.1\r\n'
     's=Ava persistent controller test\r\n'
@@ -26,71 +26,33 @@ const _offerSdp = 'v=0\r\n'
     'm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n';
 
 void main() {
-  test('startup prepares once and mic taps only toggle the existing track',
+  test('startup prepares once and mic taps retain the same V4 session',
       () async {
     final harness = _ControllerHarness();
     addTearDown(harness.close);
 
     final preparing = harness.controller.prepare();
-    await _waitFor(
-      () => harness.transport.sentEvents.isNotEmpty,
-      'clientReady was not sent',
-    );
+    await harness.raw.waitForSent('clientReady');
     harness.sendListeningTurn();
     await preparing;
 
-    expect(harness.bootstrap.requestCount, 1);
+    expect(harness.builder.createCount, 1);
     expect(harness.media.microphoneEnabled, isFalse);
-    expect(harness.controller.state.turnState, AvaSessionPhase.idle);
-    expect(harness.controller.state.userMicIntent, isFalse);
-    expect(harness.controller.state.actualTrackEnabled, isFalse);
+    expect(harness.controller.state.connectionHealth,
+        AvaConnectionHealth.connected);
 
     await harness.controller.setMicrophoneActive(true);
     expect(harness.media.microphoneEnabled, isTrue);
-    expect(harness.controller.state.userMicIntent, isTrue);
-    expect(harness.controller.state.actualTrackEnabled, isTrue);
-    expect(harness.bootstrap.requestCount, 1);
-
-    harness.presentation.setPhase(AvaRealtimeTurnPhase.planning);
-    expect(harness.controller.state.turnState, AvaSessionPhase.thinking);
-    expect(harness.controller.state.userMicIntent, isTrue);
-    harness.presentation.setPhase(AvaRealtimeTurnPhase.speaking);
-    expect(harness.controller.state.turnState, AvaSessionPhase.speaking);
-    expect(harness.controller.state.userMicIntent, isTrue);
-    harness.presentation.complete(
-      AvaRealtimeServerEvent.fromJson({
-        'protocolVersion': 3,
-        'event': 'turnCancelled',
-        'sessionId': _sessionId,
-        'turnId': _turnId,
-        'sequence': 3,
-        'revision': 3,
-        'deliveredSampleCount': 0,
-        'deliveredText': '',
-        'reason': 'testTurnBoundary',
-      }),
-    );
-    expect(harness.controller.state.turnState, AvaSessionPhase.listening);
-    expect(harness.controller.state.userMicIntent, isTrue);
-    expect(harness.controller.state.actualTrackEnabled, isTrue);
-
     await harness.controller.setMicrophoneActive(false);
     expect(harness.media.microphoneEnabled, isFalse);
     expect(harness.media.closed, isFalse);
-    expect(harness.controller.state.userMicIntent, isFalse);
-    expect(harness.controller.state.actualTrackEnabled, isFalse);
-    expect(harness.bootstrap.requestCount, 1);
-
     await harness.controller.setMicrophoneActive(true);
+
     expect(harness.media.microphoneEnabled, isTrue);
-    expect(harness.bootstrap.requestCount, 1);
+    expect(harness.builder.createCount, 1);
     expect(
-      harness.transport.sentEvents
-          .where(
-            (event) => event.type == AvaRealtimeClientEventType.clientReady,
-          )
-          .length,
-      1,
+      harness.raw.sentJson.where((event) => event['event'] == 'clientReady'),
+      hasLength(1),
     );
   });
 
@@ -100,271 +62,245 @@ void main() {
     addTearDown(harness.close);
 
     final turnOn = harness.controller.setMicrophoneActive(true);
-    expect(harness.controller.state.userMicIntent, isTrue);
-    await _waitFor(
-      () => harness.transport.sentEvents.isNotEmpty,
-      'clientReady was not sent',
-    );
-
+    await harness.raw.waitForSent('clientReady');
     final turnOff = harness.controller.setMicrophoneActive(false);
-    expect(harness.controller.state.userMicIntent, isFalse);
     harness.sendListeningTurn();
     await Future.wait([turnOn, turnOff]);
 
+    expect(harness.controller.state.userMicIntent, isFalse);
     expect(harness.media.microphoneEnabled, isFalse);
-    expect(harness.bootstrap.requestCount, 1);
-
-    await harness.controller.setMicrophoneActive(true);
-    expect(harness.media.microphoneEnabled, isTrue);
-    expect(harness.bootstrap.requestCount, 1);
+    expect(harness.builder.createCount, 1);
   });
 
-  test('a failed turn never changes mic intent or the live track', () async {
-    final harness = _ControllerHarness();
-    addTearDown(harness.close);
-
-    final preparing = harness.controller.prepare();
-    await _waitFor(
-      () => harness.transport.sentEvents.isNotEmpty,
-      'clientReady was not sent',
-    );
-    harness.sendListeningTurn();
-    await preparing;
-    await harness.controller.setMicrophoneActive(true);
-
-    harness.presentation.setPhase(AvaRealtimeTurnPhase.planning);
-    harness.presentation.complete(
-      AvaRealtimeServerEvent.fromJson({
-        'protocolVersion': 3,
-        'event': 'turnFailed',
-        'sessionId': _sessionId,
-        'turnId': _turnId,
-        'sequence': 3,
-        'revision': 3,
-        'failure': {
-          'failureId': 'failure-controller-model',
-          'component': 'realtimeProvider',
-          'code': 'modelInvalid',
-          'message': 'The response failed validation.',
-          'retryable': false,
-        },
-        'deliveredSampleCount': 0,
-        'deliveredText': '',
-      }),
-    );
-
-    expect(harness.controller.state.turnState, AvaSessionPhase.failure);
-    expect(harness.controller.state.userMicIntent, isTrue);
-    expect(harness.controller.state.actualTrackEnabled, isTrue);
-    expect(harness.media.microphoneEnabled, isTrue);
-  });
-
-  test('canvas and memory failures remain isolated from conversation media',
+  test('muted warm expiry cancels and closes without a failure state',
       () async {
-    final harness = _ControllerHarness();
-    addTearDown(harness.close);
-
-    final preparing = harness.controller.prepare();
-    await _waitFor(
-      () => harness.transport.sentEvents.isNotEmpty,
-      'clientReady was not sent',
+    final harness = _ControllerHarness(
+      warmRetention: const Duration(milliseconds: 20),
     );
+    addTearDown(harness.close);
+    final preparing = harness.controller.prepare();
+    await harness.raw.waitForSent('clientReady');
     harness.sendListeningTurn();
     await preparing;
     await harness.controller.setMicrophoneActive(true);
+    await harness.controller.setMicrophoneActive(false);
 
-    harness.presentation.setPhase(AvaRealtimeTurnPhase.synthesizing);
-    harness.presentation.recordCanvasRejection(
-      'The optional visual could not be prepared.',
-    );
-    expect(
-      harness.controller.state.canvasState,
-      AvaCanvasSessionState.rejected,
-    );
-    expect(harness.controller.state.userMicIntent, isTrue);
-    expect(harness.controller.state.actualTrackEnabled, isTrue);
+    await harness.raw.waitForSent('cancelTurn');
+    harness.addControl({
+      'protocolVersion': 4,
+      'event': 'turnPhaseChanged',
+      'sessionId': _sessionId,
+      'turnId': _turnId,
+      'sequence': 3,
+      'revision': 3,
+      'phase': 'cancelling',
+    });
+    harness.addControl({
+      'protocolVersion': 4,
+      'event': 'turnCancelled',
+      'sessionId': _sessionId,
+      'turnId': _turnId,
+      'sequence': 4,
+      'revision': 4,
+      'deliveredSampleCount': 0,
+      'deliveredText': '',
+      'reason': 'mutedConversationExpired',
+    });
+    await harness.mediaClosed.future;
 
-    harness.presentation.setPhase(AvaRealtimeTurnPhase.speaking);
-    harness.presentation.recordMemoryPersistenceFailure(
-      const AvaRealtimeFailure(
-        failureId: 'failure-controller-memory',
-        component: 'memoryStore',
-        code: 'memoryUnavailable',
-        message: 'Delivered turn could not be persisted.',
-        retryable: true,
-      ),
-    );
-    harness.presentation.complete(
-      AvaRealtimeServerEvent.fromJson({
-        'protocolVersion': 3,
-        'event': 'turnCompleted',
-        'sessionId': _sessionId,
-        'turnId': _turnId,
-        'sequence': 3,
-        'revision': 3,
-        'deliveredSampleCount': 0,
-        'deliveredText': '',
-      }),
-    );
-
-    expect(
-      harness.controller.state.memoryState,
-      AvaMemorySessionState.retryRequired,
-    );
-    expect(harness.controller.state.turnState, AvaSessionPhase.listening);
-    expect(harness.controller.state.userMicIntent, isTrue);
-    expect(harness.controller.state.actualTrackEnabled, isTrue);
-    expect(harness.media.microphoneEnabled, isTrue);
+    expect(harness.controller.state.connectionHealth,
+        AvaConnectionHealth.disconnected);
+    expect(harness.controller.state.turnState, AvaSessionPhase.idle);
+    expect(harness.controller.state.errorMessage, isNull);
   });
 }
 
 final class _ControllerHarness {
-  _ControllerHarness() {
-    bootstrap = _BootstrapTransportFake();
-    media = DeterministicAvaRealtimeMediaSession(offerSdp: _offerSdp);
-    transport = _PushRealtimeTransport();
-    presentation = AvaRealtimePresentationController();
-    canvasEngine = AvaCanvasEngine();
-    factory = AvaRealtimeRuntimeFactory(
-      bootstrapService: AvaRealtimeBootstrapService(
-        configuration: AvaBackendConfiguration.parse(
-          'https://ava.example.test',
-        ),
-        transport: bootstrap,
-      ),
-      mediaConnector: (bootstrap) async => media,
-      transportConnector: (bootstrap) async => transport,
-      speechOutput: const _NoopPcmOutput(),
-      canvasEngine: canvasEngine,
+  _ControllerHarness({
+    Duration warmRetention = const Duration(minutes: 2),
+  })  : raw = _PushRawTransportV4(),
+        media = DeterministicAvaRealtimeMediaSession(offerSdp: _offerSdp),
+        presentation = AvaRealtimePresentationController(),
+        canvasHost = AvaSvgCanvasSessionHost() {
+    builder = _RuntimeBuilder(
+      raw: raw,
+      media: media,
       presentation: presentation,
-      cancelRequestIdFactory: () => 'cancel-controller-test',
+      canvasHost: canvasHost,
     );
     controller = AvaRealtimeSessionController(
-      runtimeFactory: factory,
+      runtimeFactory: builder,
       presentation: presentation,
-      canvasEngine: canvasEngine,
+      canvasHost: canvasHost,
       ageBand: () => AvaRealtimeAgeBand.middleChildhood,
       volume: () => 0.8,
+      warmRetention: warmRetention,
     );
+    unawaited(media.states.drain<void>().whenComplete(() {
+      if (!mediaClosed.isCompleted) mediaClosed.complete();
+    }));
   }
 
-  late final _BootstrapTransportFake bootstrap;
-  late final DeterministicAvaRealtimeMediaSession media;
-  late final _PushRealtimeTransport transport;
-  late final AvaRealtimePresentationController presentation;
-  late final AvaCanvasEngine canvasEngine;
-  late final AvaRealtimeRuntimeFactory factory;
+  final _PushRawTransportV4 raw;
+  final DeterministicAvaRealtimeMediaSession media;
+  final AvaRealtimePresentationController presentation;
+  final AvaSvgCanvasSessionHost canvasHost;
+  final Completer<void> mediaClosed = Completer<void>();
+  late final _RuntimeBuilder builder;
   late final AvaRealtimeSessionController controller;
+  bool _closed = false;
 
   void sendListeningTurn() {
-    for (final payload in const [
+    for (final event in [
       {
-        'protocolVersion': 3,
+        'protocolVersion': 4,
         'event': 'turnCreated',
         'sessionId': _sessionId,
         'turnId': _turnId,
         'sequence': 0,
         'revision': 0,
-        'requestId': 'request-persistent-controller',
+        'requestId': 'request-controller-v4',
       },
-      {
-        'protocolVersion': 3,
-        'event': 'turnPhaseChanged',
-        'sessionId': _sessionId,
-        'turnId': _turnId,
-        'sequence': 1,
-        'revision': 1,
-        'phase': 'connecting',
-      },
-      {
-        'protocolVersion': 3,
-        'event': 'turnPhaseChanged',
-        'sessionId': _sessionId,
-        'turnId': _turnId,
-        'sequence': 2,
-        'revision': 2,
-        'phase': 'listening',
-      },
+      for (final phase in const [
+        (1, 1, 'connecting'),
+        (2, 2, 'listening'),
+      ])
+        {
+          'protocolVersion': 4,
+          'event': 'turnPhaseChanged',
+          'sessionId': _sessionId,
+          'turnId': _turnId,
+          'sequence': phase.$1,
+          'revision': phase.$2,
+          'phase': phase.$3,
+        },
     ]) {
-      transport.add(
-        AvaRealtimeControlFrame(
-          AvaRealtimeServerEvent.fromJson(payload),
-        ),
-      );
+      addControl(event);
     }
   }
 
-  Future<void> close() async {
-    controller.dispose();
-    await _waitFor(() => media.closed, 'media did not close on disposal');
-    await factory.close();
-  }
-}
-
-final class _BootstrapTransportFake implements AvaRealtimeBootstrapTransport {
-  int requestCount = 0;
-
-  @override
-  Future<AvaRealtimeBootstrapResponse> postJson({
-    required Uri endpoint,
-    required Map<String, String> headers,
-    required String body,
-    required Duration timeout,
-  }) async {
-    requestCount += 1;
-    final payload = <String, Object?>{
-      'protocolVersion': 3,
-      'sessionId': _sessionId,
-      'eventUrl': 'wss://ava.example.test/v3/realtime/$_sessionId/events',
-      'webrtcUrl': 'https://ava.example.test/v3/realtime/$_sessionId/webrtc',
-      'sessionToken': 'session-token-controller-test',
-      'webrtcToken': 'webrtc-token-controller-test',
-      'expiresAt': DateTime.now()
-          .toUtc()
-          .add(const Duration(minutes: 2))
-          .toIso8601String(),
-      'limits': {
-        'maxTurnSeconds': 90,
-        'maxResponseCharacters': 1800,
-        'maxCanvasNodes': 96,
-        'maxAudioChunkBytes': 192000,
-        'playbackProgressIntervalMs': 250,
-      },
-    };
-    return AvaRealtimeBootstrapResponse(
-      statusCode: HttpStatus.created,
-      contentType: 'application/json',
-      protocolVersion: '3',
-      bytes: Stream.value(utf8.encode(jsonEncode(payload))),
+  void addControl(Map<String, Object?> json) {
+    raw.add(
+      AvaRealtimeControlFrameV4(AvaRealtimeServerEventV4.fromJson(json)),
     );
   }
 
-  @override
-  void close() {}
+  Future<void> close() async {
+    if (_closed) return;
+    _closed = true;
+    controller.dispose();
+    await builder.close();
+    canvasHost.dispose();
+  }
 }
 
-final class _PushRealtimeTransport implements AvaRealtimeTransport {
-  final StreamController<AvaRealtimeInboundFrame> _frames = StreamController();
-  final List<AvaRealtimeClientEvent> sentEvents = [];
-  bool _closed = false;
+final class _RuntimeBuilder implements AvaRealtimeRuntimeBuilder {
+  _RuntimeBuilder({
+    required this.raw,
+    required this.media,
+    required this.presentation,
+    required this.canvasHost,
+  });
 
-  void add(AvaRealtimeInboundFrame frame) => _frames.add(frame);
+  final _PushRawTransportV4 raw;
+  final DeterministicAvaRealtimeMediaSession media;
+  final AvaRealtimePresentationController presentation;
+  final AvaSvgCanvasSessionHost canvasHost;
+  AvaRealtimeTurnRuntime? runtime;
+  int createCount = 0;
 
   @override
-  Stream<AvaRealtimeInboundFrame> frames() => _frames.stream;
-
-  @override
-  Future<void> send(AvaRealtimeClientEvent event) async {
-    if (_closed) throw StateError('transport is closed');
-    sentEvents.add(event);
+  Future<AvaRealtimeTurnRuntime> create({
+    required AvaRealtimeAgeBand ageBand,
+    required double volume,
+    void Function(bool enabled)? onMicrophoneTrackChanged,
+  }) async {
+    createCount += 1;
+    final created = AvaRealtimeTurnRuntime(
+      sessionId: _sessionId,
+      limits: const AvaSessionLimitsV4(
+        maxTurnSeconds: 5,
+        maxResponseCharacters: 1200,
+        maxSvgBytes: 262144,
+        maxManifestBytes: 65536,
+        maxAudioChunkBytes: 192000,
+        playbackProgressIntervalMs: 100,
+      ),
+      mediaSession: media,
+      transport: raw,
+      documents: const _UnexpectedDocumentLoader(),
+      speechOutput: const _NoopPcmOutput(),
+      presentation: presentation,
+      volume: volume,
+      cancelRequestIdFactory: () => 'cancel-controller-v4',
+      onCanvasClosed: canvasHost.detach,
+      onMicrophoneTrackChanged: onMicrophoneTrackChanged,
+      automaticPlaybackPolling: false,
+      microphoneInitiallyEnabled: false,
+    );
+    runtime = created;
+    canvasHost.attach(created.canvasController);
+    return created;
   }
 
   @override
   Future<void> close() async {
-    if (_closed) return;
-    _closed = true;
+    await runtime?.close();
+  }
+}
+
+final class _PushRawTransportV4 implements AvaRealtimeRawTransportV4 {
+  final StreamController<AvaRealtimeInboundFrameV4> _frames =
+      StreamController<AvaRealtimeInboundFrameV4>();
+  final List<AvaRealtimeClientEventV4> sentEvents = [];
+  final Map<String, List<Completer<void>>> _waiters = {};
+  bool closed = false;
+
+  List<Map<String, Object?>> get sentJson => [
+        for (final event in sentEvents) event.toJson(),
+      ];
+
+  void add(AvaRealtimeInboundFrameV4 frame) => _frames.add(frame);
+
+  Future<void> waitForSent(String type) {
+    if (sentJson.any((event) => event['event'] == type)) return Future.value();
+    final result = Completer<void>();
+    _waiters.putIfAbsent(type, () => []).add(result);
+    return result.future;
+  }
+
+  @override
+  Stream<AvaRealtimeInboundFrameV4> frames() => _frames.stream;
+
+  @override
+  Future<void> send(AvaRealtimeClientEventV4 event) async {
+    sentEvents.add(event);
+    final type = event.toJson()['event'];
+    if (type is! String) return;
+    for (final waiter in _waiters.remove(type) ?? const []) {
+      waiter.complete();
+    }
+  }
+
+  @override
+  Future<void> close() async {
+    if (closed) return;
+    closed = true;
     await _frames.close();
   }
+}
+
+final class _UnexpectedDocumentLoader implements AvaSvgDocumentLoader {
+  const _UnexpectedDocumentLoader();
+
+  @override
+  Future<AvaValidatedSvgCanvasDocument> fetch(
+    AvaSvgCanvasDocumentDescriptorV4 descriptor,
+  ) =>
+      throw StateError('Unexpected canvas document fetch.');
+
+  @override
+  void close() {}
 }
 
 final class _NoopPcmOutput implements PcmSpeechOutputService {
@@ -405,12 +341,4 @@ final class _NoopPcmOutput implements PcmSpeechOutputService {
 
   @override
   Future<void> stop() async {}
-}
-
-Future<void> _waitFor(bool Function() predicate, String failure) async {
-  for (var attempt = 0; attempt < 200; attempt += 1) {
-    if (predicate()) return;
-    await Future<void>.delayed(const Duration(milliseconds: 1));
-  }
-  fail(failure);
 }

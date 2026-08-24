@@ -1,13 +1,35 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:developer' as developer;
 import 'dart:io';
 
+import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
-import '../models/ava_realtime_protocol.dart';
+import '../models/ava_realtime_protocol_v4.dart';
 import 'ava_realtime_trace.dart';
 
 const int avaMaximumSdpBytes = 256 * 1024;
+
+const Map<String, Object> avaRealtimeMicrophoneConstraints = {
+  'audio': <String, Object>{
+    'echoCancellation': true,
+    'noiseSuppression': true,
+    'autoGainControl': true,
+    // flutter_webrtc 1.5.2's Darwin parser reads the legacy optional map,
+    // while its other native implementations read the W3C keys above.
+    // Request both shapes so Apple capture does not depend on SDK defaults.
+    'optional': <Map<String, Object>>[
+      <String, Object>{'googEchoCancellation': true},
+      <String, Object>{'googNoiseSuppression': true},
+      <String, Object>{'googAutoGainControl': true},
+    ],
+  },
+  'video': false,
+};
+
+const MethodChannel _audioDiagnosticsChannel =
+    MethodChannel('ava/audio_diagnostics');
 
 enum AvaRealtimeMediaState {
   newSession,
@@ -125,8 +147,8 @@ final class AvaRealtimeSdpService {
   final AvaRealtimeSdpTransport _transport;
   final Duration _requestTimeout;
 
-  Future<String> negotiate({
-    required AvaSessionBootstrapV3 bootstrap,
+  Future<String> negotiateV4({
+    required AvaSessionBootstrapV4 bootstrap,
     required String offerSdp,
   }) async {
     _validateAudioSdp(offerSdp, description: 'offer');
@@ -136,7 +158,7 @@ final class AvaRealtimeSdpService {
         HttpHeaders.acceptHeader: 'application/sdp',
         HttpHeaders.contentTypeHeader: 'application/sdp',
         HttpHeaders.authorizationHeader: 'Bearer ${bootstrap.webrtcToken}',
-        'x-ava-protocol-version': '$avaRealtimeProtocolVersion',
+        'x-ava-protocol-version': '$avaRealtimeProtocolVersionV4',
       },
       offerSdp: offerSdp,
       timeout: _requestTimeout,
@@ -144,12 +166,12 @@ final class AvaRealtimeSdpService {
     if (response.statusCode != HttpStatus.ok) {
       await _drainBounded(response.bytes).timeout(_requestTimeout);
       throw AvaRealtimeSdpException(
-        message: 'Ava backend rejected WebRTC negotiation.',
+        message: 'Ava backend rejected protocol-v4 WebRTC negotiation.',
         statusCode: response.statusCode,
         requestId: response.requestId,
       );
     }
-    if (response.protocolVersion != '$avaRealtimeProtocolVersion') {
+    if (response.protocolVersion != '$avaRealtimeProtocolVersionV4') {
       await _drainBounded(response.bytes).timeout(_requestTimeout);
       throw AvaRealtimeSdpException(
         message: 'Ava backend returned a mismatched SDP protocol version.',
@@ -252,14 +274,7 @@ final class FlutterAvaRealtimeMediaSession implements AvaRealtimeMediaSession {
     try {
       Future<MediaStream> captureMicrophone() =>
           navigator.mediaDevices.getUserMedia(
-            const {
-              'audio': {
-                'echoCancellation': true,
-                'noiseSuppression': true,
-                'autoGainControl': true,
-              },
-              'video': false,
-            },
+            avaRealtimeMicrophoneConstraints,
           );
       final capturedMicrophone = trace == null
           ? await captureMicrophone()
@@ -273,6 +288,13 @@ final class FlutterAvaRealtimeMediaSession implements AvaRealtimeMediaSession {
         );
       }
       final microphoneTrack = microphoneTracks.single..enabled = false;
+      if (trace != null) {
+        await recordAvaRealtimeAudioDiagnostics(
+          trace: trace,
+          trigger: 'captureCreated',
+          trackSettings: microphoneTrack.getSettings(),
+        );
+      }
       final microphoneSender = await peer.addTrack(
         microphoneTrack,
         capturedMicrophone,
@@ -388,7 +410,7 @@ final class FlutterAvaRealtimeMediaSession implements AvaRealtimeMediaSession {
 
   @override
   Future<void> setMicrophoneEnabled(bool enabled) async {
-    _requireOpen();
+    if (_closed) return;
     if (_microphoneSender == null) {
       throw StateError(
         'Ava microphone ownership was lost before the WebRTC call closed.',
@@ -406,8 +428,10 @@ final class FlutterAvaRealtimeMediaSession implements AvaRealtimeMediaSession {
         'Ava microphone track ownership changed unexpectedly.',
       );
     }
-    tracks.single.enabled = enabled;
-    if (tracks.single.enabled != enabled) {
+    final track = tracks.single;
+    track.enabled = enabled;
+    await Helper.setMicrophoneMute(!enabled, track);
+    if (track.enabled != enabled) {
       throw StateError('Ava microphone track did not accept its new state.');
     }
   }
@@ -483,6 +507,109 @@ final class FlutterAvaRealtimeMediaSession implements AvaRealtimeMediaSession {
   }
 }
 
+/// Records content-free Apple microphone processing and route state.
+///
+/// Track settings are reported separately from the Audio Device Module's
+/// actual platform voice-processing state because flutter_webrtc's Darwin
+/// track settings are declarative rather than a native pipeline query.
+Future<void> recordAvaRealtimeAudioDiagnostics({
+  required AvaRealtimeTrace trace,
+  required String trigger,
+  Map<String, dynamic> trackSettings = const {},
+  String? turnId,
+  String? streamId,
+  String? interruptionReasonCode,
+}) async {
+  final identityFields = <String, Object?>{
+    'trigger': trigger,
+    if (turnId != null) 'turnId': turnId,
+    if (streamId != null) 'streamId': streamId,
+    if (interruptionReasonCode != null)
+      'interruptionReasonCode': interruptionReasonCode,
+  };
+  if (!Platform.isIOS && !Platform.isMacOS) {
+    trace.mark(
+      'microphone.processing_settings',
+      fields: {
+        ...identityFields,
+        'platform': Platform.operatingSystem,
+        'supported': false,
+      },
+    );
+    return;
+  }
+
+  try {
+    final platformVoiceProcessingAllowed =
+        await NativeAudioManagement.isVoiceProcessingEnabled();
+    final voiceProcessingBypassed =
+        await NativeAudioManagement.isVoiceProcessingBypassed();
+    final route = await _audioDiagnosticsChannel
+            .invokeMapMethod<String, Object?>('currentRoute') ??
+        const <String, Object?>{};
+    final fields = <String, Object?>{
+      ...identityFields,
+      'platform': Platform.operatingSystem,
+      'requestedEchoCancellation': true,
+      'requestedNoiseSuppression': true,
+      'requestedAutoGainControl': true,
+      'reportedEchoCancellation':
+          _reportedBool(trackSettings, 'echoCancellation'),
+      'reportedNoiseSuppression':
+          _reportedBool(trackSettings, 'noiseSuppression'),
+      'reportedAutoGainControl':
+          _reportedBool(trackSettings, 'autoGainControl'),
+      'platformVoiceProcessingAllowed': platformVoiceProcessingAllowed,
+      'voiceProcessingBypassed': voiceProcessingBypassed,
+    };
+    for (final key in const <String>[
+      'inputRouteType',
+      'outputRouteType',
+      'audioCategory',
+      'audioMode',
+      'inputAvailable',
+      'sameDevice',
+      'sampleRateHz',
+      'inputSampleRateHz',
+      'outputSampleRateHz',
+    ]) {
+      final value = route[key];
+      if (_isSafeDiagnosticScalar(value)) {
+        fields[key] = value;
+      }
+    }
+    trace.mark('microphone.processing_settings', fields: fields);
+  } catch (error, stackTrace) {
+    developer.log(
+      'Apple microphone diagnostics failed without affecting capture.',
+      name: 'ava.realtime.media',
+      error: error,
+      stackTrace: stackTrace,
+    );
+    trace.mark(
+      'microphone.diagnostics_failed',
+      fields: {
+        ...identityFields,
+        'platform': Platform.operatingSystem,
+        'errorType': error.runtimeType.toString(),
+      },
+    );
+  }
+}
+
+bool? _reportedBool(Map<String, dynamic> settings, String key) {
+  final value = settings[key];
+  return value is bool ? value : null;
+}
+
+bool _isSafeDiagnosticScalar(Object? value) {
+  if (value == null || value is bool) return true;
+  if (value is num) return value.isFinite;
+  return value is String &&
+      value.length <= 80 &&
+      RegExp(r'^[A-Za-z0-9.,_:+-]*$').hasMatch(value);
+}
+
 final class DeterministicAvaRealtimeMediaSession
     implements AvaRealtimeMediaSession {
   DeterministicAvaRealtimeMediaSession({
@@ -529,7 +656,7 @@ final class DeterministicAvaRealtimeMediaSession
 
   @override
   Future<void> setMicrophoneEnabled(bool enabled) async {
-    if (closed) throw StateError('Deterministic media session is closed.');
+    if (closed) return;
     microphoneChangeCount += 1;
     microphoneEnabled = enabled;
   }
@@ -547,11 +674,11 @@ final class DeterministicAvaRealtimeMediaSession
 typedef AvaRealtimeMediaSessionFactory = Future<AvaRealtimeMediaSession>
     Function();
 
-typedef AvaRealtimeMediaConnector = Future<AvaRealtimeMediaSession> Function(
-  AvaSessionBootstrapV3 bootstrap,
+typedef AvaRealtimeMediaConnectorV4 = Future<AvaRealtimeMediaSession> Function(
+  AvaSessionBootstrapV4 bootstrap,
 );
 
-AvaRealtimeMediaConnector createAvaRealtimeMediaConnector({
+AvaRealtimeMediaConnectorV4 createAvaRealtimeMediaConnectorV4({
   required AvaRealtimeMediaSessionFactory mediaSessionFactory,
   required AvaRealtimeSdpService sdpService,
 }) {
@@ -559,21 +686,17 @@ AvaRealtimeMediaConnector createAvaRealtimeMediaConnector({
     final trace = AvaRealtimeTrace.current;
     final media = await mediaSessionFactory();
     try {
-      // The production media session negotiates one attached audio track so
-      // every later microphone toggle is an immediate local mute/unmute. The
-      // track is disabled before the offer and remains disabled until the
-      // child's first explicit microphone tap.
       final offer = trace == null
           ? await media.createOffer()
           : await trace.measure('webrtc.offer', media.createOffer);
       final answer = trace == null
-          ? await sdpService.negotiate(
+          ? await sdpService.negotiateV4(
               bootstrap: bootstrap,
               offerSdp: offer,
             )
           : await trace.measure(
               'webrtc.sdp',
-              () => sdpService.negotiate(
+              () => sdpService.negotiateV4(
                 bootstrap: bootstrap,
                 offerSdp: offer,
               ),

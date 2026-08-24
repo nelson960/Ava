@@ -2,7 +2,7 @@
 
 Status: active plan  
 Architecture: `docs/production_architecture.md`  
-Last reviewed: 2026-08-03
+Last reviewed: 2026-08-21
 
 This plan is based on the code currently in the repository. It separates work
 that can be completed without provider credentials from live integration that
@@ -14,7 +14,7 @@ requires the OpenAI and ElevenLabs keys.
 
 | Existing area | Why it stays | Required adaptation |
 | --- | --- | --- |
-| `lib/ui/avatar/` | Production avatar, real picking, touch, camera return, idle and lip-sync boundaries already exist | Drive speaking state from protocol v3 sample-clock events; remove obsolete response-gesture audition paths only after regression coverage |
+| `lib/ui/avatar/` | Production avatar, real picking, touch, camera return, idle and lip-sync boundaries already exist | Drive speaking state from protocol v4 sample-clock events; remove obsolete response-gesture audition paths only after regression coverage |
 | `avatar/ava_vroid_source.glb` and rig maps | Existing validated Ava asset | No new avatar copies; verify viseme mapping against normalized phoneme fixtures |
 | `PcmSpeechOutputService` | Native sample-counted PCM playback is the correct master clock | Add stream IDs, buffered-sample reporting, underrun/route events, fade-stop and exact final rendered sample |
 | `LivingWorld` | Approved local day/night atmosphere and bounded touches | Preserve; do not put weather work on the voice critical path |
@@ -29,36 +29,29 @@ requires the OpenAI and ElevenLabs keys.
 
 1. Physical-device and app-lifecycle verification of the implemented Flutter
    WebRTC microphone boundary.
-2. Production wiring of the implemented live OpenAI adapter behind the backend
-   SDP negotiation and provider call-ID interface.
-3. Production wiring of the implemented server-side OpenAI Realtime sideband
-   session.
-4. Production-authenticated bidirectional Ava event WebSocket deployment. The
-   protocol-v3 bootstrap, short-lived separately scoped one-use token registry,
-   strict
-   WebSocket authentication, JSON/binary bridge, and keyless integration tests
-   are implemented.
-5. Completion of protocol-v3 cancellation and binary-audio framing around the
-   implemented session, turn, event, canvas, and state-machine schemas.
-6. Live-validate the implemented strict Responses canvas specialist and its
-   deterministic compiler/validator. Realtime emits natural assistant text and
-   may select one optional semantic `request_interactive_canvas` function.
-7. ElevenLabs input-streaming WebSocket TTS.
-8. Physical-device verification of the implemented Flutter rendered-sample
+2. Guarded production verification of the wired OpenAI Realtime SDP/sideband
+   adapter, provider-item reconciliation, cancellation, and reconnect.
+3. Deployment verification of the authenticated protocol-v4 event WebSocket,
+   scoped SVG document endpoint, token rotation, limits, and abuse controls.
+4. Guarded live Sol corpus evaluation of the implemented exact extraction,
+   non-mutating validator, hash-bound manifest, independent document delivery,
+   and presentation acknowledgement path.
+5. Guarded live and physical-device validation of the implemented ElevenLabs
+   input-streaming WebSocket TTS adapter.
+6. Physical-device verification of the implemented Flutter rendered-sample
    playback progress and delivered-sample-to-delivered-text ledger.
-9. Deterministic text/audio alignment to VRM visemes.
-10. Physical-device and performance verification of the implemented dynamic
-    scene-graph model, validator, renderer and hit-test engine.
-11. Barge-in, provider cancellation, stale-event suppression and reconnect.
-12. Production authentication, rate limits, App Attest/abuse controls.
-13. Supabase deployment verification of the implemented portable PostgreSQL
-   delivered-turn persistence, summary compaction, cloud reset and weekly
-   recap.
-14. Per-turn latency, queue, provider-usage and cost telemetry.
-15. Physical-device audio route, interruption, 60/120 Hz and long-session
-    testing.
+7. Deterministic text/audio alignment to VRM visemes.
+8. Physical-device and performance verification of the direct SVG renderer,
+    element hit testing, independent fetch, and candidate activation handshake.
+9. Physical-device barge-in, provider cancellation, stale-event suppression,
+   route-change, reconnect, and long-session verification.
+10. Production authentication, rate limits, App Attest/abuse controls.
+11. Supabase deployment verification of the implemented portable PostgreSQL
+    delivered-turn persistence, summary compaction, cloud reset and weekly
+    recap.
+12. Per-turn latency, queue, provider-usage and cost telemetry.
 
-### 1.2.1 Implemented protocol-v3 brain foundation
+### 1.2.1 Implemented protocol-v3 brain foundation retained by v4
 
 Completed on 2026-07-30 without provider credentials:
 
@@ -82,39 +75,32 @@ deployment and live-provider wiring remain.
 
 | Current implementation | Replacement |
 | --- | --- |
-| `POST /v1/lesson-turns` | Delete after protocol-v3 cutover |
-| `POST /v2/performance-turns` NDJSON | Persistent protocol-v3 event WebSocket |
+| Legacy lesson-turn HTTP route | Removed after protocol-v4 cutover |
+| Legacy performance-turn NDJSON route | Persistent protocol-v4 event WebSocket |
 | `OpenAIAvaModel` Responses call for every turn | OpenAI Realtime sideband coordinator |
 | Entire-plan-before-TTS orchestration | Incremental validated segment pipeline |
 | ElevenLabs HTTP `stream/with-timestamps` | ElevenLabs input-streaming WebSocket |
 | Base64 audio inside JSON lines | Bounded binary PCM frames |
 | `SystemSpeechInputService` | WebRTC microphone track |
 | Client-provided recent history | Backend authoritative delivered-turn context |
-| `DiagramSpec` fraction/number-line union | `AvaCanvasScene` and transactions |
-| `SvgPicture.string` generated markup | Native validated vector renderer |
+| Protocol-v3 typed canvas scene/transactions | Exact Sol-authored SVG plus hash-bound semantic manifest |
+| Primitive custom-painter reconstruction | Direct validated SVG renderer with element hit testing |
 | Lesson/progress terminology | Conversation, explanation, memory and recap terminology |
 
 ### 1.4 Remove after replacement gates pass
 
-The legacy Flutter fixed-SVG rendering path was removed early on 2026-07-30
-by explicit product decision. `flutter_svg`, the fixed dashboard widgets and
-the fixed SVG asset are gone. Protocol-v2 diagram cue events now fail
-explicitly; only validated protocol-v3 canvas transactions may open a visual
-panel.
+The legacy fixed diagram catalog and asset were removed early on 2026-07-30.
+Protocol-v2 diagram cues still fail explicitly. Protocol-v4 reintroduces
+runtime SVG only as a complete Sol-authored, non-mutatingly validated document;
+it does not revive the fixed catalog or accept arbitrary client markup.
 
-Do not delete these in advance of a verified replacement:
+The backend lesson-turn and performance-turn routes, their orchestration, and
+their stream composer were removed after the verified protocol-v4 replacement.
+Do not delete these remaining compatibility assets without a separate proof:
 
-- `lib/services/production_conversation_service.dart`;
-- `lib/services/performance_stream_service.dart`;
-- `lib/services/speech_input_service.dart`;
-- `lib/services/speech_output_service.dart`;
 - `lib/models/lesson_response.dart`;
 - protocol-v1/v2 Dart models and fixtures;
-- backend `/v1` and `/v2` routes, orchestration and stream composer;
 - `backend/src/ava_backend/providers/openai_speech_provider.py`;
-- `assets/learning_activities.json`;
-- activity catalog/model/picker code;
-- learning-progress model/service/provider/sheet/tests;
 - math/science score fields and old progress database table;
 - obsolete response-animation audition UI and code not used by touch or the
   restrained speaking baseline.
@@ -145,124 +131,103 @@ Gate:
 - `rg` finds no document presenting protocol v1/v2, fixed diagrams, activities,
   progress scores, platform TTS, or full-turn Responses as the production plan.
 
-## Phase 1 — protocol v3 and deterministic state machines
+## Phase 1 — protocol v4 and deterministic state machines
 
-Status: completed on 2026-07-29. The shared fixtures, strict Python/Dart
-contracts, incremental backend parser, mirrored turn state machines, bounded
-buffers, deterministic fake streams, and native rendered-sample/fade-stop PCM
-contract are implemented and verified. No live provider is connected.
+Status: implemented and green under deterministic backend/Dart fixtures.
+Protocol-v3 speech, alignment, cancellation, rendered-sample PCM, and
+persistent-conversation behavior remain the proven foundation.
+Protocol v4 replaces the incompatible canvas wire contract and fixes microphone,
+turn-creation, caption, transcript, and session-state defects exposed by the
+migration.
 
-Create a transport-independent shared contract before network code.
+Backend additions:
 
-Backend:
+- strict candidate/prepared/presented/active canvas state;
+- immediate accepted/rejected Realtime tool result with generation ownership;
+- `canvasDocumentAvailable`, `canvasPresent`, `canvasActivated`,
+  `canvasRejected`, and `interactionRejected` controls;
+- `canvasDocumentPrepared` and `canvasPresented` client acknowledgements;
+- independent authenticated document retrieval;
+- compare-and-swap base scene/revision checks and bounded timeouts;
+- explicit committed-turn transcription attributed by provider item ID.
 
-- add strict Pydantic models for session capabilities, assistant text and the
-  optional canvas function, normalized alignment, canvas scene/transactions,
-  control events and errors;
-- add a `RealtimeSessionCoordinator` interface;
-- add a bounded `StreamingSpeechParser` that accepts arbitrary text-delta
-  fragmentation and releases only complete speakable phrases;
-- add a turn state machine with revisioned, idempotent cancellation;
-- add a bounded queue abstraction and explicit overflow errors.
+Flutter additions:
 
-Flutter:
+- matching strict Dart protocol models and shared fixtures;
+- independent exact document fetch and hash verification;
+- renderer preload, first-frame presentation acknowledgement, and activation;
+- microphone intent independent of turn phase;
+- active-turn rejection before `turnCreated` reset;
+- sample-clock-only captions and visible non-terminal interaction errors.
 
-- add matching Dart protocol models;
-- add an `AvaRealtimeTransport` interface independent of WebRTC;
-- add mirrored state/sequence validation;
-- extend PCM service contract with sample progress and fade-stop.
-
-Shared fixtures:
-
-- valid one-segment conversation;
-- multi-segment explanation with canvas;
-- segment fragmented at every byte boundary;
-- invalid enum/unknown key/oversized text;
-- out-of-order and duplicate events;
-- cancel during planning, TTS and playback;
-- partial completion and persistence failure;
-- malformed binary-audio metadata.
-
-Tests:
-
-- Python and Dart parse/round-trip the same fixtures;
-- property/fuzz tests cover fragmentation and event ordering;
-- no state after cancelled/terminal can return to speaking;
-- queue limits fail explicitly.
+Tests cover malformed, stale, replayed, superseded, interrupted, disconnected,
+timed-out, hash-mismatched, and out-of-order document/acknowledgement states in
+addition to the retained protocol-v3 audio fixtures.
 
 Gate:
 
-- the complete question-to-idle state machine runs with fake audio and no
-  network or provider key.
+- fake Realtime, Sol, TTS, document transport, and Flutter execute two turns,
+  one canvas creation, one revision, interruption before presentation, and a
+  semantic interaction without network/provider keys or state divergence.
 
-## Phase 2 — dynamic local vector canvas
+## Phase 2 — exact Sol SVG canvas
 
-Status: completed on 2026-07-30.
+Status: locally implemented and green under exact-byte, validator, state,
+transport, Flutter renderer, full test, and native-build gates. Guarded live Sol
+corpus evaluation and physical-device visual approval remain. This phase
+supersedes the completed protocol-v3 typed canvas. The old implementation
+remains only until every replacement gate passes; there is no automatic runtime
+fallback.
 
-This phase proves that drawings are dynamic without allowing raw model SVG.
+Provider boundary:
 
-Models:
+- `gpt-5.6-sol` returns one complete SVG assistant text payload;
+- completed Responses status only; reasoning bookkeeping is allowed;
+- exact Unicode-to-UTF-8 encoding with no normalization or stripping;
+- complete active SVG supplied for revisions;
+- explicit model, reasoning, timeout, output, repair, and spend configuration.
 
-- `AvaCanvasScene`;
-- stable node IDs and scene revisions;
-- typed node union;
-- typed state variables;
-- typed transactions and phrase anchors;
-- typed local interaction bindings/outcomes;
-- provider-free compound explore/reveal/toggle/drag/state/reset execution;
-- ID-only `select`/`submitOutcome` event reporting with canonical backend
-  resolution;
-- complete-scene specialist revisions compiled into stable-ID atomic patches;
-- renderer capability/limit manifest.
+Validation and manifests:
 
-Validation:
+- hardened non-mutating XML/SVG inspection;
+- active/external content rejection;
+- syntax and render-expansion graph limits with cycle rejection;
+- explicit CSS and renderer-capability policy;
+- stable element/binding IDs and bounded `data-ava-*` metadata;
+- deterministic interaction/accessibility manifest;
+- exact SVG and canonical-manifest hashes plus validator/capability versions;
+- one complete Sol repair at most; no backend artwork repair.
 
-- exact allowed keys;
-- all numeric values finite and in bounds;
-- referential integrity;
-- path command parser and complexity bounds;
-- clipped viewport;
-- text/font/color/stroke/transform allowlists;
-- transaction atomicity;
-- interaction target and effect validation;
-- accessibility labels for interactive nodes.
+Delivery and activation:
 
-Rendering:
+- SVG never enters the PCM WebSocket queue;
+- scoped header-authenticated, no-store canvas document fetch;
+- candidate fetch/hash/preload acknowledgement;
+- coordinator-owned phrase/segment anchor mapped to rendered samples;
+- first-rendered-frame `canvasPresented` acknowledgement;
+- backend activation only after actual presentation;
+- prior active scene preserved through every candidate failure.
 
-- Flutter custom painter/render object;
-- local tweening at display refresh rate;
-- deterministic hit testing;
-- Reduce Motion behavior;
-- dashboard open/resize/close transitions that preserve avatar interaction;
-- optional scene-to-SVG serializer only for golden verification.
+Rendering and interaction:
 
-Fixtures should demonstrate variety, not a hardcoded catalog:
-
-- free-form labeled plant cell;
-- solar-system relationship;
-- triangle construction;
-- force arrows;
-- timeline;
-- bar/line comparison;
-- custom curved path;
-- interactive drag/toggle/reveal.
-- layered multi-stage explore with exclusive detail cards and connector pulses.
-
-Tests:
-
-- parser and validation limits;
-- golden images on iPhone and iPad dimensions;
-- hit tests and local interactions;
-- malformed paths and node explosions rejected;
-- avatar touches still win when a pointer begins on the avatar;
-- canvas animation does not exceed frame budget.
+- direct SVG rendering without primitive reconstruction;
+- renderer selected from the frozen live Sol corpus;
+- element-level hit testing or exact validated hit geometry;
+- 44-point physical target expansion without visible geometry changes;
+- provider-free local reveal/toggle/drag/focus/reset/selection;
+- ID-only semantic actions resolved from the backend manifest;
+- Reduce Motion, accessibility, avatar-touch, and frame-budget verification.
 
 Gate:
 
-- all fixture scenes are generated from the same general scene grammar and
-  render interactively without raw SVG, HTML or special-case diagram code.
+- accepted Sol bytes hash identically at extraction, storage, fetch, preload,
+  and presentation; the representative corpus retains visual fidelity on
+  iPhone, iPad, and macOS; maximum accepted canvas delivery cannot underrun PCM.
 
 ## Phase 3 — backend coordinator with fake providers
+
+Status: deterministic/keyless implementation complete. The full backend suite
+passes; cross-process deployment and live-provider gates remain.
 
 Refactor the backend around session ownership while keeping current routes
 temporarily available for comparison tests.
@@ -407,6 +372,11 @@ Gate:
 
 ## Phase 4 — Flutter realtime transport
 
+Status: protocol-v4 bootstrap, WebRTC reuse, raw event transport, independent
+SVG fetch, PCM adapter, persistent controller, and production screen cutover
+are implemented. Flutter analysis/tests and unsigned macOS/iOS builds pass;
+physical-device gates remain.
+
 Dependencies:
 
 - add a maintained Flutter WebRTC package after iOS/iPadOS/macOS support and
@@ -446,6 +416,11 @@ Gate:
 - foreground/background and route changes do not revive stale audio.
 
 ## Phase 5 — interruption, sync and resilience
+
+Status: deterministic microphone-race, active-turn replacement, sample-clock
+caption, committed-transcript attribution, cancellation, stale-event, and
+delivered-prefix gates pass. Physical audio-route, backgrounding, reconnect,
+and latency measurements remain.
 
 Implement:
 
@@ -498,12 +473,14 @@ Implementation status on 2026-08-02:
 - no scene was accepted or sent to Flutter;
 - only `request_interactive_canvas` carries a compact semantic brief and
   optional interaction goal;
-- a strict `gpt-5.6-luna` Responses specialist converts that brief into a
-  generic node/interaction draft without a scene ID. The backend owns scene
-  and transaction identity plus revision data, requires at least one usable
-  local interaction, compiles the draft, and applies the strict validator;
-- offline parser/compiler/coordinator and failure-isolation gates pass; one
-  explicitly authorized live specialist probe remains.
+- the protocol-v3 strict typed canvas experiment demonstrated that Realtime
+  arguments must stay semantic, but constrained Luna/primitive output did not
+  meet the measured visual-quality baseline;
+- protocol v4 therefore keeps Realtime semantic-only and replaces the canvas
+  specialist with exact Sol-authored SVG, independent delivery, and
+  presentation acknowledgement;
+- offline parser/coordinator and failure-isolation gates pass for the retained
+  speech foundation; the v4 SVG and activation gates remain active.
 
 Configuration:
 
@@ -513,14 +490,15 @@ Configuration:
 - provider timeout/retry policy;
 - explicit live-test spending flag.
 
-Implement the provider adapter:
+Implemented provider adapter:
 
 - backend-mediated SDP negotiation;
 - server sideband attachment;
 - `session.update` for prompt, tools, VAD and text-only output;
 - natural assistant-text streaming plus at most one optional semantic canvas
   function call;
-- a matching bounded `function_call_output` and one tool-disabled continuation;
+- an immediate matching accepted/rejected `function_call_output` and one
+  tool-disabled continuation independent of Sol completion;
 - usage and provider request IDs;
 - response cancellation and provider-item reconciliation.
 
@@ -545,6 +523,13 @@ and does not block live ElevenLabs voice integration.
 
 ## Phase 7 — ElevenLabs production voice
 
+Status: the phrase-bounded input-streaming WebSocket adapter, strict PCM and
+exact character-alignment validation, bounded transport chunking, explicit
+concurrency rejection, cancellation, and production-only configuration gate
+are implemented with deterministic fakes. Exact approved voice metadata,
+guarded live-provider runs, viseme conversion, and physical-device approval
+remain open.
+
 Before the key is used, update
 `avatar/sounds/ava_voice_selection.v1.json` with:
 
@@ -565,12 +550,15 @@ Configuration:
 - audio/character limits;
 - live-test spending flag.
 
-Implement:
+Implemented locally:
 
 - input-streaming WebSocket;
 - text chunk/flush policy;
 - PCM/alignment validation;
 - cancellation and connection cleanup;
+
+Still required:
+
 - provider usage/error telemetry;
 - deterministic alignment-to-viseme stage.
 
@@ -658,11 +646,11 @@ Gate:
 
 ## 5. On-demand canvas specialist
 
-## Phase 6A — strict canvas generation
+## Phase 6A — exact Sol SVG generation
 
-Build an evaluation set of canvas briefs and score the Responses specialist on:
+Freeze the successful experimental corpus and score the Responses specialist on:
 
-- schema validity;
+- exact output/status validity;
 - visual correctness;
 - layout/readability;
 - interaction correctness;
@@ -670,26 +658,27 @@ Build an evaluation set of canvas briefs and score the Responses specialist on:
 - cost;
 - child appropriateness.
 
-Enable the live `gpt-5.6-luna` call only after strict parse, compilation,
-validation, timeout, cancellation, and spend-limit tests pass. Invoke it only
-when Realtime semantically selects `request_interactive_canvas`; no-canvas
-conversation never pays this cost. Canvas failure must remain independent of
-speech delivery.
+Enable the live `gpt-5.6-sol` call only after exact extraction, non-mutating
+validation, renderer capability, independent document delivery, activation,
+timeout, cancellation, and spend-limit tests pass. Invoke it only when Realtime
+semantically selects `request_interactive_canvas`; no-canvas conversation never
+pays this cost. Canvas failure remains independent of speech delivery.
 
-The specialist receives only the minimum visual brief, age band and approved
-style/capability manifest. It never receives provider keys, raw child audio,
-exact profile data, or control of Ava's skeleton.
+The specialist receives only the minimum visual brief, age band, approved
+renderer capability manifest, and complete current accepted SVG when revising.
+It never receives provider keys, raw child audio, exact profile data, or control
+of Ava's skeleton.
 
 ## 6. Legacy removal and cleanup
 
-After the v3 gate:
+After the v4 gate:
 
 1. remove v1/v2 backend routes and old config;
 2. remove old Flutter conversation transports/controllers/models;
 3. remove platform speech paths and OpenAI audition TTS;
 4. remove remaining activity/progress runtime and assets;
 5. migrate the local database away from score/progress fields;
-6. update tests to v3 terminology;
+6. update tests to v4 terminology;
 7. remove other dependencies left unused by the migration;
 8. remove obsolete prompt layers and environment variables;
 9. prove no release code can select a legacy runtime.
@@ -706,9 +695,9 @@ compatibility paths.
 - validate and synthesize per segment;
 - persistent sideband/event channels;
 - semantic TTS chunks rather than character-at-a-time writes;
-- pre-open TTS connection at turn-planning start if ElevenLabs permits it
-  without billable generation;
-- preload validated canvas transactions;
+- measure whether safe phrase-socket preconnection improves latency without
+  weakening cancellation ownership or creating billable/stale generation;
+- preload validated SVG candidates over the independent document lane;
 - never wait for memory writes before first audio.
 
 ### Audio quality and responsiveness
@@ -726,7 +715,7 @@ compatibility paths.
 - canvas and living world in separate repaint boundaries;
 - local tweens;
 - bounded node/particle pools;
-- no SVG reparsing for every value change;
+- no provider call or full document parse for each local interaction frame;
 - pause nonessential animation in background/thermal pressure;
 - honor Reduce Motion;
 - performance overlays only in debug.
@@ -775,12 +764,14 @@ configure:
 | --- | --- |
 | Realtime function arguments do not yield a valid segment soon enough | Small first segment, streaming parser, latency eval, strict timeout |
 | External TTS makes model history disagree after interruption | Rendered-sample delivered ledger and provider-history reconciliation |
-| Dynamic canvas produces unsafe or huge scenes | Declarative schema, hard complexity limits, atomic validation, no raw markup/code |
+| Dynamic canvas produces unsafe or pathological scenes | Non-mutating active-content rejection, syntax and render-graph limits, hash-bound manifests, renderer sandbox |
 | Voice cost dominates | Short responses, cancellation, account budgets, measured model/voice choices |
 | Child privacy exposure | Backend-only keys/context, age band only, typed memory, redacted logs, no raw audio |
 | WebRTC/native plugin instability | Early physical-device spike and lifecycle/audio-route suite |
-| Legacy paths cause divergent behavior | No release fallback; remove all legacy selection after v3 gate |
-| Canvas specialist adds latency | First speech remains independent; explicit deadline, cancellation, cache and hard per-turn/daily budgets |
+| Legacy paths cause divergent behavior | No release fallback; remove all legacy selection after v4 gate |
+| Canvas document blocks audio | Independent authenticated fetch lane; SVG never enters the ordered PCM socket |
+| Client/backend canvas state diverges | Candidate/prepared/presented/active handshake; activation after first rendered frame |
+| Canvas specialist adds latency | Immediate accepted tool output, independent first speech, explicit deadline, cancellation, cache and hard per-turn/daily budgets |
 | Memory claims too much | Weekly recap from bounded factual topic/event records only |
 | Avatar regressions during transport rewrite | Full touch/picking/camera/speech composition suite at every shared-state change |
 

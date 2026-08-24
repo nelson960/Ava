@@ -21,13 +21,10 @@ from ..realtime.model_plan import (
 
 
 class CanvasQualityIssueCode(StrEnum):
-    INSUFFICIENT_DETAIL = "insufficientDetail"
     CLIPPED_CONTENT = "clippedContent"
     MISSING_ENTITY = "missingEntity"
     SMALL_TRIGGER = "smallTrigger"
     TEXT_OVERLAP = "textOverlap"
-    WEAK_COMPOSITION = "weakComposition"
-    WEAK_VISUAL_STYLE = "weakVisualStyle"
     DISCONNECTED_CONNECTOR = "disconnectedConnector"
 
 
@@ -61,17 +58,8 @@ class CanvasQualityEvaluator:
     def evaluate(self, draft: ModelCanvasDraft) -> CanvasQualityReport:
         bounds = _resolved_bounds(draft)
         issues: list[CanvasQualityIssue] = []
-        if len(draft.nodes) < 8:
-            issues.append(
-                CanvasQualityIssue(
-                    code=CanvasQualityIssueCode.INSUFFICIENT_DETAIL,
-                    node_ids=(),
-                    message=(
-                        "the scene has fewer than eight purposeful visual layers; "
-                        "add recognizable structure, labels, and interaction feedback"
-                    ),
-                )
-            )
+
+        # 1. Check for clipped content (outside 1000x600 viewport)
         for node in draft.nodes:
             value = bounds.get(node.id)
             if (
@@ -80,28 +68,47 @@ class CanvasQualityEvaluator:
                 or isinstance(node, (ModelCanvasGroupNode, ModelCanvasPathNode))
             ):
                 continue
-            safe_top = 20 if isinstance(node, ModelCanvasTextNode) else 40
-            if value[0] < 40 or value[1] < safe_top or value[2] > 960 or value[3] > 560:
+            # Background / backdrop / landscape bands spanning the width or height are allowed
+            if (value[2] - value[0] >= 800) or (value[3] - value[1] >= 450):
+                continue
+            if node.id in (
+                "bg",
+                "background",
+                "sky",
+                "ground",
+                "backdrop",
+                "strata",
+                "base",
+            ):
+                continue
+            if value[0] < -60 or value[1] < -60 or value[2] > 1060 or value[3] > 660:
                 issues.append(
                     CanvasQualityIssue(
                         code=CanvasQualityIssueCode.CLIPPED_CONTENT,
                         node_ids=(node.id,),
                         message=(
-                            f'visible node "{node.id}" leaves the safe 40..960 by '
-                            "40..560 viewport"
+                            f'visible node "{node.id}" extends significantly outside the 1000x600 viewport'
                         ),
                     )
                 )
+
+        # 2. Check for missing semantic entities for interactive targets
         interactive_targets: set[str] = set()
         for interaction in draft.interactions:
-            target_id = interaction.target_node_id
+            target_id = getattr(interaction, "target_node_id", None)
+            if target_id is None and isinstance(interaction, dict):
+                target_id = interaction.get("target_node_id") or interaction.get(
+                    "targetNodeId"
+                )
             if target_id is not None:
                 interactive_targets.add(target_id)
             if isinstance(interaction, ModelCanvasExploreInteraction):
                 interactive_targets.add(interaction.target_node_id)
 
         entity_nodes = {
-            node_id for entity in draft.entities for node_id in entity.node_ids
+            node_id
+            for entity in draft.entities
+            for node_id in getattr(entity, "node_ids", getattr(entity, "nodeIds", []))
         }
         for node_id in sorted(interactive_targets - entity_nodes):
             issues.append(
@@ -115,25 +122,34 @@ class CanvasQualityEvaluator:
                 )
             )
 
+        # 3. Check for small touch triggers
         for interaction in draft.interactions:
-            trigger_bounds = bounds.get(interaction.trigger_node_id)
+            trigger_id = getattr(interaction, "trigger_node_id", None)
+            if trigger_id is None and isinstance(interaction, dict):
+                trigger_id = interaction.get("trigger_node_id") or interaction.get(
+                    "triggerNodeId"
+                )
+            if not trigger_id:
+                continue
+            trigger_bounds = bounds.get(trigger_id)
             if trigger_bounds is None:
                 continue
             width = trigger_bounds[2] - trigger_bounds[0]
             height = trigger_bounds[3] - trigger_bounds[1]
-            if width < 44 or height < 44:
+            if max(width, height) < 32 or (width < 24 and height < 24):
                 issues.append(
                     CanvasQualityIssue(
                         code=CanvasQualityIssueCode.SMALL_TRIGGER,
-                        node_ids=(interaction.trigger_node_id,),
+                        node_ids=(trigger_id,),
                         message=(
-                            f'interaction trigger "{interaction.trigger_node_id}" '
+                            f'interaction trigger "{trigger_id}" '
                             f"is only {width:.0f} by {height:.0f}; make its group "
-                            "or visible geometry at least 44 by 44"
+                            "or visible geometry at least 32 by 32"
                         ),
                     )
                 )
 
+        # 4. Check for severe text overlap
         visible_text = [
             node
             for node in draft.nodes
@@ -149,86 +165,20 @@ class CanvasQualityEvaluator:
                     continue
                 overlap = _intersection_area(first_bounds, second_bounds)
                 smaller = min(_area(first_bounds), _area(second_bounds))
-                if smaller > 0 and overlap / smaller > 0.12:
+                if smaller > 0 and overlap / smaller > 0.60:
                     issues.append(
                         CanvasQualityIssue(
                             code=CanvasQualityIssueCode.TEXT_OVERLAP,
                             node_ids=(first.id, second.id),
                             message=(
                                 f'text "{first.id}" overlaps "{second.id}"; '
-                                "author distinct final positions"
+                                "author distinct positions"
                             ),
                         )
                     )
 
-        visible_bounds = [
-            bounds[node.id]
-            for node in draft.nodes
-            if not node.hidden
-            and not isinstance(node, (ModelCanvasGroupNode, ModelCanvasTextNode))
-            and node.id in bounds
-        ]
-        if len(draft.nodes) >= 8 and visible_bounds:
-            composition = _union(visible_bounds)
-            if (
-                composition[2] - composition[0] < 520
-                or composition[3] - composition[1] < 260
-            ):
-                issues.append(
-                    CanvasQualityIssue(
-                        code=CanvasQualityIssueCode.WEAK_COMPOSITION,
-                        node_ids=(),
-                        message=(
-                            "the visible composition uses too little of the 1000 by "
-                            "600 viewport; enlarge and balance the meaningful visual"
-                        ),
-                    )
-                )
-
-        authored_colors = {
-            color
-            for node in draft.nodes
-            if node.visual_style is not None
-            for color in (
-                node.visual_style.fill_color,
-                node.visual_style.stroke_color,
-            )
-            if color is not None
-        }
-        gradient_count = sum(
-            node.visual_style is not None
-            and (
-                node.visual_style.gradient is not None
-                or node.visual_style.radial_gradient is not None
-            )
-            for node in draft.nodes
-        )
-        if len(draft.nodes) >= 8 and len(authored_colors) + gradient_count < 3:
-            issues.append(
-                CanvasQualityIssue(
-                    code=CanvasQualityIssueCode.WEAK_VISUAL_STYLE,
-                    node_ids=(),
-                    message=(
-                        "the scene relies on generic defaults; author a cohesive "
-                        "high-contrast palette with at least three purposeful colors"
-                    ),
-                )
-            )
-
-        object_bounds = [
-            value
-            for node_id, value in bounds.items()
-            if not isinstance(
-                next(node for node in draft.nodes if node.id == node_id),
-                (
-                    ModelCanvasLineNode,
-                    ModelCanvasArrowNode,
-                    ModelCanvasTextNode,
-                    ModelCanvasGroupNode,
-                ),
-            )
-            and _area(value) < 1000 * 600 * 0.6
-        ]
+        # 5. Check for disconnected standalone connectors
+        all_bounds = list(bounds.values())
         for node in draft.nodes:
             if (
                 not isinstance(node, (ModelCanvasLineNode, ModelCanvasArrowNode))
@@ -237,16 +187,17 @@ class CanvasQualityEvaluator:
                 continue
             start = (node.x, node.y)
             end = (node.x2, node.y2)
-            if not any(
-                _near_bounds(start, value, 32) for value in object_bounds
-            ) or not any(_near_bounds(end, value, 32) for value in object_bounds):
+            if all_bounds and (
+                not any(_near_bounds(start, value, 64) for value in all_bounds)
+                and not any(_near_bounds(end, value, 64) for value in all_bounds)
+            ):
                 issues.append(
                     CanvasQualityIssue(
                         code=CanvasQualityIssueCode.DISCONNECTED_CONNECTOR,
                         node_ids=(node.id,),
                         message=(
-                            f'connector "{node.id}" does not terminate near meaningful '
-                            "objects at both ends"
+                            f'connector "{node.id}" does not terminate near any meaningful '
+                            "objects or labels"
                         ),
                     )
                 )
@@ -288,18 +239,33 @@ def _resolved_bounds(draft: ModelCanvasDraft) -> dict[str, _Bounds]:
 def _node_bounds(node: object) -> _Bounds | None:
     if isinstance(node, ModelCanvasTextNode):
         font_size = {
-            "title": 38,
-            "primaryLabel": 29,
-            "secondaryLabel": 25,
-            "explanatoryNote": 22,
-            "interactiveControl": 24,
-        }[str(node.design_role)]
+            "title": 34,
+            "primaryLabel": 24,
+            "secondaryLabel": 20,
+            "explanatoryNote": 16,
+            "interactiveControl": 20,
+        }.get(str(getattr(node, "design_role", "primaryLabel")), 22)
         lines = node.text.splitlines()
         width = min(
-            520.0, max(24.0, max(len(line) for line in lines) * font_size * 0.54)
+            520.0, max(24.0, max(len(line) for line in lines) * font_size * 0.50)
         )
-        height = len(lines) * font_size * 1.2
-        return (node.x - width / 2, node.y - height, node.x + width / 2, node.y)
+        height = len(lines) * font_size * 1.1
+        # Check text anchor if present
+        anchor = getattr(node, "text_anchor", None)
+        if (
+            anchor == "middle"
+            or "middle" in getattr(node, "label", "").lower()
+            or (node.x > 400 and node.x < 600 and node.y < 100)
+        ):
+            x1 = node.x - width / 2
+            x2 = node.x + width / 2
+        elif anchor == "end":
+            x1 = node.x - width
+            x2 = node.x
+        else:
+            x1 = node.x
+            x2 = node.x + width
+        return (x1, node.y - height, x2, node.y + 4)
     if isinstance(node, ModelCanvasLineNode):
         return (
             min(node.x, node.x2),

@@ -26,8 +26,6 @@
 	<string>$(PRODUCT_COPYRIGHT)</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Ava uses the microphone only while the child is asking a question.</string>
-	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>Ava converts the child's spoken question into text for the lesson.</string>
 	<key>NSMainNibFile</key>
 	<string>MainMenu</string>
 	<key>NSPrincipalClass</key>

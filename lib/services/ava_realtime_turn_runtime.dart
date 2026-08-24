@@ -3,13 +3,16 @@ import 'dart:developer' as developer;
 
 import 'package:flutter/foundation.dart';
 
-import '../canvas/ava_canvas_engine.dart';
-import '../models/ava_canvas_protocol.dart';
+import '../canvas/ava_svg_canvas_controller.dart';
+import '../canvas/ava_svg_canvas_telemetry.dart';
 import '../models/ava_realtime_protocol.dart';
+import '../models/ava_realtime_protocol_v4.dart';
+import '../models/ava_svg_canvas_protocol.dart';
 import 'ava_realtime_presentation.dart';
-import 'ava_realtime_session.dart';
+import 'ava_realtime_session_v4.dart';
 import 'ava_realtime_trace.dart';
 import 'ava_realtime_webrtc.dart';
+import 'ava_svg_document_service.dart';
 import 'pcm_speech_output_service.dart';
 
 final class AvaRealtimeRuntimeException implements Exception {
@@ -21,22 +24,44 @@ final class AvaRealtimeRuntimeException implements Exception {
   String toString() => 'AvaRealtimeRuntimeException: $message';
 }
 
-/// Owns one protocol-v3 conversation from ordered frames through native PCM.
+final class AvaRealtimeTurnSnapshotV4 {
+  const AvaRealtimeTurnSnapshotV4({
+    required this.sessionId,
+    required this.turnId,
+    required this.phase,
+    required this.revision,
+    required this.segmentCount,
+    required this.receivedSampleCount,
+    required this.terminal,
+  });
+
+  final String sessionId;
+  final String? turnId;
+  final AvaRealtimeTurnPhase? phase;
+  final int revision;
+  final int segmentCount;
+  final int receivedSampleCount;
+  final bool terminal;
+}
+
+/// Owns one persistent protocol-v4 conversation from raw frames through PCM.
 ///
 /// This class deliberately has no provider SDK dependency. A live WebSocket
 /// Consecutive turns retain the transport while resetting all turn-local
-/// validation, playback, caption, viseme, and canvas-cue state.
+/// validation, playback, caption, and viseme state.
 final class AvaRealtimeTurnRuntime {
   AvaRealtimeTurnRuntime({
     required String sessionId,
-    required AvaSessionLimitsV3 limits,
+    required AvaSessionLimitsV4 limits,
     required AvaRealtimeMediaSession mediaSession,
-    required AvaRealtimeTransport transport,
+    required AvaRealtimeRawTransportV4 transport,
+    required AvaSvgDocumentLoader documents,
     required PcmSpeechOutputService speechOutput,
-    required AvaCanvasEngine canvasEngine,
     required AvaRealtimePresentationController presentation,
     required double volume,
     required String Function() cancelRequestIdFactory,
+    AvaSvgCanvasTelemetrySink? canvasTelemetry,
+    void Function(AvaSvgCanvasController controller)? onCanvasClosed,
     AvaRealtimeTrace? trace,
     void Function(bool enabled)? onMicrophoneTrackChanged,
     bool automaticPlaybackPolling = true,
@@ -46,14 +71,20 @@ final class AvaRealtimeTurnRuntime {
         _mediaSession = mediaSession,
         _transport = transport,
         _speechOutput = speechOutput,
-        _canvasEngine = canvasEngine,
         _presentation = presentation,
         _volume = volume,
         _cancelRequestIdFactory = cancelRequestIdFactory,
+        _canvasTelemetry = canvasTelemetry,
+        _onCanvasClosed = onCanvasClosed,
         _trace = trace,
         _onMicrophoneTrackChanged = onMicrophoneTrackChanged,
         _automaticPlaybackPolling = automaticPlaybackPolling,
         _microphoneRequested = microphoneInitiallyEnabled {
+    canvasController = AvaSvgCanvasController(
+      documents: documents,
+      commandSink: _enqueueCanvasCommand,
+      telemetry: canvasTelemetry,
+    );
     if (volume < 0 || volume > 1) {
       throw RangeError.range(volume, 0, 1, 'volume');
     }
@@ -64,28 +95,36 @@ final class AvaRealtimeTurnRuntime {
   }
 
   final String _sessionId;
-  final AvaSessionLimitsV3 _limits;
+  final AvaSessionLimitsV4 _limits;
   final AvaRealtimeMediaSession _mediaSession;
-  final AvaRealtimeTransport _transport;
+  final AvaRealtimeRawTransportV4 _transport;
   final PcmSpeechOutputService _speechOutput;
-  final AvaCanvasEngine _canvasEngine;
   final AvaRealtimePresentationController _presentation;
   final double _volume;
   final String Function() _cancelRequestIdFactory;
+  final AvaSvgCanvasTelemetrySink? _canvasTelemetry;
+  final void Function(AvaSvgCanvasController controller)? _onCanvasClosed;
   final AvaRealtimeTrace? _trace;
   final void Function(bool enabled)? _onMicrophoneTrackChanged;
   final bool _automaticPlaybackPolling;
-  AvaRealtimeTurnStateMachine _machine = AvaRealtimeTurnStateMachine();
-  final List<_PendingCanvasCue> _canvasCues = [];
-  final Set<String> _appliedCanvasCueIds = {};
+  late final AvaSvgCanvasController canvasController;
 
   Future<void> _sendTail = Future<void>.value();
+  Future<void> _microphoneTail = Future<void>.value();
   Timer? _progressTimer;
-  AvaRealtimeServerEvent? _pendingAudioDescriptor;
+  AvaRealtimeServerEventV4? _pendingAudioDescriptor;
   String? _turnId;
   String? _streamId;
+  AvaRealtimeTurnPhase? _phase;
+  int _revision = -1;
+  int _nextSegmentIndex = 0;
+  int _nextAudioChunkIndex = 0;
+  int _receivedSampleCount = 0;
+  String? _validatedAudioStreamId;
+  String? _cancelRequestId;
   PcmPlaybackProgress? _lastProgress;
   int? _finalRenderedSampleCount;
+  int _nextServerSequence = 0;
   int _nextClientSequence = 0;
   bool _started = false;
   bool _closed = false;
@@ -101,43 +140,22 @@ final class AvaRealtimeTurnRuntime {
   final Completer<void> _firstListening = Completer<void>();
   bool _firstSegmentTraced = false;
   bool _firstPcmTraced = false;
+  bool _firstRenderedSampleTraced = false;
+  int _speechSegmentCount = 0;
+  int _speechCharacterCount = 0;
 
-  AvaRealtimeTurnSnapshot get snapshot => _machine.snapshot;
+  AvaRealtimeTurnSnapshotV4 get snapshot => AvaRealtimeTurnSnapshotV4(
+        sessionId: _sessionId,
+        turnId: _turnId,
+        phase: _phase,
+        revision: _revision,
+        segmentCount: _nextSegmentIndex,
+        receivedSampleCount: _receivedSampleCount,
+        terminal: _terminal,
+      );
   bool get isTerminal => _terminal;
   bool get microphoneTrackEnabled => _mediaSession.microphoneEnabled;
   Future<void> get firstListening => _firstListening.future;
-
-  /// Reports only interactions whose meaning belongs in conversation context.
-  ///
-  /// Reveal, toggle, drag, state, and reset actions remain instant and local.
-  /// Explore, select, and submitOutcome are sent as IDs only; the backend
-  /// resolves their meaning from its canonical validated binding.
-  Future<bool> reportCanvasInteraction(
-    AvaCanvasInteractionOutcome outcome,
-  ) async {
-    if (outcome.action != 'explore' &&
-        outcome.action != 'select' &&
-        outcome.action != 'submitOutcome') {
-      return false;
-    }
-    if (!_started || _closed) {
-      throw StateError(
-        'Cannot report a semantic canvas interaction outside an active '
-        'conversation session.',
-      );
-    }
-    await _sendClient(
-      (sequence) => AvaRealtimeClientEvent.canvasInteraction(
-        sessionId: _sessionId,
-        sequence: sequence,
-        sceneId: outcome.sceneId,
-        sceneRevision: outcome.sceneRevision,
-        interactionRevision: outcome.interactionRevision,
-        bindingId: outcome.bindingId,
-      ),
-    );
-    return true;
-  }
 
   Future<void> run() async {
     if (_started) {
@@ -155,24 +173,31 @@ final class AvaRealtimeTurnRuntime {
       );
       _trace?.mark('runtime.started');
       await _sendClient(
-        (sequence) => AvaRealtimeClientEvent.clientReady(
+        (sequence) => AvaRealtimeClientEventV4.clientReady(
           sessionId: _sessionId,
           sequence: sequence,
         ),
       );
       _trace?.mark('client.ready');
       await for (final frame in _transport.frames()) {
+        if (_closed) return;
         _throwAsynchronousFailure();
-        if (_pendingAudioDescriptor != null && frame is! AvaRealtimePcmFrame) {
+        if (_pendingAudioDescriptor != null &&
+            frame is! AvaRealtimePcmFrameV4) {
           throw const AvaRealtimeRuntimeException(
             'audioChunk must be followed immediately by one binary PCM frame.',
           );
         }
         switch (frame) {
-          case AvaRealtimeControlFrame():
-            await _handleControl(frame.event);
+          case AvaRealtimeControlFrameV4():
+            _acceptServerSequence(frame.event);
+            if (frame.event.isCanvas) {
+              _dispatchCanvasEvent(frame.event);
+            } else {
+              await _handleControl(frame.event);
+            }
             break;
-          case AvaRealtimePcmFrame():
+          case AvaRealtimePcmFrameV4():
             await _handlePcm(frame.bytes);
             break;
         }
@@ -309,7 +334,7 @@ final class AvaRealtimeTurnRuntime {
       );
     }
     final requestId = _cancelRequestIdFactory();
-    if (!_machine.registerCancellation(requestId)) return;
+    if (!_registerCancellation(requestId)) return;
     _interrupting = true;
     _progressTimer?.cancel();
     _progressTimer = null;
@@ -318,13 +343,28 @@ final class AvaRealtimeTurnRuntime {
     if (_playbackStarted && _streamId != null) {
       final stopped = await _speechOutput.fadeOutAndStop(turnId: turnId);
       _finalRenderedSampleCount = stopped.renderedSampleCount;
+      _traceFirstRenderedSample(stopped.renderedSampleCount);
+      _trace?.mark(
+        'speech.playback_interrupted',
+        fields: _speechPlaybackFields(
+          turnId: turnId,
+          renderedSampleCount: stopped.renderedSampleCount,
+          // The wire reason is intentionally extensible; do not copy that
+          // caller-provided text into telemetry.
+          termination: 'interrupted',
+        ),
+      );
       _presentation.updatePlaybackClock(
         renderedSampleCount: stopped.renderedSampleCount,
         receivedSampleCount: snapshot.receivedSampleCount,
       );
-      await _applyDueCanvasCues(stopped.renderedSampleCount);
+      _updateCanvasPlaybackClock(
+        turnId: turnId,
+        renderedSampleCount: stopped.renderedSampleCount,
+        event: 'playbackStopped',
+      );
       await _sendClient(
-        (sequence) => AvaRealtimeClientEvent.playbackStopped(
+        (sequence) => AvaRealtimeClientEventV4.playbackStopped(
           sessionId: _sessionId,
           sequence: sequence,
           turnId: turnId,
@@ -335,7 +375,7 @@ final class AvaRealtimeTurnRuntime {
       );
     }
     await _sendClient(
-      (sequence) => AvaRealtimeClientEvent.cancelTurn(
+      (sequence) => AvaRealtimeClientEventV4.cancelTurn(
         sessionId: _sessionId,
         sequence: sequence,
         turnId: turnId,
@@ -372,6 +412,22 @@ final class AvaRealtimeTurnRuntime {
         'turn deadline.',
       ),
     );
+  }
+
+  /// Sets whether the local child microphone track is active without
+  /// interrupting Ava if she is currently speaking or planning.
+  Future<void> setMicrophoneEnabled(bool enabled) async {
+    if (!_started || _closed) return;
+    _microphoneRequested = enabled;
+    if (enabled) {
+      if (!_terminal &&
+          _turnId != null &&
+          snapshot.phase == AvaRealtimeTurnPhase.listening) {
+        await _setMicrophoneEnabled(true);
+      }
+    } else {
+      await _setMicrophoneEnabled(false);
+    }
   }
 
   /// Re-enables the already-negotiated microphone track.
@@ -414,6 +470,12 @@ final class AvaRealtimeTurnRuntime {
     _closed = true;
     _progressTimer?.cancel();
     _progressTimer = null;
+    Object? microphoneError;
+    try {
+      await _microphoneTail;
+    } catch (error) {
+      microphoneError = error;
+    }
     Object? stopError;
     if (_playbackStarted &&
         !_terminal &&
@@ -425,12 +487,20 @@ final class AvaRealtimeTurnRuntime {
         stopError = error;
       }
     }
+    Object? sendError;
+    try {
+      await _sendTail;
+    } catch (error) {
+      sendError = error;
+    }
     Object? transportError;
     try {
       await _transport.close();
     } catch (error) {
       transportError = error;
     }
+    _onCanvasClosed?.call(canvasController);
+    canvasController.dispose();
     Object? mediaError;
     try {
       await _mediaSession.close();
@@ -442,35 +512,46 @@ final class AvaRealtimeTurnRuntime {
         'Closing realtime PCM playback failed: $stopError',
       );
     }
-    if (transportError != null || mediaError != null) {
+    if (microphoneError != null ||
+        sendError != null ||
+        transportError != null ||
+        mediaError != null) {
       throw AvaRealtimeRuntimeException(
         'Closing realtime transport failed: '
+        'microphone=$microphoneError send=$sendError '
         'event=$transportError media=$mediaError',
       );
     }
   }
 
-  Future<void> _handleControl(AvaRealtimeServerEvent event) async {
+  Future<void> _handleControl(AvaRealtimeServerEventV4 event) async {
     if (event.sessionId != _sessionId) {
       throw const AvaRealtimeRuntimeException(
         'Server event sessionId does not match session bootstrap.',
       );
     }
-    if (event.type == AvaRealtimeServerEventType.turnCreated && _terminal) {
-      _resetForNextTurn();
+    if (event.type == AvaRealtimeServerEventTypeV4.turnCreated) {
+      if (_turnId != null && !_terminal) {
+        throw const AvaRealtimeRuntimeException(
+          'A new turn cannot replace an active realtime turn.',
+        );
+      }
+      _resetForNextTurn(event);
+    } else {
+      _acceptTurnEvent(event);
     }
-    _machine.accept(event);
 
     switch (event.type) {
-      case AvaRealtimeServerEventType.turnCreated:
+      case AvaRealtimeServerEventTypeV4.turnCreated:
         _turnId = event.turnId;
-        _trace?.mark('turn.created');
+        _trace?.mark('turn.created', fields: {'turnId': event.turnId});
         _presentation.beginTurn(
           sessionId: event.sessionId,
-          turnId: event.turnId,
+          turnId: event.turnId!,
         );
+        canvasController.beginPlaybackClock(event.turnId!);
         break;
-      case AvaRealtimeServerEventType.turnPhaseChanged:
+      case AvaRealtimeServerEventTypeV4.turnPhaseChanged:
         developer.log(
           'turn_phase session=$_sessionId phase=${event.phase!.name}',
           name: 'ava.realtime',
@@ -496,20 +577,61 @@ final class AvaRealtimeTurnRuntime {
           _startPlaybackFinish();
         }
         break;
-      case AvaRealtimeServerEventType.segmentReady:
+      case AvaRealtimeServerEventTypeV4.segmentReady:
+        _speechSegmentCount += 1;
+        _speechCharacterCount += event.segment!.speech.runes.length;
         if (!_firstSegmentTraced) {
           _firstSegmentTraced = true;
-          _trace?.mark('response.first_segment');
+          _trace?.mark(
+            'response.first_segment',
+            fields: {
+              'turnId': _requireTurnId(),
+              'segmentIndex': event.segmentIndex,
+              'speechCharacterCount': event.segment!.speech.runes.length,
+            },
+          );
         }
         _presentation.addSegment(event.segmentIndex!, event.segment!);
         break;
-      case AvaRealtimeServerEventType.audioMetadata:
+      case AvaRealtimeServerEventTypeV4.audioMetadata:
         await _startPlayback(event);
         break;
-      case AvaRealtimeServerEventType.alignmentBatch:
+      case AvaRealtimeServerEventTypeV4.alignmentBatch:
         _presentation.addAlignmentSpans(event.alignmentSpans);
         break;
-      case AvaRealtimeServerEventType.audioChunk:
+      case AvaRealtimeServerEventTypeV4.interruptRequested:
+        if (event.streamId != _streamId) {
+          throw const AvaRealtimeRuntimeException(
+            'Provider interruption streamId does not match active playback.',
+          );
+        }
+        final trace = _trace;
+        if (trace != null) {
+          final reasonCode = event.interruptReason == 'providerSpeechStarted'
+              ? 'providerSpeechStarted'
+              : 'serverInterruption';
+          trace.mark(
+            'microphone.interruption_requested',
+            fields: {
+              'turnId': _requireTurnId(),
+              'streamId': event.streamId,
+              'reasonCode': reasonCode,
+            },
+          );
+          // Diagnostics must never delay the click-free fade or cancellation.
+          unawaited(
+            recordAvaRealtimeAudioDiagnostics(
+              trace: trace,
+              trigger: 'interruptionRequested',
+              turnId: _requireTurnId(),
+              streamId: event.streamId,
+              interruptionReasonCode: reasonCode,
+            ),
+          );
+        }
+        await interrupt(reason: event.interruptReason!);
+        break;
+      case AvaRealtimeServerEventTypeV4.audioChunk:
         if (event.byteLength! > _limits.maxAudioChunkBytes) {
           throw AvaRealtimeBufferOverflow(
             'PCM descriptor exceeds the negotiated '
@@ -518,53 +640,26 @@ final class AvaRealtimeTurnRuntime {
         }
         _pendingAudioDescriptor = event;
         break;
-      case AvaRealtimeServerEventType.canvasCue:
-        developer.log(
-          'canvas_cue_received session=$_sessionId turn=${event.turnId} '
-          'cue=${event.cueId} scene=${event.transaction!.sceneId} '
-          'revision=${event.transaction!.revision} '
-          'sample_offset=${event.sampleOffset}',
-          name: 'ava.realtime.canvas',
-        );
-        _canvasCues.add(
-          _PendingCanvasCue(
-            cueId: event.cueId!,
-            sampleOffset: event.sampleOffset!,
-            transaction: event.transaction!,
-          ),
-        );
-        _canvasCues.sort(
-          (left, right) => left.sampleOffset.compareTo(right.sampleOffset),
-        );
-        await _applyDueCanvasCues(
-          _lastProgress?.renderedSampleCount ?? 0,
-        );
-        break;
-      case AvaRealtimeServerEventType.canvasRejected:
-        final failure = event.failure!;
-        _presentation.recordCanvasRejection(
-          failure.message,
-          failureId: failure.failureId,
-          component: failure.component,
-        );
-        break;
-      case AvaRealtimeServerEventType.interactionRejected:
-        _presentation.recordCanvasInteractionRejection(
-          event.interactionRejectionMessage!,
-        );
-        break;
-      case AvaRealtimeServerEventType.memoryPersistenceFailed:
+      case AvaRealtimeServerEventTypeV4.memoryPersistenceFailed:
         _presentation.recordMemoryPersistenceFailure(event.failure!);
         break;
-      case AvaRealtimeServerEventType.turnCompleted:
-      case AvaRealtimeServerEventType.turnCancelled:
-      case AvaRealtimeServerEventType.turnFailed:
+      case AvaRealtimeServerEventTypeV4.turnCompleted:
+      case AvaRealtimeServerEventTypeV4.turnCancelled:
+      case AvaRealtimeServerEventTypeV4.turnFailed:
         await _handleTerminal(event);
         break;
+      case AvaRealtimeServerEventTypeV4.canvasGenerationStarted:
+      case AvaRealtimeServerEventTypeV4.canvasDocumentAvailable:
+      case AvaRealtimeServerEventTypeV4.canvasPresentationCue:
+      case AvaRealtimeServerEventTypeV4.canvasActivated:
+      case AvaRealtimeServerEventTypeV4.canvasDocumentDiscarded:
+      case AvaRealtimeServerEventTypeV4.canvasRejected:
+      case AvaRealtimeServerEventTypeV4.interactionRejected:
+        throw StateError('Canvas event reached the speech runtime.');
     }
   }
 
-  Future<void> _startPlayback(AvaRealtimeServerEvent event) async {
+  Future<void> _startPlayback(AvaRealtimeServerEventV4 event) async {
     if (_playbackStarted) {
       throw const AvaRealtimeRuntimeException(
         'Native PCM playback may start only once per turn.',
@@ -577,8 +672,21 @@ final class AvaRealtimeTurnRuntime {
       volume: _volume,
     );
     _playbackStarted = true;
+    _trace?.mark(
+      'speech.playback_started',
+      fields: {
+        'turnId': _requireTurnId(),
+        'streamId': _streamId,
+        'sampleRateHz': 24000,
+      },
+    );
+    _updateCanvasPlaybackClock(
+      turnId: _requireTurnId(),
+      renderedSampleCount: 0,
+      event: 'playbackStarted',
+    );
     await _sendClient(
-      (sequence) => AvaRealtimeClientEvent.playbackStarted(
+      (sequence) => AvaRealtimeClientEventV4.playbackStarted(
         sessionId: _sessionId,
         sequence: sequence,
         turnId: _requireTurnId(),
@@ -620,7 +728,15 @@ final class AvaRealtimeTurnRuntime {
     _pendingAudioDescriptor = null;
     if (!_firstPcmTraced) {
       _firstPcmTraced = true;
-      _trace?.mark('audio.first_pcm');
+      _trace?.mark(
+        'audio.first_pcm',
+        fields: {
+          'turnId': _requireTurnId(),
+          'streamId': _requireStreamId(),
+          'pcmByteLength': bytes.length,
+          'sampleCount': bytes.length ~/ 2,
+        },
+      );
     }
     await _speechOutput.append(
       turnId: _requireTurnId(),
@@ -664,6 +780,15 @@ final class AvaRealtimeTurnRuntime {
       );
     }
     _finalRenderedSampleCount = result.renderedSampleCount;
+    _traceFirstRenderedSample(result.renderedSampleCount);
+    _trace?.mark(
+      'speech.playback_completed',
+      fields: _speechPlaybackFields(
+        turnId: _requireTurnId(),
+        renderedSampleCount: result.renderedSampleCount,
+        termination: 'completed',
+      ),
+    );
     _progressTimer?.cancel();
     _progressTimer = null;
     await _publishProgress(
@@ -685,15 +810,20 @@ final class AvaRealtimeTurnRuntime {
       renderedSampleCount: progress.renderedSampleCount,
       receivedSampleCount: snapshot.receivedSampleCount,
     );
-    await _applyDueCanvasCues(progress.renderedSampleCount);
+    _traceFirstRenderedSample(progress.renderedSampleCount);
     final previous = _lastProgress;
     _lastProgress = progress;
     if (previous?.renderedSampleCount == progress.renderedSampleCount &&
         previous?.bufferedSampleCount == progress.bufferedSampleCount) {
       return;
     }
+    _updateCanvasPlaybackClock(
+      turnId: _requireTurnId(),
+      renderedSampleCount: progress.renderedSampleCount,
+      event: 'playbackProgress',
+    );
     await _sendClient(
-      (sequence) => AvaRealtimeClientEvent.playbackProgress(
+      (sequence) => AvaRealtimeClientEventV4.playbackProgress(
         sessionId: _sessionId,
         sequence: sequence,
         turnId: _requireTurnId(),
@@ -704,41 +834,7 @@ final class AvaRealtimeTurnRuntime {
     );
   }
 
-  Future<void> _applyDueCanvasCues(int renderedSampleCount) async {
-    for (final cue in _canvasCues) {
-      if (cue.sampleOffset > renderedSampleCount) break;
-      if (!_appliedCanvasCueIds.add(cue.cueId)) continue;
-      final result = _canvasEngine.apply(cue.transaction);
-      if (!result.accepted) {
-        final rejection = result.rejection!;
-        developer.log(
-          'canvas_transaction_rejected session=$_sessionId '
-          'turn=${_requireTurnId()} cue=${cue.cueId} '
-          'scene=${cue.transaction.sceneId} '
-          'revision=${cue.transaction.revision} '
-          'code=${rejection.code.name} message=${rejection.message}',
-          name: 'ava.realtime.canvas',
-          error: rejection,
-        );
-        _presentation.recordCanvasRejection(
-          'Canvas cue ${cue.cueId} was rejected '
-          '(${rejection.code.name}): ${rejection.message}',
-        );
-      } else {
-        developer.log(
-          'canvas_transaction_applied session=$_sessionId '
-          'turn=${_requireTurnId()} cue=${cue.cueId} '
-          'scene=${cue.transaction.sceneId} '
-          'revision=${cue.transaction.revision} '
-          'bindings=${cue.transaction.bindings.length}',
-          name: 'ava.realtime.canvas',
-        );
-        _presentation.recordCanvasApplied();
-      }
-    }
-  }
-
-  Future<void> _handleTerminal(AvaRealtimeServerEvent event) async {
+  Future<void> _handleTerminal(AvaRealtimeServerEventV4 event) async {
     if (_pendingAudioDescriptor != null) {
       throw const AvaRealtimeRuntimeException(
         'Terminal event arrived before pending binary PCM.',
@@ -748,7 +844,7 @@ final class AvaRealtimeTurnRuntime {
     final localRendered =
         _finalRenderedSampleCount ?? _lastProgress?.renderedSampleCount ?? 0;
     switch (event.type) {
-      case AvaRealtimeServerEventType.turnCompleted:
+      case AvaRealtimeServerEventTypeV4.turnCompleted:
         if (delivered != localRendered ||
             delivered != snapshot.receivedSampleCount) {
           throw AvaRealtimeRuntimeException(
@@ -756,17 +852,21 @@ final class AvaRealtimeTurnRuntime {
             'rendered samples $localRendered.',
           );
         }
-        await _applyDueCanvasCues(delivered);
         break;
-      case AvaRealtimeServerEventType.turnCancelled:
-        if (!_interrupting || delivered != localRendered) {
+      case AvaRealtimeServerEventTypeV4.turnCancelled:
+        if (delivered != localRendered) {
           throw AvaRealtimeRuntimeException(
             'Cancelled delivered samples $delivered do not match the local '
             'stop position $localRendered.',
           );
         }
+        if (_playbackStarted &&
+            _finalRenderedSampleCount == null &&
+            !_interrupting) {
+          await _speechOutput.stop();
+        }
         break;
-      case AvaRealtimeServerEventType.turnFailed:
+      case AvaRealtimeServerEventTypeV4.turnFailed:
         if (delivered > localRendered) {
           throw AvaRealtimeRuntimeException(
             'Failed turn delivered samples $delivered exceed local rendered '
@@ -785,19 +885,36 @@ final class AvaRealtimeTurnRuntime {
     _progressTimer?.cancel();
     _progressTimer = null;
     _terminal = true;
+    _trace?.mark(
+      'speech.turn_terminal',
+      fields: _speechPlaybackFields(
+        turnId: _requireTurnId(),
+        renderedSampleCount: delivered,
+        termination: event.type.name,
+      ),
+    );
     _presentation.complete(event);
     if (!_turnTerminal.isCompleted) _turnTerminal.complete();
   }
 
-  void _resetForNextTurn() {
+  void _resetForNextTurn(AvaRealtimeServerEventV4 event) {
+    if (event.revision != 0 || event.turnId == null) {
+      throw const AvaRealtimeStateException(
+        'turnCreated must establish a turn at revision zero.',
+      );
+    }
     _progressTimer?.cancel();
     _progressTimer = null;
-    _machine = AvaRealtimeTurnStateMachine();
-    _canvasCues.clear();
-    _appliedCanvasCueIds.clear();
     _pendingAudioDescriptor = null;
-    _turnId = null;
+    _turnId = event.turnId;
     _streamId = null;
+    _phase = AvaRealtimeTurnPhase.created;
+    _revision = 0;
+    _nextSegmentIndex = 0;
+    _nextAudioChunkIndex = 0;
+    _receivedSampleCount = 0;
+    _validatedAudioStreamId = null;
+    _cancelRequestId = null;
     _lastProgress = null;
     _finalRenderedSampleCount = null;
     _terminal = false;
@@ -810,24 +927,496 @@ final class AvaRealtimeTurnRuntime {
     _turnTerminal = Completer<void>();
     _firstSegmentTraced = false;
     _firstPcmTraced = false;
+    _firstRenderedSampleTraced = false;
+    _speechSegmentCount = 0;
+    _speechCharacterCount = 0;
   }
 
-  Future<void> _setMicrophoneEnabled(bool enabled) async {
-    await _mediaSession.setMicrophoneEnabled(enabled);
-    final actual = _mediaSession.microphoneEnabled;
-    if (actual != enabled) {
-      throw AvaRealtimeRuntimeException(
-        'Microphone track state did not match the requested state.',
+  Map<String, Object?> _speechPlaybackFields({
+    required String turnId,
+    required int renderedSampleCount,
+    required String termination,
+  }) =>
+      {
+        'turnId': turnId,
+        if (_streamId case final value?) 'streamId': value,
+        'renderedSampleCount': renderedSampleCount,
+        'sampleRateHz': 24000,
+        'renderedDurationMs': renderedSampleCount * 1000 / 24000,
+        'segmentCount': _speechSegmentCount,
+        'speechCharacterCount': _speechCharacterCount,
+        'termination': termination,
+      };
+
+  void _traceFirstRenderedSample(int renderedSampleCount) {
+    if (_firstRenderedSampleTraced || renderedSampleCount <= 0) return;
+    _firstRenderedSampleTraced = true;
+    _trace?.mark(
+      'speech.first_rendered_sample',
+      fields: {
+        'turnId': _requireTurnId(),
+        'streamId': _requireStreamId(),
+        'renderedSampleCount': renderedSampleCount,
+        'sampleRateHz': 24000,
+      },
+    );
+  }
+
+  void _acceptServerSequence(AvaRealtimeServerEventV4 event) {
+    if (event.sequence != _nextServerSequence) {
+      throw AvaRealtimeStateException(
+        'Expected protocol-v4 server sequence $_nextServerSequence, '
+        'received ${event.sequence}.',
       );
     }
-    _onMicrophoneTrackChanged?.call(actual);
+    _nextServerSequence += 1;
+  }
+
+  void _acceptTurnEvent(AvaRealtimeServerEventV4 event) {
+    if (_terminal) {
+      throw const AvaRealtimeStateException(
+        'Event received after terminal turn state.',
+      );
+    }
+    if (_turnId == null || _phase == null) {
+      throw const AvaRealtimeStateException(
+        'turnCreated must be the first speech event.',
+      );
+    }
+    if (event.turnId != _turnId) {
+      throw const AvaRealtimeStateException(
+        'turnId changed during an active turn.',
+      );
+    }
+    switch (event.type) {
+      case AvaRealtimeServerEventTypeV4.turnPhaseChanged:
+        _acceptPhaseChange(event);
+        break;
+      case AvaRealtimeServerEventTypeV4.turnCompleted:
+        _acceptCompleted(event);
+        break;
+      case AvaRealtimeServerEventTypeV4.turnCancelled:
+        _acceptCancelled(event);
+        break;
+      case AvaRealtimeServerEventTypeV4.turnFailed:
+        _acceptFailed(event);
+        break;
+      case AvaRealtimeServerEventTypeV4.segmentReady:
+      case AvaRealtimeServerEventTypeV4.audioMetadata:
+      case AvaRealtimeServerEventTypeV4.audioChunk:
+      case AvaRealtimeServerEventTypeV4.alignmentBatch:
+      case AvaRealtimeServerEventTypeV4.interruptRequested:
+      case AvaRealtimeServerEventTypeV4.memoryPersistenceFailed:
+        if (event.revision != _revision) {
+          throw AvaRealtimeStateException(
+            'Event revision ${event.revision} does not match active revision '
+            '$_revision.',
+          );
+        }
+        _acceptNonPhaseEvent(event);
+        break;
+      case AvaRealtimeServerEventTypeV4.turnCreated:
+        throw const AvaRealtimeStateException('turnCreated cannot repeat.');
+      case AvaRealtimeServerEventTypeV4.canvasGenerationStarted:
+      case AvaRealtimeServerEventTypeV4.canvasDocumentAvailable:
+      case AvaRealtimeServerEventTypeV4.canvasPresentationCue:
+      case AvaRealtimeServerEventTypeV4.canvasActivated:
+      case AvaRealtimeServerEventTypeV4.canvasDocumentDiscarded:
+      case AvaRealtimeServerEventTypeV4.canvasRejected:
+      case AvaRealtimeServerEventTypeV4.interactionRejected:
+        throw StateError('Canvas event reached turn validation.');
+    }
+  }
+
+  void _acceptPhaseChange(AvaRealtimeServerEventV4 event) {
+    final current = _requirePhase();
+    final next = event.phase;
+    if (next == null || !_allowedNextPhases(current).contains(next)) {
+      throw AvaRealtimeStateException(
+        'Invalid turn phase transition $current -> $next.',
+      );
+    }
+    if (event.revision != _revision + 1) {
+      throw const AvaRealtimeStateException(
+        'Phase changes must increment revision by one.',
+      );
+    }
+    if (next == AvaRealtimeTurnPhase.speaking &&
+        _validatedAudioStreamId == null) {
+      throw const AvaRealtimeStateException(
+        'Speaking requires prior audioMetadata.',
+      );
+    }
+    _phase = next;
+    _revision = event.revision;
+  }
+
+  void _acceptNonPhaseEvent(AvaRealtimeServerEventV4 event) {
+    final phase = _requirePhase();
+    switch (event.type) {
+      case AvaRealtimeServerEventTypeV4.segmentReady:
+        if (phase != AvaRealtimeTurnPhase.planning &&
+            phase != AvaRealtimeTurnPhase.synthesizing) {
+          throw const AvaRealtimeStateException(
+            'segmentReady requires planning or synthesizing.',
+          );
+        }
+        if (event.segmentIndex != _nextSegmentIndex) {
+          throw AvaRealtimeStateException(
+            'Expected segmentIndex $_nextSegmentIndex, '
+            'received ${event.segmentIndex}.',
+          );
+        }
+        _nextSegmentIndex += 1;
+        break;
+      case AvaRealtimeServerEventTypeV4.audioMetadata:
+        if (phase != AvaRealtimeTurnPhase.synthesizing) {
+          throw const AvaRealtimeStateException(
+            'audioMetadata requires synthesizing.',
+          );
+        }
+        if (_validatedAudioStreamId != null) {
+          throw const AvaRealtimeStateException(
+            'audioMetadata may occur only once.',
+          );
+        }
+        _validatedAudioStreamId = event.streamId;
+        break;
+      case AvaRealtimeServerEventTypeV4.audioChunk:
+        if (phase != AvaRealtimeTurnPhase.synthesizing) {
+          throw const AvaRealtimeStateException(
+            'audioChunk requires synthesizing.',
+          );
+        }
+        _requireAudioStream(event.streamId);
+        if (event.chunkIndex != _nextAudioChunkIndex) {
+          throw AvaRealtimeStateException(
+            'Expected audio chunk $_nextAudioChunkIndex, '
+            'received ${event.chunkIndex}.',
+          );
+        }
+        if (event.sampleOffset != _receivedSampleCount) {
+          throw AvaRealtimeStateException(
+            'Expected sampleOffset $_receivedSampleCount, '
+            'received ${event.sampleOffset}.',
+          );
+        }
+        _nextAudioChunkIndex += 1;
+        _receivedSampleCount += event.sampleCount!;
+        break;
+      case AvaRealtimeServerEventTypeV4.alignmentBatch:
+        if (phase != AvaRealtimeTurnPhase.synthesizing) {
+          throw const AvaRealtimeStateException(
+            'alignmentBatch requires synthesizing.',
+          );
+        }
+        _requireAudioStream(event.streamId);
+        break;
+      case AvaRealtimeServerEventTypeV4.interruptRequested:
+        if (phase != AvaRealtimeTurnPhase.speaking) {
+          throw const AvaRealtimeStateException(
+            'interruptRequested requires speaking.',
+          );
+        }
+        _requireAudioStream(event.streamId);
+        break;
+      case AvaRealtimeServerEventTypeV4.memoryPersistenceFailed:
+        if (phase != AvaRealtimeTurnPhase.listening &&
+            phase != AvaRealtimeTurnPhase.speaking) {
+          throw const AvaRealtimeStateException(
+            'memoryPersistenceFailed requires listening or speaking.',
+          );
+        }
+        break;
+      case AvaRealtimeServerEventTypeV4.turnCreated:
+      case AvaRealtimeServerEventTypeV4.turnPhaseChanged:
+      case AvaRealtimeServerEventTypeV4.turnCompleted:
+      case AvaRealtimeServerEventTypeV4.turnCancelled:
+      case AvaRealtimeServerEventTypeV4.turnFailed:
+      case AvaRealtimeServerEventTypeV4.canvasGenerationStarted:
+      case AvaRealtimeServerEventTypeV4.canvasDocumentAvailable:
+      case AvaRealtimeServerEventTypeV4.canvasPresentationCue:
+      case AvaRealtimeServerEventTypeV4.canvasActivated:
+      case AvaRealtimeServerEventTypeV4.canvasDocumentDiscarded:
+      case AvaRealtimeServerEventTypeV4.canvasRejected:
+      case AvaRealtimeServerEventTypeV4.interactionRejected:
+        throw AvaRealtimeStateException(
+          'Unsupported non-phase event ${event.type.name}.',
+        );
+    }
+  }
+
+  void _acceptCompleted(AvaRealtimeServerEventV4 event) {
+    if (_requirePhase() != AvaRealtimeTurnPhase.speaking) {
+      throw const AvaRealtimeStateException(
+        'turnCompleted requires speaking.',
+      );
+    }
+    _acceptTerminalRevision(event.revision);
+    _validateDeliveredSamples(event.deliveredSampleCount!);
+    if (_nextAudioChunkIndex == 0) {
+      throw const AvaRealtimeStateException(
+        'turnCompleted requires received audio.',
+      );
+    }
+    _phase = AvaRealtimeTurnPhase.completed;
+    _terminal = true;
+  }
+
+  void _acceptCancelled(AvaRealtimeServerEventV4 event) {
+    if (_requirePhase() != AvaRealtimeTurnPhase.cancelling) {
+      throw const AvaRealtimeStateException(
+        'turnCancelled requires cancelling.',
+      );
+    }
+    _acceptTerminalRevision(event.revision);
+    _validateDeliveredSamples(event.deliveredSampleCount!);
+    _phase = AvaRealtimeTurnPhase.cancelled;
+    _terminal = true;
+  }
+
+  void _acceptFailed(AvaRealtimeServerEventV4 event) {
+    _acceptTerminalRevision(event.revision);
+    _validateDeliveredSamples(event.deliveredSampleCount!);
+    _phase = AvaRealtimeTurnPhase.failed;
+    _terminal = true;
+  }
+
+  void _acceptTerminalRevision(int revision) {
+    if (revision != _revision + 1) {
+      throw const AvaRealtimeStateException(
+        'Terminal events must increment revision by one.',
+      );
+    }
+    _revision = revision;
+  }
+
+  void _validateDeliveredSamples(int samples) {
+    if (samples > _receivedSampleCount) {
+      throw const AvaRealtimeStateException(
+        'Delivered samples cannot exceed received samples.',
+      );
+    }
+  }
+
+  bool _registerCancellation(String requestId) {
+    if (requestId.isEmpty) {
+      throw const AvaRealtimeStateException(
+        'Cancel requestId cannot be empty.',
+      );
+    }
+    final registered = _cancelRequestId;
+    if (registered != null) {
+      if (registered == requestId) return false;
+      throw const AvaRealtimeStateException(
+        'A different cancellation request is already registered.',
+      );
+    }
+    if (_terminal) {
+      throw const AvaRealtimeStateException(
+        'Cannot cancel a terminal turn.',
+      );
+    }
+    _requirePhase();
+    _cancelRequestId = requestId;
+    return true;
+  }
+
+  AvaRealtimeTurnPhase _requirePhase() {
+    final phase = _phase;
+    if (phase == null) {
+      throw const AvaRealtimeStateException(
+        'Turn state has not been created.',
+      );
+    }
+    return phase;
+  }
+
+  void _requireAudioStream(String? streamId) {
+    if (_validatedAudioStreamId == null) {
+      throw const AvaRealtimeStateException(
+        'Audio event requires audioMetadata.',
+      );
+    }
+    if (streamId != _validatedAudioStreamId) {
+      throw const AvaRealtimeStateException(
+        'Audio streamId changed mid-turn.',
+      );
+    }
+  }
+
+  void _dispatchCanvasEvent(AvaRealtimeServerEventV4 event) {
+    final json = event.toJson();
+    switch (event.type) {
+      case AvaRealtimeServerEventTypeV4.canvasGenerationStarted:
+        canvasController.receiveGenerationStarted(json);
+        break;
+      case AvaRealtimeServerEventTypeV4.canvasDocumentAvailable:
+        AvaSvgCanvasDocumentDescriptorV4.fromJson(json);
+        unawaited(
+          canvasController
+              .receiveDocumentAvailable(json)
+              .catchError(_recordAsynchronousFailure),
+        );
+        break;
+      case AvaRealtimeServerEventTypeV4.canvasPresentationCue:
+        canvasController.receivePresentationCue(json);
+        break;
+      case AvaRealtimeServerEventTypeV4.canvasActivated:
+        canvasController.receiveActivated(json);
+        break;
+      case AvaRealtimeServerEventTypeV4.canvasDocumentDiscarded:
+        canvasController.receiveDocumentDiscarded(json);
+        break;
+      case AvaRealtimeServerEventTypeV4.canvasRejected:
+        canvasController.receiveRejected(json);
+        break;
+      case AvaRealtimeServerEventTypeV4.interactionRejected:
+        canvasController.receiveInteractionRejected(json);
+        break;
+      default:
+        throw StateError('Non-canvas event reached the SVG dispatcher.');
+    }
+  }
+
+  void _enqueueCanvasCommand(AvaSvgCanvasClientCommand command) {
+    if (_closed) return;
+    final identity = _canvasIdentity(command);
+    final event = AvaRealtimeClientEventV4.canvasCommand(
+      sessionId: _sessionId,
+      sequence: _takeClientSequence(),
+      body: command.toEventBody(),
+    );
+    if (identity != null) {
+      _recordCanvasCommand('canvas.client.command_enqueued', command, identity);
+    }
+    final operation = _enqueue(event);
+    unawaited(
+      operation.then<void>((_) {
+        if (identity != null) {
+          _recordCanvasCommand('canvas.client.command_sent', command, identity);
+        }
+      }).catchError(_recordAsynchronousFailure),
+    );
+  }
+
+  ({String generationId, String sourceTurnId})? _canvasIdentity(
+    AvaSvgCanvasClientCommand command,
+  ) {
+    final telemetryGenerationId = command.telemetryGenerationId;
+    final telemetrySourceTurnId = command.telemetrySourceTurnId;
+    if (telemetryGenerationId != null && telemetrySourceTurnId != null) {
+      return (
+        generationId: telemetryGenerationId,
+        sourceTurnId: telemetrySourceTurnId,
+      );
+    }
+    final generationId = command.fields['generationId'];
+    if (generationId is! String) return null;
+    final candidate = canvasController.candidate?.descriptor;
+    if (candidate?.generationId == generationId) {
+      return (
+        generationId: generationId,
+        sourceTurnId: candidate!.sourceTurnId,
+      );
+    }
+    final active = canvasController.active?.document.descriptor;
+    if (active?.generationId == generationId) {
+      return (
+        generationId: generationId,
+        sourceTurnId: active!.sourceTurnId,
+      );
+    }
+    final generation = canvasController.generation;
+    if (generation?.generationId == generationId) {
+      return (
+        generationId: generationId,
+        sourceTurnId: generation!.sourceTurnId,
+      );
+    }
+    return null;
+  }
+
+  void _recordCanvasCommand(
+    String stage,
+    AvaSvgCanvasClientCommand command,
+    ({String generationId, String sourceTurnId}) identity,
+  ) {
+    _canvasTelemetry?.call(
+      AvaSvgCanvasTelemetryEvent(
+        stage: stage,
+        fields: {
+          'generationId': identity.generationId,
+          'sourceTurnId': identity.sourceTurnId,
+          'command': command.type.name,
+        },
+      ),
+    );
+  }
+
+  void _updateCanvasPlaybackClock({
+    required String turnId,
+    required int renderedSampleCount,
+    required String event,
+  }) {
+    if (turnId != canvasController.renderedSampleTurnId) {
+      if (turnId == canvasController.previousRenderedSampleTurnId) {
+        developer.log(
+          'stale_playback_control_dropped session=$_sessionId '
+          'turn=$turnId current_turn=${canvasController.renderedSampleTurnId} '
+          'event=$event',
+          name: 'ava.realtime.protocol_v4',
+        );
+        return;
+      }
+      throw AvaRealtimeStateException(
+        'Playback control for $turnId cannot mutate canvas clock '
+        '${canvasController.renderedSampleTurnId ?? 'without an owner'}.',
+      );
+    }
+    canvasController.updateRenderedSample(
+      turnId: turnId,
+      renderedSample: renderedSampleCount,
+    );
+  }
+
+  Future<void> _enqueue(AvaRealtimeClientEventV4 event) {
+    final operation = _sendTail.then((_) => _transport.send(event));
+    _sendTail = operation;
+    return operation;
+  }
+
+  int _takeClientSequence() {
+    if (_nextClientSequence > 1000000) {
+      throw const AvaRealtimeStateException(
+        'Protocol-v4 client sequence exhausted its bound.',
+      );
+    }
+    final result = _nextClientSequence;
+    _nextClientSequence += 1;
+    return result;
+  }
+
+  Future<void> _setMicrophoneEnabled(bool enabled) {
+    final operation = _microphoneTail.then((_) async {
+      if (_closed) return;
+      await _mediaSession.setMicrophoneEnabled(enabled);
+      final actual = _mediaSession.microphoneEnabled;
+      if (actual != enabled) {
+        throw AvaRealtimeRuntimeException(
+          'Microphone track state did not match the requested state.',
+        );
+      }
+      _onMicrophoneTrackChanged?.call(actual);
+    });
+    _microphoneTail = operation;
+    return operation;
   }
 
   Future<void> _sendClient(
-    AvaRealtimeClientEvent Function(int sequence) build,
+    AvaRealtimeClientEventV4 Function(int sequence) build,
   ) {
-    final event = build(_nextClientSequence);
-    _nextClientSequence += 1;
+    final event = build(_takeClientSequence());
     final result = _sendTail.then((_) => _transport.send(event));
     _sendTail = result;
     return result;
@@ -873,14 +1462,38 @@ final class AvaRealtimeTurnRuntime {
   }
 }
 
-final class _PendingCanvasCue {
-  const _PendingCanvasCue({
-    required this.cueId,
-    required this.sampleOffset,
-    required this.transaction,
-  });
-
-  final String cueId;
-  final int sampleOffset;
-  final AvaCanvasTransaction transaction;
-}
+Set<AvaRealtimeTurnPhase> _allowedNextPhases(
+  AvaRealtimeTurnPhase phase,
+) =>
+    switch (phase) {
+      AvaRealtimeTurnPhase.created => const {
+          AvaRealtimeTurnPhase.connecting,
+          AvaRealtimeTurnPhase.cancelling,
+        },
+      AvaRealtimeTurnPhase.connecting => const {
+          AvaRealtimeTurnPhase.listening,
+          AvaRealtimeTurnPhase.cancelling,
+        },
+      AvaRealtimeTurnPhase.listening => const {
+          AvaRealtimeTurnPhase.planning,
+          AvaRealtimeTurnPhase.cancelling,
+        },
+      AvaRealtimeTurnPhase.planning => const {
+          AvaRealtimeTurnPhase.synthesizing,
+          AvaRealtimeTurnPhase.cancelling,
+        },
+      AvaRealtimeTurnPhase.synthesizing => const {
+          AvaRealtimeTurnPhase.speaking,
+          AvaRealtimeTurnPhase.cancelling,
+        },
+      AvaRealtimeTurnPhase.speaking => const {
+          AvaRealtimeTurnPhase.cancelling,
+        },
+      AvaRealtimeTurnPhase.cancelling => const {
+          AvaRealtimeTurnPhase.cancelled,
+        },
+      AvaRealtimeTurnPhase.completed ||
+      AvaRealtimeTurnPhase.cancelled ||
+      AvaRealtimeTurnPhase.failed =>
+        const {},
+    };

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:developer' as developer;
 import 'dart:math';
 
@@ -10,6 +11,7 @@ final class AvaRealtimeTraceEvent {
     required this.stage,
     required this.elapsed,
     required this.stageDuration,
+    required this.fields,
     this.sessionId,
   });
 
@@ -17,6 +19,7 @@ final class AvaRealtimeTraceEvent {
   final String stage;
   final Duration elapsed;
   final Duration stageDuration;
+  final Map<String, Object?> fields;
   final String? sessionId;
 }
 
@@ -74,7 +77,11 @@ final class AvaRealtimeTrace {
     _sessionId = sessionId;
   }
 
-  void mark(String stage, {Duration stageDuration = Duration.zero}) {
+  void mark(
+    String stage, {
+    Duration stageDuration = Duration.zero,
+    Map<String, Object?> fields = const {},
+  }) {
     final normalized = stage.trim();
     if (!RegExp(r'^[a-z][a-z0-9_.-]{1,63}$').hasMatch(normalized)) {
       throw ArgumentError.value(stage, 'stage', 'has an invalid format');
@@ -85,12 +92,14 @@ final class AvaRealtimeTrace {
       stage: normalized,
       elapsed: _clock.elapsed,
       stageDuration: stageDuration,
+      fields: Map.unmodifiable(_validatedTraceFields(fields)),
     );
     developer.log(
       'stage=${event.stage} attempt=${event.attemptId} '
       'session=${event.sessionId ?? '-'} '
       'elapsed_ms=${event.elapsed.inMicroseconds / 1000} '
-      'stage_ms=${event.stageDuration.inMicroseconds / 1000}',
+      'stage_ms=${event.stageDuration.inMicroseconds / 1000} '
+      'fields=${jsonEncode(event.fields)}',
       name: 'ava.realtime.lifecycle',
     );
     _observer?.call(event);
@@ -105,6 +114,38 @@ final class AvaRealtimeTrace {
       mark(stage, stageDuration: stopwatch.elapsed);
     }
   }
+}
+
+Map<String, Object?> _validatedTraceFields(Map<String, Object?> source) {
+  if (source.length > 32) {
+    throw ArgumentError.value(source.length, 'fields', 'exceeds 32 entries');
+  }
+  final result = <String, Object?>{};
+  for (final entry in source.entries) {
+    if (!RegExp(r'^[A-Za-z][A-Za-z0-9]{0,47}$').hasMatch(entry.key)) {
+      throw ArgumentError.value(entry.key, 'fields', 'contains an invalid key');
+    }
+    final value = entry.value;
+    if (value is num && !value.isFinite) {
+      throw ArgumentError.value(value, entry.key, 'must be finite');
+    }
+    if (value is String && value.length > 160) {
+      throw ArgumentError.value(
+        value.length,
+        entry.key,
+        'string exceeds 160 characters',
+      );
+    }
+    if (value != null && value is! String && value is! num && value is! bool) {
+      throw ArgumentError.value(
+        value.runtimeType,
+        entry.key,
+        'must be a scalar trace value',
+      );
+    }
+    result[entry.key] = value;
+  }
+  return result;
 }
 
 String createSecureAvaRealtimeAttemptId() {

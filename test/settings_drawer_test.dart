@@ -151,6 +151,49 @@ void main() {
     expect(find.textContaining('diagnos'), findsNothing);
   });
 
+  testWidgets('weekly recap scrolls on a short viewport without overflowing',
+      (tester) async {
+    tester.view.physicalSize = const Size(640, 600);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final database = AppDatabase.forTesting(NativeDatabase.memory());
+    addTearDown(database.close);
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          databaseProvider.overrideWithValue(database),
+          avaMemoryControlProvider.overrideWithValue(
+            _ManyRecordsMemoryControl(),
+          ),
+        ],
+        child: const MaterialApp(
+          home: Scaffold(body: SettingsDrawer()),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final recap = find.byKey(const ValueKey('settings-weekly-recap'));
+    await tester.ensureVisible(recap);
+    await tester.tap(recap);
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull);
+    await tester.scrollUntilVisible(
+      find.text('Recap topic 8 with a deliberately longer summary.'),
+      80,
+      scrollable: find.descendant(
+        of: find.byKey(const ValueKey('weekly-recap-list')),
+        matching: find.byType(Scrollable),
+      ),
+    );
+    expect(
+      find.text('Recap topic 8 with a deliberately longer summary.'),
+      findsOneWidget,
+    );
+  });
+
   testWidgets('cloud reset failure preserves the local conversation',
       (tester) async {
     final database = AppDatabase.forTesting(NativeDatabase.memory());
@@ -229,5 +272,32 @@ final class _FailingMemoryControl implements AvaMemoryControl {
       statusCode: 503,
       requestId: 'request-test',
     );
+  }
+}
+
+final class _ManyRecordsMemoryControl implements AvaMemoryControl {
+  @override
+  Future<AvaWeeklyConversationRecap> loadWeeklyRecap(
+    DateTime periodStart,
+  ) async {
+    return AvaWeeklyConversationRecap(
+      periodStart: periodStart,
+      periodEnd: periodStart.add(const Duration(days: 7)),
+      generatedAt: DateTime.utc(2026, 8, 1),
+      resetRevision: 0,
+      records: [
+        for (var index = 1; index <= 8; index += 1)
+          AvaWeeklyConversationRecord(
+            turnId: 'turn-$index',
+            summary: 'Recap topic $index with a deliberately longer summary.',
+            occurredAt: DateTime.utc(2026, 8, index),
+          ),
+      ],
+    );
+  }
+
+  @override
+  Future<AvaConversationResetReceipt> resetConversations() async {
+    throw UnimplementedError();
   }
 }

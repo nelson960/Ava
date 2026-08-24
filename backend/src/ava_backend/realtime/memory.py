@@ -12,13 +12,24 @@ from pydantic import Field, StringConstraints, model_validator
 
 from ..protocol import AgeBand
 from .common import NonEmptyText, ProtocolIdentifier, RealtimeProtocolModel
-from .plan import AvaMemoryProposal, MemoryProposalKind
 
 MAX_DELIVERED_TURNS = 8
 MAX_STABLE_MEMORIES = 12
 MAX_WEEKLY_RECORDS = 64
 MAX_SESSION_SUMMARY_CHARACTERS = 1_200
 MINIMUM_STABLE_MEMORY_CONFIDENCE = 0.8
+
+
+class MemoryProposalKind(StrEnum):
+    INTEREST = "interest"
+    PREFERENCE = "preference"
+
+
+class AvaMemoryProposal(RealtimeProtocolModel):
+    kind: MemoryProposalKind
+    summary: Annotated[NonEmptyText, StringConstraints(max_length=160)]
+    evidence: Annotated[NonEmptyText, StringConstraints(max_length=160)]
+    confidence: float = Field(ge=0, le=1, allow_inf_nan=False)
 
 
 class DeliveredTurnTerminal(StrEnum):
@@ -184,7 +195,7 @@ class AuthoritativeMemoryStore(Protocol):
 
 
 class DevelopmentAuthoritativeMemoryStore:
-    """Deterministic v3 store for coordinator tests, never selected implicitly."""
+    """Deterministic development store for realtime coordinator tests."""
 
     def __init__(
         self,

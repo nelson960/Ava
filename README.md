@@ -73,10 +73,10 @@ Live/release work still required:
 - Supabase deployment verification, production auth, abuse controls, budgets,
   and telemetry.
 
-The existing `/v1/lesson-turns` and `/v2/performance-turns` code, Apple Speech
-input, fixed fraction/number-line diagrams, and activity/progress code are
-legacy migration inputs. They are not the production target and will be removed
-only after the protocol-v3 vertical slice passes its replacement gates.
+The legacy lesson-turn and NDJSON performance-turn backend routes have been
+removed after the protocol-v4 cutover. Remaining Responses fixtures and local
+presentation types are offline evaluation or compatibility tooling, not
+shipping conversation paths.
 
 ## API keys
 

@@ -4,12 +4,13 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../canvas/ava_canvas_engine.dart';
 import '../services/ava_realtime_presentation.dart';
 import '../state/app_state.dart';
 import '../state/ava_session_state.dart';
 import 'avatar/avatar_view.dart';
-import 'dashboard/ava_canvas_panel.dart';
+import 'dashboard/ava_svg_canvas_panel.dart';
+import 'dashboard/canvas_generation_pill.dart';
+import 'dashboard/canvas_reopen_chip.dart';
 import 'design/ava_design.dart';
 import 'widgets/caption_ticker.dart';
 import 'widgets/settings_drawer.dart';
@@ -94,9 +95,23 @@ class _MainScreenState extends ConsumerState<MainScreen>
         });
       },
     );
+    ref.listen(
+      avaSvgCanvasSessionHostProvider.select(
+        (host) => host.controller?.lastIssue,
+      ),
+      (previous, next) {
+        if (next == null || identical(previous, next)) return;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          ScaffoldMessenger.of(context)
+            ..hideCurrentSnackBar()
+            ..showSnackBar(SnackBar(content: Text(next.message)));
+        });
+      },
+    );
     final session = ref.watch(avaSessionProvider);
-    final canvasEngine = ref.watch(avaCanvasEngineProvider);
-    final dashboardVisible = canvasEngine.panelVisible;
+    final canvasHost = ref.watch(avaSvgCanvasSessionHostProvider);
+    final dashboardVisible = canvasHost.panelVisible;
     final backendConfigured =
         ref.watch(avaBackendConfigurationProvider).isConfigured;
 
@@ -106,6 +121,8 @@ class _MainScreenState extends ConsumerState<MainScreen>
       body: LayoutBuilder(
         builder: (context, constraints) {
           final dashboardHeight = constraints.maxHeight * 0.5;
+          final canvasGenerating = canvasHost.generating;
+          final canReopenCanvas = canvasHost.canReopen;
 
           return Stack(
             fit: StackFit.expand,
@@ -122,13 +139,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
                 right: 0,
                 height: dashboardHeight,
                 bottom: dashboardVisible ? 0 : -dashboardHeight,
-                child: canvasEngine.panelVisible
-                    ? AvaCanvasPanel(
-                        engine: canvasEngine,
-                        onClose: canvasEngine.dismissPanel,
-                        onOutcome: _handleCanvasOutcome,
-                      )
-                    : const SizedBox.shrink(),
+                child: AvaSvgCanvasPanel(host: canvasHost),
               ),
               Positioned.fill(
                 child: IgnorePointer(
@@ -167,6 +178,21 @@ class _MainScreenState extends ConsumerState<MainScreen>
                   microphoneActive: session.userMicIntent,
                   backendConfigured: backendConfigured,
                   onPressed: _handleVoicePressed,
+                ),
+              ),
+              Positioned(
+                right: 16,
+                bottom: 16,
+                child: CanvasGenerationPill(
+                  visible: canvasGenerating,
+                ),
+              ),
+              Positioned(
+                right: 16,
+                bottom: 16,
+                child: CanvasReopenChip(
+                  visible: canReopenCanvas,
+                  onPressed: canvasHost.reopenPanel,
                 ),
               ),
               if (session.turnState != AvaSessionPhase.idle &&
@@ -230,33 +256,31 @@ class _MainScreenState extends ConsumerState<MainScreen>
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(content: Text(message)));
   }
-
-  void _handleCanvasOutcome(AvaCanvasInteractionOutcome outcome) {
-    unawaited(
-      ref
-          .read(avaSessionProvider.notifier)
-          .reportCanvasInteraction(outcome)
-          .catchError((Object error, StackTrace stackTrace) {
-        if (!mounted) return false;
-        ScaffoldMessenger.of(context)
-          ..hideCurrentSnackBar()
-          ..showSnackBar(
-            SnackBar(
-                content: Text('Canvas interaction could not sync: $error')),
-          );
-        return false;
-      }),
-    );
-  }
 }
 
-class _SessionStatusPill extends StatelessWidget {
+class _SessionStatusPill extends StatefulWidget {
   const _SessionStatusPill({required this.phase});
 
   final AvaSessionPhase phase;
 
   @override
+  State<_SessionStatusPill> createState() => _SessionStatusPillState();
+}
+
+class _SessionStatusPillState extends State<_SessionStatusPill> {
+  int _transitionRevision = 0;
+
+  @override
+  void didUpdateWidget(covariant _SessionStatusPill oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.phase != widget.phase) {
+      _transitionRevision += 1;
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final phase = widget.phase;
     final (icon, label) = switch (phase) {
       AvaSessionPhase.listening => (CupertinoIcons.waveform, 'Listening'),
       AvaSessionPhase.thinking => (CupertinoIcons.sparkles, 'Thinking'),
@@ -269,7 +293,10 @@ class _SessionStatusPill extends StatelessWidget {
     return AnimatedSwitcher(
       duration: AvaDurations.quick,
       child: Container(
-        key: ValueKey<AvaSessionPhase>(phase),
+        // A phase may recur before its previous transition has faded out
+        // (thinking -> speaking -> thinking). Give each transition instance
+        // its own identity so AnimatedSwitcher never retains duplicate keys.
+        key: ValueKey((phase, _transitionRevision)),
         padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 8),
         decoration: BoxDecoration(
           color: Colors.white.withValues(alpha: 0.86),
@@ -303,7 +330,7 @@ class _SessionStatusPill extends StatelessWidget {
   }
 }
 
-class _VoiceButton extends StatelessWidget {
+class _VoiceButton extends StatefulWidget {
   const _VoiceButton({
     required this.microphoneActive,
     required this.backendConfigured,
@@ -315,15 +342,61 @@ class _VoiceButton extends StatelessWidget {
   final Future<void> Function() onPressed;
 
   @override
+  State<_VoiceButton> createState() => _VoiceButtonState();
+}
+
+class _VoiceButtonState extends State<_VoiceButton>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _glowController;
+  late final Animation<double> _glowAnimation;
+
+  @override
+  void initState() {
+    super.initState();
+    _glowController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1600),
+    );
+    _glowAnimation = CurvedAnimation(
+      parent: _glowController,
+      curve: Curves.easeInOutSine,
+    );
+    if (widget.microphoneActive) {
+      _glowController.repeat(reverse: true);
+    }
+  }
+
+  @override
+  void didUpdateWidget(_VoiceButton oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.microphoneActive != oldWidget.microphoneActive) {
+      if (widget.microphoneActive) {
+        _glowController.repeat(reverse: true);
+      } else {
+        _glowController.animateTo(
+          0.0,
+          duration: const Duration(milliseconds: 300),
+        );
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _glowController.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final icon = microphoneActive
+    final icon = widget.microphoneActive
         ? CupertinoIcons.mic_fill
         : CupertinoIcons.mic_slash_fill;
     final label =
-        microphoneActive ? 'Turn microphone off' : 'Turn microphone on';
-    final color = microphoneActive
+        widget.microphoneActive ? 'Turn microphone off' : 'Turn microphone on';
+    final color = widget.microphoneActive
         ? const Color(0xFFE9788C)
-        : backendConfigured
+        : widget.backendConfigured
             ? const Color(0xFF44515B)
             : const Color(0xFF778084);
 
@@ -331,19 +404,44 @@ class _VoiceButton extends StatelessWidget {
       button: true,
       label: label,
       child: Tooltip(
-        message:
-            backendConfigured ? label : 'Model backend configuration required',
-        child: Material(
-          color: Colors.white.withValues(alpha: 0.9),
-          shape: const CircleBorder(),
-          elevation: 5,
-          child: InkWell(
-            customBorder: const CircleBorder(),
-            onTap: () => unawaited(onPressed()),
-            child: SizedBox(
-              width: 46,
-              height: 46,
-              child: Icon(icon, color: color, size: 21),
+        message: widget.backendConfigured
+            ? label
+            : 'Model backend configuration required',
+        child: AnimatedBuilder(
+          animation: _glowAnimation,
+          builder: (context, child) {
+            final pulse = _glowAnimation.value;
+            final isGlow = widget.microphoneActive;
+            return Container(
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                boxShadow: isGlow
+                    ? [
+                        BoxShadow(
+                          color: const Color(0xFFFFB38A).withValues(
+                            alpha: 0.45 + (pulse * 0.35),
+                          ),
+                          blurRadius: 16 + (pulse * 10),
+                          spreadRadius: 2 + (pulse * 3),
+                        ),
+                      ]
+                    : const [],
+              ),
+              child: child,
+            );
+          },
+          child: Material(
+            color: Colors.white.withValues(alpha: 0.94),
+            shape: const CircleBorder(),
+            elevation: 5,
+            child: InkWell(
+              customBorder: const CircleBorder(),
+              onTap: () => unawaited(widget.onPressed()),
+              child: SizedBox(
+                width: 46,
+                height: 46,
+                child: Icon(icon, color: color, size: 21),
+              ),
             ),
           ),
         ),

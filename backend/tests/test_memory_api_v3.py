@@ -6,16 +6,10 @@ from httpx import ASGITransport, AsyncClient
 
 from ava_backend.app import create_app
 from ava_backend.config import AvaEnvironment, Settings
-from ava_backend.providers.base import ModelAvaResult
 from ava_backend.realtime.memory import (
     DeliveredConversationTurn,
     DevelopmentAuthoritativeMemoryStore,
 )
-
-
-class _UnusedModel:
-    async def generate_response(self, **_arguments: object) -> ModelAvaResult:
-        raise AssertionError("legacy model must not run for v3 memory endpoints")
 
 
 async def _client(
@@ -23,7 +17,6 @@ async def _client(
 ) -> AsyncClient:
     app = create_app(
         Settings(environment=AvaEnvironment.TEST),
-        ava_model=_UnusedModel(),
         authoritative_memory=store,
     )
     return AsyncClient(
@@ -98,7 +91,7 @@ async def test_readiness_checks_configured_authoritative_memory() -> None:
     assert payload["protocolVersion"] == 3
     assert payload["promptVersion"] == "ava-realtime-v4.1"
     assert payload["toolContractVersion"] == "ava-realtime-tools-v4.1"
-    assert payload["canvasSpecialistVersion"] == "ava-canvas-v2.0"
+    assert payload["canvasSpecialistVersion"] == "ava-svg-canvas-v4.2"
     assert payload["build"]["version"] == "0.1.0"
     assert payload["build"]["instanceId"].startswith("instance-")
     assert payload["build"]["sourceRevision"].startswith("sha256:")

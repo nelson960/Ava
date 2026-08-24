@@ -1,0 +1,22 @@
+{
+  "protocolVersion": 4,
+  "sessionId": "session-1234",
+  "eventUrl": "wss://ava.example.test/v4/realtime/sessions/session-1234/events",
+  "webrtcUrl": "https://ava.example.test/v4/realtime/sessions/session-1234/webrtc",
+  "canvasDocumentBaseUrl": "https://ava.example.test/v4/realtime/sessions/session-1234/canvas-documents",
+  "sessionToken": "event-token-value",
+  "webrtcToken": "webrtc-token-value",
+  "canvasToken": "canvas-token-value",
+  "expiresAt": "2026-08-21T12:00:00Z",
+  "rendererCapabilityVersion": "ava-svg-renderer-v1",
+  "validatorVersion": "ava-svg-validator-v1",
+  "manifestVersion": "ava-svg-manifest-v1",
+  "limits": {
+    "maxTurnSeconds": 90,
+    "maxResponseCharacters": 1800,
+    "maxSvgBytes": 262144,
+    "maxManifestBytes": 65536,
+    "maxAudioChunkBytes": 192000,
+    "playbackProgressIntervalMs": 250
+  }
+}

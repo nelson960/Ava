@@ -369,9 +369,14 @@ class _SettingsDrawerState extends ConsumerState<SettingsDrawer> {
       setState(() => _weeklyRecapLoading = false);
       await showModalBottomSheet<void>(
         context: context,
+        isScrollControlled: true,
+        useSafeArea: true,
         showDragHandle: true,
         backgroundColor: const Color(0xFFF8FAF8),
-        builder: (context) => _WeeklyRecapSheet(recap: recap),
+        builder: (context) => FractionallySizedBox(
+          heightFactor: 0.75,
+          child: _WeeklyRecapSheet(recap: recap),
+        ),
       );
     } catch (error) {
       if (!mounted) return;
@@ -550,7 +555,7 @@ class _WeeklyRecapSheet extends StatelessWidget {
       child: Padding(
         padding: const EdgeInsets.fromLTRB(24, 4, 24, 28),
         child: Column(
-          mainAxisSize: MainAxisSize.min,
+          mainAxisSize: MainAxisSize.max,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
@@ -572,18 +577,22 @@ class _WeeklyRecapSheet extends StatelessWidget {
             ),
             const SizedBox(height: 18),
             if (recap.records.isEmpty)
-              const Text(
-                'No conversations are recorded for this week yet.',
-                style: TextStyle(
-                  color: _SettingsDrawerState._mutedInk,
-                  height: 1.4,
+              const Expanded(
+                child: Align(
+                  alignment: Alignment.topLeft,
+                  child: Text(
+                    'No conversations are recorded for this week yet.',
+                    style: TextStyle(
+                      color: _SettingsDrawerState._mutedInk,
+                      height: 1.4,
+                    ),
+                  ),
                 ),
               )
             else
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxHeight: 360),
+              Expanded(
                 child: ListView.separated(
-                  shrinkWrap: true,
+                  key: const ValueKey('weekly-recap-list'),
                   itemCount: recap.records.length,
                   separatorBuilder: (_, __) => const SizedBox(height: 10),
                   itemBuilder: (context, index) {

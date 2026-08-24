@@ -11,29 +11,18 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Literal, Protocol
+from typing import Literal
 from uuid import uuid4
 
 from ..protocol import AgeBand
 from .common import RealtimeProtocolModel
-from .coordinator import RealtimeSessionCoordinator
 from .provider_session import NegotiatedRealtimeCall
+from .websocket_v4 import RealtimeCoordinatorFactoryV4, RealtimeSessionCoordinatorV4
 
 
-class AvaSessionCreateRequest(RealtimeProtocolModel):
-    protocol_version: Literal[3]
+class AvaSessionCreateRequestV4(RealtimeProtocolModel):
+    protocol_version: Literal[4]
     age_band: AgeBand = AgeBand.UNKNOWN
-
-
-class RealtimeCoordinatorFactory(Protocol):
-    def create(
-        self,
-        *,
-        session_id: str,
-        request_id: str,
-        subject: str,
-        age_band: AgeBand,
-    ) -> RealtimeSessionCoordinator: ...
 
 
 class RealtimeSessionCapacityError(RuntimeError):
@@ -59,6 +48,7 @@ class CreatedRealtimeSession:
     session_id: str
     token: str
     webrtc_token: str
+    canvas_token: str
     expires_at: datetime
 
 
@@ -68,8 +58,9 @@ class _RealtimeSessionRecord:
     subject: str
     token_digest: bytes
     webrtc_token_digest: bytes
+    canvas_token_digest: bytes
     expires_at: datetime
-    coordinator: RealtimeSessionCoordinator
+    coordinator: RealtimeSessionCoordinatorV4
     negotiation_started: bool = False
     negotiated_call_id: str | None = None
     claimed: bool = False
@@ -79,7 +70,7 @@ class _RealtimeSessionRecord:
 class _VerifiedToken:
     session_id: str
     expires_at_epoch: int
-    scope: Literal["events", "webrtc"]
+    scope: Literal["events", "webrtc", "canvas"]
 
 
 class RealtimeSessionTokenCodec:
@@ -98,7 +89,7 @@ class RealtimeSessionTokenCodec:
         *,
         session_id: str,
         expires_at: datetime,
-        scope: Literal["events", "webrtc"],
+        scope: Literal["events", "webrtc", "canvas"],
     ) -> str:
         if expires_at.tzinfo is None:
             raise ValueError("Realtime session expiry must be timezone-aware")
@@ -126,7 +117,7 @@ class RealtimeSessionTokenCodec:
         token: str,
         *,
         expected_session_id: str,
-        expected_scope: Literal["events", "webrtc"],
+        expected_scope: Literal["events", "webrtc", "canvas"],
         now: datetime,
     ) -> _VerifiedToken:
         if now.tzinfo is None:
@@ -160,7 +151,7 @@ class RealtimeSessionTokenCodec:
             or set(payload) != {"exp", "scope", "sid", "v"}
             or payload["v"] != 1
             or not isinstance(payload["exp"], int)
-            or payload["scope"] not in {"events", "webrtc"}
+            or payload["scope"] not in {"events", "webrtc", "canvas"}
             or not isinstance(payload["sid"], str)
             or payload["sid"] != expected_session_id
             or payload["scope"] != expected_scope
@@ -176,12 +167,12 @@ class RealtimeSessionTokenCodec:
 
 
 class RealtimeSessionRegistry:
-    """Bounded owner of one-use protocol-v3 coordinator sessions."""
+    """Bounded owner of one-use protocol-v4 conversation sessions."""
 
     def __init__(
         self,
         *,
-        coordinator_factory: RealtimeCoordinatorFactory,
+        coordinator_factory: RealtimeCoordinatorFactoryV4,
         token_codec: RealtimeSessionTokenCodec,
         ttl: timedelta,
         max_sessions: int,
@@ -239,6 +230,11 @@ class RealtimeSessionRegistry:
                 expires_at=expires_at,
                 scope="webrtc",
             )
+            canvas_token = self._token_codec.issue(
+                session_id=session_id,
+                expires_at=expires_at,
+                scope="canvas",
+            )
             coordinator = self._coordinator_factory.create(
                 session_id=session_id,
                 request_id=request_id,
@@ -252,6 +248,9 @@ class RealtimeSessionRegistry:
                 webrtc_token_digest=hashlib.sha256(
                     webrtc_token.encode("utf-8")
                 ).digest(),
+                canvas_token_digest=hashlib.sha256(
+                    canvas_token.encode("utf-8")
+                ).digest(),
                 expires_at=expires_at,
                 coordinator=coordinator,
             )
@@ -259,6 +258,7 @@ class RealtimeSessionRegistry:
                 session_id=session_id,
                 token=token,
                 webrtc_token=webrtc_token,
+                canvas_token=canvas_token,
                 expires_at=expires_at,
             )
 
@@ -326,7 +326,7 @@ class RealtimeSessionRegistry:
         *,
         session_id: str,
         token: str,
-    ) -> RealtimeSessionCoordinator:
+    ) -> RealtimeSessionCoordinatorV4:
         now = self._now()
         self._token_codec.verify(
             token,
@@ -359,6 +359,49 @@ class RealtimeSessionRegistry:
                 )
             record.claimed = True
             return record.coordinator
+
+    async def authorize_canvas_document(
+        self,
+        *,
+        session_id: str,
+        token: str,
+        subject: str,
+    ) -> None:
+        """Authorize an independent SVG/manifest fetch without claiming events."""
+
+        now = self._now()
+        self._token_codec.verify(
+            token,
+            expected_session_id=session_id,
+            expected_scope="canvas",
+            now=now,
+        )
+        token_digest = hashlib.sha256(token.encode("utf-8")).digest()
+        async with self._lock:
+            record = self._records.get(session_id)
+            if record is None:
+                raise RealtimeSessionAuthenticationError(
+                    RealtimeSessionAuthFailure.UNKNOWN
+                )
+            if record.expires_at <= now:
+                raise RealtimeSessionAuthenticationError(
+                    RealtimeSessionAuthFailure.EXPIRED
+                )
+            if not hmac.compare_digest(record.canvas_token_digest, token_digest):
+                raise RealtimeSessionAuthenticationError(
+                    RealtimeSessionAuthFailure.INVALID
+                )
+            if not hmac.compare_digest(
+                record.subject.encode("utf-8"),
+                subject.encode("utf-8"),
+            ):
+                raise RealtimeSessionAuthenticationError(
+                    RealtimeSessionAuthFailure.INVALID
+                )
+            if record.negotiated_call_id is None:
+                raise RealtimeSessionAuthenticationError(
+                    RealtimeSessionAuthFailure.NOT_READY
+                )
 
     async def release(self, session_id: str) -> None:
         async with self._lock:

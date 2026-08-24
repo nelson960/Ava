@@ -3,6 +3,7 @@ import 'dart:collection';
 import 'package:flutter/foundation.dart';
 
 import '../models/ava_realtime_protocol.dart';
+import '../models/ava_realtime_protocol_v4.dart';
 
 enum AvaRealtimeViseme { aa, ih, ou, ee, oh, closed }
 
@@ -130,7 +131,7 @@ final class AvaRealtimePresentationState {
       phase != AvaRealtimeTurnPhase.failed;
 }
 
-/// Long-lived Flutter presentation state for one protocol-v3 turn at a time.
+/// Long-lived Flutter presentation state for one protocol-v4 turn at a time.
 ///
 /// Network events update this controller, but animation frames do not. Caption
 /// and viseme positions are derived only from the native rendered-sample clock.
@@ -152,11 +153,6 @@ final class AvaRealtimePresentationController extends ChangeNotifier {
     required String sessionId,
     required String turnId,
   }) {
-    if (_state.isActive) {
-      throw StateError(
-        'Realtime presentation turn ${_state.turnId} is still active.',
-      );
-    }
     _segments.clear();
     _segmentsById.clear();
     _spans.clear();
@@ -273,7 +269,11 @@ final class AvaRealtimePresentationController extends ChangeNotifier {
     final currentSegment = deliveredSpan == null
         ? (_segments.isEmpty ? null : _segments.first)
         : _segmentsById[deliveredSpan.segmentId];
-    final caption = deliveredSpan == null || currentSegment == null
+    const captionLingerSamples = 24000 * 3 ~/ 2;
+    final caption = deliveredSpan == null ||
+            currentSegment == null ||
+            (renderedSampleCount >
+                deliveredSpan.sampleEnd + captionLingerSamples)
         ? null
         : _captionLineAt(
             currentSegment.speech,
@@ -390,7 +390,7 @@ final class AvaRealtimePresentationController extends ChangeNotifier {
     );
   }
 
-  void complete(AvaRealtimeServerEvent event) {
+  void complete(AvaRealtimeServerEventV4 event) {
     if (!event.isTerminal) {
       throw ArgumentError.value(
         event.type,
@@ -401,11 +401,11 @@ final class AvaRealtimePresentationController extends ChangeNotifier {
     _requireActiveTurn();
     _replace(
       phase: switch (event.type) {
-        AvaRealtimeServerEventType.turnCompleted =>
+        AvaRealtimeServerEventTypeV4.turnCompleted =>
           AvaRealtimeTurnPhase.completed,
-        AvaRealtimeServerEventType.turnCancelled =>
+        AvaRealtimeServerEventTypeV4.turnCancelled =>
           AvaRealtimeTurnPhase.cancelled,
-        AvaRealtimeServerEventType.turnFailed => AvaRealtimeTurnPhase.failed,
+        AvaRealtimeServerEventTypeV4.turnFailed => AvaRealtimeTurnPhase.failed,
         _ => throw StateError('Unexpected non-terminal event.'),
       },
       caption: null,

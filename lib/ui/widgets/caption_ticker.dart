@@ -1,9 +1,11 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../state/app_state.dart';
 
-class CaptionTicker extends ConsumerWidget {
+class CaptionTicker extends ConsumerStatefulWidget {
   const CaptionTicker({
     super.key,
     required this.dashboardVisible,
@@ -12,12 +14,59 @@ class CaptionTicker extends ConsumerWidget {
   final bool dashboardVisible;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<CaptionTicker> createState() => _CaptionTickerState();
+}
+
+class _CaptionTickerState extends ConsumerState<CaptionTicker> {
+  Timer? _lingerTimer;
+  String? _displayedCaption;
+  String? _sourceCaption;
+
+  @override
+  void dispose() {
+    _lingerTimer?.cancel();
+    super.dispose();
+  }
+
+  void _scheduleFadeOut() {
+    _lingerTimer?.cancel();
+    _lingerTimer = Timer(const Duration(milliseconds: 1400), () {
+      if (mounted) {
+        setState(() {
+          _displayedCaption = null;
+        });
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final enabled = ref.watch(
       studentProvider.select((student) => student.captionsEnabled),
     );
-    final realtimePresentation = ref.watch(avaRealtimePresentationProvider);
-    final caption = realtimePresentation.state.caption;
+    final currentCaption = ref
+        .watch(
+          avaRealtimePresentationProvider,
+        )
+        .state
+        .caption;
+
+    if (!enabled) {
+      _displayedCaption = null;
+      _sourceCaption = null;
+      _lingerTimer?.cancel();
+    } else if (currentCaption != null && currentCaption.isNotEmpty) {
+      _sourceCaption = currentCaption;
+      _displayedCaption = currentCaption;
+      _lingerTimer?.cancel();
+    } else if (_sourceCaption != null) {
+      _sourceCaption = null;
+      if (_displayedCaption != null) {
+        _scheduleFadeOut();
+      }
+    }
+
+    final caption = enabled ? _displayedCaption : null;
 
     return AnimatedSwitcher(
       duration: const Duration(milliseconds: 180),
@@ -37,7 +86,7 @@ class CaptionTicker extends ConsumerWidget {
                     overflow: TextOverflow.ellipsis,
                     textAlign: TextAlign.center,
                     style: TextStyle(
-                      color: dashboardVisible
+                      color: widget.dashboardVisible
                           ? const Color(0xFF303440)
                           : const Color(0xFF29313C),
                       fontSize: 15,

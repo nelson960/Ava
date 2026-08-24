@@ -3,56 +3,41 @@ from __future__ import annotations
 import asyncio
 import logging
 from builtins import anext
-from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from dataclasses import dataclass
-from hashlib import sha256
 from time import monotonic
-from typing import Protocol, TypeAlias, cast
+from typing import TypeAlias, cast
 
-from ..canvas.specialist import (
-    CanvasSpecialist,
-    CanvasSpecialistError,
-    CanvasSpecialistGeneration,
-    CanvasSpecialistInvalidError,
-    CanvasSpecialistRequest,
-    CanvasSpecialistUnavailableError,
-)
-from ..canvas.session import (
-    CanvasInteractionRejected,
-    CanvasInteractionRejectionCode,
-    CanvasSessionState,
-    PreparedCanvasDraft,
-)
 from ..diagnostics import new_failure_id
 from ..protocol import AgeBand
 from .bounded_queue import BoundedAsyncQueue, QueueClosed
+from .coordinator_v4 import ProtocolV4CanvasEventSink
 from .delivery import (
     DeliveredTextLedger,
     SpeechDeliveryError,
     StreamingSpeechSynthesizer,
     SynthesizedAlignmentBatch,
     SynthesizedAudioChunk,
+    SynthesizedSpeechItem,
 )
-from .events import (
-    AVA_SERVER_EVENT_ADAPTER,
-    PROTOCOL_V3,
-    AlignmentBatchEvent,
-    AudioChunkEvent,
-    AudioMetadataEvent,
-    AvaAlignmentSpan,
-    AvaClientEventUnion,
-    AvaFailureCode,
-    AvaFailureComponent,
-    AvaServerEventUnion,
-    AvaTurnPhase,
-    CancelTurnEvent,
-    CanvasInteractionEvent,
-    ClientReadyEvent,
-    InteractionRejectedEvent,
-    PlaybackProgressEvent,
-    PlaybackStartedEvent,
-    PlaybackStoppedEvent,
+from .events_v4 import (
+    AVA_SERVER_EVENT_ADAPTER_V4,
+    PROTOCOL_V4,
+    AlignmentBatchEventV4,
+    AudioChunkEventV4,
+    AudioMetadataEventV4,
+    AvaClientEventUnionV4,
+    AvaServerEventUnionV4,
+    CancelTurnEventV4,
+    CanvasDocumentPreparedEventV4,
+    CanvasInteractionEventV4,
+    CanvasPreparationFailedEventV4,
+    CanvasPresentedEventV4,
+    CanvasRuntimeFailedEventV4,
+    ClientReadyEventV4,
+    PlaybackProgressEventV4,
+    PlaybackStartedEventV4,
+    PlaybackStoppedEventV4,
 )
 from .harness import RealtimeHarness, build_realtime_harness
 from .memory import (
@@ -63,22 +48,36 @@ from .memory import (
     DeliveredTurnTerminal,
     MemoryProposalDecision,
 )
-from .plan import AvaTurnPlan, AvaTurnSegment, CanvasComplexity
 from .provider_session import (
     NegotiatedRealtimeCall,
+    RealtimeProviderInputEvent,
+    RealtimeProviderProtocolError,
     RealtimeProviderTurnEvent,
     RealtimeProviderSession,
+    RealtimeProviderUnavailableError,
 )
 from .state_machine import RealtimeStateError, RealtimeTurnStateMachine
+from .speech_contract import (
+    SpeechAlignment,
+    SpeechFailureCode,
+    SpeechFailureComponent,
+    SpeechPhase,
+    SpeechPhrase,
+)
+from .svg_canvas_jobs import SvgCanvasJobCoordinator
 from .tool_contract import (
-    InteractiveCanvasRequest,
-    InteractiveCanvasToolOutput,
-    InteractiveCanvasToolStatus,
+    InteractiveCanvasToolOutputV4,
+    InteractiveCanvasToolStatusV4,
     RealtimeCanvasToolCall,
     RealtimeRejectedCanvasToolCall,
     RealtimeSpeechTextDelta,
 )
 from .turn_parser import StreamingSpeechParser, StreamingTurnParseError
+from .websocket_v4 import (
+    AvaServerControlFrameV4,
+    AvaServerOutboundFrameV4,
+    AvaServerPcmFrameV4,
+)
 
 LOGGER = logging.getLogger("ava_backend.realtime_coordinator")
 
@@ -87,77 +86,24 @@ class CoordinatorStateError(RuntimeError):
     """Raised when a client command violates coordinator ownership or ordering."""
 
 
-@dataclass(frozen=True, slots=True)
-class AvaServerControlFrame:
-    event: AvaServerEventUnion
-
-
-@dataclass(frozen=True, slots=True)
-class AvaServerPcmFrame:
-    """Binary frame that immediately follows its audioChunk control descriptor."""
-
-    descriptor: AudioChunkEvent
-    pcm: bytes
-
-    def __post_init__(self) -> None:
-        if len(self.pcm) != self.descriptor.byte_length:
-            raise ValueError("binary PCM length does not match audioChunk byteLength")
-
-
-AvaServerOutboundFrame: TypeAlias = AvaServerControlFrame | AvaServerPcmFrame
-MemoryIdFactory: TypeAlias = Callable[[str], str]
 IdentifierFactory: TypeAlias = Callable[[], str]
 
 
 @dataclass(slots=True)
 class _PlanningState:
-    canvas_task: asyncio.Task[CanvasSpecialistGeneration] | None = None
     canvas_started: float | None = None
-    canvas_prepared: PreparedCanvasDraft | None = None
-    canvas_transaction: dict[str, object] | None = None
-    canvas_rejection: str | None = None
-    canvas_failure_id: str | None = None
     canvas_call_id: str | None = None
-    canvas_brief: str | None = None
+    canvas_generation_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
-class _CanvasInteractionRejection:
-    scene_id: str
-    scene_revision: int
-    interaction_revision: int
-    binding_id: str
-    code: CanvasInteractionRejectionCode
-    message: str
-
-
-class RealtimeSessionCoordinator(Protocol):
-    """Transport-independent boundary for one realtime conversation."""
-
-    def frames(self) -> AsyncIterator[AvaServerOutboundFrame]:
-        """Yield ordered JSON control and binary PCM frames."""
-        ...
-
-    async def negotiate(self, *, offer_sdp: str) -> NegotiatedRealtimeCall:
-        """Negotiate the one WebRTC media session owned by this Ava session."""
-        ...
-
-    async def receive(self, event: AvaClientEventUnion) -> None:
-        """Accept one validated protocol-v3 client control event."""
-        ...
-
-    async def close(self) -> None:
-        """Release the session and all provider/network resources."""
-        ...
-
-    @property
-    def turn_id(self) -> str:
-        """Current turn identifier for safe diagnostics."""
-        ...
+class _TurnResult:
+    segments: tuple[SpeechPhrase, ...]
+    child_turn_summary: str
 
 
 class DeterministicRealtimeSessionCoordinator:
-    """Protocol-v3 conversation using injected provider and memory seams.
+    """Protocol-v4 conversation using injected provider and memory seams.
 
     This coordinator is production-shaped but transport-free. Deterministic
     fake providers exercise it without credentials; live adapters implement the
@@ -175,11 +121,10 @@ class DeterministicRealtimeSessionCoordinator:
         age_band: AgeBand,
         realtime: RealtimeProviderSession,
         speech: StreamingSpeechSynthesizer,
-        canvas_specialist: CanvasSpecialist,
+        canvas_jobs: SvgCanvasJobCoordinator,
+        canvas_events: ProtocolV4CanvasEventSink,
         memory: AuthoritativeMemoryStore,
-        memory_id_factory: MemoryIdFactory,
         max_audio_chunk_bytes: int = 192_000,
-        canvas_state: CanvasSessionState | None = None,
         persistent: bool = False,
         turn_id_factory: IdentifierFactory | None = None,
         request_id_factory: IdentifierFactory | None = None,
@@ -199,11 +144,10 @@ class DeterministicRealtimeSessionCoordinator:
         self._child_text_source: ChildTurnTextSource | None = None
         self._realtime = realtime
         self._speech = speech
-        self._canvas_specialist = canvas_specialist
+        self._canvas_jobs = canvas_jobs
+        self._canvas_events = canvas_events
         self._memory = memory
-        self._memory_id_factory = memory_id_factory
         self._max_audio_chunk_bytes = max_audio_chunk_bytes
-        self._canvas_state = canvas_state or CanvasSessionState()
         self._persistent = persistent
         self._turn_id_factory = turn_id_factory
         self._request_id_factory = request_id_factory
@@ -219,21 +163,18 @@ class DeterministicRealtimeSessionCoordinator:
             )
 
         self._machine = RealtimeTurnStateMachine()
-        self._controls: BoundedAsyncQueue[AvaClientEventUnion] = BoundedAsyncQueue(
+        self._controls: BoundedAsyncQueue[AvaClientEventUnionV4] = BoundedAsyncQueue(
             max_items=64,
             max_weight=64 * 1024,
             weigh=lambda event: len(event.model_dump_json(by_alias=True)),
         )
-        self._interaction_rejections: deque[_CanvasInteractionRejection] = deque()
-        self._interaction_rejection_available = asyncio.Event()
-        self._interaction_rejection_capacity = asyncio.Event()
-        self._interaction_rejection_capacity.set()
         self._canvas_context_lock = asyncio.Lock()
         self._memory_snapshot: AuthoritativeMemorySnapshot | None = None
         self._harness: RealtimeHarness | None = None
         self._negotiated_call: NegotiatedRealtimeCall | None = None
         self._sequence = 0
         self._revision = 0
+        self._canvas_revision = 0
         self._next_client_sequence = 0
         self._next_audio_chunk_index = 0
         self._started = False
@@ -242,24 +183,27 @@ class DeterministicRealtimeSessionCoordinator:
         self._playback_started = False
         self._last_rendered_sample_count = 0
         self._stopped_sample_count: int | None = None
-        self._cancel_event: CancelTurnEvent | None = None
+        self._cancel_event: CancelTurnEventV4 | None = None
         self._cancellation_requested = asyncio.Event()
         self._terminal = False
         self._session_reusable = True
         self._closed = False
         self._last_memory_decision: MemoryProposalDecision | None = None
-        self._last_canvas_generation: CanvasSpecialistGeneration | None = None
-        self._canvas_cue_sent = False
         self._canvas_status = "notRequested"
         self._terminal_failure_code: str | None = None
         self._last_failure_id: str | None = None
         self._last_failure_component: str | None = None
         self._pending_memory_refresh_warning: tuple[str, str] | None = None
         self._last_error: Exception | None = None
-        self._active_planning_task: asyncio.Task[AvaTurnPlan | None] | None = None
-        self._active_canvas_task: asyncio.Task[CanvasSpecialistGeneration] | None = None
+        self._active_planning_task: asyncio.Task[_TurnResult | None] | None = None
+        self._active_provider_input_task: (
+            asyncio.Task[RealtimeProviderInputEvent] | None
+        ) = None
         self._previous_terminal_turn_id: str | None = None
         self._previous_terminal_stream_id: str | None = None
+        self._pending_provider_input_item_ids: set[str] = set()
+        self._interrupt_signalled_item_ids: set[str] = set()
+        self._interruption_provider_item_id: str | None = None
 
     @property
     def harness(self) -> RealtimeHarness:
@@ -278,14 +222,6 @@ class DeterministicRealtimeSessionCoordinator:
     @property
     def last_memory_decision(self) -> MemoryProposalDecision | None:
         return self._last_memory_decision
-
-    @property
-    def last_canvas_generation(self) -> CanvasSpecialistGeneration | None:
-        return self._last_canvas_generation
-
-    @property
-    def canvas_state(self) -> CanvasSessionState:
-        return self._canvas_state
 
     @property
     def last_error(self) -> Exception | None:
@@ -326,7 +262,7 @@ class DeterministicRealtimeSessionCoordinator:
             harness_started = monotonic()
             harness = build_realtime_harness(
                 snapshot,
-                canvas_context=self._canvas_state.render_realtime_context(),
+                canvas_context=self._current_canvas_context(),
             )
             LOGGER.info(
                 "realtime_stage session_id=%s request_id=%s stage=harness.build "
@@ -375,7 +311,7 @@ class DeterministicRealtimeSessionCoordinator:
         )
         return negotiated
 
-    async def receive(self, event: AvaClientEventUnion) -> None:
+    async def receive(self, event: AvaClientEventUnionV4) -> None:
         if self._closed:
             raise CoordinatorStateError("cannot receive on a closed coordinator")
         if event.session_id != self._session_id:
@@ -385,8 +321,9 @@ class DeterministicRealtimeSessionCoordinator:
                 f"expected client sequence {self._next_client_sequence}, "
                 f"received {event.sequence}"
             )
+        self._next_client_sequence += 1
 
-        if isinstance(event, ClientReadyEvent):
+        if isinstance(event, ClientReadyEventV4):
             if self._client_ready:
                 raise CoordinatorStateError("clientReady may occur only once")
             if self._started:
@@ -394,35 +331,26 @@ class DeterministicRealtimeSessionCoordinator:
                     "clientReady must arrive before turn streaming starts"
                 )
             self._client_ready = True
-            self._next_client_sequence += 1
             return
 
-        if isinstance(event, CanvasInteractionEvent):
-            try:
-                self._canvas_state.record_interaction(
-                    scene_id=event.scene_id,
-                    scene_revision=event.scene_revision,
-                    interaction_revision=event.interaction_revision,
-                    binding_id=event.binding_id,
-                )
-            except CanvasInteractionRejected as error:
-                while len(self._interaction_rejections) >= 32:
-                    self._interaction_rejection_capacity.clear()
-                    await self._interaction_rejection_capacity.wait()
-                self._interaction_rejections.append(
-                    _CanvasInteractionRejection(
-                        scene_id=event.scene_id,
-                        scene_revision=event.scene_revision,
-                        interaction_revision=event.interaction_revision,
-                        binding_id=event.binding_id,
-                        code=error.code,
-                        message=str(error),
-                    )
-                )
-                self._interaction_rejection_available.set()
-            else:
+        if isinstance(event, CanvasDocumentPreparedEventV4):
+            await self._canvas_jobs.document_prepared(event)
+            return
+        if isinstance(event, CanvasPreparationFailedEventV4):
+            await self._canvas_jobs.preparation_failed(event)
+            return
+        if isinstance(event, CanvasPresentedEventV4):
+            await self._canvas_jobs.presented(event)
+            await self._refresh_canvas_context()
+            return
+        if isinstance(event, CanvasRuntimeFailedEventV4):
+            await self._canvas_jobs.runtime_failed(event)
+            await self._refresh_canvas_context()
+            return
+        if isinstance(event, CanvasInteractionEventV4):
+            interaction = await self._canvas_jobs.interaction(event)
+            if interaction is not None:
                 await self._refresh_canvas_context()
-            self._next_client_sequence += 1
             return
 
         if self._is_late_terminal_playback_control(event):
@@ -435,7 +363,6 @@ class DeterministicRealtimeSessionCoordinator:
                 str(event.event),
                 event.sequence,
             )
-            self._next_client_sequence += 1
             return
 
         if self._terminal:
@@ -443,7 +370,7 @@ class DeterministicRealtimeSessionCoordinator:
 
         self._validate_turn_and_stream(event)
         should_enqueue = True
-        if isinstance(event, PlaybackStartedEvent):
+        if isinstance(event, PlaybackStartedEventV4):
             if not self._audio_metadata_sent:
                 raise CoordinatorStateError(
                     "playbackStarted requires prior audioMetadata"
@@ -451,24 +378,44 @@ class DeterministicRealtimeSessionCoordinator:
             if self._playback_started:
                 raise CoordinatorStateError("playbackStarted may occur only once")
             self._playback_started = True
-        elif isinstance(event, PlaybackProgressEvent):
+        elif isinstance(event, PlaybackProgressEventV4):
             self._require_playback_started()
             self._validate_rendered_position(
                 event.rendered_sample_count,
                 buffered_sample_count=event.buffered_sample_count,
             )
             self._last_rendered_sample_count = event.rendered_sample_count
-        elif isinstance(event, PlaybackStoppedEvent):
+        elif isinstance(event, PlaybackStoppedEventV4):
             self._require_playback_started()
             self._validate_rendered_position(event.rendered_sample_count)
             self._last_rendered_sample_count = event.rendered_sample_count
             self._stopped_sample_count = event.rendered_sample_count
-        elif isinstance(event, CancelTurnEvent):
+        elif isinstance(event, CancelTurnEventV4):
             registered = self._machine.register_cancellation(event.request_id)
             if registered:
                 self._cancel_event = event
                 self._cancellation_requested.set()
-                await self._canvas_specialist.cancel(turn_id=self._turn_id)
+                LOGGER.info(
+                    "realtime_cancellation_received session_id=%s turn_id=%s "
+                    "request_id=%s reason=%s provider_input_item_id=%s",
+                    self._session_id,
+                    self._turn_id,
+                    event.request_id,
+                    event.reason,
+                    self._interruption_provider_item_id,
+                    extra={
+                        "ava_context": {
+                            "sessionId": self._session_id,
+                            "turnId": self._turn_id,
+                            "requestId": event.request_id,
+                            "cancellationReason": event.reason,
+                            "providerInputItemId": (
+                                self._interruption_provider_item_id
+                            ),
+                        }
+                    },
+                )
+                await self._interrupt_canvas_turn()
             else:
                 should_enqueue = False
         else:
@@ -478,15 +425,18 @@ class DeterministicRealtimeSessionCoordinator:
 
         if should_enqueue:
             self._controls.put_nowait(event)
-        self._next_client_sequence += 1
 
     def _is_late_terminal_playback_control(
         self,
-        event: AvaClientEventUnion,
+        event: AvaClientEventUnionV4,
     ) -> bool:
         if not isinstance(
             event,
-            (PlaybackStartedEvent, PlaybackProgressEvent, PlaybackStoppedEvent),
+            (
+                PlaybackStartedEventV4,
+                PlaybackProgressEventV4,
+                PlaybackStoppedEventV4,
+            ),
         ):
             return False
         if self._terminal:
@@ -497,7 +447,7 @@ class DeterministicRealtimeSessionCoordinator:
             and event.stream_id == self._previous_terminal_stream_id
         )
 
-    async def frames(self) -> AsyncIterator[AvaServerOutboundFrame]:
+    async def frames(self) -> AsyncIterator[AvaServerOutboundFrameV4]:
         if self._started:
             raise CoordinatorStateError("coordinator frames may be consumed only once")
         if self._closed:
@@ -513,19 +463,19 @@ class DeterministicRealtimeSessionCoordinator:
         self._started = True
 
         conversation = self._conversation_frames().__aiter__()
-        conversation_task: asyncio.Task[AvaServerOutboundFrame] | None = (
+        conversation_task: asyncio.Task[AvaServerOutboundFrameV4] | None = (
             asyncio.create_task(_next_outbound_frame(conversation))
         )
-        rejection_task: asyncio.Task[bool] | None = asyncio.create_task(
-            self._interaction_rejection_available.wait()
+        canvas_task: asyncio.Task[dict[str, object]] = asyncio.create_task(
+            self._canvas_events.next_payload(),
+            name="ava-v4-canvas-control",
         )
         try:
             while conversation_task is not None:
                 pending: set[asyncio.Task[object]] = {
-                    cast(asyncio.Task[object], conversation_task)
+                    cast(asyncio.Task[object], conversation_task),
+                    cast(asyncio.Task[object], canvas_task),
                 }
-                if rejection_task is not None:
-                    pending.add(cast(asyncio.Task[object], rejection_task))
                 done, _ = await asyncio.wait(
                     pending,
                     return_when=asyncio.FIRST_COMPLETED,
@@ -541,66 +491,42 @@ class DeterministicRealtimeSessionCoordinator:
                         conversation_task = None
                     else:
                         yield frame
-                        if isinstance(frame, AvaServerControlFrame) and isinstance(
+                        if isinstance(frame, AvaServerControlFrameV4) and isinstance(
                             frame.event,
-                            AudioChunkEvent,
+                            AudioChunkEventV4,
                         ):
                             pcm = await anext(conversation)
-                            if not isinstance(pcm, AvaServerPcmFrame):
+                            if not isinstance(pcm, AvaServerPcmFrameV4):
                                 raise CoordinatorStateError(
                                     "audioChunk was not followed by binary PCM"
                                 )
                             yield pcm
-                        # A client action can arrive while the generator is
-                        # suspended at ``yield``. Emit its session warning
-                        # before allocating the next turn-frame sequence.
-                        if self._interaction_rejections:
-                            if rejection_task is None:
-                                raise CoordinatorStateError(
-                                    "canvas interaction rejection reader is missing"
-                                )
-                            await rejection_task
-                            rejection = self._pop_interaction_rejection()
-                            yield self._interaction_rejected_frame(rejection)
-                            rejection_task = asyncio.create_task(
-                                self._interaction_rejection_available.wait()
-                            )
                         conversation_task = asyncio.create_task(
                             _next_outbound_frame(conversation)
                         )
 
-                if rejection_task is not None and rejection_task in done:
-                    rejection_task.result()
-                    rejection = self._pop_interaction_rejection()
-                    yield self._interaction_rejected_frame(rejection)
-                    rejection_task = asyncio.create_task(
-                        self._interaction_rejection_available.wait()
+                if canvas_task in done:
+                    yield AvaServerControlFrameV4(
+                        event=self._canvas_event(canvas_task.result())
+                    )
+                    canvas_task = asyncio.create_task(
+                        self._canvas_events.next_payload(),
+                        name="ava-v4-canvas-control",
                     )
         finally:
             tasks = tuple(
-                task for task in (conversation_task, rejection_task) if task is not None
+                task for task in (conversation_task, canvas_task) if task is not None
             )
             for task in tasks:
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             await cast(
-                AsyncGenerator[AvaServerOutboundFrame, None],
+                AsyncGenerator[AvaServerOutboundFrameV4, None],
                 conversation,
             ).aclose()
 
-    def _pop_interaction_rejection(self) -> _CanvasInteractionRejection:
-        if not self._interaction_rejections:
-            raise CoordinatorStateError(
-                "canvas interaction rejection signal had no queued event"
-            )
-        rejection = self._interaction_rejections.popleft()
-        if not self._interaction_rejections:
-            self._interaction_rejection_available.clear()
-        self._interaction_rejection_capacity.set()
-        return rejection
-
-    async def _conversation_frames(self) -> AsyncIterator[AvaServerOutboundFrame]:
+    async def _conversation_frames(self) -> AsyncIterator[AvaServerOutboundFrameV4]:
         while not self._closed:
             async for frame in self._one_turn_frames():
                 yield frame
@@ -618,7 +544,7 @@ class DeterministicRealtimeSessionCoordinator:
                 return
             await self._prepare_next_turn()
 
-    async def _one_turn_frames(self) -> AsyncIterator[AvaServerOutboundFrame]:
+    async def _one_turn_frames(self) -> AsyncIterator[AvaServerOutboundFrameV4]:
         parser = StreamingSpeechParser()
         ledger = DeliveredTextLedger()
         pending_binary_pcm = False
@@ -627,18 +553,60 @@ class DeterministicRealtimeSessionCoordinator:
                 parser=parser,
                 ledger=ledger,
             ):
-                if isinstance(frame, AvaServerControlFrame) and isinstance(
+                if isinstance(frame, AvaServerControlFrameV4) and isinstance(
                     frame.event,
-                    AudioChunkEvent,
+                    AudioChunkEventV4,
                 ):
                     pending_binary_pcm = True
-                elif isinstance(frame, AvaServerPcmFrame):
+                elif isinstance(frame, AvaServerPcmFrameV4):
                     if not pending_binary_pcm:
                         raise CoordinatorStateError(
                             "coordinator emitted binary PCM without its descriptor"
                         )
                     pending_binary_pcm = False
                 yield frame
+        except RealtimeProviderProtocolError as error:
+            if self._terminal:
+                raise
+            if pending_binary_pcm:
+                raise CoordinatorStateError(
+                    "turn failed while a binary PCM frame was pending"
+                ) from error
+            await self._cancel_active_turn_work()
+            self._last_error = error
+            delivered_samples = self._bounded_rendered_sample_count()
+            yield self._failed_frame(
+                SpeechFailureCode.MODEL_INVALID,
+                _format_failure_message(
+                    "Realtime turn failed provider validation",
+                    error,
+                ),
+                component=SpeechFailureComponent.REALTIME_PROVIDER,
+                retryable=False,
+                delivered_sample_count=delivered_samples,
+                delivered_text=ledger.delivered_text(delivered_samples),
+            )
+        except RealtimeProviderUnavailableError as error:
+            if self._terminal:
+                raise
+            if pending_binary_pcm:
+                raise CoordinatorStateError(
+                    "turn failed while a binary PCM frame was pending"
+                ) from error
+            await self._cancel_active_turn_work()
+            self._last_error = error
+            delivered_samples = self._bounded_rendered_sample_count()
+            yield self._failed_frame(
+                SpeechFailureCode.MODEL_UNAVAILABLE,
+                _format_failure_message(
+                    "Realtime planning stream became unavailable",
+                    error,
+                ),
+                component=SpeechFailureComponent.REALTIME_PROVIDER,
+                retryable=True,
+                delivered_sample_count=delivered_samples,
+                delivered_text=ledger.delivered_text(delivered_samples),
+            )
         except Exception as error:
             if self._terminal:
                 raise
@@ -650,30 +618,35 @@ class DeterministicRealtimeSessionCoordinator:
             self._last_error = error
             delivered_samples = self._bounded_rendered_sample_count()
             yield self._failed_frame(
-                AvaFailureCode.INTERNAL,
+                SpeechFailureCode.INTERNAL,
                 "Ava's turn could not be completed safely.",
-                component=AvaFailureComponent.COORDINATOR,
+                component=SpeechFailureComponent.COORDINATOR,
                 retryable=True,
                 delivered_sample_count=delivered_samples,
                 delivered_text=ledger.delivered_text(delivered_samples),
             )
+        finally:
+            # The provider-input observer is turn-owned. It starts before
+            # planning, so every turn exit must join it -- including an empty
+            # provider response that returns before the playback-loop cleanup.
+            await self._cancel_provider_input_observer()
 
     async def _one_turn_frames_impl(
         self,
         *,
         parser: StreamingSpeechParser,
         ledger: DeliveredTextLedger,
-    ) -> AsyncIterator[AvaServerOutboundFrame]:
+    ) -> AsyncIterator[AvaServerOutboundFrameV4]:
         turn_started = monotonic()
         yield self._turn_created_frame()
-        yield self._phase_frame(AvaTurnPhase.CONNECTING)
+        yield self._phase_frame(SpeechPhase.CONNECTING)
 
         if self._harness is None:
             raise CoordinatorStateError(
                 "Realtime prompt must be prepared during media negotiation"
             )
 
-        yield self._phase_frame(AvaTurnPhase.LISTENING)
+        yield self._phase_frame(SpeechPhase.LISTENING)
         if self._pending_memory_refresh_warning is not None:
             failure_id, message = self._pending_memory_refresh_warning
             self._pending_memory_refresh_warning = None
@@ -689,12 +662,42 @@ class DeterministicRealtimeSessionCoordinator:
             (monotonic() - turn_started) * 1000,
         )
 
-        plan: AvaTurnPlan | None = None
+        # Provider input observed while the previous turn was being
+        # cancelled/playback-drained remains unowned until this explicit
+        # turn-admission boundary. It must never be assigned merely because
+        # this turn later became current.
+        admit_pending = getattr(
+            self._realtime,
+            "admit_pending_input_items",
+            None,
+        )
+        if callable(admit_pending):
+            await admit_pending(turn_id=self._turn_id)
+        self._pending_provider_input_item_ids.clear()
+        self._interrupt_signalled_item_ids.clear()
+        self._interruption_provider_item_id = None
+
+        # Keep a provider-input observer alive before planning/synthesis. The
+        # sideband reader is session-owned, while this turn observer owns only
+        # the indexed input lifecycle; it must not wait until playback starts
+        # and miss a VAD signal that arrived during synthesis.
+        next_input_event = getattr(self._realtime, "next_input_event", None)
+        input_task: asyncio.Task[RealtimeProviderInputEvent] | None = (
+            asyncio.create_task(
+                next_input_event(),
+                name="ava-provider-input-observer",
+            )
+            if callable(next_input_event)
+            else None
+        )
+        self._active_provider_input_task = input_task
+
+        plan: _TurnResult | None = None
         synthesis_started = False
         provider_error: (
             tuple[
-                AvaFailureCode,
-                AvaFailureComponent,
+                SpeechFailureCode,
+                SpeechFailureComponent,
                 str,
                 bool,
             ]
@@ -702,9 +705,7 @@ class DeterministicRealtimeSessionCoordinator:
         ) = None
         planning_started = False
         planning_state = _PlanningState()
-        planning_updates: asyncio.Queue[AvaTurnSegment | None] = asyncio.Queue(
-            maxsize=8
-        )
+        planning_updates: asyncio.Queue[SpeechPhrase | None] = asyncio.Queue(maxsize=8)
         planning_task = asyncio.create_task(
             self._produce_plan(
                 parser=parser,
@@ -728,7 +729,7 @@ class DeterministicRealtimeSessionCoordinator:
                         self._turn_id,
                         (monotonic() - turn_started) * 1000,
                     )
-                    yield self._phase_frame(AvaTurnPhase.PLANNING)
+                    yield self._phase_frame(SpeechPhase.PLANNING)
 
                 segment = update
                 if ledger.segment_count == 0:
@@ -748,7 +749,7 @@ class DeterministicRealtimeSessionCoordinator:
                     break
                 if not synthesis_started:
                     synthesis_started = True
-                    yield self._phase_frame(AvaTurnPhase.SYNTHESIZING)
+                    yield self._phase_frame(SpeechPhase.SYNTHESIZING)
                     yield self._audio_metadata_frame()
 
                 try:
@@ -758,28 +759,34 @@ class DeterministicRealtimeSessionCoordinator:
                     ):
                         yield frame
                         if self._cancel_event is not None and (
-                            isinstance(frame, AvaServerPcmFrame)
+                            isinstance(frame, AvaServerPcmFrameV4)
                             or not (
-                                isinstance(frame, AvaServerControlFrame)
-                                and isinstance(frame.event, AudioChunkEvent)
+                                isinstance(frame, AvaServerControlFrameV4)
+                                and isinstance(frame.event, AudioChunkEventV4)
                             )
                         ):
                             break
                 except (SpeechDeliveryError, ValueError) as error:
                     self._last_error = error
                     provider_error = (
-                        AvaFailureCode.SPEECH_INVALID,
-                        AvaFailureComponent.SPEECH_PROVIDER,
-                        "Speech PCM or alignment failed validation.",
+                        SpeechFailureCode.SPEECH_INVALID,
+                        SpeechFailureComponent.SPEECH_PROVIDER,
+                        _format_failure_message(
+                            "Speech PCM or alignment failed validation",
+                            error,
+                        ),
                         False,
                     )
                     break
                 except Exception as error:
                     self._last_error = error
                     provider_error = (
-                        AvaFailureCode.SPEECH_UNAVAILABLE,
-                        AvaFailureComponent.SPEECH_PROVIDER,
-                        "Speech synthesis stream became unavailable.",
+                        SpeechFailureCode.SPEECH_UNAVAILABLE,
+                        SpeechFailureComponent.SPEECH_PROVIDER,
+                        _format_failure_message(
+                            "Speech synthesis stream became unavailable",
+                            error,
+                        ),
                         True,
                     )
                     break
@@ -789,46 +796,63 @@ class DeterministicRealtimeSessionCoordinator:
             if provider_error is not None or self._cancel_event is not None:
                 await self._cancel_planning_work(
                     planning_task=planning_task,
-                    state=planning_state,
                 )
             else:
                 plan = await planning_task
                 self._active_planning_task = None
-                if plan is None:
-                    raise StreamingTurnParseError(
-                        "Realtime planning ended without a complete turn"
+                if plan is not None:
+                    LOGGER.info(
+                        "realtime_plan_ready session_id=%s turn_id=%s segments=%d",
+                        self._session_id,
+                        self._turn_id,
+                        len(plan.segments),
                     )
-                LOGGER.info(
-                    "realtime_plan_ready session_id=%s turn_id=%s segments=%d "
-                    "canvas_decision=%s",
-                    self._session_id,
-                    self._turn_id,
-                    len(plan.segments),
-                    plan.canvas_decision.complexity,
-                )
-        except (StreamingTurnParseError, ValueError) as error:
+        except (
+            RealtimeProviderProtocolError,
+            StreamingTurnParseError,
+            ValueError,
+        ) as error:
             await self._cancel_planning_work(
                 planning_task=planning_task,
-                state=planning_state,
             )
             self._last_error = error
             provider_error = (
-                AvaFailureCode.MODEL_INVALID,
-                AvaFailureComponent.REALTIME_PROVIDER,
-                "Realtime turn failed protocol-v3 validation.",
+                SpeechFailureCode.MODEL_INVALID,
+                SpeechFailureComponent.REALTIME_PROVIDER,
+                _format_failure_message(
+                    "Realtime turn failed provider validation",
+                    error,
+                ),
                 False,
+            )
+        except RealtimeProviderUnavailableError as error:
+            await self._cancel_planning_work(
+                planning_task=planning_task,
+            )
+            self._last_error = error
+            provider_error = (
+                SpeechFailureCode.MODEL_UNAVAILABLE,
+                SpeechFailureComponent.REALTIME_PROVIDER,
+                _format_failure_message(
+                    "Realtime planning stream became unavailable",
+                    error,
+                ),
+                True,
             )
         except Exception as error:
             await self._cancel_planning_work(
                 planning_task=planning_task,
-                state=planning_state,
             )
             self._last_error = error
             provider_error = (
-                AvaFailureCode.MODEL_UNAVAILABLE,
-                AvaFailureComponent.REALTIME_PROVIDER,
-                "Realtime planning stream became unavailable.",
-                True,
+                SpeechFailureCode.INTERNAL,
+                SpeechFailureComponent.COORDINATOR,
+                _format_failure_message(
+                    "Realtime planning coordinator encountered an unexpected "
+                    "local failure",
+                    error,
+                ),
+                False,
             )
 
         if self._cancel_event is not None:
@@ -854,15 +878,23 @@ class DeterministicRealtimeSessionCoordinator:
             return
 
         if plan is None or not synthesis_started:
-            await self._cancel_active_turn_work()
-            yield self._failed_frame(
-                AvaFailureCode.MODEL_INVALID,
-                "Realtime turn completed without a valid speech segment.",
-                component=AvaFailureComponent.REALTIME_PROVIDER,
-                retryable=False,
-                delivered_sample_count=0,
-                delivered_text="",
-            )
+            if self._cancel_event is None:
+                self._cancel_event = CancelTurnEventV4.model_validate(
+                    {
+                        "protocolVersion": 4,
+                        "sessionId": self._session_id,
+                        "event": "cancelTurn",
+                        "sequence": self._next_client_sequence,
+                        "turnId": self._turn_id,
+                        "requestId": self._request_id,
+                        "reason": "interrupted_by_speech",
+                    }
+                )
+            async for frame in self._cancel_frames(
+                plan=plan,
+                ledger=ledger,
+            ):
+                yield frame
             return
 
         try:
@@ -873,9 +905,9 @@ class DeterministicRealtimeSessionCoordinator:
             await self._cancel_active_turn_work()
             self._last_error = error
             yield self._failed_frame(
-                AvaFailureCode.SPEECH_INVALID,
+                SpeechFailureCode.SPEECH_INVALID,
                 "Speech alignment did not cover the validated turn.",
-                component=AvaFailureComponent.SPEECH_PROVIDER,
+                component=SpeechFailureComponent.SPEECH_PROVIDER,
                 retryable=False,
                 delivered_sample_count=self._bounded_rendered_sample_count(),
                 delivered_text=ledger.delivered_text(
@@ -886,11 +918,7 @@ class DeterministicRealtimeSessionCoordinator:
 
         # The client can close its streaming PCM input and begin completion
         # immediately. Optional specialist work continues while audio plays.
-        yield self._phase_frame(AvaTurnPhase.SPEAKING)
-
-        canvas_transaction = planning_state.canvas_transaction
-        canvas_rejection = planning_state.canvas_rejection
-        canvas_failure_id = planning_state.canvas_failure_id
+        yield self._phase_frame(SpeechPhase.SPEAKING)
 
         if self._cancel_event is not None:
             async for frame in self._cancel_frames(
@@ -900,55 +928,149 @@ class DeterministicRealtimeSessionCoordinator:
                 yield frame
             return
 
-        if canvas_rejection is not None:
-            if canvas_failure_id is None:
-                raise CoordinatorStateError(
-                    "canvas rejection is missing its diagnostic failure ID"
-                )
-            yield self._canvas_rejected_frame(
-                canvas_rejection,
-                failure_id=canvas_failure_id,
-            )
-        elif canvas_transaction is not None:
+        if planning_state.canvas_generation_id is not None:
             target_segment = (
                 plan.segments[1] if len(plan.segments) > 1 else plan.segments[0]
             )
             sample_offset = ledger.sample_offset_for_segment_start(target_segment.id)
-            LOGGER.info(
-                "canvas_cue_emitted session_id=%s turn_id=%s scene_id=%s "
-                "revision=%s sample_offset=%d",
-                self._session_id,
-                self._turn_id,
-                canvas_transaction["sceneId"],
-                canvas_transaction["revision"],
-                sample_offset,
-            )
-            yield self._canvas_cue_frame(
-                cue_id=_canvas_identifier("canvas_cue", self._turn_id),
-                sample_offset=sample_offset,
-                transaction=canvas_transaction,
-            )
-        while not self._terminal:
             try:
-                control = await self._controls.get()
-            except QueueClosed:
-                return
+                await self._canvas_jobs.request_presentation(
+                    generation_id=planning_state.canvas_generation_id,
+                    presentation_sample_offset=sample_offset,
+                )
+            except Exception as error:
+                # Optional canvas scheduling cannot invalidate already-valid speech.
+                self._last_error = error
+                failure_id = self._failure_id_factory()
+                LOGGER.exception(
+                    "canvas_presentation_schedule_failed failure_id=%s "
+                    "session_id=%s turn_id=%s generation_id=%s",
+                    failure_id,
+                    self._session_id,
+                    self._turn_id,
+                    planning_state.canvas_generation_id,
+                )
+        control_task: asyncio.Task[AvaClientEventUnionV4] | None = asyncio.create_task(
+            self._controls.get(),
+            name="ava-turn-playback-control",
+        )
+        try:
+            while not self._terminal:
+                wait_tasks = {
+                    task for task in (control_task, input_task) if task is not None
+                }
+                done, _ = await asyncio.wait(
+                    wait_tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if input_task is not None and input_task in done:
+                    input_event = input_task.result()
+                    self._pending_provider_input_item_ids.add(input_event.item_id)
+                    if input_event.event_type == "input_audio_buffer.speech_started":
+                        owner_turn_id = self._realtime.input_item_owner(
+                            item_id=input_event.item_id
+                        )
+                        if owner_turn_id == self._turn_id:
+                            LOGGER.info(
+                                "realtime_originating_input_ignored session_id=%s "
+                                "turn_id=%s provider_input_item_id=%s",
+                                self._session_id,
+                                self._turn_id,
+                                input_event.item_id,
+                            )
+                        elif owner_turn_id is not None:
+                            LOGGER.info(
+                                "realtime_stale_input_ignored session_id=%s "
+                                "turn_id=%s owner_turn_id=%s "
+                                "provider_input_item_id=%s",
+                                self._session_id,
+                                self._turn_id,
+                                owner_turn_id,
+                                input_event.item_id,
+                            )
+                        elif (
+                            input_event.item_id
+                            not in self._interrupt_signalled_item_ids
+                        ):
+                            self._interrupt_signalled_item_ids.add(input_event.item_id)
+                            if self._interruption_provider_item_id is None:
+                                self._interruption_provider_item_id = (
+                                    input_event.item_id
+                                )
+                            LOGGER.info(
+                                "realtime_interruption_requested session_id=%s "
+                                "turn_id=%s stream_id=%s provider_input_item_id=%s "
+                                "audio_start_ms=%s",
+                                self._session_id,
+                                self._turn_id,
+                                self._stream_id,
+                                input_event.item_id,
+                                input_event.audio_start_ms,
+                                extra={
+                                    "ava_context": {
+                                        "sessionId": self._session_id,
+                                        "turnId": self._turn_id,
+                                        "streamId": self._stream_id,
+                                        "providerInputItemId": input_event.item_id,
+                                        "providerAudioStartMs": (
+                                            input_event.audio_start_ms
+                                        ),
+                                        "interruptionReason": (
+                                            "providerSpeechStarted"
+                                        ),
+                                    }
+                                },
+                            )
+                            yield self._interrupt_requested_frame(
+                                stream_id=self._stream_id,
+                                reason="providerSpeechStarted",
+                            )
+                    if not callable(next_input_event):
+                        raise CoordinatorStateError(
+                            "provider input observer disappeared during playback"
+                        )
+                    input_task = asyncio.create_task(
+                        next_input_event(),
+                        name="ava-provider-input-observer",
+                    )
+                    self._active_provider_input_task = input_task
+                    continue
 
-            if isinstance(control, CancelTurnEvent):
-                async for frame in self._cancel_frames(plan=plan, ledger=ledger):
-                    yield frame
-                return
-            if isinstance(control, PlaybackProgressEvent):
-                if (
-                    control.rendered_sample_count == self.received_sample_count
-                    and control.buffered_sample_count == 0
-                ):
-                    async for frame in self._complete_frames(
-                        plan=plan,
-                        ledger=ledger,
-                    ):
+                assert control_task is not None
+                try:
+                    control = control_task.result()
+                except QueueClosed:
+                    return
+
+                if isinstance(control, CancelTurnEventV4):
+                    async for frame in self._cancel_frames(plan=plan, ledger=ledger):
                         yield frame
                     return
+                if isinstance(control, PlaybackProgressEventV4):
+                    if (
+                        control.rendered_sample_count == self.received_sample_count
+                        and control.buffered_sample_count == 0
+                    ):
+                        async for frame in self._complete_frames(
+                            plan=plan,
+                            ledger=ledger,
+                        ):
+                            yield frame
+                        return
+                control_task = asyncio.create_task(
+                    self._controls.get(),
+                    name="ava-turn-playback-control",
+                )
+        finally:
+            for task in (control_task, input_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (control_task, input_task) if task is not None),
+                return_exceptions=True,
+            )
+            if self._active_provider_input_task is input_task:
+                self._active_provider_input_task = None
 
     async def _prepare_next_turn(self) -> None:
         if not self._terminal:
@@ -984,7 +1106,6 @@ class DeterministicRealtimeSessionCoordinator:
         self._child_text_source = None
         self._machine = RealtimeTurnStateMachine()
         self._harness = harness
-        self._sequence = 0
         self._revision = 0
         self._next_audio_chunk_index = 0
         self._audio_metadata_sent = False
@@ -993,13 +1114,12 @@ class DeterministicRealtimeSessionCoordinator:
         self._stopped_sample_count = None
         self._cancel_event = None
         self._cancellation_requested = asyncio.Event()
+        self._interruption_provider_item_id = None
         self._terminal = False
-        self._canvas_cue_sent = False
         self._canvas_status = "notRequested"
         self._terminal_failure_code = None
         self._last_failure_id = None
         self._last_failure_component = None
-        self._last_canvas_generation = None
         self._last_error = None
         LOGGER.info(
             "realtime_turn_rearmed session_id=%s turn_id=%s prompt_version=%s "
@@ -1028,11 +1148,11 @@ class DeterministicRealtimeSessionCoordinator:
                 )
             harness = build_realtime_harness(
                 snapshot,
-                canvas_context=self._canvas_state.render_realtime_context(),
+                canvas_context=self._current_canvas_context(),
             )
             await self._realtime.prepare(harness=harness)
             self._harness = harness
-            interaction = self._canvas_state.last_interaction
+            interaction = self._canvas_jobs.state.last_interaction
             LOGGER.info(
                 "canvas_interaction_context_installed session_id=%s scene_id=%s "
                 "scene_revision=%s interaction_revision=%s binding_id=%s",
@@ -1043,13 +1163,17 @@ class DeterministicRealtimeSessionCoordinator:
                 interaction.binding_id if interaction is not None else None,
             )
 
+    def _current_canvas_context(self) -> str | None:
+        context = self._canvas_jobs.state.render_realtime_context()
+        return context or None
+
     async def _produce_plan(
         self,
         *,
         parser: StreamingSpeechParser,
-        updates: asyncio.Queue[AvaTurnSegment | None],
+        updates: asyncio.Queue[SpeechPhrase | None],
         state: _PlanningState,
-    ) -> AvaTurnPlan | None:
+    ) -> _TurnResult | None:
         try:
             async for event in self._turn_events_until_cancelled():
                 if isinstance(event, RealtimeSpeechTextDelta):
@@ -1064,15 +1188,10 @@ class DeterministicRealtimeSessionCoordinator:
                             "Realtime requested more than one canvas in one turn"
                         )
                     state.canvas_call_id = event.call_id
-                    state.canvas_failure_id = self._failure_id_factory()
-                    state.canvas_rejection = (
-                        "The optional visual request did not pass validation."
-                    )
                     self._canvas_status = "rejected"
                     LOGGER.warning(
-                        "canvas_tool_arguments_rejected failure_id=%s "
-                        "session_id=%s turn_id=%s call_id=%s reason=%s",
-                        state.canvas_failure_id,
+                        "canvas_tool_arguments_rejected session_id=%s "
+                        "turn_id=%s call_id=%s reason=%s",
                         self._session_id,
                         self._turn_id,
                         event.call_id,
@@ -1081,12 +1200,17 @@ class DeterministicRealtimeSessionCoordinator:
                     await self._realtime.complete_canvas_tool(
                         turn_id=self._turn_id,
                         call_id=event.call_id,
-                        output=InteractiveCanvasToolOutput.model_validate(
+                        output=InteractiveCanvasToolOutputV4.model_validate(
                             {
-                                "status": InteractiveCanvasToolStatus.REJECTED,
+                                "status": InteractiveCanvasToolStatusV4.REJECTED,
                                 "reason": event.reason,
                             }
                         ),
+                    )
+                    await self._canvas_events.tool_call_rejected(
+                        call_id=event.call_id,
+                        source_turn_id=self._turn_id,
+                        message=event.reason,
                     )
                     continue
                 if not isinstance(event, RealtimeCanvasToolCall):
@@ -1104,10 +1228,11 @@ class DeterministicRealtimeSessionCoordinator:
 
             if self._cancel_event is not None:
                 return None
-            self._commit_prepared_canvas(state)
-            for segment in parser.finish():
+            for segment in parser.finish(allow_empty=True):
                 await updates.put(segment)
             segments = parser.emitted_segments
+            if not segments:
+                return None
             child_transcript = await self._realtime.child_transcript(
                 turn_id=self._turn_id
             )
@@ -1119,26 +1244,9 @@ class DeterministicRealtimeSessionCoordinator:
                 self._child_text = _bounded_child_transcript(child_transcript)
                 self._child_text_source = ChildTurnTextSource.TRANSCRIPT
                 child_summary = _bounded_child_summary(self._child_text)
-            brief = None
-            if state.canvas_call_id is not None:
-                brief = state.canvas_brief
-            return AvaTurnPlan.model_validate(
-                {
-                    "segments": [
-                        segment.model_dump(mode="json", by_alias=True)
-                        for segment in segments
-                    ],
-                    "memoryProposal": None,
-                    "childTurnSummary": child_summary,
-                    "canvasDecision": {
-                        "complexity": (
-                            CanvasComplexity.SPECIALIST_REQUIRED
-                            if brief is not None
-                            else CanvasComplexity.NONE
-                        ),
-                        "specialistBrief": brief,
-                    },
-                }
+            return _TurnResult(
+                segments=segments,
+                child_turn_summary=child_summary,
             )
         finally:
             updates.put_nowait(None)
@@ -1151,152 +1259,56 @@ class DeterministicRealtimeSessionCoordinator:
     ) -> None:
         state.canvas_started = monotonic()
         self._canvas_status = "requested"
-        state.canvas_brief = call.request.brief
-        request = self._canvas_specialist_request(call.request)
-        state.canvas_task = asyncio.create_task(
-            self._canvas_specialist.generate(request)
+        output = await self._canvas_jobs.accept_tool_call(
+            source_turn_id=self._turn_id,
+            call=call,
+            complete_tool=self._complete_canvas_tool,
         )
-        self._active_canvas_task = state.canvas_task
-        LOGGER.info(
-            "canvas_specialist_started session_id=%s turn_id=%s call_id=%s",
-            self._session_id,
-            self._turn_id,
-            call.call_id,
-        )
-        try:
-            try:
-                self._last_canvas_generation = await state.canvas_task
-            finally:
-                if self._active_canvas_task is state.canvas_task:
-                    self._active_canvas_task = None
-            prepared = self._canvas_state.prepare_draft(
-                self._last_canvas_generation.draft,
-                transaction_id=_canvas_identifier("canvas", self._turn_id),
-            )
-            state.canvas_prepared = prepared
-            transaction = prepared.transaction
-        except Exception as error:
-            self._last_error = error
-            state.canvas_failure_id = self._failure_id_factory()
-            state.canvas_rejection = _canvas_rejection_message(error)
-            canvas_provider_error = (
-                error if isinstance(error, CanvasSpecialistError) else None
-            )
-            LOGGER.warning(
-                "canvas_specialist_rejected failure_id=%s session_id=%s turn_id=%s "
-                "error_type=%s provider_status=%s provider_code=%s "
-                "provider_request_id=%s message=%s",
-                state.canvas_failure_id,
+        if output.status == InteractiveCanvasToolStatusV4.ACCEPTED:
+            generation_id = output.generation_id
+            if generation_id is None:  # guarded by the validated model
+                raise CoordinatorStateError(
+                    "accepted protocol-v4 canvas output lost generationId"
+                )
+            state.canvas_generation_id = generation_id
+            self._canvas_status = "accepted"
+            LOGGER.info(
+                "canvas_specialist_accepted_async session_id=%s turn_id=%s "
+                "call_id=%s generation_id=%s elapsed_ms=%.2f",
                 self._session_id,
                 self._turn_id,
-                type(error).__name__,
-                (
-                    canvas_provider_error.provider_status_code
-                    if canvas_provider_error is not None
-                    else None
-                ),
-                (
-                    canvas_provider_error.provider_error_code
-                    if canvas_provider_error is not None
-                    else None
-                ),
-                (
-                    canvas_provider_error.provider_request_id
-                    if canvas_provider_error is not None
-                    else None
-                ),
-                str(error),
-            )
-            await self._realtime.complete_canvas_tool(
-                turn_id=self._turn_id,
-                call_id=call.call_id,
-                output=InteractiveCanvasToolOutput.model_validate(
-                    {
-                        "status": InteractiveCanvasToolStatus.REJECTED,
-                        "reason": _canvas_tool_rejection_reason(error),
-                    }
-                ),
+                call.call_id,
+                generation_id,
+                (monotonic() - state.canvas_started) * 1000,
             )
             return
+        self._canvas_status = "rejected"
 
-        await self._realtime.complete_canvas_tool(
-            turn_id=self._turn_id,
-            call_id=call.call_id,
-            output=InteractiveCanvasToolOutput.model_validate(
-                {
-                    "status": InteractiveCanvasToolStatus.READY,
-                    "sceneId": transaction.scene_id,
-                    "revision": transaction.revision,
-                    "summary": _bounded_canvas_summary(call.request.brief),
-                }
-            ),
-        )
-        LOGGER.info(
-            "canvas_specialist_ready session_id=%s turn_id=%s "
-            "elapsed_ms=%.2f scene_id=%s revision=%d operations=%d bindings=%d",
-            self._session_id,
-            self._turn_id,
-            (monotonic() - state.canvas_started) * 1000,
-            transaction.scene_id,
-            transaction.revision,
-            len(transaction.operations),
-            len(transaction.bindings),
-        )
-
-    def _commit_prepared_canvas(self, state: _PlanningState) -> None:
-        prepared = state.canvas_prepared
-        if prepared is None:
-            return
-        self._canvas_state.commit_prepared(prepared)
-        state.canvas_transaction = prepared.transaction.model_dump(
-            mode="json",
-            by_alias=True,
-        )
-
-    def _canvas_specialist_request(
+    async def _complete_canvas_tool(
         self,
-        request: InteractiveCanvasRequest,
-    ) -> CanvasSpecialistRequest:
-        return CanvasSpecialistRequest.model_validate(
-            {
-                "turnId": self._turn_id,
-                "brief": request.brief,
-                "interactionGoal": request.interaction_goal,
-                "ageBand": self._age_band,
-                "currentRevision": (
-                    self._canvas_state.scene.revision
-                    if self._canvas_state.scene is not None
-                    else None
-                ),
-                "currentScene": (
-                    self._canvas_state.draft.model_dump(
-                        mode="json",
-                        by_alias=True,
-                    )
-                    if self._canvas_state.draft is not None
-                    else None
-                ),
-            }
+        turn_id: str,
+        call_id: str,
+        output: InteractiveCanvasToolOutputV4,
+    ) -> None:
+        await self._realtime.complete_canvas_tool(
+            turn_id=turn_id,
+            call_id=call_id,
+            output=output,
         )
 
     async def _cancel_planning_work(
         self,
         *,
-        planning_task: asyncio.Task[AvaTurnPlan | None],
-        state: _PlanningState,
+        planning_task: asyncio.Task[_TurnResult | None],
     ) -> None:
         await self._cancel_active_turn_work()
         # Local references may have completed before they were registered as
         # active; gathering them here still retrieves every terminal result.
-        await asyncio.gather(
-            planning_task,
-            *(tuple((state.canvas_task,)) if state.canvas_task is not None else ()),
-            return_exceptions=True,
-        )
+        await asyncio.gather(planning_task, return_exceptions=True)
 
     async def _cancel_active_turn_work(self) -> None:
         planning_task = self._active_planning_task
-        canvas_task = self._active_canvas_task
+        await self._cancel_provider_input_observer()
         if planning_task is not None:
             if not planning_task.done():
                 planning_task.cancel()
@@ -1309,21 +1321,27 @@ class DeterministicRealtimeSessionCoordinator:
                     self._session_id,
                     self._turn_id,
                 )
-        if canvas_task is not None and not canvas_task.done():
-            try:
-                await self._canvas_specialist.cancel(turn_id=self._turn_id)
-            except Exception:
-                LOGGER.exception(
-                    "canvas_planning_cleanup_failed session_id=%s turn_id=%s",
-                    self._session_id,
-                    self._turn_id,
-                )
-            canvas_task.cancel()
-        tasks = tuple(task for task in (planning_task, canvas_task) if task is not None)
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await self._interrupt_canvas_turn()
+        except Exception:
+            LOGGER.exception(
+                "canvas_planning_cleanup_failed session_id=%s turn_id=%s",
+                self._session_id,
+                self._turn_id,
+            )
         self._active_planning_task = None
-        self._active_canvas_task = None
+
+    async def _cancel_provider_input_observer(self) -> None:
+        task = self._active_provider_input_task
+        if task is None:
+            return
+
+        # Claim the task before awaiting it so concurrent turn/session cleanup
+        # is idempotent and cannot cancel the same observer twice.
+        self._active_provider_input_task = None
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     async def _turn_events_until_cancelled(
         self,
@@ -1386,23 +1404,27 @@ class DeterministicRealtimeSessionCoordinator:
         if not self._terminal:
             await self._realtime.cancel(turn_id=self._turn_id)
             await self._speech.cancel(turn_id=self._turn_id)
-            await self._canvas_specialist.cancel(turn_id=self._turn_id)
+            await self._interrupt_canvas_turn()
         await self._realtime.close()
         await self._speech.close()
-        await self._canvas_specialist.close()
+        await self._canvas_jobs.close()
         self._controls.close()
 
     async def _speech_frames_for_segment(
         self,
-        segment: AvaTurnSegment,
+        segment: SpeechPhrase,
         *,
         ledger: DeliveredTextLedger,
-    ) -> AsyncIterator[AvaServerOutboundFrame]:
+    ) -> AsyncIterator[AvaServerOutboundFrameV4]:
         segment_sample_offset = self.received_sample_count
-        async for item in self._speech.synthesize(segment):
+        turn_id = self._turn_id
+        async for item in self._speech_items_until_cancelled(
+            segment,
+            turn_id=turn_id,
+        ):
             if isinstance(item, SynthesizedAlignmentBatch):
                 spans = tuple(
-                    AvaAlignmentSpan.model_validate(
+                    SpeechAlignment.model_validate(
                         {
                             "segmentId": span.segment_id,
                             "textStart": span.text_start,
@@ -1425,33 +1447,73 @@ class DeterministicRealtimeSessionCoordinator:
                     )
                 descriptor_frame = self._audio_chunk_frame(item.pcm)
                 yield descriptor_frame
-                yield AvaServerPcmFrame(
-                    descriptor=cast(AudioChunkEvent, descriptor_frame.event),
+                yield AvaServerPcmFrameV4(
+                    descriptor=cast(AudioChunkEventV4, descriptor_frame.event),
                     pcm=item.pcm,
                 )
                 continue
 
             raise SpeechDeliveryError(f"unsupported speech item {type(item).__name__}")
 
-        for cue in segment.canvas_cues:
-            yield self._canvas_cue_frame(
-                cue_id=cue.id,
-                sample_offset=ledger.sample_offset_for_anchor(
-                    segment_id=segment.id,
-                    anchor=cue.anchor,
-                ),
-                transaction=cue.transaction.model_dump(
-                    mode="json",
-                    by_alias=True,
-                ),
-            )
+    async def _speech_items_until_cancelled(
+        self,
+        segment: SpeechPhrase,
+        *,
+        turn_id: str,
+    ) -> AsyncIterator[SynthesizedSpeechItem]:
+        if self._cancellation_requested.is_set():
+            return
+        speech_items = self._speech.synthesize(
+            segment,
+            turn_id=turn_id,
+        ).__aiter__()
+        try:
+            while True:
+                if self._cancellation_requested.is_set():
+                    await self._speech.cancel(turn_id=turn_id)
+                    return
+                next_item = asyncio.create_task(_next_speech_item(speech_items))
+                cancellation = asyncio.create_task(self._cancellation_requested.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        {next_item, cancellation},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                except BaseException:
+                    next_item.cancel()
+                    cancellation.cancel()
+                    await asyncio.gather(
+                        next_item,
+                        cancellation,
+                        return_exceptions=True,
+                    )
+                    raise
+
+                if cancellation in done:
+                    try:
+                        await self._speech.cancel(turn_id=turn_id)
+                    finally:
+                        next_item.cancel()
+                        await asyncio.gather(next_item, return_exceptions=True)
+                    return
+
+                cancellation.cancel()
+                await asyncio.gather(cancellation, return_exceptions=True)
+                try:
+                    yield next_item.result()
+                except StopAsyncIteration:
+                    return
+        finally:
+            close_iterator = getattr(speech_items, "aclose", None)
+            if close_iterator is not None:
+                await close_iterator()
 
     async def _complete_frames(
         self,
         *,
-        plan: AvaTurnPlan,
+        plan: _TurnResult,
         ledger: DeliveredTextLedger,
-    ) -> AsyncIterator[AvaServerOutboundFrame]:
+    ) -> AsyncIterator[AvaServerOutboundFrameV4]:
         delivered_samples = self.received_sample_count
         delivered_text = ledger.delivered_text(delivered_samples)
         try:
@@ -1472,7 +1534,7 @@ class DeterministicRealtimeSessionCoordinator:
                 extra={
                     "ava_context": {
                         "failureId": failure_id,
-                        "component": str(AvaFailureComponent.MEMORY_STORE),
+                        "component": str(SpeechFailureComponent.MEMORY_STORE),
                         "sessionId": self._session_id,
                         "turnId": self._turn_id,
                     }
@@ -1493,16 +1555,16 @@ class DeterministicRealtimeSessionCoordinator:
     async def _cancel_frames(
         self,
         *,
-        plan: AvaTurnPlan | None,
+        plan: _TurnResult | None,
         ledger: DeliveredTextLedger,
-    ) -> AsyncIterator[AvaServerOutboundFrame]:
+    ) -> AsyncIterator[AvaServerOutboundFrameV4]:
         cancel = self._cancel_event
         if cancel is None:
             raise CoordinatorStateError("cancellation frames require cancelTurn")
-        yield self._phase_frame(AvaTurnPhase.CANCELLING)
+        yield self._phase_frame(SpeechPhase.CANCELLING)
         await self._realtime.cancel(turn_id=self._turn_id)
         await self._speech.cancel(turn_id=self._turn_id)
-        await self._canvas_specialist.cancel(turn_id=self._turn_id)
+        await self._interrupt_canvas_turn()
 
         delivered_samples = self._bounded_rendered_sample_count()
         delivered_text = ledger.delivered_text(delivered_samples)
@@ -1526,7 +1588,7 @@ class DeterministicRealtimeSessionCoordinator:
                     extra={
                         "ava_context": {
                             "failureId": failure_id,
-                            "component": str(AvaFailureComponent.MEMORY_STORE),
+                            "component": str(SpeechFailureComponent.MEMORY_STORE),
                             "sessionId": self._session_id,
                             "turnId": self._turn_id,
                         }
@@ -1549,11 +1611,19 @@ class DeterministicRealtimeSessionCoordinator:
     async def _commit_memory(
         self,
         *,
-        plan: AvaTurnPlan,
+        plan: _TurnResult,
         delivered_sample_count: int,
         delivered_text: str,
         terminal: DeliveredTurnTerminal,
     ) -> None:
+        if self._child_text is None or self._child_text_source is None:
+            child_transcript = await self._realtime.child_transcript(
+                turn_id=self._turn_id
+            )
+            if child_transcript is not None:
+                self._child_text = _bounded_child_transcript(child_transcript)
+                self._child_text_source = ChildTurnTextSource.TRANSCRIPT
+
         if self._child_text is None or self._child_text_source is None:
             LOGGER.info(
                 "memory_commit_skipped session_id=%s turn_id=%s "
@@ -1563,11 +1633,6 @@ class DeterministicRealtimeSessionCoordinator:
             )
             self._last_memory_decision = None
             return
-        memory_id = (
-            self._memory_id_factory(self._turn_id)
-            if plan.memory_proposal is not None
-            else None
-        )
         turn = DeliveredConversationTurn.model_validate(
             {
                 "turnId": self._turn_id,
@@ -1582,9 +1647,12 @@ class DeterministicRealtimeSessionCoordinator:
         self._last_memory_decision = await self._memory.commit_delivered_turn(
             subject=self._subject,
             turn=turn,
-            proposal=plan.memory_proposal,
-            memory_id=memory_id,
+            proposal=None,
+            memory_id=None,
         )
+
+    async def _interrupt_canvas_turn(self) -> None:
+        await self._canvas_jobs.interrupt_turn(source_turn_id=self._turn_id)
 
     def _require_child_text(self) -> str:
         if self._child_text is None:
@@ -1600,7 +1668,7 @@ class DeterministicRealtimeSessionCoordinator:
             )
         return self._child_text_source
 
-    def _turn_created_frame(self) -> AvaServerControlFrame:
+    def _turn_created_frame(self) -> AvaServerControlFrameV4:
         return self._control_frame(
             {
                 "event": "turnCreated",
@@ -1609,7 +1677,7 @@ class DeterministicRealtimeSessionCoordinator:
             }
         )
 
-    def _phase_frame(self, phase: AvaTurnPhase) -> AvaServerControlFrame:
+    def _phase_frame(self, phase: SpeechPhase) -> AvaServerControlFrameV4:
         next_revision = self._revision + 1
         frame = self._control_frame(
             {
@@ -1621,12 +1689,32 @@ class DeterministicRealtimeSessionCoordinator:
         self._revision = next_revision
         return frame
 
+    def _interrupt_requested_frame(
+        self,
+        *,
+        stream_id: str | None,
+        reason: str,
+    ) -> AvaServerControlFrameV4:
+        if stream_id is None:
+            raise CoordinatorStateError(
+                "provider speech_started cannot interrupt without an active "
+                "playback stream"
+            )
+        return self._control_frame(
+            {
+                "event": "interruptRequested",
+                "revision": self._revision,
+                "streamId": stream_id,
+                "reason": reason,
+            }
+        )
+
     def _segment_frame(
         self,
-        segment: AvaTurnSegment,
+        segment: SpeechPhrase,
         *,
         segment_index: int,
-    ) -> AvaServerControlFrame:
+    ) -> AvaServerControlFrameV4:
         return self._control_frame(
             {
                 "event": "segmentReady",
@@ -1636,7 +1724,7 @@ class DeterministicRealtimeSessionCoordinator:
             }
         )
 
-    def _audio_metadata_frame(self) -> AvaServerControlFrame:
+    def _audio_metadata_frame(self) -> AvaServerControlFrameV4:
         frame = self._control_frame(
             {
                 "event": "audioMetadata",
@@ -1650,15 +1738,15 @@ class DeterministicRealtimeSessionCoordinator:
                 "voiceId": self._speech.voice_id,
             }
         )
-        if not isinstance(frame.event, AudioMetadataEvent):
+        if not isinstance(frame.event, AudioMetadataEventV4):
             raise AssertionError("audio metadata frame resolved to the wrong type")
         self._audio_metadata_sent = True
         return frame
 
     def _alignment_frame(
         self,
-        spans: tuple[AvaAlignmentSpan, ...],
-    ) -> AvaServerControlFrame:
+        spans: tuple[SpeechAlignment, ...],
+    ) -> AvaServerControlFrameV4:
         frame = self._control_frame(
             {
                 "event": "alignmentBatch",
@@ -1669,11 +1757,11 @@ class DeterministicRealtimeSessionCoordinator:
                 ],
             }
         )
-        if not isinstance(frame.event, AlignmentBatchEvent):
+        if not isinstance(frame.event, AlignmentBatchEventV4):
             raise AssertionError("alignment frame resolved to the wrong type")
         return frame
 
-    def _audio_chunk_frame(self, pcm: bytes) -> AvaServerControlFrame:
+    def _audio_chunk_frame(self, pcm: bytes) -> AvaServerControlFrameV4:
         sample_count = len(pcm) // 2
         frame = self._control_frame(
             {
@@ -1686,83 +1774,9 @@ class DeterministicRealtimeSessionCoordinator:
                 "byteLength": len(pcm),
             }
         )
-        if not isinstance(frame.event, AudioChunkEvent):
+        if not isinstance(frame.event, AudioChunkEventV4):
             raise AssertionError("audio chunk frame resolved to the wrong type")
         self._next_audio_chunk_index += 1
-        return frame
-
-    def _canvas_cue_frame(
-        self,
-        *,
-        cue_id: str,
-        sample_offset: int,
-        transaction: dict[str, object],
-    ) -> AvaServerControlFrame:
-        frame = self._control_frame(
-            {
-                "event": "canvasCue",
-                "revision": self._revision,
-                "cueId": cue_id,
-                "sampleOffset": sample_offset,
-                "transaction": transaction,
-            }
-        )
-        self._canvas_cue_sent = True
-        self._canvas_status = "delivered"
-        return frame
-
-    def _canvas_rejected_frame(
-        self,
-        message: str,
-        *,
-        failure_id: str,
-    ) -> AvaServerControlFrame:
-        self._canvas_status = "rejected"
-        self._terminal_failure_code = str(AvaFailureCode.CANVAS_REJECTED)
-        self._last_failure_id = failure_id
-        self._last_failure_component = str(AvaFailureComponent.CANVAS_SPECIALIST)
-        return self._control_frame(
-            {
-                "event": "canvasRejected",
-                "revision": self._revision,
-                "failure": {
-                    "failureId": failure_id,
-                    "component": AvaFailureComponent.CANVAS_SPECIALIST,
-                    "code": "canvasRejected",
-                    "message": message,
-                    "retryable": False,
-                },
-            }
-        )
-
-    def _interaction_rejected_frame(
-        self,
-        rejection: _CanvasInteractionRejection,
-    ) -> AvaServerControlFrame:
-        frame = self._control_frame(
-            {
-                "event": "interactionRejected",
-                "revision": self._revision,
-                "sceneId": rejection.scene_id,
-                "sceneRevision": rejection.scene_revision,
-                "interactionRevision": rejection.interaction_revision,
-                "bindingId": rejection.binding_id,
-                "rejectionCode": rejection.code,
-                "message": rejection.message,
-            }
-        )
-        if not isinstance(frame.event, InteractionRejectedEvent):
-            raise AssertionError("interaction rejection resolved to the wrong type")
-        LOGGER.info(
-            "canvas_interaction_rejected session_id=%s scene_id=%s "
-            "scene_revision=%s interaction_revision=%s binding_id=%s code=%s",
-            self._session_id,
-            rejection.scene_id,
-            rejection.scene_revision,
-            rejection.interaction_revision,
-            rejection.binding_id,
-            rejection.code,
-        )
         return frame
 
     def _memory_persistence_failed_frame(
@@ -1770,17 +1784,17 @@ class DeterministicRealtimeSessionCoordinator:
         message: str,
         *,
         failure_id: str,
-    ) -> AvaServerControlFrame:
-        self._terminal_failure_code = str(AvaFailureCode.MEMORY_UNAVAILABLE)
+    ) -> AvaServerControlFrameV4:
+        self._terminal_failure_code = str(SpeechFailureCode.MEMORY_UNAVAILABLE)
         self._last_failure_id = failure_id
-        self._last_failure_component = str(AvaFailureComponent.MEMORY_STORE)
+        self._last_failure_component = str(SpeechFailureComponent.MEMORY_STORE)
         return self._control_frame(
             {
                 "event": "memoryPersistenceFailed",
                 "revision": self._revision,
                 "failure": {
                     "failureId": failure_id,
-                    "component": AvaFailureComponent.MEMORY_STORE,
+                    "component": SpeechFailureComponent.MEMORY_STORE,
                     "code": "memoryUnavailable",
                     "message": message,
                     "retryable": True,
@@ -1790,14 +1804,14 @@ class DeterministicRealtimeSessionCoordinator:
 
     def _failed_frame(
         self,
-        code: AvaFailureCode,
+        code: SpeechFailureCode,
         message: str,
         *,
-        component: AvaFailureComponent,
+        component: SpeechFailureComponent,
         retryable: bool,
         delivered_sample_count: int,
         delivered_text: str,
-    ) -> AvaServerControlFrame:
+    ) -> AvaServerControlFrameV4:
         failure_id = self._failure_id_factory()
         # A turnFailed event means at least one required provider or invariant
         # no longer has a proven clean boundary. End this persistent session
@@ -1850,7 +1864,7 @@ class DeterministicRealtimeSessionCoordinator:
             }
         )
 
-    def _terminal_frame(self, payload: dict[str, object]) -> AvaServerControlFrame:
+    def _terminal_frame(self, payload: dict[str, object]) -> AvaServerControlFrameV4:
         next_revision = self._revision + 1
         payload["revision"] = next_revision
         frame = self._control_frame(payload)
@@ -1879,7 +1893,8 @@ class DeterministicRealtimeSessionCoordinator:
             "realtime_turn_terminal session_id=%s turn_id=%s terminal=%s "
             "failure_id=%s failure_component=%s failure_code=%s "
             "internal_error_type=%s provider_response_id=%s "
-            "provider_call_id=%s canvas_status=%s",
+            "provider_call_id=%s provider_input_item_id=%s "
+            "cancellation_reason=%s canvas_status=%s",
             self._session_id,
             self._turn_id,
             payload.get("event"),
@@ -1889,6 +1904,8 @@ class DeterministicRealtimeSessionCoordinator:
             type(self._last_error).__name__ if self._last_error is not None else None,
             provider_response_id,
             provider_call_id,
+            self._interruption_provider_item_id,
+            self._cancel_event.reason if self._cancel_event is not None else None,
             self._canvas_status,
             extra={
                 "ava_context": {
@@ -1900,21 +1917,27 @@ class DeterministicRealtimeSessionCoordinator:
                     "code": str(failure_code) if failure_code is not None else None,
                     "providerResponseId": provider_response_id,
                     "providerCallId": provider_call_id,
+                    "providerInputItemId": self._interruption_provider_item_id,
+                    "cancellationReason": (
+                        self._cancel_event.reason
+                        if self._cancel_event is not None
+                        else None
+                    ),
                     "canvasStatus": self._canvas_status,
                 }
             },
         )
         return frame
 
-    def _control_frame(self, payload: dict[str, object]) -> AvaServerControlFrame:
+    def _control_frame(self, payload: dict[str, object]) -> AvaServerControlFrameV4:
         complete = {
-            "protocolVersion": PROTOCOL_V3,
+            "protocolVersion": PROTOCOL_V4,
             "sessionId": self._session_id,
             "turnId": self._turn_id,
             "sequence": self._sequence,
             **payload,
         }
-        event = AVA_SERVER_EVENT_ADAPTER.validate_python(complete)
+        event = AVA_SERVER_EVENT_ADAPTER_V4.validate_python(complete)
         try:
             self._machine.accept(event)
         except RealtimeStateError as error:
@@ -1922,9 +1945,22 @@ class DeterministicRealtimeSessionCoordinator:
                 f"coordinator generated an invalid server event: {error}"
             ) from error
         self._sequence += 1
-        return AvaServerControlFrame(event)
+        return AvaServerControlFrameV4(event)
 
-    def _validate_turn_and_stream(self, event: AvaClientEventUnion) -> None:
+    def _canvas_event(self, payload: dict[str, object]) -> AvaServerEventUnionV4:
+        self._canvas_revision += 1
+        complete = {
+            "protocolVersion": PROTOCOL_V4,
+            "sessionId": self._session_id,
+            "sequence": self._sequence,
+            "revision": self._canvas_revision,
+            **payload,
+        }
+        event = AVA_SERVER_EVENT_ADAPTER_V4.validate_python(complete)
+        self._sequence += 1
+        return event
+
+    def _validate_turn_and_stream(self, event: AvaClientEventUnionV4) -> None:
         turn_id = getattr(event, "turn_id", None)
         if turn_id != self._turn_id:
             raise CoordinatorStateError("client event turnId does not match turn")
@@ -1970,8 +2006,14 @@ async def _next_provider_event(
 
 
 async def _next_outbound_frame(
-    iterator: AsyncIterator[AvaServerOutboundFrame],
-) -> AvaServerOutboundFrame:
+    iterator: AsyncIterator[AvaServerOutboundFrameV4],
+) -> AvaServerOutboundFrameV4:
+    return await iterator.__anext__()
+
+
+async def _next_speech_item(
+    iterator: AsyncIterator[SynthesizedSpeechItem],
+) -> SynthesizedSpeechItem:
     return await iterator.__anext__()
 
 
@@ -1993,37 +2035,25 @@ def _bounded_child_summary(value: str) -> str:
     return f"{value[:boundary].rstrip()}…"
 
 
-def _bounded_canvas_summary(brief: str) -> str:
-    prefix = "Interactive visual ready: "
-    available = 240 - len(prefix)
-    if len(brief) <= available:
-        return f"{prefix}{brief}"
-    boundary = brief.rfind(" ", 0, available - 1)
-    if boundary <= 0:
-        boundary = available - 1
-    return f"{prefix}{brief[:boundary].rstrip()}…"
-
-
-def _canvas_rejection_message(error: Exception) -> str:
-    if isinstance(error, CanvasSpecialistUnavailableError):
-        if "deadline" in str(error).lower():
-            return "The optional visual took too long to prepare."
-        return "The optional visual service is temporarily unavailable."
-    if isinstance(error, CanvasSpecialistInvalidError):
-        return "The optional visual could not be prepared from that response."
-    return "The optional visual could not be safely prepared."
-
-
-def _canvas_tool_rejection_reason(error: Exception) -> str:
-    if isinstance(error, CanvasSpecialistUnavailableError):
-        if "deadline" in str(error).lower():
-            return "The visual specialist exceeded its bounded deadline."
-        return "The visual specialist is temporarily unavailable."
-    if isinstance(error, CanvasSpecialistInvalidError):
-        return "The generated visual did not pass strict validation."
-    return "The visual could not be compiled into a safe scene."
-
-
-def _canvas_identifier(prefix: str, turn_id: str) -> str:
-    digest = sha256(turn_id.encode("utf-8")).hexdigest()[:16]
-    return f"{prefix}_{digest}"
+def _format_failure_message(
+    base_message: str,
+    error: Exception | None = None,
+) -> str:
+    if error is None:
+        return base_message[:240]
+    error_str = str(error).strip()
+    error_type = type(error).__name__
+    if not error_str or error_str == error_type:
+        detail = error_type
+    elif error_str.startswith(error_type):
+        detail = error_str
+    else:
+        detail = f"{error_type}: {error_str}"
+    detail = " ".join(detail.split())
+    combined = f"{base_message} ({detail})"
+    if len(combined) <= 240:
+        return combined
+    available = 240 - len(base_message) - 6
+    if available > 20:
+        return f"{base_message} ({detail[:available]}...)"
+    return base_message[:240]

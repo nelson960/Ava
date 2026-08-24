@@ -16,11 +16,6 @@ from ava_backend.realtime.memory import DevelopmentAuthoritativeMemoryStore
 from ava_backend.realtime.plan import AvaTurnSegment
 
 
-class _LegacyModel:
-    async def generate_response(self, **_arguments: object) -> object:
-        raise AssertionError("legacy model must not run during app construction")
-
-
 async def test_caption_preview_emits_bounded_silence_and_complete_alignment() -> None:
     segment = AvaTurnSegment.model_validate(
         {
@@ -38,7 +33,13 @@ async def test_caption_preview_emits_bounded_silence_and_complete_alignment() ->
         chunk_sample_count=1_200,
     )
 
-    items = [item async for item in synthesizer.synthesize(segment)]
+    items = [
+        item
+        async for item in synthesizer.synthesize(
+            segment,
+            turn_id="turn-preview",
+        )
+    ]
 
     alignment = items[0]
     assert isinstance(alignment, SynthesizedAlignmentBatch)
@@ -70,7 +71,6 @@ def test_caption_preview_is_explicit_and_cannot_enter_production() -> None:
     )
     app = create_app(
         settings,
-        ava_model=_LegacyModel(),  # type: ignore[arg-type]
         authoritative_memory=DevelopmentAuthoritativeMemoryStore(),
     )
-    assert app.state.realtime_sessions is not None
+    assert app.state.realtime_v4_sessions is not None

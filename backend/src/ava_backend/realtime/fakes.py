@@ -5,28 +5,24 @@ import re
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 
-from ..canvas.specialist import (
-    CanvasSpecialistGeneration,
-    CanvasSpecialistRequest,
-)
 from .delivery import (
     SynthesizedAlignmentBatch,
     SynthesizedAudioChunk,
     SynthesizedSpeechItem,
 )
-from .events import AvaAlignmentSpan
-from .events import AvaServerEventUnion
 from .harness import RealtimeHarness
-from .model_plan import ModelCanvasDraft
-from .plan import AvaTurnPlan, AvaTurnSegment
+from .plan import AvaTurnPlan
+from .speech_contract import SpeechAlignment, SpeechPhrase
 from .provider_session import (
     NegotiatedRealtimeCall,
+    RealtimeProviderInputEvent,
     RealtimeProviderTurnEvent,
     validate_sdp,
 )
 from .tool_contract import (
     InteractiveCanvasRequest,
     InteractiveCanvasToolOutput,
+    InteractiveCanvasToolOutputV4,
     RealtimeCanvasToolCall,
     RealtimeRejectedCanvasToolCall,
     RealtimeSpeechTextDelta,
@@ -137,8 +133,12 @@ class DeterministicRealtimePlanProvider:
         self.negotiated_offers: list[str] = []
         self.yield_count = 0
         self.cancelled_turn_ids: list[str] = []
-        self.completed_canvas_outputs: list[InteractiveCanvasToolOutput] = []
+        self.completed_canvas_outputs: list[
+            InteractiveCanvasToolOutput | InteractiveCanvasToolOutputV4
+        ] = []
         self._pending_call_id: str | None = None
+        self._input_events: asyncio.Queue[RealtimeProviderInputEvent] = asyncio.Queue()
+        self._input_item_turn_ids: dict[str, str | None] = {}
         self.closed = False
 
     async def negotiate(self, *, offer_sdp: str) -> NegotiatedRealtimeCall:
@@ -186,6 +186,37 @@ class DeterministicRealtimePlanProvider:
         await asyncio.sleep(0)
         return self._child_text
 
+    async def next_input_event(self) -> RealtimeProviderInputEvent:
+        return await self._input_events.get()
+
+    def input_item_owner(self, *, item_id: str) -> str | None:
+        if item_id not in self._input_item_turn_ids:
+            raise ValueError("fake input item ownership requested before observation")
+        return self._input_item_turn_ids[item_id]
+
+    def emit_input_event(
+        self,
+        event: RealtimeProviderInputEvent,
+        *,
+        owner_turn_id: str | None = None,
+    ) -> None:
+        existing = self._input_item_turn_ids.setdefault(event.item_id, owner_turn_id)
+        if owner_turn_id is not None and existing != owner_turn_id:
+            raise ValueError("fake provider input item changed turn ownership")
+        self._input_events.put_nowait(event)
+
+    async def admit_pending_input_items(self, *, turn_id: str) -> tuple[str, ...]:
+        if not turn_id:
+            raise ValueError("turn_id cannot be empty")
+        pending = tuple(
+            item_id
+            for item_id, owner in self._input_item_turn_ids.items()
+            if owner is None
+        )
+        for item_id in pending:
+            self._input_item_turn_ids[item_id] = turn_id
+        return pending
+
     async def _stream(self) -> AsyncIterator[RealtimeProviderTurnEvent]:
         for index, speech in enumerate(self._speech_segments):
             stream = DeterministicArgumentDeltaStream(
@@ -216,7 +247,7 @@ class DeterministicRealtimePlanProvider:
         *,
         turn_id: str,
         call_id: str,
-        output: InteractiveCanvasToolOutput,
+        output: InteractiveCanvasToolOutput | InteractiveCanvasToolOutputV4,
     ) -> None:
         if not turn_id:
             raise ValueError("turn_id cannot be empty")
@@ -224,49 +255,6 @@ class DeterministicRealtimePlanProvider:
             raise RuntimeError("fake canvas completion does not match pending call")
         self.completed_canvas_outputs.append(output)
         await asyncio.sleep(0)
-
-    async def cancel(self, *, turn_id: str) -> None:
-        if turn_id not in self.cancelled_turn_ids:
-            self.cancelled_turn_ids.append(turn_id)
-
-    async def close(self) -> None:
-        self.closed = True
-
-
-class DeterministicCanvasSpecialist:
-    """Strict fake canvas specialist with observable request/cancel behavior."""
-
-    def __init__(
-        self,
-        draft: ModelCanvasDraft,
-        *,
-        error: Exception | None = None,
-    ) -> None:
-        self._draft = draft
-        self._error = error
-        self.requests: list[CanvasSpecialistRequest] = []
-        self.request_started = asyncio.Event()
-        self.cancelled_turn_ids: list[str] = []
-        self.closed = False
-
-    async def generate(
-        self,
-        request: CanvasSpecialistRequest,
-    ) -> CanvasSpecialistGeneration:
-        if self.closed:
-            raise RuntimeError("fake canvas specialist is closed")
-        self.requests.append(request)
-        self.request_started.set()
-        await asyncio.sleep(0)
-        if self._error is not None:
-            raise self._error
-        return CanvasSpecialistGeneration(
-            draft=self._draft,
-            provider_request_id="resp_fake_canvas_0001",
-            input_tokens=120,
-            output_tokens=240,
-            cached_input_tokens=80,
-        )
 
     async def cancel(self, *, turn_id: str) -> None:
         if turn_id not in self.cancelled_turn_ids:
@@ -309,13 +297,17 @@ class DeterministicStreamingSpeechSynthesizer:
 
     async def synthesize(
         self,
-        segment: AvaTurnSegment,
+        segment: SpeechPhrase,
+        *,
+        turn_id: str,
     ) -> AsyncIterator[SynthesizedSpeechItem]:
+        if not turn_id.strip():
+            raise ValueError("turn_id cannot be empty")
         if self.closed:
             raise RuntimeError("fake streaming speech session is closed")
         self.synthesized_segment_ids.append(segment.id)
         spans = tuple(
-            AvaAlignmentSpan.model_validate(
+            SpeechAlignment.model_validate(
                 {
                     "segmentId": segment.id,
                     "textStart": match.start(),
@@ -345,15 +337,3 @@ class DeterministicStreamingSpeechSynthesizer:
 
     async def close(self) -> None:
         self.closed = True
-
-
-class DeterministicServerEventStream:
-    def __init__(self, events: Iterable[AvaServerEventUnion]) -> None:
-        self._events = tuple(events)
-        if not self._events:
-            raise ValueError("fake server event stream cannot be empty")
-
-    async def stream(self) -> AsyncIterator[AvaServerEventUnion]:
-        for event in self._events:
-            yield event
-            await asyncio.sleep(0)

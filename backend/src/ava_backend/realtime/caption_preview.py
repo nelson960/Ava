@@ -9,8 +9,7 @@ from .delivery import (
     SynthesizedAudioChunk,
     SynthesizedSpeechItem,
 )
-from .events import AvaAlignmentSpan
-from .plan import AvaTurnSegment
+from .speech_contract import SpeechAlignment, SpeechPhrase
 
 
 class DevelopmentCaptionPreviewSynthesizer:
@@ -47,15 +46,19 @@ class DevelopmentCaptionPreviewSynthesizer:
 
     async def synthesize(
         self,
-        segment: AvaTurnSegment,
+        segment: SpeechPhrase,
+        *,
+        turn_id: str,
     ) -> AsyncIterator[SynthesizedSpeechItem]:
+        if not turn_id.strip():
+            raise ValueError("turn_id cannot be empty")
         if self._closed:
             raise RuntimeError("caption preview synthesizer is closed")
         matches = tuple(re.finditer(r"\S+", segment.speech))
         if not matches:
             raise ValueError("caption preview requires non-whitespace speech")
         spans = tuple(
-            AvaAlignmentSpan.model_validate(
+            SpeechAlignment.model_validate(
                 {
                     "segmentId": segment.id,
                     "textStart": match.start(),

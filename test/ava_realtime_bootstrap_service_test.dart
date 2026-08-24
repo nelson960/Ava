@@ -8,16 +8,16 @@ import 'package:ava/services/ava_realtime_bootstrap_service.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  test('creates a strict v3 session without sending profile identity',
+  test('creates a strict v4 session without sending profile identity',
       () async {
     final bootstrapJson =
-        File('protocol/fixtures/ava_session_bootstrap_v3.json')
+        File('protocol/fixtures/ava_session_bootstrap_v4.json')
             .readAsStringSync();
     final transport = _BootstrapTransportFake(
       AvaRealtimeBootstrapResponse(
         statusCode: HttpStatus.created,
         contentType: 'application/json',
-        protocolVersion: '3',
+        protocolVersion: '4',
         bytes: Stream.value(utf8.encode(bootstrapJson)),
         requestId: 'request-bootstrap-1',
       ),
@@ -29,25 +29,25 @@ void main() {
       transport: transport,
     );
 
-    final bootstrap = await service.createSession(
+    final bootstrap = await service.createSessionV4(
       ageBand: AvaRealtimeAgeBand.middleChildhood,
     );
 
     expect(bootstrap.sessionId, 'session-1234');
     expect(
       bootstrap.webrtcUrl,
-      'https://ava.example.test/v3/realtime/sessions/session-1234/webrtc',
+      'https://ava.example.test/v4/realtime/sessions/session-1234/webrtc',
     );
     expect(
       transport.endpoint,
-      Uri.parse('https://ava.example/api/v3/realtime/sessions'),
+      Uri.parse('https://ava.example/api/v4/realtime/sessions'),
     );
-    expect(transport.headers['x-ava-protocol-version'], '3');
+    expect(transport.headers['x-ava-protocol-version'], '4');
     expect(transport.headers[HttpHeaders.acceptHeader], 'application/json');
     expect(
       jsonDecode(transport.body),
       {
-        'protocolVersion': 3,
+        'protocolVersion': 4,
         'ageBand': 'middleChildhood',
       },
     );
@@ -66,7 +66,7 @@ void main() {
         transport: _BootstrapTransportFake(response),
       );
       await expectLater(
-        service.createSession(ageBand: AvaRealtimeAgeBand.unknown),
+        service.createSessionV4(ageBand: AvaRealtimeAgeBand.unknown),
         throwsA(matcher),
       );
     }
@@ -87,7 +87,7 @@ void main() {
       AvaRealtimeBootstrapResponse(
         statusCode: HttpStatus.created,
         contentType: 'application/json',
-        protocolVersion: '2',
+        protocolVersion: '3',
         bytes: Stream.value(utf8.encode('{}')),
       ),
       isA<AvaRealtimeBootstrapException>(),
@@ -96,7 +96,7 @@ void main() {
       AvaRealtimeBootstrapResponse(
         statusCode: HttpStatus.created,
         contentType: 'text/html',
-        protocolVersion: '3',
+        protocolVersion: '4',
         bytes: Stream.value(utf8.encode('<html></html>')),
       ),
       isA<AvaRealtimeBootstrapException>(),
@@ -105,7 +105,7 @@ void main() {
       AvaRealtimeBootstrapResponse(
         statusCode: HttpStatus.created,
         contentType: 'application/json',
-        protocolVersion: '3',
+        protocolVersion: '4',
         bytes: Stream.value(utf8.encode('{')),
       ),
       isA<AvaRealtimeBootstrapException>(),
@@ -114,7 +114,7 @@ void main() {
       AvaRealtimeBootstrapResponse(
         statusCode: HttpStatus.created,
         contentType: 'application/json',
-        protocolVersion: '3',
+        protocolVersion: '4',
         bytes: Stream.value(
           List<int>.filled(
             AvaRealtimeBootstrapService.maximumResponseBytes + 1,
@@ -137,14 +137,14 @@ void main() {
         AvaRealtimeBootstrapResponse(
           statusCode: HttpStatus.created,
           contentType: 'application/json',
-          protocolVersion: '3',
+          protocolVersion: '4',
           bytes: body.stream,
         ),
       ),
     );
 
     await expectLater(
-      service.createSession(ageBand: AvaRealtimeAgeBand.unknown),
+      service.createSessionV4(ageBand: AvaRealtimeAgeBand.unknown),
       throwsA(isA<TimeoutException>()),
     );
     await body.close();

@@ -9,7 +9,7 @@
   "colorTokens": ["ink", "muted", "accent", "accentSoft", "positive", "warning", "paper", "transparent"],
   "limits": {
     "maxNodes": 96,
-    "maxOperationsPerTransaction": 64,
+    "maxOperationsPerTransaction": 128,
     "maxBindingsPerTransaction": 24,
     "maxStateVariables": 16,
     "maxPathCharacters": 2000,

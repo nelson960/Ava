@@ -1,0 +1,62 @@
+[
+  {
+    "protocolVersion": 4,
+    "event": "canvasDocumentAvailable",
+    "sessionId": "session-1234",
+    "sequence": 12,
+    "revision": 1,
+    "generationId": "generation-1234",
+    "sourceTurnId": "turn-1234",
+    "sceneId": "scene-1234",
+    "sceneRevision": 1,
+    "svgPath": "/v4/realtime/sessions/session-1234/canvas-documents/generation-1234/svg",
+    "manifestPath": "/v4/realtime/sessions/session-1234/canvas-documents/generation-1234/manifest",
+    "svgSha256": "32972b9caf71c3cda6b6b3c7582558e4eaa4c9fe4428e1082ea9c33a4e768aca",
+    "manifestSha256": "b0870e34f26d7226659d2a3b806e16d4ae2292cdf257e8c08518b82dc1e08d20",
+    "svgByteLength": 384,
+    "manifestByteLength": 531,
+    "rendererCapabilityVersion": "ava-svg-renderer-v1",
+    "validatorVersion": "ava-svg-validator-v1",
+    "manifestVersion": "ava-svg-manifest-v1"
+  },
+  {
+    "protocolVersion": 4,
+    "event": "canvasPresentationCue",
+    "sessionId": "session-1234",
+    "sequence": 18,
+    "revision": 2,
+    "generationId": "generation-1234",
+    "sourceTurnId": "turn-1234",
+    "sceneId": "scene-1234",
+    "sceneRevision": 1,
+    "presentationSampleOffset": 4800,
+    "svgSha256": "32972b9caf71c3cda6b6b3c7582558e4eaa4c9fe4428e1082ea9c33a4e768aca",
+    "manifestSha256": "b0870e34f26d7226659d2a3b806e16d4ae2292cdf257e8c08518b82dc1e08d20"
+  },
+  {
+    "protocolVersion": 4,
+    "event": "canvasActivated",
+    "sessionId": "session-1234",
+    "sequence": 20,
+    "revision": 3,
+    "generationId": "generation-1234",
+    "sourceTurnId": "turn-1234",
+    "sceneId": "scene-1234",
+    "sceneRevision": 1,
+    "firstRenderedSample": 4812,
+    "svgSha256": "32972b9caf71c3cda6b6b3c7582558e4eaa4c9fe4428e1082ea9c33a4e768aca",
+    "manifestSha256": "b0870e34f26d7226659d2a3b806e16d4ae2292cdf257e8c08518b82dc1e08d20"
+  },
+  {
+    "protocolVersion": 4,
+    "event": "canvasDocumentDiscarded",
+    "sessionId": "session-1234",
+    "sequence": 24,
+    "revision": 4,
+    "generationId": "generation-5678",
+    "sourceTurnId": "turn-5678",
+    "sceneId": "scene-1234",
+    "sceneRevision": 2,
+    "reason": "interruptedBeforePresentation"
+  }
+]

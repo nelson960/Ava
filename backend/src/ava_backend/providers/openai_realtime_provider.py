@@ -7,10 +7,11 @@ from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from time import monotonic
-from typing import Protocol
+from typing import Protocol, TypeVar
 from urllib.parse import quote, urlsplit
 
 import httpx
+from websockets.exceptions import ConnectionClosed
 from pydantic import ValidationError
 from websockets.asyncio.client import connect as connect_websocket
 
@@ -18,8 +19,12 @@ from ..realtime.harness import RealtimeHarness
 from ..realtime.provider_session import (
     MAX_SDP_BYTES,
     NegotiatedRealtimeCall,
+    RealtimeProviderError,
+    RealtimeProviderProtocolError,
+    RealtimeProviderUnavailableError,
     RealtimeNegotiationResponseError,
     RealtimeNegotiationUnavailableError,
+    RealtimeProviderInputEvent,
     RealtimeProviderTurnEvent,
     validate_sdp,
 )
@@ -27,6 +32,7 @@ from ..realtime.tool_contract import (
     INTERACTIVE_CANVAS_TOOL_NAME,
     InteractiveCanvasRequest,
     InteractiveCanvasToolOutput,
+    InteractiveCanvasToolOutputV4,
     RealtimeCanvasToolCall,
     RealtimeRejectedCanvasToolCall,
     RealtimeSpeechTextDelta,
@@ -39,20 +45,52 @@ DEFAULT_OPENAI_API_ORIGIN = "https://api.openai.com"
 DEFAULT_OPENAI_REALTIME_WEBSOCKET = "wss://api.openai.com/v1/realtime"
 MAX_PROVIDER_EVENT_BYTES = 512 * 1024
 MAX_PROVIDER_EVENTS_PER_TURN = 4096
+MAX_PROVIDER_ROUTER_EVENTS = 4096
 MAX_FUNCTION_ARGUMENT_BYTES = 256 * 1024
 MAX_PROVIDER_ERROR_BYTES = 64 * 1024
 
 
-class OpenAIRealtimeProviderError(RuntimeError):
+class OpenAIRealtimeProviderError(RealtimeProviderError):
     """Base error for an invalid or unavailable OpenAI Realtime session."""
 
 
-class OpenAIRealtimeProtocolError(OpenAIRealtimeProviderError):
+class OpenAIRealtimeProtocolError(
+    RealtimeProviderProtocolError,
+    OpenAIRealtimeProviderError,
+):
     """OpenAI emitted an event sequence that Ava cannot safely consume."""
 
 
-class OpenAIRealtimeUnavailableError(OpenAIRealtimeProviderError):
+class OpenAIRealtimeUnavailableError(
+    RealtimeProviderUnavailableError,
+    OpenAIRealtimeProviderError,
+):
     """The OpenAI Realtime connection could not complete the requested turn."""
+
+
+class OpenAIRealtimeConnectionClosedError(OpenAIRealtimeUnavailableError):
+    """The sideband socket closed, retaining safe close metadata."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        local_close: bool | None,
+        close_code: int | None,
+        close_reason: str | None,
+    ) -> None:
+        super().__init__(message)
+        self.local_close = local_close
+        self.close_code = close_code
+        self.close_reason = close_reason
+
+
+class OpenAIRealtimeRouterBackpressureError(OpenAIRealtimeProviderError):
+    """A bounded application mailbox could not retain provider events."""
+
+
+class _OpenAIRealtimeReceiveTimeout(OpenAIRealtimeUnavailableError):
+    """No provider event arrived within a deliberately bounded drain window."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +109,13 @@ class OpenAIRealtimeUsage:
 class OpenAIRealtimeValidationIssue:
     path: tuple[str | int, ...]
     code: str
+
+
+@dataclass(frozen=True, slots=True)
+class _InputTranscriptionOutcome:
+    turn_id: str | None
+    transcript: str | None
+    failed: bool
 
 
 class OpenAIRealtimeOutputValidationError(OpenAIRealtimeProtocolError):
@@ -174,8 +219,10 @@ class _OpenAIRealtimeEventChannel:
         model: str,
         max_output_tokens: int,
         turn_timeout_seconds: float,
+        transcription_model: str = "gpt-transcribe",
         max_event_bytes: int = MAX_PROVIDER_EVENT_BYTES,
         max_events_per_turn: int = MAX_PROVIDER_EVENTS_PER_TURN,
+        max_router_events: int = MAX_PROVIDER_ROUTER_EVENTS,
         max_argument_bytes: int = MAX_FUNCTION_ARGUMENT_BYTES,
         noise_reduction: str = "near_field",
         vad_threshold: float = 0.45,
@@ -184,10 +231,17 @@ class _OpenAIRealtimeEventChannel:
     ) -> None:
         self._socket = socket
         self._model = model
+        self._transcription_model = _required_name(
+            transcription_model,
+            "OpenAI Realtime transcription model",
+        )
         self._max_output_tokens = max_output_tokens
         self._turn_timeout_seconds = turn_timeout_seconds
         self._max_event_bytes = max_event_bytes
         self._max_events_per_turn = max_events_per_turn
+        if not 8 <= max_router_events <= 16_384:
+            raise ValueError("max_router_events must be between 8 and 16384")
+        self._max_router_events = max_router_events
         self._max_argument_bytes = max_argument_bytes
         self._noise_reduction = _validated_noise_reduction(noise_reduction)
         self._vad_threshold = _validated_vad_threshold(vad_threshold)
@@ -199,9 +253,20 @@ class _OpenAIRealtimeEventChannel:
         )
         self._received_event_count = 0
         self._pending_events: deque[dict[str, object]] = deque()
+        self._router_events: asyncio.Queue[dict[str, object] | object] = asyncio.Queue(
+            maxsize=max_router_events
+        )
+        self._input_events: asyncio.Queue[RealtimeProviderInputEvent | object] = (
+            asyncio.Queue(maxsize=max_router_events)
+        )
+        self._receiver_task: asyncio.Task[None] | None = None
+        self._receiver_started = False
+        self._receiver_error: BaseException | None = None
+        self._receiver_terminal = object()
         self._closed = False
         self._active_turn_id: str | None = None
         self._active_response_id: str | None = None
+        self._response_owner_by_id: dict[str, str | None] = {}
         self._late_cancel_error_expected = False
         self._prepared_session_update: str | None = None
         self._cancelled_turn_ids: set[str] = set()
@@ -211,8 +276,208 @@ class _OpenAIRealtimeEventChannel:
         self.last_response_id: str | None = None
         self.last_first_delta_ms: float | None = None
         self.last_completed_ms: float | None = None
+        self._child_transcripts_by_turn: dict[str, str] = {}
+        self._input_item_turn_ids: dict[str, str | None] = {}
+        self._input_transcription_outcomes: dict[str, _InputTranscriptionOutcome] = {}
+
+    async def start_receiver(self) -> None:
+        """Start the sole raw sideband reader for this provider session."""
+
+        if self._closed:
+            raise OpenAIRealtimeProtocolError(
+                "cannot start a receiver on a closed OpenAI Realtime channel"
+            )
+        if self._receiver_started:
+            return
+        self._receiver_started = True
+        self._receiver_task = asyncio.create_task(
+            self._receive_session_events(),
+            name="ava-openai-realtime-sideband-reader",
+        )
+        # Let the task begin before negotiation returns. This keeps the
+        # provider session readable even while no turn consumer is active.
+        await asyncio.sleep(0)
+
+    async def next_input_event(self) -> RealtimeProviderInputEvent:
+        """Return the next indexed provider input lifecycle event."""
+
+        await self.start_receiver()
+        if self._receiver_error is not None and self._input_events.empty():
+            raise self._receiver_error
+        value = await self._input_events.get()
+        if value is self._receiver_terminal:
+            if self._receiver_error is not None:
+                raise self._receiver_error
+            raise OpenAIRealtimeUnavailableError(
+                "OpenAI Realtime sideband receiver stopped unexpectedly"
+            )
+        if not isinstance(value, RealtimeProviderInputEvent):
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI Realtime router produced an invalid input event"
+            )
+        return value
+
+    def input_item_owner(self, *, item_id: str) -> str | None:
+        """Return the explicitly admitted Ava turn for one observed input item."""
+
+        if not item_id.strip():
+            raise ValueError("item_id cannot be empty")
+        if item_id not in self._input_item_turn_ids:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI input item ownership was requested before observation"
+            )
+        return self._input_item_turn_ids[item_id]
+
+    async def admit_pending_input_items(self, *, turn_id: str) -> tuple[str, ...]:
+        """Explicitly associate pending provider input with an Ava turn."""
+
+        if not turn_id.strip():
+            raise ValueError("turn_id cannot be empty")
+        pending = tuple(
+            item_id
+            for item_id, owner in self._input_item_turn_ids.items()
+            if owner is None
+        )
+        for item_id in pending:
+            self._admit_input_item(item_id=item_id, turn_id=turn_id)
+        return pending
+
+    async def _receive_session_events(self) -> None:
+        """Own every raw recv for the negotiated sideband lifetime."""
+
+        try:
+            while not self._closed:
+                raw = await self._socket.recv()
+                event = self._decode_event(raw)
+                self._index_provider_identity(event)
+                try:
+                    self._router_events.put_nowait(event)
+                except asyncio.QueueFull as error:
+                    raise OpenAIRealtimeRouterBackpressureError(
+                        "OpenAI Realtime session router capacity was exhausted"
+                    ) from error
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self._receiver_error = _as_realtime_receive_error(error)
+            LOGGER.warning(
+                "openai_realtime_sideband_reader_stopped error_type=%s",
+                type(error).__name__,
+                extra={
+                    "ava_context": {
+                        "component": "realtimeProvider",
+                        "errorType": type(error).__name__,
+                        **_connection_error_context(error),
+                    }
+                },
+            )
+        finally:
+            self._put_receiver_terminal()
+
+    def _put_receiver_terminal(self) -> None:
+        for queue in (self._router_events, self._input_events):
+            try:
+                queue.put_nowait(self._receiver_terminal)
+            except asyncio.QueueFull:
+                # The receiver has already recorded the explicit capacity
+                # failure. Consumers will observe it after retained events.
+                pass
+
+    def _decode_event(self, raw: str | bytes) -> dict[str, object]:
+        if isinstance(raw, bytes):
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI Realtime sideband emitted an unexpected binary event"
+            )
+        if len(raw.encode("utf-8")) > self._max_event_bytes:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI Realtime event exceeded Ava's byte limit"
+            )
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI Realtime emitted malformed JSON"
+            ) from error
+        if not isinstance(decoded, dict):
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI Realtime event must be a JSON object"
+            )
+        return decoded
+
+    def _index_provider_identity(self, event: Mapping[str, object]) -> None:
+        event_type = _event_type(event)
+        if event_type in _INPUT_LIFECYCLE_EVENT_TYPES:
+            self._index_input_lifecycle(event)
+        response_id = _response_id_from_event(event)
+        if response_id is not None and event_type.startswith("response."):
+            if response_id not in self._response_owner_by_id:
+                # The session receiver observes provider identity before a
+                # turn consumer necessarily reaches the event. Keep the
+                # response unowned until its explicit response.created
+                # admission (or cancellation admission).
+                self._response_owner_by_id[response_id] = None
+                _retain_latest(self._response_owner_by_id, maximum=64)
+
+    def _index_input_lifecycle(self, event: Mapping[str, object]) -> None:
+        event_type = _event_type(event)
+        item_id_value = event.get("item_id")
+        if event_type == "input_audio_buffer.speech_stopped" and item_id_value is None:
+            return
+        item_id = _required_string(event, "item_id")
+        if (
+            event_type in _INPUT_TRANSCRIPTION_PROGRESS_EVENT_TYPES
+            or event_type
+            in {
+                "conversation.item.input_audio_transcription.completed",
+                "conversation.item.input_audio_transcription.failed",
+            }
+        ) and item_id not in self._input_item_turn_ids:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI input transcription progress has no committed item owner"
+            )
+        if item_id not in self._input_item_turn_ids:
+            self._input_item_turn_ids[item_id] = None
+            _retain_latest(self._input_item_turn_ids, maximum=64)
+        if event_type in _INPUT_TRANSCRIPTION_PROGRESS_EVENT_TYPES:
+            self._validate_input_transcription_progress(event)
+        elif event_type == "conversation.item.input_audio_transcription.completed":
+            self._record_input_transcription(event, failed=False)
+        elif event_type == "conversation.item.input_audio_transcription.failed":
+            self._record_input_transcription(event, failed=True)
+        elif event_type == "input_audio_buffer.committed":
+            self._queue_input_event(event)
+        elif event_type == "input_audio_buffer.speech_started":
+            self._queue_input_event(event)
+        elif event_type == "input_audio_buffer.speech_stopped":
+            self._queue_input_event(event)
+
+    def _queue_input_event(self, event: Mapping[str, object]) -> None:
+        event_type = _event_type(event)
+        item_id = _required_string(event, "item_id")
+        audio_start_ms = event.get("audio_start_ms")
+        if audio_start_ms is not None and (
+            isinstance(audio_start_ms, bool)
+            or not isinstance(audio_start_ms, int)
+            or audio_start_ms < 0
+        ):
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI speech_started audio_start_ms is invalid"
+            )
+        try:
+            self._input_events.put_nowait(
+                RealtimeProviderInputEvent(
+                    event_type=event_type,
+                    item_id=item_id,
+                    audio_start_ms=audio_start_ms,
+                )
+            )
+        except asyncio.QueueFull as error:
+            raise OpenAIRealtimeRouterBackpressureError(
+                "OpenAI Realtime input-event router capacity was exhausted"
+            ) from error
 
     async def expect_session_created(self) -> None:
+        await self.start_receiver()
         event = await self._receive_event(
             timeout_seconds=self._turn_timeout_seconds,
         )
@@ -259,6 +524,7 @@ class _OpenAIRealtimeEventChannel:
         self.last_first_delta_ms = None
         self.last_completed_ms = None
         self._received_event_count = 0
+        await self.start_receiver()
 
         response_completed = False
         try:
@@ -298,6 +564,7 @@ class _OpenAIRealtimeEventChannel:
             async for event in self._stream_semantic_turn(
                 trigger_started=trigger_started,
                 response_expected=normalized_text is not None,
+                turn_id=turn_id,
             ):
                 yield event
             response_completed = True
@@ -315,7 +582,7 @@ class _OpenAIRealtimeEventChannel:
         *,
         turn_id: str,
         call_id: str,
-        output: InteractiveCanvasToolOutput,
+        output: InteractiveCanvasToolOutput | InteractiveCanvasToolOutputV4,
     ) -> None:
         if self._closed:
             raise OpenAIRealtimeProtocolError(
@@ -361,6 +628,7 @@ class _OpenAIRealtimeEventChannel:
             harness,
             self._model,
             self._max_output_tokens,
+            transcription_model=self._transcription_model,
             noise_reduction=self._noise_reduction,
             vad_threshold=self._vad_threshold,
             vad_prefix_padding_ms=self._vad_prefix_padding_ms,
@@ -447,6 +715,11 @@ class _OpenAIRealtimeEventChannel:
         """Restore the persistent socket to an exact response boundary."""
 
         response_id = self._active_response_id
+        if response_id is not None:
+            self._admit_response(
+                response_id=response_id,
+                turn_id=self._active_turn_id or "",
+            )
         await self._send_json({"type": "response.cancel"})
         deferred_events: list[dict[str, object]] = []
         while True:
@@ -462,6 +735,7 @@ class _OpenAIRealtimeEventChannel:
                         self._active_turn_id,
                         response_id,
                     )
+                    self._pending_events.extend(deferred_events)
                     self._active_response_id = None
                     self._active_turn_id = None
                     return
@@ -473,6 +747,10 @@ class _OpenAIRealtimeEventChannel:
                         "OpenAI created a different response while cancelling"
                     )
                 response_id = candidate
+                self._admit_response(
+                    response_id=candidate,
+                    turn_id=self._active_turn_id or "",
+                )
                 self._active_response_id = candidate
                 continue
             if event_type == "response.done":
@@ -480,6 +758,15 @@ class _OpenAIRealtimeEventChannel:
                 if response_id is not None and completed_response_id != response_id:
                     raise OpenAIRealtimeProtocolError(
                         "OpenAI completed a different response while cancelling"
+                    )
+                if completed_response_id is None:
+                    raise OpenAIRealtimeProtocolError(
+                        "OpenAI completed response without a response ID"
+                    )
+                owner = self._response_owner_by_id.get(completed_response_id)
+                if owner != self._active_turn_id:
+                    raise OpenAIRealtimeProtocolError(
+                        "OpenAI completed response belongs to a different Ava turn"
                     )
                 status = _nested_string(event, "response", "status")
                 LOGGER.info(
@@ -513,6 +800,13 @@ class _OpenAIRealtimeEventChannel:
             if event_type in _PRE_RESPONSE_EVENT_TYPES:
                 deferred_events.append(event)
                 continue
+            if event_type in _INPUT_LIFECYCLE_EVENT_TYPES:
+                # Input transcription is asynchronous and may belong to the
+                # just-cancelled turn or to the child's barge-in. Preserve the
+                # provider ordering and let the next turn boundary bind each
+                # committed item by item_id.
+                deferred_events.append(event)
+                continue
             if (
                 event_type not in _IN_TURN_IGNORED_EVENT_TYPES
                 and not event_type.startswith("response.")
@@ -521,11 +815,267 @@ class _OpenAIRealtimeEventChannel:
                     f"unexpected OpenAI event while cancelling: {event_type}"
                 )
 
+    async def child_transcript_for_turn(self, turn_id: str) -> str | None:
+        await self.start_receiver()
+        transcript = self._child_transcripts_by_turn.get(turn_id)
+        if transcript is not None:
+            return transcript
+        # Transcription is explicitly asynchronous to the model response. A
+        # short drain after response.done lets committed-turn memory observe a
+        # transcript that arrived just behind the response without turning STT
+        # into a speech or playback gate. Non-transcription events are retained
+        # in exact order for the next turn reader.
+        while True:
+            try:
+                event = await self._receive_event(timeout_seconds=0.05)
+            except _OpenAIRealtimeReceiveTimeout:
+                return self._child_transcripts_by_turn.get(turn_id)
+            event_type = _event_type(event)
+            if event_type in _INPUT_TRANSCRIPTION_PROGRESS_EVENT_TYPES:
+                self._validate_input_transcription_progress(event)
+                continue
+            if event_type == "conversation.item.input_audio_transcription.completed":
+                self._record_input_transcription(event, failed=False)
+            elif event_type == "conversation.item.input_audio_transcription.failed":
+                self._record_input_transcription(event, failed=True)
+            elif event_type in _PRE_RESPONSE_EVENT_TYPES:
+                continue
+            else:
+                self._pending_events.appendleft(event)
+                return self._child_transcripts_by_turn.get(turn_id)
+            transcript = self._child_transcripts_by_turn.get(turn_id)
+            if transcript is not None:
+                return transcript
+
+    def _bind_committed_input_item(
+        self,
+        event: Mapping[str, object],
+        *,
+        turn_id: str,
+    ) -> None:
+        item_id = _required_string(event, "item_id")
+        existing = self._input_item_turn_ids.get(item_id)
+        if existing is not None:
+            if existing == turn_id:
+                return
+            # A committed item can remain in the routed mailbox after the
+            # turn that admitted it has already been cancelled. It is a
+            # known duplicate/late event, never a request to reassign that
+            # provider item to the newer turn.
+            LOGGER.info(
+                "openai_late_committed_item_ignored item_id=%s owner_turn_id=%s "
+                "consumer_turn_id=%s",
+                item_id,
+                existing,
+                turn_id,
+            )
+            return
+        originating_item_id = next(
+            (
+                candidate_item_id
+                for candidate_item_id, owner_turn_id in self._input_item_turn_ids.items()
+                if owner_turn_id == turn_id
+            ),
+            None,
+        )
+        if originating_item_id is not None and originating_item_id != item_id:
+            # A turn owns exactly one committed provider input item. A later
+            # item observed while its response is still active is a pending
+            # barge-in for the next turn, not additional input for this turn.
+            LOGGER.info(
+                "openai_input_item_deferred active_turn_id=%s "
+                "originating_item_id=%s pending_item_id=%s",
+                turn_id,
+                originating_item_id,
+                item_id,
+            )
+            return
+        self._admit_input_item(item_id=item_id, turn_id=turn_id)
+
+    def _admit_input_item(self, *, item_id: str, turn_id: str) -> None:
+        if not turn_id.strip():
+            raise ValueError("turn_id cannot be empty")
+        existing = self._input_item_turn_ids.get(item_id)
+        if item_id not in self._input_item_turn_ids:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI input item cannot be admitted before it is observed"
+            )
+        if existing is not None and existing != turn_id:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI input item changed Ava turn ownership"
+            )
+        self._input_item_turn_ids[item_id] = turn_id
+        outcome = self._input_transcription_outcomes.get(item_id)
+        if outcome is not None:
+            if outcome.turn_id is not None and outcome.turn_id != turn_id:
+                raise OpenAIRealtimeProtocolError(
+                    "OpenAI input transcription changed committed item ownership"
+                )
+            self._input_transcription_outcomes[item_id] = _InputTranscriptionOutcome(
+                turn_id=turn_id,
+                transcript=outcome.transcript,
+                failed=outcome.failed,
+            )
+            if outcome.transcript is not None:
+                self._child_transcripts_by_turn[turn_id] = outcome.transcript
+            _retain_latest(self._child_transcripts_by_turn, maximum=64)
+        _retain_latest(self._input_item_turn_ids, maximum=64)
+
+    def _validate_response_owner(
+        self,
+        event: Mapping[str, object],
+        *,
+        turn_id: str,
+    ) -> None:
+        response_id = _response_id_from_event(event)
+        if response_id is None:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI response event omitted its response ID"
+            )
+        owner = self._response_owner_by_id.get(response_id)
+        if owner is None and response_id not in self._response_owner_by_id:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI response event has no registered response owner"
+            )
+        if owner is None:
+            if _event_type(event) != "response.created":
+                raise OpenAIRealtimeProtocolError(
+                    "OpenAI response event arrived before response.created"
+                )
+            self._admit_response(response_id=response_id, turn_id=turn_id)
+            return
+        if owner != turn_id:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI response event belongs to a different Ava turn"
+            )
+
+    def _admit_response(self, *, response_id: str, turn_id: str) -> None:
+        if not turn_id.strip():
+            raise ValueError("turn_id cannot be empty")
+        if response_id not in self._response_owner_by_id:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI response cannot be admitted before it is observed"
+            )
+        owner = self._response_owner_by_id[response_id]
+        if owner is not None and owner != turn_id:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI response changed Ava turn ownership"
+            )
+        self._response_owner_by_id[response_id] = turn_id
+
+    def _validate_input_transcription_progress(
+        self,
+        event: Mapping[str, object],
+    ) -> None:
+        event_type = _event_type(event)
+        item_id = _required_string(event, "item_id")
+        if item_id not in self._input_item_turn_ids:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI input transcription progress has no committed item owner"
+            )
+        if event_type == "conversation.item.input_audio_transcription.delta":
+            _required_string(event, "delta", allow_empty=True)
+            return
+        if event_type == "conversation.item.input_audio_transcription.segment":
+            _required_string(event, "id")
+            _required_string(event, "speaker")
+            _required_string(event, "text", allow_empty=True)
+            return
+        raise OpenAIRealtimeProtocolError(
+            f"unsupported OpenAI input transcription progress event: {event_type}"
+        )
+
+    def _record_input_transcription(
+        self,
+        event: Mapping[str, object],
+        *,
+        failed: bool,
+    ) -> None:
+        item_id = _required_string(event, "item_id")
+        previous = self._input_transcription_outcomes.get(item_id)
+        turn_id = self._input_item_turn_ids.get(item_id)
+        if item_id not in self._input_item_turn_ids:
+            if previous is None:
+                raise OpenAIRealtimeProtocolError(
+                    "OpenAI input transcription has no committed item owner"
+                )
+            turn_id = previous.turn_id
+        elif previous is not None and previous.turn_id != turn_id:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI input transcription changed committed item ownership"
+            )
+
+        if failed:
+            outcome = _InputTranscriptionOutcome(
+                turn_id=turn_id,
+                transcript=None,
+                failed=True,
+            )
+        else:
+            transcript = _required_string(event, "transcript", allow_empty=True)
+            clean_text = transcript.strip()
+            outcome = _InputTranscriptionOutcome(
+                turn_id=turn_id,
+                transcript=clean_text or None,
+                failed=False,
+            )
+
+        if previous is not None:
+            if previous != outcome:
+                raise OpenAIRealtimeProtocolError(
+                    "OpenAI input transcription changed after its terminal event"
+                )
+            LOGGER.info(
+                "openai_child_transcription_duplicate turn_id=%s item_id=%s "
+                "failed=%s has_text=%s",
+                turn_id,
+                item_id,
+                failed,
+                outcome.transcript is not None,
+            )
+            return
+
+        self._input_transcription_outcomes[item_id] = outcome
+        _retain_latest(self._input_transcription_outcomes, maximum=64)
+
+        if failed:
+            LOGGER.warning(
+                "openai_child_transcription_failed turn_id=%s item_id=%s",
+                turn_id,
+                item_id,
+            )
+            return
+
+        if outcome.transcript is None:
+            LOGGER.info(
+                "openai_child_transcription_empty turn_id=%s item_id=%s",
+                turn_id,
+                item_id,
+            )
+            return
+
+        if turn_id is not None:
+            self._child_transcripts_by_turn[turn_id] = outcome.transcript
+            _retain_latest(self._child_transcripts_by_turn, maximum=64)
+        LOGGER.info(
+            "openai_child_transcript_received turn_id=%s item_id=%s characters=%d",
+            turn_id,
+            item_id,
+            len(outcome.transcript or ""),
+        )
+
     async def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        await self._socket.close(code=1000, reason="Ava session closed")
+        try:
+            await self._socket.close(code=1000, reason="Ava session closed")
+        finally:
+            task = self._receiver_task
+            if task is not None and not task.done():
+                task.cancel()
+            if task is not None:
+                await asyncio.gather(task, return_exceptions=True)
 
     async def _wait_for_session_updated(self) -> None:
         while True:
@@ -547,6 +1097,7 @@ class _OpenAIRealtimeEventChannel:
         *,
         trigger_started: float,
         response_expected: bool,
+        turn_id: str,
     ) -> AsyncIterator[RealtimeProviderTurnEvent]:
         continuation = False
         canvas_called = False
@@ -567,6 +1118,8 @@ class _OpenAIRealtimeEventChannel:
                     )
                 )
                 event_type = _event_type(event)
+                if event_type.startswith("response."):
+                    self._validate_response_owner(event, turn_id=turn_id)
                 if event_type == "error":
                     if (
                         self._late_cancel_error_expected
@@ -579,6 +1132,27 @@ class _OpenAIRealtimeEventChannel:
                         )
                         continue
                     raise _provider_error(event)
+
+                if event_type == "input_audio_buffer.committed":
+                    self._bind_committed_input_item(
+                        event,
+                        turn_id=turn_id,
+                    )
+
+                if event_type in _INPUT_TRANSCRIPTION_PROGRESS_EVENT_TYPES:
+                    self._validate_input_transcription_progress(event)
+                    continue
+
+                if (
+                    event_type
+                    == "conversation.item.input_audio_transcription.completed"
+                ):
+                    self._record_input_transcription(event, failed=False)
+                    continue
+
+                if event_type == "conversation.item.input_audio_transcription.failed":
+                    self._record_input_transcription(event, failed=True)
+                    continue
 
                 if event_type == "response.created":
                     if not response_expected:
@@ -594,7 +1168,10 @@ class _OpenAIRealtimeEventChannel:
                     self._active_response_id = candidate
                     continue
 
-                if event_type == "response.output_text.delta":
+                if event_type in (
+                    "response.text.delta",
+                    "response.output_text.delta",
+                ):
                     candidate_response_id = _required_string(event, "response_id")
                     if response_id is not None and candidate_response_id != response_id:
                         raise OpenAIRealtimeProtocolError(
@@ -822,6 +1399,8 @@ class _OpenAIRealtimeEventChannel:
             )
         try:
             await self._socket.send(serialized)
+        except ConnectionClosed as error:
+            raise _as_realtime_receive_error(error) from error
         except Exception as error:
             raise OpenAIRealtimeUnavailableError(
                 "OpenAI Realtime send failed"
@@ -832,6 +1411,7 @@ class _OpenAIRealtimeEventChannel:
         *,
         timeout_seconds: float | None,
     ) -> dict[str, object]:
+        await self.start_receiver()
         self._received_event_count += 1
         if self._received_event_count > self._max_events_per_turn:
             raise OpenAIRealtimeProtocolError(
@@ -839,39 +1419,29 @@ class _OpenAIRealtimeEventChannel:
             )
         if self._pending_events:
             return self._pending_events.popleft()
+        if self._receiver_error is not None and self._router_events.empty():
+            raise self._receiver_error
         try:
             if timeout_seconds is None:
-                raw = await self._socket.recv()
+                value = await self._router_events.get()
             else:
                 async with asyncio.timeout(timeout_seconds):
-                    raw = await self._socket.recv()
+                    value = await self._router_events.get()
         except TimeoutError as error:
-            raise OpenAIRealtimeUnavailableError(
+            raise _OpenAIRealtimeReceiveTimeout(
                 "OpenAI Realtime active-response event receive timed out"
             ) from error
-        except Exception as error:
+        if value is self._receiver_terminal:
+            if self._receiver_error is not None:
+                raise self._receiver_error
             raise OpenAIRealtimeUnavailableError(
-                "OpenAI Realtime connection closed unexpectedly"
-            ) from error
-        if isinstance(raw, bytes):
-            raise OpenAIRealtimeProtocolError(
-                "OpenAI Realtime sideband emitted an unexpected binary event"
+                "OpenAI Realtime sideband receiver stopped unexpectedly"
             )
-        if len(raw.encode("utf-8")) > self._max_event_bytes:
+        if not isinstance(value, dict):
             raise OpenAIRealtimeProtocolError(
-                "OpenAI Realtime event exceeded Ava's byte limit"
+                "OpenAI Realtime router produced an invalid provider event"
             )
-        try:
-            decoded = json.loads(raw)
-        except json.JSONDecodeError as error:
-            raise OpenAIRealtimeProtocolError(
-                "OpenAI Realtime emitted malformed JSON"
-            ) from error
-        if not isinstance(decoded, dict):
-            raise OpenAIRealtimeProtocolError(
-                "OpenAI Realtime event must be a JSON object"
-            )
-        return decoded
+        return value
 
 
 class OpenAIRealtimeProviderSession:
@@ -882,6 +1452,7 @@ class OpenAIRealtimeProviderSession:
         *,
         api_key: str,
         model: str,
+        transcription_model: str = "gpt-transcribe",
         safety_identifier: str,
         connect_timeout_seconds: float,
         turn_timeout_seconds: float,
@@ -899,6 +1470,10 @@ class OpenAIRealtimeProviderSession:
     ) -> None:
         self._api_key = _required_secret(api_key, "OpenAI API key")
         self._model = _required_name(model, "OpenAI Realtime model")
+        self._transcription_model = _required_name(
+            transcription_model,
+            "OpenAI Realtime transcription model",
+        )
         self._safety_identifier = _required_safety_identifier(safety_identifier)
         if not 3 <= connect_timeout_seconds <= 60:
             raise ValueError("connect_timeout_seconds must be between 3 and 60")
@@ -1026,11 +1601,13 @@ class OpenAIRealtimeProviderSession:
                 model=self._model,
                 max_output_tokens=self._max_output_tokens,
                 turn_timeout_seconds=self._turn_timeout_seconds,
+                transcription_model=self._transcription_model,
                 noise_reduction=self._noise_reduction,
                 vad_threshold=self._vad_threshold,
                 vad_prefix_padding_ms=self._vad_prefix_padding_ms,
                 vad_silence_duration_ms=self._vad_silence_duration_ms,
             )
+            await channel.start_receiver()
         except Exception as error:
             status_code, request_id = _websocket_handshake_error_metadata(error)
             LOGGER.warning(
@@ -1078,6 +1655,15 @@ class OpenAIRealtimeProviderSession:
             turn_id=turn_id,
         )
 
+    async def next_input_event(self) -> RealtimeProviderInputEvent:
+        return await self._require_channel().next_input_event()
+
+    def input_item_owner(self, *, item_id: str) -> str | None:
+        return self._require_channel().input_item_owner(item_id=item_id)
+
+    async def admit_pending_input_items(self, *, turn_id: str) -> tuple[str, ...]:
+        return await self._require_channel().admit_pending_input_items(turn_id=turn_id)
+
     async def prepare(self, *, harness: RealtimeHarness) -> None:
         await self._require_channel().prepare(harness=harness)
 
@@ -1086,7 +1672,7 @@ class OpenAIRealtimeProviderSession:
         *,
         turn_id: str,
         call_id: str,
-        output: InteractiveCanvasToolOutput,
+        output: InteractiveCanvasToolOutput | InteractiveCanvasToolOutputV4,
     ) -> None:
         await self._require_channel().complete_canvas_tool(
             turn_id=turn_id,
@@ -1097,6 +1683,9 @@ class OpenAIRealtimeProviderSession:
     async def child_transcript(self, *, turn_id: str) -> str | None:
         if not turn_id.strip():
             raise ValueError("turn_id cannot be empty")
+        channel = self._channel
+        if channel is not None:
+            return await channel.child_transcript_for_turn(turn_id)
         return None
 
     async def cancel(self, *, turn_id: str) -> None:
@@ -1406,6 +1995,7 @@ def _session_update(
     model: str,
     max_output_tokens: int,
     *,
+    transcription_model: str = "gpt-transcribe",
     noise_reduction: str = "near_field",
     vad_threshold: float = 0.45,
     vad_prefix_padding_ms: int = 500,
@@ -1428,6 +2018,12 @@ def _session_update(
             "reasoning": {"effort": harness.reasoning_effort},
             "audio": {
                 "input": {
+                    "transcription": {
+                        "model": _required_name(
+                            transcription_model,
+                            "OpenAI Realtime transcription model",
+                        )
+                    },
                     "noise_reduction": {
                         "type": _validated_noise_reduction(noise_reduction)
                     },
@@ -1483,11 +2079,18 @@ def _validate_semantic_response_done(
     response_id = _required_string(response, "id")
     if expected_response_id is not None and response_id != expected_response_id:
         raise OpenAIRealtimeProtocolError(
-            "OpenAI response ID changed at response completion"
+            f"OpenAI response ID changed at response completion: expected {expected_response_id}, got {response_id}"
         )
-    if response.get("status") != "completed":
+    status = response.get("status")
+    if status == "failed":
+        status_details = response.get("status_details")
+        details = f", details={status_details}" if status_details is not None else ""
         raise OpenAIRealtimeUnavailableError(
-            "OpenAI Realtime response did not complete successfully"
+            f"OpenAI Realtime response failed (status={status}{details})"
+        )
+    if status not in {"completed", "cancelled", "incomplete"}:
+        raise OpenAIRealtimeProtocolError(
+            f"OpenAI Realtime response reported unsupported status: {status}"
         )
     _response_output(response)
     return response, response_id
@@ -1495,6 +2098,8 @@ def _validate_semantic_response_done(
 
 def _response_output(response: Mapping[str, object]) -> list[object]:
     output = response.get("output")
+    if output is None and response.get("status") == "cancelled":
+        return []
     if not isinstance(output, list):
         raise OpenAIRealtimeProtocolError(
             "OpenAI Realtime response omitted its output items"
@@ -1543,20 +2148,13 @@ def _merge_usage(
 
 def _parse_usage(event: Mapping[str, object]) -> OpenAIRealtimeUsage:
     response = _mapping(event.get("response"), "response.done response")
-    usage = _mapping(response.get("usage"), "response usage")
+    usage = _mapping(response.get("usage"), "response.done usage")
     input_details = _optional_mapping(usage.get("input_token_details"))
     output_details = _optional_mapping(usage.get("output_token_details"))
-    input_tokens = _non_negative_integer(usage, "input_tokens")
-    output_tokens = _non_negative_integer(usage, "output_tokens")
-    total_tokens = _non_negative_integer(usage, "total_tokens")
-    if input_tokens + output_tokens != total_tokens:
-        raise OpenAIRealtimeProtocolError(
-            "OpenAI Realtime usage total does not match input plus output"
-        )
     return OpenAIRealtimeUsage(
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        total_tokens=total_tokens,
+        input_tokens=_non_negative_integer(usage, "input_tokens"),
+        output_tokens=_non_negative_integer(usage, "output_tokens"),
+        total_tokens=_non_negative_integer(usage, "total_tokens"),
         cached_input_tokens=_optional_non_negative_integer(
             input_details,
             "cached_tokens",
@@ -1581,10 +2179,16 @@ def _parse_usage(event: Mapping[str, object]) -> OpenAIRealtimeUsage:
 
 
 def _provider_error(event: Mapping[str, object]) -> OpenAIRealtimeProviderError:
-    normalized_code = _provider_error_code(event)
-    return OpenAIRealtimeUnavailableError(
-        f"OpenAI Realtime emitted provider error code={normalized_code}"
-    )
+    error = _optional_mapping(event.get("error"))
+    code = error.get("code") if isinstance(error.get("code"), str) else "unknown"
+    message = error.get("message") if isinstance(error.get("message"), str) else ""
+    param = error.get("param") if isinstance(error.get("param"), str) else None
+    details = f"code={code}"
+    if param:
+        details += f", param={param}"
+    if message:
+        details += f": {message}"
+    return OpenAIRealtimeUnavailableError(f"OpenAI Realtime provider error ({details})")
 
 
 def _provider_error_code(event: Mapping[str, object]) -> str:
@@ -1810,6 +2414,82 @@ def _validated_websocket_url(value: str) -> str:
     return normalized
 
 
+_RetainedValue = TypeVar("_RetainedValue")
+
+
+def _retain_latest(
+    values: dict[str, _RetainedValue],
+    *,
+    maximum: int,
+) -> None:
+    while len(values) > maximum:
+        oldest = next(iter(values))
+        del values[oldest]
+
+
+def _response_id_from_event(event: Mapping[str, object]) -> str | None:
+    event_type = event.get("type")
+    if event_type in {"response.created", "response.done"}:
+        response = event.get("response")
+        if isinstance(response, dict):
+            value = response.get("id")
+            if isinstance(value, str) and value:
+                return value
+            return None
+    value = event.get("response_id")
+    return value if isinstance(value, str) and value else None
+
+
+def _safe_close_reason(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    normalized = " ".join(value.split())
+    return normalized[:120] or None
+
+
+def _connection_error_context(error: BaseException) -> dict[str, object]:
+    if not isinstance(error, ConnectionClosed):
+        return {}
+    received = getattr(error, "rcvd", None)
+    sent = getattr(error, "sent", None)
+    close = received or sent
+    local_close = None
+    if sent is not None and received is None:
+        local_close = True
+    elif received is not None and sent is None:
+        local_close = False
+    return {
+        "localClose": local_close,
+        "closeCode": getattr(close, "code", None),
+        "closeReason": _safe_close_reason(getattr(close, "reason", None)),
+    }
+
+
+def _as_realtime_receive_error(error: BaseException) -> BaseException:
+    if isinstance(error, OpenAIRealtimeProviderError):
+        return error
+    if isinstance(error, ConnectionClosed):
+        context = _connection_error_context(error)
+        local_close = context["localClose"]
+        close_code = context["closeCode"]
+        close_reason = context["closeReason"]
+        if not isinstance(local_close, (bool, type(None))):
+            raise AssertionError("invalid local close diagnostic")
+        if not isinstance(close_code, (int, type(None))):
+            raise AssertionError("invalid close code diagnostic")
+        if not isinstance(close_reason, (str, type(None))):
+            raise AssertionError("invalid close reason diagnostic")
+        return OpenAIRealtimeConnectionClosedError(
+            "OpenAI Realtime sideband connection closed",
+            local_close=local_close,
+            close_code=close_code,
+            close_reason=close_reason,
+        )
+    return OpenAIRealtimeUnavailableError(
+        "OpenAI Realtime connection closed unexpectedly"
+    )
+
+
 _PRE_RESPONSE_EVENT_TYPES = frozenset(
     {
         "conversation.created",
@@ -1817,12 +2497,35 @@ _PRE_RESPONSE_EVENT_TYPES = frozenset(
     }
 )
 
+_INPUT_TRANSCRIPTION_PROGRESS_EVENT_TYPES = frozenset(
+    {
+        "conversation.item.input_audio_transcription.delta",
+        "conversation.item.input_audio_transcription.segment",
+    }
+)
+
+_INPUT_LIFECYCLE_EVENT_TYPES = frozenset(
+    {
+        *_INPUT_TRANSCRIPTION_PROGRESS_EVENT_TYPES,
+        "conversation.item.input_audio_transcription.completed",
+        "conversation.item.input_audio_transcription.failed",
+        "input_audio_buffer.committed",
+        "input_audio_buffer.speech_started",
+        "input_audio_buffer.speech_stopped",
+    }
+)
+
 _IN_TURN_IGNORED_EVENT_TYPES = frozenset(
     {
+        *_INPUT_TRANSCRIPTION_PROGRESS_EVENT_TYPES,
         "conversation.created",
         "conversation.item.added",
         "conversation.item.created",
+        "conversation.item.deleted",
         "conversation.item.done",
+        "conversation.item.input_audio_transcription.completed",
+        "conversation.item.input_audio_transcription.failed",
+        "conversation.item.truncated",
         "input_audio_buffer.committed",
         "input_audio_buffer.speech_started",
         "input_audio_buffer.speech_stopped",
@@ -1831,6 +2534,7 @@ _IN_TURN_IGNORED_EVENT_TYPES = frozenset(
         "response.content_part.done",
         "response.output_item.done",
         "response.output_text.done",
+        "response.text.done",
         "session.updated",
     }
 )

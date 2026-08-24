@@ -80,6 +80,16 @@ async def _run(arguments: argparse.Namespace) -> int:
             transaction_id=f"canvas_live_{request_nonce[:16]}",
         )
         CanvasSceneValidator().apply(transaction)
+        try:
+            import os
+            from .svg_export import export_transaction_to_svg
+
+            os.makedirs("temp", exist_ok=True)
+            svg_content = export_transaction_to_svg(transaction)
+            with open("temp/live_test_output.svg", "w", encoding="utf-8") as f:
+                f.write(svg_content)
+        except Exception:
+            pass
     except CanvasSpecialistError as error:
         print(
             json.dumps(

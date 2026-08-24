@@ -11,7 +11,7 @@ from .common import NonEmptyText, RealtimeProtocolModel
 
 
 INTERACTIVE_CANVAS_TOOL_NAME = "request_interactive_canvas"
-INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS = 600
+INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS = 500
 INTERACTIVE_CANVAS_GOAL_MAX_CHARACTERS = 160
 _CALL_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
@@ -45,6 +45,33 @@ class InteractiveCanvasRequest(RealtimeProtocolModel):
 class InteractiveCanvasToolStatus(StrEnum):
     READY = "ready"
     REJECTED = "rejected"
+
+
+class InteractiveCanvasToolStatusV4(StrEnum):
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+
+
+class InteractiveCanvasToolOutputV4(RealtimeProtocolModel):
+    """Immediate function result; SVG generation is always asynchronous."""
+
+    status: InteractiveCanvasToolStatusV4
+    generation_id: str | None = Field(default=None, min_length=1, max_length=64)
+    reason: Annotated[str, StringConstraints(max_length=240)] | None = None
+
+    @model_validator(mode="after")
+    def status_fields_are_atomic(self) -> InteractiveCanvasToolOutputV4:
+        if self.status == InteractiveCanvasToolStatusV4.ACCEPTED:
+            if self.generation_id is None:
+                raise ValueError("accepted canvas output requires generationId")
+            if self.reason is not None:
+                raise ValueError("accepted canvas output cannot include reason")
+        else:
+            if not self.reason:
+                raise ValueError("rejected canvas output requires reason")
+            if self.generation_id is not None:
+                raise ValueError("rejected canvas output cannot include generationId")
+        return self
 
 
 class InteractiveCanvasToolOutput(RealtimeProtocolModel):

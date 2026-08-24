@@ -76,19 +76,10 @@ Protocol-v3 foundations now implemented and covered by deterministic tests:
   capture, SDP/ICE, sideband/prompt setup, listening, first segment, and first
   PCM without logging child content or credentials.
 
-The package also still contains the older turn-based migration path:
-
-- `POST /v1/lesson-turns`;
-- `POST /v2/performance-turns`;
-- OpenAI Responses structured output;
-- sequential ElevenLabs HTTP timed speech;
-- NDJSON with base64 PCM;
-- raw recent-turn memory;
-- fixed fraction/number-line diagram contracts.
-
-Those boundaries remain only to preserve a tested baseline while protocol v3
-is built. They are not release architecture and must not receive new product
-features.
+The older lesson-turn and NDJSON performance-turn HTTP routes, their
+orchestrators, and their stream composer have been removed. OpenAI Responses
+fixtures and related prompt/voice evaluation code remain available only as
+offline regression tooling; they are not release architecture.
 
 Useful seams to retain include:
 

@@ -328,11 +328,11 @@ async def test_canvas_provider_uses_one_strict_cost_bounded_response() -> None:
     )
 
     arguments = client.responses.arguments
-    assert arguments["model"] == "gpt-5.6-luna"
+    assert arguments["model"] == "gpt-5.6-sol"
     assert arguments["text_format"] is ModelCanvasSpecialistDraft
     assert arguments["reasoning"] == {"effort": "none"}
     assert arguments["text"] == {"verbosity": "low"}
-    assert arguments["max_output_tokens"] == 3600
+    assert arguments["max_output_tokens"] == 4096
     assert arguments["store"] is False
     assert arguments["prompt_cache_key"] == CANVAS_SPECIALIST_PROMPT_VERSION
     assert arguments["safety_identifier"] == "canvas-test-safety"

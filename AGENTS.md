@@ -59,11 +59,14 @@ optional application-owned function, `request_interactive_canvas`, configured
 with `tool_choice=auto`. Tool selection is semantic and contextual; no keyword
 router or forced no-op tool is permitted.
 
-A strict `gpt-5.6-luna` Responses call generates a bounded canvas scene only
-when Realtime calls `request_interactive_canvas`. It receives that tool's
-compact semantic brief and age band, uses the same OpenAI key, never sits on a
+A `gpt-5.6-sol` Responses call authors the complete desired SVG only when
+Realtime calls `request_interactive_canvas`. It receives that tool's compact
+semantic brief, age band, renderer capability version, and the complete current
+accepted SVG when revising a scene. It uses the same OpenAI key, never sits on a
 no-canvas turn, and has a hard timeout, output limit, validation boundary, and
-spend budget.
+spend budget. Sol owns visual composition. Ava validates and either preserves
+the exact UTF-8 SVG bytes or rejects the candidate; Ava never reconstructs,
+clamps, truncates, restyles, or silently repairs accepted artwork.
 
 Do not add a separate cloud STT provider. Local Apple transcription may be a
 non-blocking caption/diagnostic aid but never gates conversation.
@@ -83,12 +86,15 @@ logs, crash reports, or the app bundle.
    function call independently.
 5. Each complete valid speech phrase streams immediately to ElevenLabs over
    its input-streaming WebSocket.
-6. When a visual is requested, the backend calls the strict Responses canvas
-   specialist and compiles its scene draft into a validated transaction.
-7. The backend returns a matching `function_call_output` for every canvas call;
-   success or rejection never terminates ordinary speech.
+6. When a visual is requested, the backend validates and reserves a bounded
+   generation, returns exactly one immediate `accepted` or `rejected`
+   `function_call_output`, and runs Sol independently of Realtime continuation.
+7. A non-mutating validator inspects the complete SVG and prepares a candidate
+   scene. Flutter fetches it over a separately authenticated canvas-document
+   lane, preloads it, presents it on the rendered-sample cue, and acknowledges
+   actual presentation before the backend makes the revision canonical.
 8. An authenticated Ava event WebSocket sends JSON control frames and binary
-   PCM to Flutter.
+   PCM to Flutter. SVG bytes never share the ordered PCM lane.
 
 The WebRTC peer, OpenAI sideband, and Ava event WebSocket persist across
 consecutive turns in one conversation. Each turn gets fresh IDs, revisions,
@@ -108,12 +114,13 @@ The rendered audio sample clock is the master timeline for captions, visemes,
 expressions, canvas cues, and return to idle. The model emits phrase/text
 anchors; ElevenLabs alignment maps them to sample offsets.
 
-Every server event has protocol version, session ID, turn ID, monotonic
-sequence, and revision. Turn-scoped client controls carry the turn ID;
-session-scoped controls such as `canvasInteraction` do not. Unknown values,
-gaps, stale revisions, and invalid transitions fail visibly. The explicitly
-non-terminal `interactionRejected` session warning may follow a terminal turn
-while the persistent conversation remains connected.
+Every turn-scoped server event has protocol version, session ID, turn ID,
+monotonic sequence, and revision. Session-scoped canvas controls carry session,
+generation, scene, revision, and content-hash identity instead of a speaking
+turn ID. Unknown values, gaps, stale revisions, mismatched hashes, and invalid
+transitions fail visibly. Explicitly non-terminal canvas and interaction
+warnings may follow a terminal turn while the persistent conversation remains
+connected.
 
 ## Interruption
 
@@ -141,47 +148,52 @@ exclusivity, dependency, or replacement of real relationships.
 
 ## Dynamic canvas
 
-The lower panel is a specialist-authored, locally rendered vector scene—not a
-fixed diagram catalog and not arbitrary SVG. Realtime only requests the visual
-and describes its conversational purpose.
+The lower panel is a Sol-authored, locally rendered SVG scene—not a fixed
+diagram catalog and not a backend-authored primitive reconstruction. Realtime
+only requests the visual and describes its conversational purpose. It never
+authors markup, coordinates, paths, styles, interactions, or timing.
 
-Allow bounded declarative groups, text, lines/arrows, circles/ellipses,
-rectangles, polygons/polylines, and a validated SVG-compatible path grammar.
-Allow atomic create/update/delete/reveal/focus/animate/clear transactions and
-bounded local tap/explore/select/toggle/reveal/drag/set/reset interactions.
-`explore` is the compound production interaction: one tap selects a visible
-stage, optionally hides the previous stage's details, reveals a bounded set of
-local nodes, and pulses declared connectors. Flutter owns its timing, dimming,
-hit feedback, and reset; the provider supplies node IDs only.
+Sol may use the complete versioned static-SVG capability manifest, including
+bounded paths, text, groups, transforms, gradients, clipping, masks, filters,
+and document-local references. Visual freedom never includes provider scripts,
+event handlers, `foreignObject`, DTDs/entities, remote resources, navigation,
+network access, unsupported CSS, reference cycles, or unbounded expansion.
+The validator parses a separate inspection representation but never serializes
+it back. Accepted provider text is UTF-8 encoded exactly once and is the
+canonical SVG byte sequence and hash.
+
+Sol declares stable element and binding IDs plus bounded `data-ava-*` semantic
+metadata. The backend derives a hash-bound interaction/accessibility manifest
+without changing the visual. The selected renderer must support element-level
+hit testing or consume exact validated hit geometry; Flutter must never guess
+from labels or rebuild the SVG into the old primitive canvas. Visible geometry
+is preserved while compact interactive targets expand to at least 44 physical
+points.
 
 Reveal, toggle, drag, state changes, and reset remain local and provider-free.
-Declared `explore`, `select`, or `submitOutcome` bindings may cross the event socket,
-as scene/revision/binding IDs. The backend resolves their meaning from its
-canonical validated scene; it never trusts client-authored labels or values.
-The canonical scene belongs to one persistent realtime session, not a child
-profile or speaking turn. `canvasInteraction` has no turn ID. Stale scene,
-revision, binding, or replay controls emit non-terminal `interactionRejected`
-events and never close speech, microphone, or transport.
-When a later turn requests a visual change, the specialist receives the
-complete current bounded draft and returns the complete desired next scene.
-The backend preserves stable IDs and derives the atomic revision patch.
+Declared `explore`, `select`, or `submitOutcome` bindings may cross the control
+socket only as session/scene/revision/interaction/binding IDs. The backend
+resolves their meaning from its canonical hash-bound manifest and never trusts
+client-authored labels or values. Stale, replayed, unknown, or mismatched
+controls emit non-terminal `interactionRejected` events and never close speech,
+microphone, or transport.
 
-Flutter must validate finite bounds, node/path/action/text limits, allowed
-styles/transforms, referential integrity, accessibility labels, and scene
-revisions. No remote assets, scripts, arbitrary expressions, network access,
-or raw model markup.
+Canvas state progresses through candidate, prepared, presented, and active.
+Backend validation alone never makes a revision canonical. Flutter fetches the
+document over an independent authenticated lane, verifies its exact hash,
+preloads it, presents it at a coordinator-owned rendered-sample cue, and reports
+`canvasPresented`. Only then may the backend activate the revision and expose
+its semantics to Realtime. Barge-in, disconnect, renderer failure, supersession,
+or timeout before presentation discards the candidate and preserves the prior
+active scene.
 
-The specialist owns complete composition, semantic entities, topology,
-back-to-front paint order, bounded exact colors, linear/radial gradients, soft shadows,
-groups/pivots, and optional slow declarative motion. The backend runs
-deterministic quality checks and permits at most one bounded repair request.
-Flutter preserves authored geometry and expands hit areas to a minimum of 44
-physical points using the actual viewport scale. It must not silently move
-authored labels or replace specialist styling.
-
-Render through a native Flutter vector canvas with local hit testing/tweening.
-SVG serialization is allowed for tests/export only. An invalid optional canvas
-emits `canvasRejected`, stays closed, and cannot corrupt valid speech.
+A later visual request receives the complete active SVG and returns the
+complete desired replacement. Runtime validation is deterministic safety,
+complexity, renderer-compatibility, reference-integrity, interaction, and
+accessibility validation—not subjective restyling. At most one bounded Sol
+repair may return a complete replacement. Invalid optional canvas work emits
+`canvasRejected`, stays closed or preserves the prior scene, and cannot corrupt
+valid speech.
 
 ## Avatar
 
@@ -240,14 +252,14 @@ Replace:
 
 Already removed by explicit product decision:
 
-- the fixed `DiagramSpec`-to-SVG Flutter renderer, fixed dashboard UI/assets,
-  and `flutter_svg` runtime dependency;
-- protocol-v2 fixed diagram cues now fail explicitly and cannot reach the UI.
+- the fixed `DiagramSpec` catalog, dashboard UI/assets, and protocol-v2 fixed
+  diagram cues;
+- protocol-v2 diagram events fail explicitly and cannot reach the UI.
+- the legacy lesson-turn and NDJSON performance-turn backend routes and their
+  route-only orchestration.
 
-Remove only after protocol v3 passes:
+Remove only after protocol v4 passes:
 
-- `/v1/lesson-turns`, `/v2/performance-turns`, clients, models, fixtures, and
-  compatibility code;
 - platform speech input/output and OpenAI audition TTS;
 - activity catalog/picker, learning progress/scores/sheet/assets/database
   fields;
@@ -257,20 +269,23 @@ Never remove avatar touch or rotation during this migration.
 
 ## Active order
 
-1. Freeze protocol-v3 schemas/state machines/canvas limits with fake fixtures.
-2. Build and test the local dynamic canvas without provider keys.
-3. Build the backend realtime coordinator with fake Realtime and TTS streams.
-4. Build Flutter WebRTC/event transport while preserving touch and PCM.
-5. Add interruption, delivered-prefix, cancellation, reconnect, and
-   backpressure tests.
-6. Configure the strict Responses canvas specialist, exact ElevenLabs voice
-   metadata/rights, and the two provider keys; run guarded live tests with
-   spend limits.
-7. Verify voice, visemes, captions, canvas, touch, and idle on physical iPhone
-   and iPad.
-8. Add bounded memory, cloud reset, and weekly recap.
-9. Remove legacy paths and harden auth, privacy, safety, cost, telemetry, and
-    release behavior.
+1. Freeze protocol-v4 control, canvas-document, activation, interaction, and
+   state-machine fixtures with fake providers.
+2. Build the exact SVG extraction, non-mutating validator, hash-bound manifest,
+   independent document lane, and candidate-to-active session state.
+3. Select and test a direct SVG renderer with element hit testing without live
+   provider keys, while preserving avatar touch and native PCM.
+4. Decouple Realtime tool acceptance from Sol completion and prove independent
+   speech, audio, canvas, cancellation, reconnect, and backpressure behavior.
+5. Fix microphone intent, turn creation, sample-clock captions, transcript
+   attribution, delivered-prefix memory, and hermetic configuration tests.
+6. Configure Sol, the exact ElevenLabs voice metadata/rights, and the two
+   provider keys; run guarded live tests with spend limits.
+7. Verify voice, visemes, captions, canvas, interactions, touch, interruption,
+   and idle on physical iPhone and iPad.
+8. Complete bounded memory, cloud reset, and weekly recap.
+9. Remove protocol-v3 typed-canvas and legacy lesson paths, then harden auth,
+   privacy, safety, cost, telemetry, and release behavior.
 
 Do not start with API keys. They first become necessary at step 6.
 

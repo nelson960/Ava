@@ -4,13 +4,15 @@ import re
 
 from pydantic import ValidationError
 
-from .plan import (
-    AvaDelivery,
-    AvaExpressionIntent,
-    AvaGazeIntent,
-    AvaMotionIntent,
-    AvaTurnSegment,
-    MAX_REALTIME_SPEECH_SEGMENTS,
+from .speech_contract import (
+    MAX_SPEECH_PHRASES,
+    MAX_SPEECH_PHRASE_CHARACTERS,
+    MAX_SPEECH_RESPONSE_CHARACTERS,
+    SpeechDelivery,
+    SpeechExpressionIntent,
+    SpeechGazeIntent,
+    SpeechMotionIntent,
+    SpeechPhrase,
 )
 
 
@@ -32,29 +34,27 @@ class StreamingSpeechParser:
     def __init__(
         self,
         *,
-        max_total_characters: int = 1_800,
-        max_segment_characters: int = 600,
-        max_segments: int = MAX_REALTIME_SPEECH_SEGMENTS,
+        max_total_characters: int = MAX_SPEECH_RESPONSE_CHARACTERS,
+        max_segment_characters: int = MAX_SPEECH_PHRASE_CHARACTERS,
+        max_segments: int = MAX_SPEECH_PHRASES,
     ) -> None:
         if not 1 <= max_segment_characters <= max_total_characters:
             raise ValueError("invalid streaming speech character limits")
-        if not 1 <= max_segments <= MAX_REALTIME_SPEECH_SEGMENTS:
-            raise ValueError(
-                f"max_segments must be between 1 and {MAX_REALTIME_SPEECH_SEGMENTS}"
-            )
+        if not 1 <= max_segments <= MAX_SPEECH_PHRASES:
+            raise ValueError(f"max_segments must be between 1 and {MAX_SPEECH_PHRASES}")
         self._max_total_characters = max_total_characters
         self._max_segment_characters = max_segment_characters
         self._max_segments = max_segments
         self._buffer = ""
         self._received_characters = 0
-        self._segments: list[AvaTurnSegment] = []
+        self._segments: list[SpeechPhrase] = []
         self._finished = False
 
     @property
-    def emitted_segments(self) -> tuple[AvaTurnSegment, ...]:
+    def emitted_segments(self) -> tuple[SpeechPhrase, ...]:
         return tuple(self._segments)
 
-    def feed(self, delta: str) -> tuple[AvaTurnSegment, ...]:
+    def feed(self, delta: str) -> tuple[SpeechPhrase, ...]:
         if self._finished:
             raise StreamingTurnParseError("cannot feed a finished speech parser")
         if not isinstance(delta, str):
@@ -73,26 +73,26 @@ class StreamingSpeechParser:
         self._buffer += delta
         return self._release(ending=False)
 
-    def finish(self) -> tuple[AvaTurnSegment, ...]:
+    def finish(self, *, allow_empty: bool = False) -> tuple[SpeechPhrase, ...]:
         if self._finished:
             raise StreamingTurnParseError("speech parser was already finished")
         self._finished = True
         emitted = list(self._release(ending=True))
-        if not self._segments:
+        if not self._segments and not allow_empty:
             raise StreamingTurnParseError(
                 "Realtime response completed without child-facing speech"
             )
         return tuple(emitted)
 
-    def finish_response_chunk(self) -> tuple[AvaTurnSegment, ...]:
+    def finish_response_chunk(self) -> tuple[SpeechPhrase, ...]:
         """Release text before a tool boundary without ending the whole turn."""
 
         if self._finished:
             raise StreamingTurnParseError("cannot finish a chunk on a finished parser")
         return self._release(ending=True)
 
-    def _release(self, *, ending: bool) -> tuple[AvaTurnSegment, ...]:
-        emitted: list[AvaTurnSegment] = []
+    def _release(self, *, ending: bool) -> tuple[SpeechPhrase, ...]:
+        emitted: list[SpeechPhrase] = []
         while True:
             self._buffer = self._buffer.lstrip()
             if not self._buffer:
@@ -119,14 +119,14 @@ class StreamingSpeechParser:
                     f"assistant speech exceeded the {self._max_segments}-segment limit"
                 )
             try:
-                segment = AvaTurnSegment.model_validate(
+                segment = SpeechPhrase.model_validate(
                     {
                         "id": f"speech_{len(self._segments) + 1}",
                         "speech": speech,
-                        "delivery": AvaDelivery.NEUTRAL,
-                        "expression": AvaExpressionIntent.NEUTRAL,
-                        "gaze": AvaGazeIntent.CHILD,
-                        "motionIntent": AvaMotionIntent.NONE,
+                        "delivery": SpeechDelivery.NEUTRAL,
+                        "expression": SpeechExpressionIntent.NEUTRAL,
+                        "gaze": SpeechGazeIntent.CHILD,
+                        "motionIntent": SpeechMotionIntent.NONE,
                         "canvasCues": [],
                     }
                 )

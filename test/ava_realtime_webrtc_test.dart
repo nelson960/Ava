@@ -1,7 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:ava/models/ava_realtime_protocol.dart';
+import 'package:ava/models/ava_realtime_protocol_v4.dart';
 import 'package:ava/services/ava_realtime_webrtc.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -20,13 +20,27 @@ const _answerSdp = 'v=0\r\n'
     'm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n';
 
 void main() {
+  test('Apple microphone processing is requested in both supported shapes', () {
+    final audio =
+        avaRealtimeMicrophoneConstraints['audio']! as Map<String, Object>;
+    expect(audio['echoCancellation'], isTrue);
+    expect(audio['noiseSuppression'], isTrue);
+    expect(audio['autoGainControl'], isTrue);
+    expect(audio['optional'], [
+      {'googEchoCancellation': true},
+      {'googNoiseSuppression': true},
+      {'googAutoGainControl': true},
+    ]);
+    expect(avaRealtimeMicrophoneConstraints['video'], isFalse);
+  });
+
   test('posts bounded SDP with session auth and validates the answer',
       () async {
     final transport = _SdpTransportFake(
       AvaRealtimeSdpResponse(
         statusCode: HttpStatus.ok,
         contentType: 'application/sdp',
-        protocolVersion: '3',
+        protocolVersion: '4',
         bytes: Stream.value(utf8.encode(_answerSdp)),
         requestId: 'request-sdp-1',
       ),
@@ -37,7 +51,7 @@ void main() {
     );
     final bootstrap = _bootstrap();
 
-    final answer = await service.negotiate(
+    final answer = await service.negotiateV4(
       bootstrap: bootstrap,
       offerSdp: _offerSdp,
     );
@@ -46,7 +60,7 @@ void main() {
     expect(transport.endpoint, Uri.parse(bootstrap.webrtcUrl));
     expect(transport.offerSdp, _offerSdp);
     expect(transport.headers[HttpHeaders.contentTypeHeader], 'application/sdp');
-    expect(transport.headers['x-ava-protocol-version'], '3');
+    expect(transport.headers['x-ava-protocol-version'], '4');
     expect(
       transport.headers[HttpHeaders.authorizationHeader],
       'Bearer ${bootstrap.webrtcToken}',
@@ -61,13 +75,13 @@ void main() {
         AvaRealtimeSdpResponse(
           statusCode: HttpStatus.serviceUnavailable,
           contentType: 'application/json',
-          protocolVersion: '3',
+          protocolVersion: '4',
           bytes: Stream.value(utf8.encode('{"error":"unavailable"}')),
         ),
       ),
       requestTimeout: const Duration(seconds: 5),
     );
-    final connector = createAvaRealtimeMediaConnector(
+    final connector = createAvaRealtimeMediaConnectorV4(
       mediaSessionFactory: () async => media,
       sdpService: service,
     );
@@ -86,7 +100,7 @@ void main() {
         AvaRealtimeSdpResponse(
           statusCode: HttpStatus.serviceUnavailable,
           contentType: 'application/json',
-          protocolVersion: '3',
+          protocolVersion: '4',
           bytes: const Stream.empty(),
           requestId: 'request-empty-failure',
         ),
@@ -95,7 +109,7 @@ void main() {
     );
 
     await expectLater(
-      service.negotiate(
+      service.negotiateV4(
         bootstrap: _bootstrap(),
         offerSdp: _offerSdp,
       ),
@@ -113,14 +127,14 @@ void main() {
 
   test('media connector completes one ordered offer and answer', () async {
     final media = DeterministicAvaRealtimeMediaSession(offerSdp: _offerSdp);
-    final connector = createAvaRealtimeMediaConnector(
+    final connector = createAvaRealtimeMediaConnectorV4(
       mediaSessionFactory: () async => media,
       sdpService: AvaRealtimeSdpService(
         transport: _SdpTransportFake(
           AvaRealtimeSdpResponse(
             statusCode: HttpStatus.ok,
             contentType: 'application/sdp',
-            protocolVersion: '3',
+            protocolVersion: '4',
             bytes: Stream.value(utf8.encode(_answerSdp)),
           ),
         ),
@@ -153,7 +167,7 @@ void main() {
         requestTimeout: const Duration(milliseconds: 100),
       );
       await expectLater(
-        service.negotiate(
+        service.negotiateV4(
           bootstrap: _bootstrap(),
           offerSdp: _offerSdp,
         ),
@@ -165,15 +179,7 @@ void main() {
       AvaRealtimeSdpResponse(
         statusCode: HttpStatus.ok,
         contentType: 'text/plain',
-        protocolVersion: '3',
-        bytes: Stream.value(utf8.encode(_answerSdp)),
-      ),
-    );
-    await expectFailure(
-      AvaRealtimeSdpResponse(
-        statusCode: HttpStatus.ok,
-        contentType: 'application/sdp',
-        protocolVersion: '2',
+        protocolVersion: '4',
         bytes: Stream.value(utf8.encode(_answerSdp)),
       ),
     );
@@ -182,6 +188,14 @@ void main() {
         statusCode: HttpStatus.ok,
         contentType: 'application/sdp',
         protocolVersion: '3',
+        bytes: Stream.value(utf8.encode(_answerSdp)),
+      ),
+    );
+    await expectFailure(
+      AvaRealtimeSdpResponse(
+        statusCode: HttpStatus.ok,
+        contentType: 'application/sdp',
+        protocolVersion: '4',
         bytes: Stream.value(utf8.encode('v=0\r\nm=video 9 RTP/AVP 96\r\n')),
       ),
     );
@@ -189,7 +203,7 @@ void main() {
       AvaRealtimeSdpResponse(
         statusCode: HttpStatus.ok,
         contentType: 'application/sdp',
-        protocolVersion: '3',
+        protocolVersion: '4',
         bytes: Stream.value(
           List<int>.filled(avaMaximumSdpBytes + 1, 65),
         ),
@@ -198,11 +212,11 @@ void main() {
   });
 }
 
-AvaSessionBootstrapV3 _bootstrap() {
+AvaSessionBootstrapV4 _bootstrap() {
   final raw = jsonDecode(
-    File('protocol/fixtures/ava_session_bootstrap_v3.json').readAsStringSync(),
+    File('protocol/fixtures/ava_session_bootstrap_v4.json').readAsStringSync(),
   );
-  return AvaSessionBootstrapV3.fromJson(
+  return AvaSessionBootstrapV4.fromJson(
     (raw as Map).cast<String, Object?>(),
   );
 }

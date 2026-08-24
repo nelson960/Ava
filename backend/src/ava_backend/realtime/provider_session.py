@@ -6,11 +6,36 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from .harness import RealtimeHarness
-from .tool_contract import InteractiveCanvasToolOutput, RealtimeTurnEvent
+from .tool_contract import (
+    InteractiveCanvasToolOutput,
+    InteractiveCanvasToolOutputV4,
+    RealtimeTurnEvent,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeProviderInputEvent:
+    """A provider input lifecycle signal observed outside turn parsing."""
+
+    event_type: str
+    item_id: str
+    audio_start_ms: int | None = None
 
 
 MAX_SDP_BYTES = 256 * 1024
 _PROVIDER_CALL_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{7,127}$")
+
+
+class RealtimeProviderError(RuntimeError):
+    """Base error raised while consuming an established provider session."""
+
+
+class RealtimeProviderProtocolError(RealtimeProviderError):
+    """The provider emitted data or ordering Ava cannot safely consume."""
+
+
+class RealtimeProviderUnavailableError(RealtimeProviderError):
+    """The provider session could not complete the active Ava turn."""
 
 
 class RealtimeNegotiationError(RuntimeError):
@@ -85,12 +110,18 @@ class RealtimeProviderSession(Protocol):
         turn_id: str,
     ) -> AsyncIterator[RealtimeProviderTurnEvent]: ...
 
+    async def next_input_event(self) -> RealtimeProviderInputEvent: ...
+
+    def input_item_owner(self, *, item_id: str) -> str | None: ...
+
+    async def admit_pending_input_items(self, *, turn_id: str) -> tuple[str, ...]: ...
+
     async def complete_canvas_tool(
         self,
         *,
         turn_id: str,
         call_id: str,
-        output: InteractiveCanvasToolOutput,
+        output: InteractiveCanvasToolOutput | InteractiveCanvasToolOutputV4,
     ) -> None: ...
 
     async def child_transcript(self, *, turn_id: str) -> str | None: ...

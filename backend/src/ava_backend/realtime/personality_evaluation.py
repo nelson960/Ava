@@ -10,8 +10,11 @@ from pydantic import Field, StringConstraints, model_validator
 from ..protocol import AgeBand
 from .common import NonEmptyText, RealtimeProtocolModel
 from .harness import REALTIME_PROMPT_VERSION
-from .memory import AuthoritativeMemorySnapshot, evaluate_memory_proposal
-from .plan import AvaMemoryProposal
+from .memory import (
+    AvaMemoryProposal,
+    AuthoritativeMemorySnapshot,
+    evaluate_memory_proposal,
+)
 from .tool_contract import InteractiveCanvasRequest
 from .turn_parser import StreamingSpeechParser, StreamingTurnParseError
 

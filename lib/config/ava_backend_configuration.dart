@@ -78,8 +78,8 @@ class AvaBackendConfiguration {
 
   bool get isConfigured => baseUri != null;
 
-  Uri get realtimeSessionsEndpoint =>
-      _requireBaseUri().resolve('v3/realtime/sessions');
+  Uri get realtimeSessionsV4Endpoint =>
+      _requireBaseUri().resolve('v4/realtime/sessions');
 
   Uri weeklyRecapEndpoint(DateTime periodStart) {
     final date = DateTime(
@@ -97,14 +97,6 @@ class AvaBackendConfiguration {
 
   Uri get resetConversationsEndpoint =>
       _requireBaseUri().resolve('v3/memory/conversations');
-
-  Uri get lessonTurnsEndpoint {
-    return _requireBaseUri().resolve('v1/lesson-turns');
-  }
-
-  Uri get performanceTurnsEndpoint {
-    return _requireBaseUri().resolve('v2/performance-turns');
-  }
 
   Uri _requireBaseUri() {
     final base = baseUri;

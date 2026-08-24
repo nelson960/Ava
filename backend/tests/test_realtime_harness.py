@@ -98,7 +98,7 @@ def test_harness_exposes_one_optional_bounded_canvas_tool() -> None:
     assert parameters["additionalProperties"] is False
     assert parameters["required"] == ["brief"]
     assert set(parameters["properties"]) == {"brief", "interactionGoal"}
-    assert parameters["properties"]["brief"]["maxLength"] == 600
+    assert parameters["properties"]["brief"]["maxLength"] == 500
     assert parameters["properties"]["interactionGoal"]["anyOf"][0]["maxLength"] == 160
     serialized = str(tool)
     assert "'title':" not in serialized

@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import '../config/ava_backend_configuration.dart';
 import '../models/ava_realtime_protocol.dart';
+import '../models/ava_realtime_protocol_v4.dart';
 
 final class AvaRealtimeBootstrapException implements Exception {
   const AvaRealtimeBootstrapException({
@@ -100,16 +101,16 @@ final class AvaRealtimeBootstrapService {
   final AvaBackendConfiguration _configuration;
   final AvaRealtimeBootstrapTransport _transport;
 
-  Future<AvaSessionBootstrapV3> createSession({
+  Future<AvaSessionBootstrapV4> createSessionV4({
     required AvaRealtimeAgeBand ageBand,
   }) async {
-    final request = AvaSessionCreateRequestV3(ageBand: ageBand);
+    final request = AvaSessionCreateRequestV4(ageBand: ageBand);
     final response = await _transport.postJson(
-      endpoint: _configuration.realtimeSessionsEndpoint,
+      endpoint: _configuration.realtimeSessionsV4Endpoint,
       headers: const {
         HttpHeaders.acceptHeader: 'application/json',
         HttpHeaders.contentTypeHeader: 'application/json; charset=utf-8',
-        'x-ava-protocol-version': '$avaRealtimeProtocolVersion',
+        'x-ava-protocol-version': '$avaRealtimeProtocolVersionV4',
       },
       body: jsonEncode(request.toJson()),
       timeout: _configuration.requestTimeout,
@@ -117,12 +118,12 @@ final class AvaRealtimeBootstrapService {
     if (response.statusCode != HttpStatus.created) {
       await _readResponse(response.bytes);
       throw AvaRealtimeBootstrapException(
-        message: 'Ava backend rejected realtime session creation.',
+        message: 'Ava backend rejected protocol-v4 session creation.',
         statusCode: response.statusCode,
         requestId: response.requestId,
       );
     }
-    if (response.protocolVersion != '$avaRealtimeProtocolVersion') {
+    if (response.protocolVersion != '$avaRealtimeProtocolVersionV4') {
       await _readResponse(response.bytes);
       throw AvaRealtimeBootstrapException(
         message: 'Ava backend returned a mismatched protocol version.',
@@ -152,10 +153,10 @@ final class AvaRealtimeBootstrapService {
     }
     if (decoded is! Map) {
       throw const FormatException(
-        'Ava realtime session bootstrap must be a JSON object.',
+        'Ava protocol-v4 session bootstrap must be a JSON object.',
       );
     }
-    return AvaSessionBootstrapV3.fromJson(
+    return AvaSessionBootstrapV4.fromJson(
       decoded.cast<String, Object?>(),
       allowInsecureLoopback: _configuration.allowsInsecureLoopback,
     );

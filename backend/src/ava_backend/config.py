@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     openai_max_retries: int = Field(default=2, ge=0, le=3)
     openai_max_output_tokens: int = Field(default=1200, ge=256, le=4096)
     openai_realtime_model: str = "gpt-realtime-2.1-mini"
+    openai_realtime_transcription_model: str = "gpt-transcribe"
     openai_realtime_connect_timeout_seconds: float = Field(
         default=15,
         ge=3,
@@ -66,15 +67,23 @@ class Settings(BaseSettings):
         ge=100,
         le=2_000,
     )
-    openai_canvas_model: str = "gpt-5.6-luna"
+    openai_canvas_model: Literal["gpt-5.6-sol"] = "gpt-5.6-sol"
     openai_canvas_reasoning_effort: Literal["none", "low"] = "none"
-    openai_canvas_timeout_seconds: float = Field(default=25, ge=3, le=30)
+    openai_canvas_timeout_seconds: float = Field(
+        default=60,
+        ge=3,
+        le=180,
+        description=(
+            "One generation-wide deadline shared by the original SVG request, "
+            "validation, and the optional repair."
+        ),
+    )
     openai_canvas_max_retries: Literal[0] = 0
     openai_canvas_max_quality_repairs: Literal[0, 1] = 1
     openai_canvas_max_output_tokens: int = Field(
-        default=3600,
+        default=4096,
         ge=512,
-        le=4096,
+        le=16384,
     )
     openai_live_tests_enabled: bool = False
     openai_tts_model: str = "gpt-4o-mini-tts-2025-12-15"
@@ -137,6 +146,7 @@ class Settings(BaseSettings):
     @field_validator(
         "openai_model",
         "openai_realtime_model",
+        "openai_realtime_transcription_model",
         "openai_canvas_model",
         "openai_tts_model",
         "elevenlabs_voice_label",
@@ -180,6 +190,10 @@ class Settings(BaseSettings):
             raise ValueError(
                 "AVA_REALTIME_DELIVERY_MODE=captionPreview is development-only"
             )
+        if self.realtime_delivery_mode is not RealtimeDeliveryMode.ELEVENLABS:
+            raise ValueError(
+                "AVA_REALTIME_DELIVERY_MODE=elevenlabs is required in production"
+            )
         if self.realtime_allow_insecure_loopback:
             raise ValueError(
                 "AVA_REALTIME_ALLOW_INSECURE_LOOPBACK cannot be enabled in production"
@@ -207,6 +221,10 @@ class Settings(BaseSettings):
             )
         try:
             self.require_postgres_memory_url()
+        except BackendConfigurationError as error:
+            raise ValueError(str(error)) from error
+        try:
+            self.require_elevenlabs_credentials()
         except BackendConfigurationError as error:
             raise ValueError(str(error)) from error
         return self

@@ -2,18 +2,15 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:ava/canvas/ava_canvas_engine.dart';
-import 'package:ava/canvas/ava_canvas_geometry.dart';
 import 'package:ava/config/ava_backend_configuration.dart';
-import 'package:ava/models/ava_canvas_protocol.dart';
 import 'package:ava/models/ava_realtime_protocol.dart';
+import 'package:ava/models/ava_realtime_protocol_v4.dart';
 import 'package:ava/services/ava_realtime_bootstrap_service.dart';
-import 'package:ava/services/ava_realtime_session.dart';
+import 'package:ava/services/ava_realtime_session_v4.dart';
 import 'package:ava/services/ava_realtime_webrtc.dart';
 import 'package:ava/services/memory_service.dart';
 import 'package:ava/state/app_state.dart';
 import 'package:ava/ui/avatar/ava_filament_viewer.dart';
-import 'package:ava/ui/dashboard/ava_canvas_view.dart';
 import 'package:ava/ui/main_screen.dart';
 import 'package:drift/native.dart';
 import 'package:flutter/cupertino.dart';
@@ -67,12 +64,12 @@ void main() {
           avaRealtimeBootstrapTransportProvider.overrideWithValue(
             bootstrapTransport,
           ),
-          avaRealtimeMediaConnectorProvider.overrideWithValue(
+          avaRealtimeMediaConnectorV4Provider.overrideWithValue(
             (bootstrap) async => DeterministicAvaRealtimeMediaSession(
               offerSdp: _testOfferSdp,
             ),
           ),
-          avaRealtimeTransportConnectorProvider.overrideWithValue(
+          avaRealtimeRawTransportConnectorV4Provider.overrideWithValue(
             (bootstrap) async => realtimeTransport,
           ),
         ],
@@ -85,67 +82,42 @@ void main() {
     expect(find.byIcon(CupertinoIcons.mic_slash_fill), findsOneWidget);
   });
 
-  testWidgets(
-    'dynamic canvas stays in the lower half and leaves avatar input exposed',
-    (tester) async {
-      final database = AppDatabase.forTesting(NativeDatabase.memory());
-      addTearDown(database.close);
-      final engine = AvaCanvasEngine();
-      final gallery = jsonDecode(
-        File(
-          'protocol/fixtures/ava_canvas_gallery_v3.json',
-        ).readAsStringSync(),
-      ) as List;
-      final interactive =
-          (gallery.last as Map)['transaction'] as Map<String, Object?>;
-      final applied = engine.apply(
-        AvaCanvasTransaction.fromJson(interactive),
-      );
-      expect(applied.accepted, isTrue);
+  testWidgets('rapid recurring session phases keep unique transition keys', (
+    tester,
+  ) async {
+    final database = AppDatabase.forTesting(NativeDatabase.memory());
+    addTearDown(database.close);
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [databaseProvider.overrideWithValue(database)],
+        child: const MaterialApp(home: MainScreen()),
+      ),
+    );
+    await tester.pump();
 
-      await tester.pumpWidget(
-        ProviderScope(
-          overrides: [
-            avaCanvasEngineProvider.overrideWith((ref) => engine),
-            databaseProvider.overrideWithValue(database),
-          ],
-          child: const MaterialApp(home: MainScreen()),
-        ),
-      );
-      await tester.pump(const Duration(milliseconds: 500));
+    final container = ProviderScope.containerOf(
+      tester.element(find.byType(MainScreen)),
+    );
+    final presentation = container.read(
+      avaRealtimePresentationProvider.notifier,
+    );
+    presentation.beginTurn(
+      sessionId: 'session-main-screen-transition',
+      turnId: 'turn-main-screen-transition',
+    );
+    presentation.setPhase(AvaRealtimeTurnPhase.planning);
+    await tester.pump();
+    presentation.setPhase(AvaRealtimeTurnPhase.speaking);
+    await tester.pump(const Duration(milliseconds: 20));
+    presentation.setPhase(AvaRealtimeTurnPhase.synthesizing);
+    await tester.pump();
 
-      final canvasFinder = find.byType(AvaCanvasView);
-      expect(canvasFinder, findsOneWidget);
-      expect(find.byType(AvaFilamentViewer), findsOneWidget);
-      final screenSize =
-          tester.view.physicalSize / tester.view.devicePixelRatio;
-      final canvasRect = tester.getRect(canvasFinder);
-      expect(canvasRect.top, greaterThanOrEqualTo(screenSize.height * 0.5));
-
-      final beforeTopTouch = engine.scene!.interactionRevision;
-      await tester
-          .tapAt(Offset(screenSize.width / 2, screenSize.height * 0.25));
-      await tester.pump();
-      expect(engine.scene!.interactionRevision, beforeTopTouch);
-
-      final viewport = AvaCanvasViewportTransform.forSize(canvasRect.size);
-      await tester.tapAt(
-        canvasRect.topLeft + viewport.toLocal(const Offset(500, 465)),
-      );
-      await tester.pump();
-      expect(
-        engine.effectiveNodeJson(
-          engine.scene!.nodes['interactive_answer']!,
-        )['visible'],
-        isTrue,
-      );
-
-      await tester.tap(find.byKey(const ValueKey('close_dynamic_canvas')));
-      await tester.pump(const Duration(milliseconds: 500));
-      expect(engine.panelVisible, isFalse);
-      expect(find.byType(AvaFilamentViewer), findsOneWidget);
-    },
-  );
+    expect(tester.takeException(), isNull);
+    expect(find.text('Thinking'), findsWidgets);
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(tester.takeException(), isNull);
+    expect(find.text('Thinking'), findsOneWidget);
+  });
 }
 
 final class _CountingBootstrapTransport
@@ -161,14 +133,17 @@ final class _CountingBootstrapTransport
   }) async {
     requestCount += 1;
     final payload = <String, Object?>{
-      'protocolVersion': 3,
+      'protocolVersion': 4,
       'sessionId': 'session-main-screen-prepared',
       'eventUrl':
-          'wss://ava.example.test/v3/realtime/session-main-screen-prepared/events',
+          'wss://ava.example.test/v4/realtime/sessions/session-main-screen-prepared/events',
       'webrtcUrl':
-          'https://ava.example.test/v3/realtime/session-main-screen-prepared/webrtc',
+          'https://ava.example.test/v4/realtime/sessions/session-main-screen-prepared/webrtc',
+      'canvasDocumentBaseUrl':
+          'https://ava.example.test/v4/realtime/sessions/session-main-screen-prepared/canvas-documents',
       'sessionToken': 'session-token-main-screen',
       'webrtcToken': 'webrtc-token-main-screen',
+      'canvasToken': 'canvas-token-main-screen',
       'expiresAt': DateTime.now()
           .toUtc()
           .add(const Duration(minutes: 2))
@@ -176,15 +151,19 @@ final class _CountingBootstrapTransport
       'limits': {
         'maxTurnSeconds': 90,
         'maxResponseCharacters': 1800,
-        'maxCanvasNodes': 96,
+        'maxSvgBytes': 262144,
+        'maxManifestBytes': 65536,
         'maxAudioChunkBytes': 192000,
         'playbackProgressIntervalMs': 250,
       },
+      'rendererCapabilityVersion': 'ava-svg-renderer-v1',
+      'validatorVersion': 'ava-svg-validator-v1',
+      'manifestVersion': 'ava-svg-manifest-v1',
     };
     return AvaRealtimeBootstrapResponse(
       statusCode: HttpStatus.created,
       contentType: 'application/json',
-      protocolVersion: '3',
+      protocolVersion: '4',
       bytes: Stream.value(utf8.encode(jsonEncode(payload))),
     );
   }
@@ -200,15 +179,16 @@ const _testOfferSdp = 'v=0\r\n'
     'm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n'
     'm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n';
 
-final class _HoldingRealtimeTransport implements AvaRealtimeTransport {
-  final StreamController<AvaRealtimeInboundFrame> _frames = StreamController();
+final class _HoldingRealtimeTransport implements AvaRealtimeRawTransportV4 {
+  final StreamController<AvaRealtimeInboundFrameV4> _frames =
+      StreamController();
   bool _closed = false;
 
   @override
-  Stream<AvaRealtimeInboundFrame> frames() => _frames.stream;
+  Stream<AvaRealtimeInboundFrameV4> frames() => _frames.stream;
 
   @override
-  Future<void> send(AvaRealtimeClientEvent event) async {}
+  Future<void> send(AvaRealtimeClientEventV4 event) async {}
 
   @override
   Future<void> close() async {

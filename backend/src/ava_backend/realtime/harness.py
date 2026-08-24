@@ -179,10 +179,15 @@ def build_realtime_harness(
     sections = [render_stable_instructions(), context.content]
     if canvas_context is not None:
         if (
-            not canvas_context.startswith('<active_canvas trust="validated_scene_data"')
+            not (
+                canvas_context.startswith('<active_canvas trust="validated_scene_data"')
+                or canvas_context.startswith(
+                    '<canvas_context trust="untrusted_model_generated_data"'
+                )
+            )
             or len(canvas_context) > 2_400
         ):
-            raise ValueError("canvas_context is not bounded validated context")
+            raise ValueError("canvas_context is not bounded declared-trust context")
         sections.append(canvas_context)
     return RealtimeHarness(
         prompt_version=REALTIME_PROMPT_VERSION,
@@ -196,7 +201,7 @@ def build_realtime_harness(
 
 
 def render_stable_instructions() -> str:
-    sections = [f'# Ava Realtime Contract\nPrompt version: "{REALTIME_PROMPT_VERSION}"']
+    sections = ["# Ava"]
     for layer in PROMPT_LAYERS:
         title = layer.name.replace("_", " ").title()
         sections.append(f"## {title}\n{layer.content.strip()}")

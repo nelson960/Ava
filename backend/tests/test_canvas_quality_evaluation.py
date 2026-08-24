@@ -156,8 +156,32 @@ def test_canvas_quality_gate_accepts_authored_composition() -> None:
     assert CanvasQualityEvaluator().evaluate(_quality_draft(polished=True)).accepted
 
 
-def test_canvas_quality_gate_rejects_generic_unstyled_composition() -> None:
-    report = CanvasQualityEvaluator().evaluate(_quality_draft(polished=False))
-    assert CanvasQualityIssueCode.WEAK_VISUAL_STYLE in {
+def test_canvas_quality_gate_rejects_clipped_composition() -> None:
+    draft = _quality_draft(polished=True)
+    # Move object_0 out of bounds
+    for node in draft.nodes:
+        if node.id == "object_0":
+            node.x = 1150.0
+    report = CanvasQualityEvaluator().evaluate(draft)
+    assert not report.accepted
+    assert CanvasQualityIssueCode.CLIPPED_CONTENT in {
+        issue.code for issue in report.issues
+    }
+
+
+def test_canvas_quality_gate_rejects_missing_entity() -> None:
+    draft = _quality_draft(polished=True)
+    # Add interaction referencing non-existent entity target
+    draft.interactions.append(
+        {
+            "id": "explore_mystery",
+            "triggerNodeId": "mystery_node",
+            "action": "explore",
+            "targetNodeId": "mystery_node",
+        }  # type: ignore
+    )
+    report = CanvasQualityEvaluator().evaluate(draft)
+    assert not report.accepted
+    assert CanvasQualityIssueCode.MISSING_ENTITY in {
         issue.code for issue in report.issues
     }

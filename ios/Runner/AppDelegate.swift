@@ -1,13 +1,11 @@
 import Flutter
 import UIKit
 @preconcurrency import AVFoundation
-@preconcurrency import Speech
 
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
-  private var speechChannelHandler: SpeechChannelHandler?
-  private var speechRecognitionChannelHandler: SpeechRecognitionChannelHandler?
   private var pcmSpeechChannelHandler: PcmSpeechChannelHandler?
+  private var audioDiagnosticsChannel: FlutterMethodChannel?
 
   override func application(
     _ application: UIApplication,
@@ -18,15 +16,33 @@ import UIKit
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
-    speechChannelHandler = SpeechChannelHandler(
-      messenger: engineBridge.applicationRegistrar.messenger()
-    )
-    speechRecognitionChannelHandler = SpeechRecognitionChannelHandler(
-      messenger: engineBridge.applicationRegistrar.messenger()
-    )
+    let messenger = engineBridge.applicationRegistrar.messenger()
     pcmSpeechChannelHandler = PcmSpeechChannelHandler(
-      messenger: engineBridge.applicationRegistrar.messenger()
+      messenger: messenger
     )
+    audioDiagnosticsChannel = FlutterMethodChannel(
+      name: "ava/audio_diagnostics",
+      binaryMessenger: messenger
+    )
+    audioDiagnosticsChannel?.setMethodCallHandler { call, result in
+      guard call.method == "currentRoute" else {
+        result(FlutterMethodNotImplemented)
+        return
+      }
+      let session = AVAudioSession.sharedInstance()
+      result([
+        "inputRouteType": session.currentRoute.inputs
+          .map { $0.portType.rawValue }
+          .joined(separator: ","),
+        "outputRouteType": session.currentRoute.outputs
+          .map { $0.portType.rawValue }
+          .joined(separator: ","),
+        "audioCategory": session.category.rawValue,
+        "audioMode": session.mode.rawValue,
+        "inputAvailable": session.isInputAvailable,
+        "sampleRateHz": session.sampleRate,
+      ])
+    }
   }
 }
 
@@ -114,9 +130,9 @@ private final class PcmSpeechChannelHandler: NSObject, @unchecked Sendable {
     }
 
     do {
-      let session = AVAudioSession.sharedInstance()
-      try session.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
-      try session.setActive(true)
+      // The persistent WebRTC call owns AVAudioSession category, mode, route,
+      // and active lifetime. Reconfiguring it as playback-only here disables
+      // the capture-side voice-processing path while Ava speaks.
       audioEngine.connect(player, to: audioEngine.mainMixerNode, format: streamFormat)
       audioEngine.prepare()
       try audioEngine.start()
@@ -374,10 +390,6 @@ private final class PcmSpeechChannelHandler: NSObject, @unchecked Sendable {
     scheduledBufferCount = 0
     completedBufferCount = 0
     scheduledSampleCount = 0
-    try? AVAudioSession.sharedInstance().setActive(
-      false,
-      options: .notifyOthersOnDeactivation
-    )
   }
 
   private func validTurnId(_ value: Any?) -> String? {
@@ -391,412 +403,5 @@ private final class PcmSpeechChannelHandler: NSObject, @unchecked Sendable {
 
   private func flutterError(_ code: String, _ message: String) -> FlutterError {
     FlutterError(code: code, message: message, details: nil)
-  }
-}
-
-private final class SpeechRecognitionChannelHandler: NSObject, @unchecked Sendable {
-  private let channel: FlutterMethodChannel
-  private let audioEngine = AVAudioEngine()
-  private var recognitionTask: SFSpeechRecognitionTask?
-  private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
-  private var activeResult: FlutterResult?
-  private var bestTranscript = ""
-  private var silenceTimer: Timer?
-  private var maximumTimer: Timer?
-
-  init(messenger: FlutterBinaryMessenger) {
-    channel = FlutterMethodChannel(name: "ava/speech_input", binaryMessenger: messenger)
-    super.init()
-    channel.setMethodCallHandler { [weak self] call, result in
-      guard let self else {
-        result(FlutterError(
-          code: "speech_recognition_unavailable",
-          message: "The iOS speech recognition handler is unavailable.",
-          details: nil
-        ))
-        return
-      }
-      switch call.method {
-      case "listen":
-        self.listen(call.arguments, result: result)
-      case "stop":
-        self.cancelActiveRecognition()
-        result(nil)
-      default:
-        result(FlutterMethodNotImplemented)
-      }
-    }
-  }
-
-  private func listen(_ arguments: Any?, result: @escaping FlutterResult) {
-    guard activeResult == nil else {
-      result(FlutterError(
-        code: "speech_recognition_busy",
-        message: "Ava is already listening.",
-        details: nil
-      ))
-      return
-    }
-    guard
-      let arguments = arguments as? [String: Any],
-      let locale = arguments["locale"] as? String,
-      !locale.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    else {
-      result(FlutterError(
-        code: "invalid_speech_recognition_request",
-        message: "Speech recognition requires a locale.",
-        details: arguments
-      ))
-      return
-    }
-
-    authorizeSpeech { [weak self] speechError in
-      guard let self else { return }
-      if let speechError {
-        result(speechError)
-        return
-      }
-      self.authorizeMicrophone { [weak self] microphoneError in
-        guard let self else { return }
-        if let microphoneError {
-          result(microphoneError)
-          return
-        }
-        self.startRecognition(locale: locale, result: result)
-      }
-    }
-  }
-
-  private func authorizeSpeech(_ completion: @escaping (FlutterError?) -> Void) {
-    func resolve(_ status: SFSpeechRecognizerAuthorizationStatus) {
-      switch status {
-      case .authorized:
-        completion(nil)
-      case .denied, .restricted:
-        completion(FlutterError(
-          code: "speech_recognition_permission_denied",
-          message: "Speech recognition permission is required in Settings.",
-          details: nil
-        ))
-      case .notDetermined:
-        completion(FlutterError(
-          code: "speech_recognition_permission_unresolved",
-          message: "Speech recognition permission was not resolved.",
-          details: nil
-        ))
-      @unknown default:
-        completion(FlutterError(
-          code: "speech_recognition_permission_unknown",
-          message: "iOS returned an unknown speech recognition permission state.",
-          details: nil
-        ))
-      }
-    }
-
-    let current = SFSpeechRecognizer.authorizationStatus()
-    if current == .notDetermined {
-      SFSpeechRecognizer.requestAuthorization { status in
-        DispatchQueue.main.async { resolve(status) }
-      }
-    } else {
-      resolve(current)
-    }
-  }
-
-  private func authorizeMicrophone(_ completion: @escaping (FlutterError?) -> Void) {
-    let session = AVAudioSession.sharedInstance()
-    switch session.recordPermission {
-    case .granted:
-      completion(nil)
-    case .undetermined:
-      session.requestRecordPermission { granted in
-        DispatchQueue.main.async {
-          completion(granted ? nil : FlutterError(
-            code: "microphone_permission_denied",
-            message: "Microphone permission is required in Settings.",
-            details: nil
-          ))
-        }
-      }
-    case .denied:
-      completion(FlutterError(
-        code: "microphone_permission_denied",
-        message: "Microphone permission is required in Settings.",
-        details: nil
-      ))
-    @unknown default:
-      completion(FlutterError(
-        code: "microphone_permission_unknown",
-        message: "iOS returned an unknown microphone permission state.",
-        details: nil
-      ))
-    }
-  }
-
-  private func startRecognition(locale: String, result: @escaping FlutterResult) {
-    guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: locale)) else {
-      result(FlutterError(
-        code: "speech_recognizer_locale_unavailable",
-        message: "No speech recognizer is available for \(locale).",
-        details: nil
-      ))
-      return
-    }
-    guard recognizer.isAvailable else {
-      result(FlutterError(
-        code: "speech_recognizer_offline",
-        message: "Apple speech recognition is currently unavailable.",
-        details: nil
-      ))
-      return
-    }
-
-    do {
-      let audioSession = AVAudioSession.sharedInstance()
-      try audioSession.setCategory(.record, mode: .measurement, options: [.duckOthers])
-      try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
-    } catch {
-      result(FlutterError(
-        code: "microphone_audio_session_failed",
-        message: "Could not prepare microphone input: \(error.localizedDescription)",
-        details: nil
-      ))
-      return
-    }
-
-    let request = SFSpeechAudioBufferRecognitionRequest()
-    request.shouldReportPartialResults = true
-    request.taskHint = .dictation
-    let inputNode = audioEngine.inputNode
-    let format = inputNode.outputFormat(forBus: 0)
-    guard format.sampleRate > 0 && format.channelCount > 0 else {
-      result(FlutterError(
-        code: "microphone_format_unavailable",
-        message: "The microphone did not provide a usable audio format.",
-        details: nil
-      ))
-      return
-    }
-
-    activeResult = result
-    bestTranscript = ""
-    recognitionRequest = request
-    inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
-      request.append(buffer)
-    }
-    audioEngine.prepare()
-    do {
-      try audioEngine.start()
-    } catch {
-      cleanupRecognition()
-      result(FlutterError(
-        code: "microphone_start_failed",
-        message: "Could not start microphone capture: \(error.localizedDescription)",
-        details: nil
-      ))
-      return
-    }
-
-    recognitionTask = recognizer.recognitionTask(with: request) { [weak self] recognitionResult, error in
-      DispatchQueue.main.async {
-        guard let self, self.activeResult != nil else { return }
-        if let recognitionResult {
-          let transcript = recognitionResult.bestTranscription.formattedString
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-          if !transcript.isEmpty {
-            self.bestTranscript = transcript
-            self.scheduleSilenceCompletion()
-          }
-          if recognitionResult.isFinal {
-            self.completeRecognition()
-            return
-          }
-        }
-        if let error {
-          self.failRecognition(
-            code: "speech_recognition_failed",
-            message: "Speech recognition failed: \(error.localizedDescription)"
-          )
-        }
-      }
-    }
-    maximumTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: false) { [weak self] _ in
-      self?.completeRecognition()
-    }
-  }
-
-  private func scheduleSilenceCompletion() {
-    silenceTimer?.invalidate()
-    silenceTimer = Timer.scheduledTimer(withTimeInterval: 1.25, repeats: false) { [weak self] _ in
-      self?.completeRecognition()
-    }
-  }
-
-  private func completeRecognition() {
-    guard activeResult != nil else { return }
-    let transcript = bestTranscript
-    if transcript.isEmpty {
-      failRecognition(
-        code: "speech_recognition_empty",
-        message: "Ava did not hear any speech."
-      )
-      return
-    }
-    let result = activeResult
-    cleanupRecognition()
-    result?(transcript)
-  }
-
-  private func failRecognition(code: String, message: String) {
-    let result = activeResult
-    cleanupRecognition()
-    result?(FlutterError(code: code, message: message, details: nil))
-  }
-
-  private func cancelActiveRecognition() {
-    guard activeResult != nil else { return }
-    let result = activeResult
-    cleanupRecognition()
-    result?(FlutterError(
-      code: "speech_recognition_cancelled",
-      message: "Ava stopped listening.",
-      details: nil
-    ))
-  }
-
-  private func cleanupRecognition() {
-    silenceTimer?.invalidate()
-    maximumTimer?.invalidate()
-    silenceTimer = nil
-    maximumTimer = nil
-    if audioEngine.isRunning { audioEngine.stop() }
-    audioEngine.inputNode.removeTap(onBus: 0)
-    recognitionRequest?.endAudio()
-    recognitionTask?.cancel()
-    recognitionTask = nil
-    recognitionRequest = nil
-    activeResult = nil
-    bestTranscript = ""
-    try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-  }
-}
-
-private final class SpeechChannelHandler: NSObject, AVSpeechSynthesizerDelegate, @unchecked Sendable {
-  private let synthesizer = AVSpeechSynthesizer()
-  private let channel: FlutterMethodChannel
-  private var activeUtterance: AVSpeechUtterance?
-  private var activeResult: FlutterResult?
-
-  init(messenger: FlutterBinaryMessenger) {
-    channel = FlutterMethodChannel(name: "ava/speech", binaryMessenger: messenger)
-    super.init()
-    synthesizer.delegate = self
-    channel.setMethodCallHandler { [weak self] call, result in
-      guard let self else {
-        result(FlutterError(
-          code: "speech_unavailable",
-          message: "The iOS speech handler is unavailable.",
-          details: nil
-        ))
-        return
-      }
-      self.handle(call, result: result)
-    }
-  }
-
-  private func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-    switch call.method {
-    case "speak":
-      speak(call.arguments, result: result)
-    case "stop":
-      synthesizer.stopSpeaking(at: .immediate)
-      result(nil)
-    default:
-      result(FlutterMethodNotImplemented)
-    }
-  }
-
-  private func speak(_ arguments: Any?, result: @escaping FlutterResult) {
-    guard activeUtterance == nil else {
-      result(FlutterError(
-        code: "speech_busy",
-        message: "Ava is already speaking.",
-        details: nil
-      ))
-      return
-    }
-    guard
-      let arguments = arguments as? [String: Any],
-      let text = arguments["text"] as? String,
-      !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-      let volumeNumber = arguments["volume"] as? NSNumber,
-      let language = arguments["language"] as? String
-    else {
-      result(FlutterError(
-        code: "invalid_speech_request",
-        message: "Speech requires non-empty text, a volume, and a language.",
-        details: arguments
-      ))
-      return
-    }
-    guard let voice = AVSpeechSynthesisVoice(language: language) else {
-      result(FlutterError(
-        code: "speech_voice_unavailable",
-        message: "No system speech voice is installed for \(language).",
-        details: nil
-      ))
-      return
-    }
-
-    do {
-      let audioSession = AVAudioSession.sharedInstance()
-      try audioSession.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
-      try audioSession.setActive(true)
-    } catch {
-      result(FlutterError(
-        code: "speech_audio_session_failed",
-        message: "Could not prepare the iOS audio session: \(error.localizedDescription)",
-        details: nil
-      ))
-      return
-    }
-
-    let utterance = AVSpeechUtterance(string: text)
-    utterance.voice = voice
-    utterance.volume = Float(truncating: volumeNumber)
-    utterance.rate = AVSpeechUtteranceDefaultSpeechRate * 0.92
-    utterance.pitchMultiplier = 1.04
-    activeUtterance = utterance
-    activeResult = result
-    synthesizer.speak(utterance)
-  }
-
-  func speechSynthesizer(
-    _ synthesizer: AVSpeechSynthesizer,
-    didFinish utterance: AVSpeechUtterance
-  ) {
-    complete(utterance, value: nil)
-  }
-
-  func speechSynthesizer(
-    _ synthesizer: AVSpeechSynthesizer,
-    didCancel utterance: AVSpeechUtterance
-  ) {
-    complete(
-      utterance,
-      value: FlutterError(
-        code: "speech_cancelled",
-        message: "Ava's speech was cancelled.",
-        details: nil
-      )
-    )
-  }
-
-  private func complete(_ utterance: AVSpeechUtterance, value: Any?) {
-    guard utterance === activeUtterance else { return }
-    let result = activeResult
-    activeUtterance = nil
-    activeResult = nil
-    result?(value)
   }
 }
