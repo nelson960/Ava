@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from builtins import anext
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from time import monotonic
 from typing import TypeAlias, cast
@@ -194,6 +194,7 @@ class DeterministicRealtimeSessionCoordinator:
         self._last_failure_id: str | None = None
         self._last_failure_component: str | None = None
         self._pending_memory_refresh_warning: tuple[str, str] | None = None
+        self._memory_commit_tasks: dict[str, asyncio.Task[None]] = {}
         self._last_error: Exception | None = None
         self._active_planning_task: asyncio.Task[_TurnResult | None] | None = None
         self._active_provider_input_task: (
@@ -1401,6 +1402,12 @@ class DeterministicRealtimeSessionCoordinator:
             return
         self._closed = True
         await self._cancel_active_turn_work()
+        memory_tasks = tuple(self._memory_commit_tasks.values())
+        for task in memory_tasks:
+            task.cancel()
+        if memory_tasks:
+            await asyncio.gather(*memory_tasks, return_exceptions=True)
+        self._memory_commit_tasks.clear()
         if not self._terminal:
             await self._realtime.cancel(turn_id=self._turn_id)
             await self._speech.cancel(turn_id=self._turn_id)
@@ -1518,6 +1525,7 @@ class DeterministicRealtimeSessionCoordinator:
         delivered_text = ledger.delivered_text(delivered_samples)
         try:
             await self._commit_memory(
+                turn_id=self._turn_id,
                 plan=plan,
                 delivered_sample_count=delivered_samples,
                 delivered_text=delivered_text,
@@ -1571,6 +1579,7 @@ class DeterministicRealtimeSessionCoordinator:
         if plan is not None:
             try:
                 await self._commit_memory(
+                    turn_id=self._turn_id,
                     plan=plan,
                     delivered_sample_count=delivered_samples,
                     delivered_text=delivered_text,
@@ -1611,6 +1620,7 @@ class DeterministicRealtimeSessionCoordinator:
     async def _commit_memory(
         self,
         *,
+        turn_id: str,
         plan: _TurnResult,
         delivered_sample_count: int,
         delivered_text: str,
@@ -1618,26 +1628,130 @@ class DeterministicRealtimeSessionCoordinator:
     ) -> None:
         if self._child_text is None or self._child_text_source is None:
             child_transcript = await self._realtime.child_transcript(
-                turn_id=self._turn_id
+                turn_id=turn_id
             )
             if child_transcript is not None:
                 self._child_text = _bounded_child_transcript(child_transcript)
                 self._child_text_source = ChildTurnTextSource.TRANSCRIPT
 
         if self._child_text is None or self._child_text_source is None:
+            wait_for_child_transcript = getattr(
+                self._realtime,
+                "wait_for_child_transcript",
+                None,
+            )
+            if callable(wait_for_child_transcript):
+                if turn_id in self._memory_commit_tasks:
+                    return
+                transcript_waiter = cast(
+                    Callable[..., Awaitable[str | None]],
+                    wait_for_child_transcript,
+                )(turn_id=turn_id)
+                self._memory_commit_tasks[turn_id] = asyncio.create_task(
+                    self._commit_memory_after_transcription(
+                        turn_id=turn_id,
+                        plan=plan,
+                        delivered_sample_count=delivered_sample_count,
+                        delivered_text=delivered_text,
+                        terminal=terminal,
+                        transcript_waiter=transcript_waiter,
+                    ),
+                    name=f"ava-memory-commit-{turn_id}",
+                )
+                return
             LOGGER.info(
                 "memory_commit_skipped session_id=%s turn_id=%s "
                 "reason=child_transcript_unavailable",
                 self._session_id,
-                self._turn_id,
+                turn_id,
             )
             self._last_memory_decision = None
             return
+        await self._persist_delivered_turn(
+            turn_id=turn_id,
+            plan=plan,
+            child_text=self._require_child_text(),
+            child_text_source=self._require_child_text_source(),
+            delivered_sample_count=delivered_sample_count,
+            delivered_text=delivered_text,
+            terminal=terminal,
+        )
+
+    async def _commit_memory_after_transcription(
+        self,
+        *,
+        turn_id: str,
+        plan: _TurnResult,
+        delivered_sample_count: int,
+        delivered_text: str,
+        terminal: DeliveredTurnTerminal,
+        transcript_waiter: Awaitable[str | None],
+    ) -> None:
+        try:
+            child_transcript = await transcript_waiter
+            if child_transcript is None:
+                LOGGER.info(
+                    "memory_commit_skipped session_id=%s turn_id=%s "
+                    "reason=child_transcription_terminal_without_text",
+                    self._session_id,
+                    turn_id,
+                )
+                return
+            child_text = _bounded_child_transcript(child_transcript)
+            await self._persist_delivered_turn(
+                turn_id=turn_id,
+                plan=plan,
+                child_text=child_text,
+                child_text_source=ChildTurnTextSource.TRANSCRIPT,
+                delivered_sample_count=delivered_sample_count,
+                delivered_text=delivered_text,
+                terminal=terminal,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self._last_error = error
+            failure_id = self._failure_id_factory()
+            LOGGER.exception(
+                "deferred_memory_commit_failed failure_id=%s session_id=%s "
+                "turn_id=%s",
+                failure_id,
+                self._session_id,
+                turn_id,
+                extra={
+                    "ava_context": {
+                        "failureId": failure_id,
+                        "component": str(SpeechFailureComponent.MEMORY_STORE),
+                        "sessionId": self._session_id,
+                        "turnId": turn_id,
+                    }
+                },
+            )
+            self._pending_memory_refresh_warning = (
+                failure_id,
+                "Delivered turn could not be persisted.",
+            )
+        finally:
+            task = asyncio.current_task()
+            if self._memory_commit_tasks.get(turn_id) is task:
+                self._memory_commit_tasks.pop(turn_id, None)
+
+    async def _persist_delivered_turn(
+        self,
+        *,
+        turn_id: str,
+        plan: _TurnResult,
+        child_text: str,
+        child_text_source: ChildTurnTextSource,
+        delivered_sample_count: int,
+        delivered_text: str,
+        terminal: DeliveredTurnTerminal,
+    ) -> None:
         turn = DeliveredConversationTurn.model_validate(
             {
-                "turnId": self._turn_id,
-                "childText": self._require_child_text(),
-                "childTextSource": self._require_child_text_source(),
+                "turnId": turn_id,
+                "childText": child_text,
+                "childTextSource": child_text_source,
                 "avaDeliveredText": delivered_text,
                 "deliveredSampleCount": delivered_sample_count,
                 "childTurnSummary": plan.child_turn_summary,

@@ -805,6 +805,37 @@ async def test_transcription_progress_drain_reaches_late_completed_event() -> No
 
 
 @pytest.mark.asyncio
+async def test_owned_transcription_terminal_wakes_deferred_memory_waiter() -> None:
+    channel, socket = _channel(
+        [
+            {"type": "input_audio_buffer.committed", "item_id": "item-memory"},
+            *_text_response_events(
+                response_id=RESPONSE_ID,
+                text="I will remember the delivered reply.",
+            ),
+        ]
+    )
+    await _collect_turn_events(channel, turn_id="turn-memory")
+    assert channel.input_item_owner(item_id="item-memory") == "turn-memory"
+
+    transcript = asyncio.create_task(
+        channel.wait_for_child_transcript_for_turn("turn-memory")
+    )
+    socket.push(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "item-memory",
+            "transcript": "Please remember this question.",
+        }
+    )
+
+    assert await transcript == "Please remember this question."
+    assert await channel.wait_for_child_transcript_for_turn("turn-memory") == (
+        "Please remember this question."
+    )
+
+
+@pytest.mark.asyncio
 async def test_transcription_segment_is_accepted_for_committed_item() -> None:
     channel, _ = _channel(
         [

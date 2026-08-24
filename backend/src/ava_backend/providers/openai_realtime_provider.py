@@ -277,6 +277,7 @@ class _OpenAIRealtimeEventChannel:
         self.last_first_delta_ms: float | None = None
         self.last_completed_ms: float | None = None
         self._child_transcripts_by_turn: dict[str, str] = {}
+        self._child_transcription_events_by_turn: dict[str, asyncio.Event] = {}
         self._input_item_turn_ids: dict[str, str | None] = {}
         self._input_transcription_outcomes: dict[str, _InputTranscriptionOutcome] = {}
 
@@ -375,6 +376,8 @@ class _OpenAIRealtimeEventChannel:
             self._put_receiver_terminal()
 
     def _put_receiver_terminal(self) -> None:
+        for event in self._child_transcription_events_by_turn.values():
+            event.set()
         for queue in (self._router_events, self._input_events):
             try:
                 queue.put_nowait(self._receiver_terminal)
@@ -847,6 +850,49 @@ class _OpenAIRealtimeEventChannel:
             if transcript is not None:
                 return transcript
 
+    async def wait_for_child_transcript_for_turn(self, turn_id: str) -> str | None:
+        """Wait for the terminal transcription of one explicitly owned input item."""
+
+        await self.start_receiver()
+        transcript = self._child_transcripts_by_turn.get(turn_id)
+        if transcript is not None:
+            return transcript
+        owned_item_ids = tuple(
+            item_id
+            for item_id, owner_turn_id in self._input_item_turn_ids.items()
+            if owner_turn_id == turn_id
+        )
+        if not owned_item_ids:
+            return None
+        if len(owned_item_ids) != 1:
+            raise OpenAIRealtimeProtocolError(
+                "one Ava turn cannot own multiple committed input items"
+            )
+        item_id = owned_item_ids[0]
+        outcome = self._input_transcription_outcomes.get(item_id)
+        if outcome is not None:
+            return outcome.transcript
+
+        terminal = self._child_transcription_events_by_turn.setdefault(
+            turn_id,
+            asyncio.Event(),
+        )
+        try:
+            await terminal.wait()
+        finally:
+            if self._child_transcription_events_by_turn.get(turn_id) is terminal:
+                self._child_transcription_events_by_turn.pop(turn_id, None)
+        outcome = self._input_transcription_outcomes.get(item_id)
+        if outcome is not None:
+            return outcome.transcript
+        if self._receiver_error is not None:
+            raise self._receiver_error
+        if self._closed:
+            return None
+        raise OpenAIRealtimeProtocolError(
+            "OpenAI input transcription waiter woke without a terminal outcome"
+        )
+
     def _bind_committed_input_item(
         self,
         event: Mapping[str, object],
@@ -919,6 +965,9 @@ class _OpenAIRealtimeEventChannel:
             if outcome.transcript is not None:
                 self._child_transcripts_by_turn[turn_id] = outcome.transcript
             _retain_latest(self._child_transcripts_by_turn, maximum=64)
+            terminal = self._child_transcription_events_by_turn.get(turn_id)
+            if terminal is not None:
+                terminal.set()
         _retain_latest(self._input_item_turn_ids, maximum=64)
 
     def _validate_response_owner(
@@ -1037,6 +1086,10 @@ class _OpenAIRealtimeEventChannel:
 
         self._input_transcription_outcomes[item_id] = outcome
         _retain_latest(self._input_transcription_outcomes, maximum=64)
+        if turn_id is not None:
+            terminal = self._child_transcription_events_by_turn.get(turn_id)
+            if terminal is not None:
+                terminal.set()
 
         if failed:
             LOGGER.warning(
@@ -1687,6 +1740,15 @@ class OpenAIRealtimeProviderSession:
         if channel is not None:
             return await channel.child_transcript_for_turn(turn_id)
         return None
+
+    def wait_for_child_transcript(
+        self,
+        *,
+        turn_id: str,
+    ) -> Awaitable[str | None]:
+        if not turn_id.strip():
+            raise ValueError("turn_id cannot be empty")
+        return self._require_channel().wait_for_child_transcript_for_turn(turn_id)
 
     async def cancel(self, *, turn_id: str) -> None:
         if not turn_id.strip():

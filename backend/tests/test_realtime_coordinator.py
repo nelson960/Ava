@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import asyncio
+from collections.abc import AsyncIterator, Awaitable
 from pathlib import Path
 
 import pytest
@@ -386,6 +387,171 @@ class _FailingCommitMemoryStore(DevelopmentAuthoritativeMemoryStore):
     async def commit_delivered_turn(self, **kwargs: object):  # type: ignore[no-untyped-def]
         del kwargs
         raise RuntimeError("database unavailable")
+
+
+class _ObservedMemoryStore(DevelopmentAuthoritativeMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.committed = asyncio.Event()
+        self.committed_turn_ids: list[str] = []
+
+    async def commit_delivered_turn(self, **kwargs: object):  # type: ignore[no-untyped-def]
+        turn = kwargs["turn"]
+        result = await super().commit_delivered_turn(**kwargs)  # type: ignore[arg-type]
+        self.committed_turn_ids.append(turn.turn_id)  # type: ignore[union-attr]
+        self.committed.set()
+        return result
+
+
+class _LateTranscriptRealtimeProvider(DeterministicRealtimePlanProvider):
+    def __init__(self, plan: AvaTurnPlan, *, transcript: str) -> None:
+        super().__init__(plan, child_text=None)
+        self.item_id = "item-late-transcript-a"
+        self._input_item_turn_ids[self.item_id] = TURN_ID
+        self._late_transcript = transcript
+        self._completed_transcript: str | None = None
+        self._transcription_terminal = asyncio.Event()
+        self.transcript_wait_requests = 0
+
+    def wait_for_child_transcript(
+        self,
+        *,
+        turn_id: str,
+    ) -> Awaitable[str | None]:
+        assert turn_id == TURN_ID
+        assert self.input_item_owner(item_id=self.item_id) == turn_id
+        self.transcript_wait_requests += 1
+
+        async def wait_for_terminal() -> str | None:
+            await self._transcription_terminal.wait()
+            return self._completed_transcript
+
+        return wait_for_terminal()
+
+    def complete_transcription(self) -> None:
+        if self._completed_transcript is not None:
+            assert self._completed_transcript == self._late_transcript
+            return
+        self._completed_transcript = self._late_transcript
+        self._transcription_terminal.set()
+
+
+async def _complete_delivered_turn(
+    coordinator: DeterministicRealtimeSessionCoordinator,
+) -> list[object]:
+    events: list[object] = []
+    async for frame in coordinator.frames():
+        if not isinstance(frame, AvaServerControlFrameV4):
+            continue
+        events.append(frame.event)
+        if isinstance(frame.event, AudioMetadataEventV4):
+            await coordinator.receive(
+                _client(
+                    {
+                        "event": "playbackStarted",
+                        "sequence": 1,
+                        "turnId": TURN_ID,
+                        "streamId": STREAM_ID,
+                        "renderedSampleCount": 0,
+                    }
+                )
+            )
+        if (
+            isinstance(frame.event, TurnPhaseChangedEventV4)
+            and frame.event.phase == SpeechPhase.SPEAKING
+        ):
+            await coordinator.receive(
+                _client(
+                    {
+                        "event": "playbackProgress",
+                        "sequence": 2,
+                        "turnId": TURN_ID,
+                        "streamId": STREAM_ID,
+                        "renderedSampleCount": coordinator.received_sample_count,
+                        "bufferedSampleCount": 0,
+                    }
+                )
+            )
+    return events
+
+
+async def test_late_owned_transcription_commits_delivered_turn_exactly_once() -> None:
+    plan = _plan()
+    provider = _LateTranscriptRealtimeProvider(
+        plan,
+        transcript="Please tell me something gentle.",
+    )
+    memory = _ObservedMemoryStore()
+    coordinator, _, _, _ = _coordinator(
+        plan=plan,
+        realtime=provider,
+        memory=memory,
+    )
+    await _ready(coordinator)
+
+    events = await _complete_delivered_turn(coordinator)
+
+    assert isinstance(events[-1], TurnCompletedEventV4)
+    assert events[-1].delivered_text == plan.speech
+    assert provider.input_item_owner(item_id=provider.item_id) == TURN_ID
+    assert provider.transcript_wait_requests == 1
+    before_transcription = await memory.load_snapshot(
+        subject="child:coordinator",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+    )
+    assert before_transcription.delivered_turns == []
+
+    provider.complete_transcription()
+    await memory.committed.wait()
+    provider.complete_transcription()
+
+    snapshot = await memory.load_snapshot(
+        subject="child:coordinator",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+    )
+    assert memory.committed_turn_ids == [TURN_ID]
+    assert [turn.turn_id for turn in snapshot.delivered_turns] == [TURN_ID]
+    assert snapshot.delivered_turns[0].child_text == (
+        "Please tell me something gentle."
+    )
+    assert snapshot.delivered_turns[0].ava_delivered_text == plan.speech
+    await coordinator.close()
+
+
+async def test_committed_turn_is_loaded_into_fresh_session_harness() -> None:
+    plan = _plan()
+    child_text = "Can you remember this gentle question?"
+    provider_a = _LateTranscriptRealtimeProvider(plan, transcript=child_text)
+    memory = _ObservedMemoryStore()
+    coordinator_a, _, _, _ = _coordinator(
+        plan=plan,
+        realtime=provider_a,
+        memory=memory,
+    )
+    await _ready(coordinator_a)
+    await _complete_delivered_turn(coordinator_a)
+    assert provider_a.transcript_wait_requests == 1
+
+    provider_a.complete_transcription()
+    await memory.committed.wait()
+    await coordinator_a.close()
+
+    provider_b = DeterministicRealtimePlanProvider(
+        plan,
+        child_text="This is a fresh session.",
+    )
+    coordinator_b, _, _, _ = _coordinator(
+        plan=plan,
+        realtime=provider_b,
+        memory=memory,
+    )
+    await _ready(coordinator_b)
+
+    context = coordinator_b.harness.context.content
+    assert child_text in context
+    assert plan.speech in context
+    assert coordinator_b.harness.context.included_delivered_turns == 1
+    await coordinator_b.close()
 
 
 async def test_memory_failure_warns_then_speech_completes() -> None:
