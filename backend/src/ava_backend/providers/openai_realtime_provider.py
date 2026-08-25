@@ -48,6 +48,7 @@ MAX_PROVIDER_EVENTS_PER_TURN = 4096
 MAX_PROVIDER_ROUTER_EVENTS = 4096
 MAX_FUNCTION_ARGUMENT_BYTES = 256 * 1024
 MAX_PROVIDER_ERROR_BYTES = 64 * 1024
+_SIDEBAND_SEQUENCE_FIELD = "__ava_sideband_sequence"
 
 
 class OpenAIRealtimeProviderError(RealtimeProviderError):
@@ -252,6 +253,7 @@ class _OpenAIRealtimeEventChannel:
             vad_silence_duration_ms
         )
         self._received_event_count = 0
+        self._sideband_event_sequence = 0
         self._pending_events: deque[dict[str, object]] = deque()
         self._router_events: asyncio.Queue[dict[str, object] | object] = asyncio.Queue(
             maxsize=max_router_events
@@ -350,7 +352,21 @@ class _OpenAIRealtimeEventChannel:
             while not self._closed:
                 raw = await self._socket.recv()
                 event = self._decode_event(raw)
+                self._sideband_event_sequence += 1
+                event[_SIDEBAND_SEQUENCE_FIELD] = self._sideband_event_sequence
                 self._index_provider_identity(event)
+                event_type = _event_type(event)
+                if event_type in _RESPONSE_DIAGNOSTIC_EVENT_TYPES:
+                    response_id = _response_id_from_event(event)
+                    _log_response_diagnostic(
+                        "openai_realtime_response_event_observed",
+                        event=event,
+                        response_owner_turn_id=self._response_owner_by_id.get(
+                            response_id or ""
+                        ),
+                        active_turn_id=self._active_turn_id,
+                        active_response_id=self._active_response_id,
+                    )
                 try:
                     self._router_events.put_nowait(event)
                 except asyncio.QueueFull as error:
@@ -621,6 +637,15 @@ class _OpenAIRealtimeEventChannel:
                 },
             }
         )
+        _log_response_diagnostic(
+            "openai_realtime_canvas_continuation_requested",
+            event_type="response.create",
+            consumer_turn_id=turn_id,
+            consumer_phase="canvasContinuation",
+            active_turn_id=self._active_turn_id,
+            active_response_id=self._active_response_id,
+            call_id=call_id,
+        )
         self._completed_canvas_call_ids.add(call_id)
         self._pending_canvas_call_id = None
 
@@ -718,6 +743,7 @@ class _OpenAIRealtimeEventChannel:
         """Restore the persistent socket to an exact response boundary."""
 
         response_id = self._active_response_id
+        cancel_not_active_received = False
         if response_id is not None:
             self._admit_response(
                 response_id=response_id,
@@ -732,6 +758,25 @@ class _OpenAIRealtimeEventChannel:
             event_type = _event_type(event)
             if event_type == "error":
                 if _provider_error_code(event) == "response_cancel_not_active":
+                    if response_id is not None:
+                        cancel_not_active_received = True
+                        _log_response_diagnostic(
+                            "openai_realtime_cancel_not_active_waiting_for_terminal",
+                            event=event,
+                            response_id=response_id,
+                            response_owner_turn_id=self._response_owner_by_id.get(
+                                response_id
+                            ),
+                            consumer_turn_id=self._active_turn_id,
+                            consumer_phase="cancellation",
+                            active_turn_id=self._active_turn_id,
+                            active_response_id=self._active_response_id,
+                        )
+                        # The response ID has already been admitted to this
+                        # turn. A cancel-not-active error can race ahead of its
+                        # in-transit response.done, but it cannot transfer or
+                        # settle that response's ownership boundary.
+                        continue
                     LOGGER.info(
                         "openai_realtime_cancel_already_settled turn_id=%s "
                         "response_id=%s",
@@ -772,19 +817,25 @@ class _OpenAIRealtimeEventChannel:
                         "OpenAI completed response belongs to a different Ava turn"
                     )
                 status = _nested_string(event, "response", "status")
-                LOGGER.info(
-                    "openai_realtime_response_drained turn_id=%s response_id=%s "
-                    "status=%s",
-                    self._active_turn_id,
-                    completed_response_id,
-                    status,
+                _log_response_diagnostic(
+                    "openai_realtime_response_drained",
+                    event=event,
+                    response_id=completed_response_id,
+                    response_owner_turn_id=owner,
+                    consumer_turn_id=self._active_turn_id,
+                    consumer_phase="cancellation",
+                    active_turn_id=self._active_turn_id,
+                    active_response_id=self._active_response_id,
+                    status=status,
                 )
                 self._pending_events.extend(deferred_events)
                 # If the response completed before the cancel was processed,
                 # OpenAI may next report response_cancel_not_active. That
                 # documented no-op error belongs to this cancel, not the next
                 # child turn.
-                self._late_cancel_error_expected = status == "completed"
+                self._late_cancel_error_expected = (
+                    status == "completed" and not cancel_not_active_received
+                )
                 self._active_response_id = None
                 self._active_turn_id = None
                 return
@@ -982,6 +1033,7 @@ class _OpenAIRealtimeEventChannel:
         event: Mapping[str, object],
         *,
         turn_id: str,
+        consumer_phase: str,
     ) -> None:
         response_id = _response_id_from_event(event)
         if response_id is None:
@@ -999,10 +1051,39 @@ class _OpenAIRealtimeEventChannel:
                     "OpenAI response event arrived before response.created"
                 )
             self._admit_response(response_id=response_id, turn_id=turn_id)
+            _log_response_diagnostic(
+                "openai_realtime_response_owner_admitted",
+                event=event,
+                response_owner_turn_id=turn_id,
+                consumer_turn_id=turn_id,
+                consumer_phase=consumer_phase,
+                active_turn_id=self._active_turn_id,
+                active_response_id=self._active_response_id,
+            )
             return
         if owner != turn_id:
+            _log_response_diagnostic(
+                "openai_realtime_response_owner_mismatch",
+                level=logging.ERROR,
+                event=event,
+                response_owner_turn_id=owner,
+                consumer_turn_id=turn_id,
+                consumer_phase=consumer_phase,
+                active_turn_id=self._active_turn_id,
+                active_response_id=self._active_response_id,
+            )
             raise OpenAIRealtimeProtocolError(
                 "OpenAI response event belongs to a different Ava turn"
+            )
+        if _event_type(event) == "response.done":
+            _log_response_diagnostic(
+                "openai_realtime_response_terminal_consumed",
+                event=event,
+                response_owner_turn_id=owner,
+                consumer_turn_id=turn_id,
+                consumer_phase=consumer_phase,
+                active_turn_id=self._active_turn_id,
+                active_response_id=self._active_response_id,
             )
 
     def _admit_response(self, *, response_id: str, turn_id: str) -> None:
@@ -1179,7 +1260,13 @@ class _OpenAIRealtimeEventChannel:
                 )
                 event_type = _event_type(event)
                 if event_type.startswith("response."):
-                    self._validate_response_owner(event, turn_id=turn_id)
+                    self._validate_response_owner(
+                        event,
+                        turn_id=turn_id,
+                        consumer_phase=(
+                            "canvasContinuation" if continuation else "turnResponse"
+                        ),
+                    )
                 if event_type == "error":
                     if (
                         self._late_cancel_error_expected
@@ -1374,6 +1461,19 @@ class _OpenAIRealtimeEventChannel:
                             raise OpenAIRealtimeProtocolError(
                                 "OpenAI response arguments differ from streamed arguments"
                             )
+                        _log_response_diagnostic(
+                            "openai_realtime_canvas_function_response_consumed",
+                            event=event,
+                            response_id=completed_response_id,
+                            response_owner_turn_id=self._response_owner_by_id.get(
+                                completed_response_id
+                            ),
+                            consumer_turn_id=turn_id,
+                            consumer_phase="turnResponse",
+                            active_turn_id=self._active_turn_id,
+                            active_response_id=self._active_response_id,
+                            call_id=completed_call_id,
+                        )
                         try:
                             request = InteractiveCanvasRequest.model_validate_json(
                                 completed_arguments
@@ -2509,6 +2609,63 @@ def _response_id_from_event(event: Mapping[str, object]) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _sideband_sequence(event: Mapping[str, object]) -> int | None:
+    value = event.get(_SIDEBAND_SEQUENCE_FIELD)
+    return value if type(value) is int and value > 0 else None
+
+
+def _log_response_diagnostic(
+    message: str,
+    *,
+    level: int = logging.INFO,
+    event: Mapping[str, object] | None = None,
+    event_type: str | None = None,
+    response_id: str | None = None,
+    response_owner_turn_id: str | None = None,
+    consumer_turn_id: str | None = None,
+    consumer_phase: str | None = None,
+    active_turn_id: str | None = None,
+    active_response_id: str | None = None,
+    call_id: str | None = None,
+    status: str | None = None,
+) -> None:
+    if event is not None:
+        event_type = event_type or _event_type(event)
+        response_id = response_id or _response_id_from_event(event)
+    sequence = _sideband_sequence(event or {})
+    context: dict[str, object] = {
+        "component": "realtimeProvider",
+        "sidebandSequence": sequence,
+        "eventType": event_type,
+        "responseId": response_id,
+        "responseOwnerTurnId": response_owner_turn_id,
+        "consumerTurnId": consumer_turn_id,
+        "consumerPhase": consumer_phase,
+        "activeTurnId": active_turn_id,
+        "activeResponseId": active_response_id,
+    }
+    if call_id is not None:
+        context["callId"] = call_id
+    if status is not None:
+        context["status"] = status
+    LOGGER.log(
+        level,
+        "%s sideband_sequence=%s event_type=%s response_id=%s "
+        "response_owner_turn_id=%s consumer_turn_id=%s consumer_phase=%s "
+        "active_turn_id=%s active_response_id=%s",
+        message,
+        sequence,
+        event_type,
+        response_id,
+        response_owner_turn_id,
+        consumer_turn_id,
+        consumer_phase,
+        active_turn_id,
+        active_response_id,
+        extra={"ava_context": context},
+    )
+
+
 def _safe_close_reason(value: object) -> str | None:
     if not isinstance(value, str) or not value:
         return None
@@ -2563,6 +2720,15 @@ _PRE_RESPONSE_EVENT_TYPES = frozenset(
     {
         "conversation.created",
         "rate_limits.updated",
+    }
+)
+
+_RESPONSE_DIAGNOSTIC_EVENT_TYPES = frozenset(
+    {
+        "response.created",
+        "response.output_item.added",
+        "response.function_call_arguments.done",
+        "response.done",
     }
 )
 

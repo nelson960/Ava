@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections import deque
 
 import pytest
@@ -488,7 +489,10 @@ async def test_duplicate_transcription_events_are_resolved_by_item_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_late_response_event_cannot_mutate_new_turn() -> None:
+async def test_late_response_event_cannot_mutate_new_turn(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.openai_realtime")
     channel, _ = _channel(
         [
             *_text_response_events(response_id=RESPONSE_ID, text="First."),
@@ -510,6 +514,22 @@ async def test_late_response_event_cannot_mutate_new_turn() -> None:
         match="different Ava turn",
     ):
         await _collect_turn_events(channel, turn_id="turn-b")
+    mismatch = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage().startswith("openai_realtime_response_owner_mismatch")
+    )
+    assert mismatch == {
+        "component": "realtimeProvider",
+        "sidebandSequence": 5,
+        "eventType": "response.output_text.delta",
+        "responseId": RESPONSE_ID,
+        "responseOwnerTurnId": "turn-a",
+        "consumerTurnId": "turn-b",
+        "consumerPhase": "turnResponse",
+        "activeTurnId": "turn-b",
+        "activeResponseId": None,
+    }
     await channel.close()
 
 
@@ -1321,6 +1341,202 @@ async def test_cancelling_pending_canvas_returns_rejection_without_continuation(
         for sent in socket.sent
         if isinstance(sent.get("response"), dict)
     )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_canvas_continuation_cannot_escape_into_next_turn(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.openai_realtime")
+    arguments = '{"brief":"Show a simple solar-system orbit."}'
+    channel, socket = _channel(_canvas_response_events(arguments=arguments))
+    iterator = channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-canvas-a",
+    ).__aiter__()
+
+    assert isinstance(await iterator.__anext__(), RealtimeSpeechTextDelta)
+    call = await iterator.__anext__()
+    assert isinstance(call, RealtimeCanvasToolCall)
+    await channel.complete_canvas_tool(
+        turn_id="turn-canvas-a",
+        call_id=call.call_id,
+        output=InteractiveCanvasToolOutput(
+            status="rejected",
+            reason="The optional visual was not available.",
+        ),
+    )
+
+    socket.push(
+        {
+            "type": "response.created",
+            "response": {"id": CONTINUATION_RESPONSE_ID},
+        }
+    )
+    socket.push(
+        {
+            "type": "response.output_text.delta",
+            "response_id": CONTINUATION_RESPONSE_ID,
+            "delta": "I can still explain it with words.",
+        }
+    )
+    assert await iterator.__anext__() == RealtimeSpeechTextDelta(
+        delta="I can still explain it with words."
+    )
+    await iterator.aclose()
+
+    # The provider can reject response.cancel after R2 has completed internally
+    # while its authoritative response.done is still in transit on the sideband.
+    # That terminal event still belongs to Turn A and must be drained by Turn A.
+    socket.push(
+        {
+            "type": "error",
+            "error": {
+                "code": "response_cancel_not_active",
+                "message": "The continuation completed before cancellation.",
+            },
+        }
+    )
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": CONTINUATION_RESPONSE_ID,
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "I can still explain it with words.",
+                            }
+                        ],
+                    }
+                ],
+                "usage": _usage(5, 3),
+            },
+        }
+    )
+    socket.push(
+        {
+            "type": "response.created",
+            "response": {"id": "resp_turn_b"},
+        }
+    )
+    socket.push(
+        {
+            "type": "response.output_text.delta",
+            "response_id": "resp_turn_b",
+            "delta": "Turn B remains healthy.",
+        }
+    )
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp_turn_b",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "Turn B remains healthy.",
+                            }
+                        ],
+                    }
+                ],
+                "usage": _usage(4, 2),
+            },
+        }
+    )
+
+    await channel.cancel(turn_id="turn-canvas-a")
+    received = await _collect_turn_events(channel, turn_id="turn-b")
+
+    assert received == [RealtimeSpeechTextDelta(delta="Turn B remains healthy.")]
+    assert channel.last_response_id == "resp_turn_b"
+
+    observed = [
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage().startswith("openai_realtime_response_event_observed")
+    ]
+    assert [
+        (
+            context["sidebandSequence"],
+            context["eventType"],
+            context["responseId"],
+        )
+        for context in observed
+    ] == [
+        (2, "response.created", RESPONSE_ID),
+        (4, "response.output_item.added", RESPONSE_ID),
+        (7, "response.function_call_arguments.done", RESPONSE_ID),
+        (8, "response.done", RESPONSE_ID),
+        (9, "response.created", CONTINUATION_RESPONSE_ID),
+        (12, "response.done", CONTINUATION_RESPONSE_ID),
+        (13, "response.created", "resp_turn_b"),
+        (15, "response.done", "resp_turn_b"),
+    ]
+
+    owner_admissions = [
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage().startswith("openai_realtime_response_owner_admitted")
+    ]
+    assert [
+        (
+            context["sidebandSequence"],
+            context["responseId"],
+            context["responseOwnerTurnId"],
+            context["consumerTurnId"],
+            context["consumerPhase"],
+        )
+        for context in owner_admissions
+    ] == [
+        (2, RESPONSE_ID, "turn-canvas-a", "turn-canvas-a", "turnResponse"),
+        (
+            9,
+            CONTINUATION_RESPONSE_ID,
+            "turn-canvas-a",
+            "turn-canvas-a",
+            "canvasContinuation",
+        ),
+        (13, "resp_turn_b", "turn-b", "turn-b", "turnResponse"),
+    ]
+
+    cancel_wait = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage().startswith(
+            "openai_realtime_cancel_not_active_waiting_for_terminal"
+        )
+    )
+    assert cancel_wait == {
+        "component": "realtimeProvider",
+        "sidebandSequence": 11,
+        "eventType": "error",
+        "responseId": CONTINUATION_RESPONSE_ID,
+        "responseOwnerTurnId": "turn-canvas-a",
+        "consumerTurnId": "turn-canvas-a",
+        "consumerPhase": "cancellation",
+        "activeTurnId": "turn-canvas-a",
+        "activeResponseId": CONTINUATION_RESPONSE_ID,
+    }
+    drained = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage().startswith("openai_realtime_response_drained")
+    )
+    assert drained["sidebandSequence"] == 12
+    assert drained["responseId"] == CONTINUATION_RESPONSE_ID
+    assert drained["responseOwnerTurnId"] == "turn-canvas-a"
+    assert drained["consumerTurnId"] == "turn-canvas-a"
 
 
 @pytest.mark.asyncio
