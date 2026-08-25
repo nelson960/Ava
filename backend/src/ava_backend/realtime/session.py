@@ -64,6 +64,7 @@ class _RealtimeSessionRecord:
     negotiation_started: bool = False
     negotiated_call_id: str | None = None
     claimed: bool = False
+    active_deadline: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,17 +176,26 @@ class RealtimeSessionRegistry:
         coordinator_factory: RealtimeCoordinatorFactoryV4,
         token_codec: RealtimeSessionTokenCodec,
         ttl: timedelta,
+        active_session_ttl: timedelta,
         max_sessions: int,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         session_id_factory: Callable[[], str] = lambda: f"session-{uuid4()}",
     ) -> None:
         if ttl < timedelta(seconds=30) or ttl > timedelta(minutes=10):
             raise ValueError("Realtime session TTL must be between 30 and 600 seconds")
+        if active_session_ttl <= timedelta(0) or active_session_ttl > timedelta(
+            hours=2
+        ):
+            raise ValueError(
+                "Realtime active session TTL must be greater than 0 and at most "
+                "7200 seconds"
+            )
         if not 1 <= max_sessions <= 10_000:
             raise ValueError("Realtime max sessions must be between 1 and 10000")
         self._coordinator_factory = coordinator_factory
         self._token_codec = token_codec
         self._ttl = ttl
+        self._active_session_ttl = active_session_ttl
         self._max_sessions = max_sessions
         self._now = now
         self._session_id_factory = session_id_factory
@@ -232,7 +242,7 @@ class RealtimeSessionRegistry:
             )
             canvas_token = self._token_codec.issue(
                 session_id=session_id,
-                expires_at=expires_at,
+                expires_at=expires_at + self._active_session_ttl,
                 scope="canvas",
             )
             coordinator = self._coordinator_factory.create(
@@ -358,6 +368,7 @@ class RealtimeSessionRegistry:
                     RealtimeSessionAuthFailure.CLAIMED
                 )
             record.claimed = True
+            record.active_deadline = now + self._active_session_ttl
             return record.coordinator
 
     async def authorize_canvas_document(
@@ -383,7 +394,16 @@ class RealtimeSessionRegistry:
                 raise RealtimeSessionAuthenticationError(
                     RealtimeSessionAuthFailure.UNKNOWN
                 )
-            if record.expires_at <= now:
+            if record.claimed:
+                if record.active_deadline is None:
+                    raise RuntimeError(
+                        "Claimed realtime session has no active deadline"
+                    )
+                if record.active_deadline < now:
+                    raise RealtimeSessionAuthenticationError(
+                        RealtimeSessionAuthFailure.EXPIRED
+                    )
+            elif record.expires_at <= now:
                 raise RealtimeSessionAuthenticationError(
                     RealtimeSessionAuthFailure.EXPIRED
                 )

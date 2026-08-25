@@ -196,6 +196,9 @@ def create_app(
             coordinator_factory=realtime_v4_coordinator_factory,
             token_codec=RealtimeSessionTokenCodec(token_secret),
             ttl=timedelta(seconds=resolved_settings.realtime_session_ttl_seconds),
+            active_session_ttl=timedelta(
+                seconds=resolved_settings.realtime_max_session_seconds
+            ),
             max_sessions=resolved_settings.realtime_max_sessions,
         )
         app.router.add_event_handler("shutdown", realtime_v4_sessions.close)
@@ -645,7 +648,23 @@ def create_app(
                 token=canvas_token,
                 subject=client.subject,
             )
-        except RealtimeSessionAuthenticationError:
+        except RealtimeSessionAuthenticationError as error:
+            LOGGER.warning(
+                "canvas_document_authorization_failed session_id=%s "
+                "generation_id=%s document_kind=%s failure=%s",
+                session_id,
+                generation_id,
+                kind,
+                error.failure.value,
+                extra={
+                    "ava_context": {
+                        "sessionId": session_id,
+                        "generationId": generation_id,
+                        "documentKind": kind,
+                        "failure": error.failure.value,
+                    }
+                },
+            )
             return _error_response(
                 request,
                 status_code=401,

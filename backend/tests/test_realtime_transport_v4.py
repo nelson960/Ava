@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 
@@ -76,6 +77,21 @@ class _Factory:
         coordinator = _Coordinator()
         self.coordinators.append(coordinator)
         return coordinator
+
+
+class _RejectingCanvasRegistry:
+    def __init__(self, failure: RealtimeSessionAuthFailure) -> None:
+        self._failure = failure
+
+    async def authorize_canvas_document(
+        self,
+        *,
+        session_id: str,
+        token: str,
+        subject: str,
+    ) -> None:
+        assert session_id and token and subject
+        raise RealtimeSessionAuthenticationError(self._failure)
 
 
 def test_v4_bootstrap_and_independent_exact_document_fetch() -> None:
@@ -189,6 +205,7 @@ async def test_v4_registry_tokens_expire_cannot_replay_and_close_owners() -> Non
         coordinator_factory=factory,
         token_codec=RealtimeSessionTokenCodec("r" * 32),
         ttl=timedelta(seconds=30),
+        active_session_ttl=timedelta(minutes=30),
         max_sessions=2,
         now=lambda: current,
         session_id_factory=lambda: next(ids),
@@ -243,3 +260,208 @@ async def test_v4_registry_tokens_expire_cannot_replay_and_close_owners() -> Non
         await registry.claim(session_id=second.session_id, token=second.token)
     assert await registry.purge_expired() == 1
     assert factory.coordinators[1].closed is True
+
+
+async def test_claimed_v4_session_keeps_canvas_authorization_until_release() -> None:
+    current = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
+    factory = _Factory()
+    registry = RealtimeSessionRegistry(
+        coordinator_factory=factory,
+        token_codec=RealtimeSessionTokenCodec("c" * 32),
+        ttl=timedelta(seconds=120),
+        active_session_ttl=timedelta(minutes=30),
+        max_sessions=1,
+        now=lambda: current,
+        session_id_factory=lambda: "session-canvas-lifetime",
+    )
+    created = await registry.create(
+        request_id="request-canvas-lifetime",
+        subject="child:canvas-lifetime",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+    )
+    await registry.negotiate(
+        session_id=created.session_id,
+        token=created.webrtc_token,
+        subject="child:canvas-lifetime",
+        offer_sdp=DETERMINISTIC_AUDIO_OFFER_SDP,
+    )
+    await registry.claim(session_id=created.session_id, token=created.token)
+
+    await registry.authorize_canvas_document(
+        session_id=created.session_id,
+        token=created.canvas_token,
+        subject="child:canvas-lifetime",
+    )
+
+    current += timedelta(seconds=121)
+    await registry.authorize_canvas_document(
+        session_id=created.session_id,
+        token=created.canvas_token,
+        subject="child:canvas-lifetime",
+    )
+
+    await registry.release(created.session_id)
+    with pytest.raises(
+        RealtimeSessionAuthenticationError,
+        match=RealtimeSessionAuthFailure.UNKNOWN,
+    ):
+        await registry.authorize_canvas_document(
+            session_id=created.session_id,
+            token=created.canvas_token,
+            subject="child:canvas-lifetime",
+        )
+
+
+async def test_v4_event_and_webrtc_admission_remain_short_lived() -> None:
+    current = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
+    factory = _Factory()
+    ids = iter(
+        (
+            "session-expired-event-admission",
+            "session-expired-webrtc-admission",
+            "session-expired-unclaimed-canvas",
+        )
+    )
+    registry = RealtimeSessionRegistry(
+        coordinator_factory=factory,
+        token_codec=RealtimeSessionTokenCodec("a" * 32),
+        ttl=timedelta(seconds=120),
+        active_session_ttl=timedelta(minutes=30),
+        max_sessions=3,
+        now=lambda: current,
+        session_id_factory=lambda: next(ids),
+    )
+    event_admission = await registry.create(
+        request_id="request-event-admission",
+        subject="child:admission",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+    )
+    webrtc_admission = await registry.create(
+        request_id="request-webrtc-admission",
+        subject="child:admission",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+    )
+    unclaimed_canvas = await registry.create(
+        request_id="request-unclaimed-canvas",
+        subject="child:admission",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+    )
+    await registry.negotiate(
+        session_id=unclaimed_canvas.session_id,
+        token=unclaimed_canvas.webrtc_token,
+        subject="child:admission",
+        offer_sdp=DETERMINISTIC_AUDIO_OFFER_SDP,
+    )
+
+    current += timedelta(seconds=121)
+
+    with pytest.raises(
+        RealtimeSessionAuthenticationError,
+        match=RealtimeSessionAuthFailure.EXPIRED,
+    ):
+        await registry.claim(
+            session_id=event_admission.session_id,
+            token=event_admission.token,
+        )
+    with pytest.raises(
+        RealtimeSessionAuthenticationError,
+        match=RealtimeSessionAuthFailure.EXPIRED,
+    ):
+        await registry.negotiate(
+            session_id=webrtc_admission.session_id,
+            token=webrtc_admission.webrtc_token,
+            subject="child:admission",
+            offer_sdp=DETERMINISTIC_AUDIO_OFFER_SDP,
+        )
+    with pytest.raises(
+        RealtimeSessionAuthenticationError,
+        match=RealtimeSessionAuthFailure.EXPIRED,
+    ):
+        await registry.authorize_canvas_document(
+            session_id=unclaimed_canvas.session_id,
+            token=unclaimed_canvas.canvas_token,
+            subject="child:admission",
+        )
+
+
+async def test_claimed_v4_canvas_authorization_expires_at_active_deadline() -> None:
+    current = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
+    factory = _Factory()
+    registry = RealtimeSessionRegistry(
+        coordinator_factory=factory,
+        token_codec=RealtimeSessionTokenCodec("d" * 32),
+        ttl=timedelta(seconds=120),
+        active_session_ttl=timedelta(minutes=30),
+        max_sessions=1,
+        now=lambda: current,
+        session_id_factory=lambda: "session-active-deadline",
+    )
+    created = await registry.create(
+        request_id="request-active-deadline",
+        subject="child:active-deadline",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+    )
+    await registry.negotiate(
+        session_id=created.session_id,
+        token=created.webrtc_token,
+        subject="child:active-deadline",
+        offer_sdp=DETERMINISTIC_AUDIO_OFFER_SDP,
+    )
+    current += timedelta(seconds=119)
+    await registry.claim(session_id=created.session_id, token=created.token)
+
+    current += timedelta(minutes=30)
+    await registry.authorize_canvas_document(
+        session_id=created.session_id,
+        token=created.canvas_token,
+        subject="child:active-deadline",
+    )
+
+    current += timedelta(microseconds=1)
+    with pytest.raises(
+        RealtimeSessionAuthenticationError,
+        match=RealtimeSessionAuthFailure.EXPIRED,
+    ):
+        await registry.authorize_canvas_document(
+            session_id=created.session_id,
+            token=created.canvas_token,
+            subject="child:active-deadline",
+        )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        RealtimeSessionAuthFailure.INVALID,
+        RealtimeSessionAuthFailure.EXPIRED,
+        RealtimeSessionAuthFailure.UNKNOWN,
+        RealtimeSessionAuthFailure.NOT_READY,
+    ),
+)
+def test_canvas_document_authorization_logs_content_free_failure(
+    failure: RealtimeSessionAuthFailure,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    app = create_app(
+        Settings(environment=AvaEnvironment.TEST),
+        authoritative_memory=DevelopmentAuthoritativeMemoryStore(),
+        realtime_v4_coordinator_factory=_Factory(),
+    )
+    app.state.realtime_v4_sessions = _RejectingCanvasRegistry(failure)
+    credential = "canvas-credential-must-not-be-logged"
+
+    with TestClient(app, base_url="https://127.0.0.1") as client:
+        with caplog.at_level(logging.WARNING, logger="ava_backend"):
+            response = client.get(
+                "/v4/realtime/sessions/session-diagnostic/"
+                "canvas-documents/generation-diagnostic/svg",
+                headers={
+                    "X-Ava-Protocol-Version": "4",
+                    "X-Ava-Canvas-Token": credential,
+                },
+            )
+
+    assert response.status_code == 401
+    assert "canvas_document_authorization_failed" in caplog.text
+    assert f"failure={failure.value}" in caplog.text
+    assert credential not in caplog.text
