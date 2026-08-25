@@ -25,6 +25,20 @@ _TRANSFORM_FUNCTION = re.compile(r"[A-Za-z][A-Za-z0-9]*\s*\(")
 _LOCAL_URL = re.compile(r"url\(\s*#([A-Za-z_][A-Za-z0-9_.:-]{0,95})\s*\)", re.I)
 _ANY_URL = re.compile(r"url\(", re.I)
 _CONTROL_CHARACTER = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_MAX_SEMANTIC_PROJECTION_ITEMS: Final = 32
+_MAX_SEMANTIC_PROJECTION_ITEM_CHARACTERS: Final = 160
+_NON_RENDERED_SEMANTIC_CONTAINERS: Final = frozenset(
+    {
+        "clipPath",
+        "defs",
+        "filter",
+        "linearGradient",
+        "marker",
+        "mask",
+        "pattern",
+        "radialGradient",
+    }
+)
 
 _ALLOWED_ELEMENTS: Final = frozenset(
     {
@@ -307,6 +321,8 @@ class ValidatedSvgDocument:
     manifest_sha256: str
     title: str
     description: str
+    visible_text_labels: tuple[str, ...]
+    named_objects: tuple[str, ...]
     view_box: tuple[float, float, float, float]
     bindings: Mapping[str, SvgInteractionBinding]
 
@@ -375,6 +391,8 @@ class SvgDocumentValidator:
         bindings: dict[str, SvgInteractionBinding] = {}
         title = ""
         description = ""
+        visible_text_labels: list[str] = []
+        named_objects: list[str] = []
         total_elements = 0
         total_attributes = 0
         total_attribute_characters = 0
@@ -385,9 +403,11 @@ class SvgDocumentValidator:
         total_references = 0
         total_filter_primitives = 0
 
-        stack: list[tuple[ET.Element, int, str]] = [(root, 1, "@root")]
+        stack: list[tuple[ET.Element, int, str, bool]] = [
+            (root, 1, "@root", True)
+        ]
         while stack:
-            element, depth, reference_owner = stack.pop()
+            element, depth, reference_owner, parent_is_rendered = stack.pop()
             total_elements += 1
             if total_elements > self._limits.max_elements:
                 self._fail("tooManyElements", "SVG exceeds the element limit")
@@ -412,6 +432,11 @@ class SvgDocumentValidator:
                     )
 
             attributes = element.attrib
+            element_is_rendered = (
+                parent_is_rendered
+                and tag not in _NON_RENDERED_SEMANTIC_CONTAINERS
+                and _element_is_rendered(attributes)
+            )
             if len(attributes) > self._limits.max_attributes_per_element:
                 self._fail("tooManyAttributes", f"<{tag}> has too many attributes")
             total_attributes += len(attributes)
@@ -493,6 +518,18 @@ class SvgDocumentValidator:
                 title = _semantic_text(element)
             elif id(element) == id(direct_descriptions[0]):
                 description = _semantic_text(element)
+            elif tag == "text" and element_is_rendered:
+                _append_semantic_projection_item(
+                    visible_text_labels,
+                    _visible_semantic_text(element, parent_is_rendered),
+                )
+
+            accessibility_label = attributes.get("aria-label")
+            if element_is_rendered and accessibility_label is not None:
+                _append_semantic_projection_item(
+                    named_objects,
+                    accessibility_label,
+                )
 
             binding_id = attributes.get("data-ava-binding")
             if binding_id is not None:
@@ -511,7 +548,9 @@ class SvgDocumentValidator:
             children = list(element)
             for child_index, child in reversed(list(enumerate(children))):
                 child_owner = element_id or f"{reference_owner}/{child_index}"
-                stack.append((child, depth + 1, child_owner))
+                stack.append(
+                    (child, depth + 1, child_owner, element_is_rendered)
+                )
 
         view_box = self._validate_view_box(root.attrib.get("viewBox"))
         title = self._validate_semantic_text(
@@ -564,6 +603,8 @@ class SvgDocumentValidator:
             manifest_sha256=sha256(manifest_bytes).hexdigest(),
             title=title,
             description=description,
+            visible_text_labels=tuple(visible_text_labels),
+            named_objects=tuple(named_objects),
             view_box=view_box,
             bindings=MappingProxyType(bindings.copy()),
         )
@@ -841,3 +882,67 @@ def _local_attribute_name(raw_name: str) -> str:
 
 def _semantic_text(element: ET.Element) -> str:
     return "".join(element.itertext())
+
+
+def _append_semantic_projection_item(values: list[str], value: str) -> None:
+    normalized = " ".join(value.split())
+    if not normalized or normalized in values:
+        return
+    if len(values) >= _MAX_SEMANTIC_PROJECTION_ITEMS:
+        return
+    values.append(normalized[:_MAX_SEMANTIC_PROJECTION_ITEM_CHARACTERS].rstrip())
+
+
+def _visible_semantic_text(
+    element: ET.Element,
+    parent_is_rendered: bool,
+) -> str:
+    values: list[str] = []
+
+    def visit(node: ET.Element, inherited_is_rendered: bool) -> None:
+        rendered = (
+            inherited_is_rendered
+            and _local_element_name(node.tag)
+            not in _NON_RENDERED_SEMANTIC_CONTAINERS
+            and _element_is_rendered(node.attrib)
+        )
+        if rendered and node.text:
+            values.append(node.text)
+        for child in node:
+            visit(child, rendered)
+            if rendered and child.tail:
+                values.append(child.tail)
+
+    visit(element, parent_is_rendered)
+    return "".join(values)
+
+
+def _element_is_rendered(attributes: Mapping[str, str]) -> bool:
+    presentation: dict[str, str] = {}
+    for name in ("display", "visibility", "opacity"):
+        value = attributes.get(name)
+        if value is not None:
+            presentation[name] = value.strip().lower()
+    style = attributes.get("style")
+    if style is not None:
+        for declaration in style.split(";"):
+            if ":" not in declaration:
+                continue
+            name, value = declaration.split(":", 1)
+            property_name = name.strip().lower()
+            if property_name in {"display", "visibility", "opacity"}:
+                presentation[property_name] = value.strip().lower()
+    if presentation.get("display") == "none":
+        return False
+    if presentation.get("visibility") in {"collapse", "hidden"}:
+        return False
+    opacity = presentation.get("opacity")
+    if opacity is not None:
+        try:
+            if float(opacity) == 0:
+                return False
+        except ValueError:
+            # The validator reports malformed presentation values through its
+            # existing attribute/style validation path.
+            pass
+    return True

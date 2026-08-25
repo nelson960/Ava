@@ -287,6 +287,50 @@ async def test_provider_uses_sol_raw_responses_and_preserves_exact_svg() -> None
     assert "Never truncate generated SVG" in instructions
 
 
+async def test_absent_interaction_goal_prefers_a_static_svg() -> None:
+    svg = _svg(label="Static cloud")
+    client = _Client([_response(svg)])
+    provider = OpenAISvgCanvasSpecialist(
+        Settings(environment=AvaEnvironment.TEST, openai_canvas_max_quality_repairs=0),
+        session_id="session_static",
+        safety_identifier="ava_test_user_static",
+        client=client,  # type: ignore[arg-type]
+    )
+
+    generation = await provider.generate(_request(interactionGoal=None))
+
+    assert generation.document.bindings == {}
+    instructions = client.responses.arguments[0]["instructions"]
+    assert isinstance(instructions, str)
+    assert "When interaction_goal is empty, produce a static SVG" in instructions
+
+
+async def test_explicit_interaction_goal_allows_only_goal_serving_bindings() -> None:
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600">'
+        "<title>Cloud</title><desc>Select the cloud to discuss rain.</desc>"
+        '<g id="cloud" data-ava-binding="select_cloud" '
+        'data-ava-action="select" aria-label="Rain cloud">'
+        '<ellipse cx="500" cy="250" rx="160" ry="70"/></g></svg>'
+    )
+    client = _Client([_response(svg)])
+    provider = OpenAISvgCanvasSpecialist(
+        Settings(environment=AvaEnvironment.TEST, openai_canvas_max_quality_repairs=0),
+        session_id="session_interactive",
+        safety_identifier="ava_test_user_interactive",
+        client=client,  # type: ignore[arg-type]
+    )
+
+    generation = await provider.generate(
+        _request(interactionGoal="Let the child select the cloud.")
+    )
+
+    assert tuple(generation.document.bindings) == ("select_cloud",)
+    instructions = client.responses.arguments[0]["instructions"]
+    assert isinstance(instructions, str)
+    assert "implement only interactions that directly serve that goal" in instructions
+
+
 def test_exact_extractor_allows_reasoning_but_does_not_join_text() -> None:
     svg = _svg()
     response = _response(svg)

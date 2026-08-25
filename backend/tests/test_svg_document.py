@@ -89,6 +89,28 @@ def test_validator_builds_deterministic_content_bound_manifest() -> None:
     ]
 
 
+def test_validator_derives_only_bounded_visible_semantics_deterministically() -> None:
+    svg = _document(
+        """
+        <defs><text id="template_label">Hidden template</text></defs>
+        <g id="water" aria-label="Water in the lake">
+          <text id="evaporation">Evaporation</text>
+          <text id="hidden_label" display="none">Internal note</text>
+        </g>
+        <g id="cloud" data-ava-binding="select_cloud" data-ava-action="select"
+           aria-label="Rain cloud"><circle cx="500" cy="150" r="50"/></g>
+        """
+    )
+
+    first = SvgDocumentValidator().validate(svg)
+    second = SvgDocumentValidator().validate(svg)
+
+    assert first.visible_text_labels == ("Evaporation",)
+    assert first.named_objects == ("Water in the lake", "Rain cloud")
+    assert first.visible_text_labels == second.visible_text_labels
+    assert first.named_objects == second.named_objects
+
+
 @pytest.mark.parametrize(
     ("svg", "code"),
     [

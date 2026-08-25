@@ -9,6 +9,8 @@ from typing import NoReturn
 from .svg_document import SvgInteractionBinding, ValidatedSvgDocument
 from .svg_specialist import SvgCanvasSpecialistGeneration
 
+_MAX_REALTIME_CANVAS_CONTEXT_CHARACTERS = 2_400
+
 
 class SvgCandidateStatus(StrEnum):
     DOCUMENT_READY = "documentReady"
@@ -380,15 +382,47 @@ class SvgCanvasSessionState:
                 f"<target>{escape(interaction.accessibility_label)}</target>"
                 "</last_interaction>"
             )
-        return (
+        prefix = (
             '<canvas_context trust="untrusted_model_generated_data" '
             f'scene_id="{escape(active.scene_id)}" revision="{active.revision}" '
             f'svg_sha256="{active.document.svg_sha256}">'
             f"<title>{escape(active.document.title)}</title>"
             f"<description>{escape(active.document.description)}</description>"
             f"{interaction_xml}"
-            "</canvas_context>"
         )
+        suffix = "</canvas_context>"
+        semantic_items = [
+            f'<item kind="visibleText">{escape(label)}</item>'
+            for label in active.document.visible_text_labels
+        ]
+        semantic_items.extend(
+            f'<item kind="namedObject">{escape(label)}</item>'
+            for label in active.document.named_objects
+        )
+        semantic_items.extend(
+            f'<item kind="interaction" action="{escape(binding.action)}">'
+            f"{escape(binding.accessibility_label)}</item>"
+            for binding in sorted(
+                active.document.bindings.values(),
+                key=lambda item: item.binding_id,
+            )
+            if binding.is_server_reportable
+        )
+        selected: list[str] = []
+        for item in semantic_items:
+            semantic_xml = (
+                f"<semantics>{''.join((*selected, item))}</semantics>"
+            )
+            if (
+                len(prefix) + len(semantic_xml) + len(suffix)
+                > _MAX_REALTIME_CANVAS_CONTEXT_CHARACTERS
+            ):
+                break
+            selected.append(item)
+        semantic_xml = (
+            f"<semantics>{''.join(selected)}</semantics>" if selected else ""
+        )
+        return f"{prefix}{semantic_xml}{suffix}"
 
     def _require_candidate(self, generation_id: str) -> SvgCanvasCandidate:
         candidate = self._candidate

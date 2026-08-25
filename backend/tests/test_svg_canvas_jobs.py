@@ -540,6 +540,76 @@ async def test_first_frame_ack_activates_and_interactions_use_manifest() -> None
     assert recorded.accessibility_label == "Rain cloud"
 
 
+async def test_revision_reuses_scene_identity_and_supplies_exact_active_svg() -> None:
+    coordinator, specialist, sink, completions, _output = await _accepted_coordinator()
+    specialist.release.set()
+    await coordinator.wait_for_background_work()
+    first_stored = sink.available[0]
+    first_candidate = coordinator.state.candidate
+    assert first_candidate is not None
+    await coordinator.request_presentation(
+        generation_id=first_candidate.generation_id,
+        presentation_sample_offset=4_800,
+    )
+    await coordinator.document_prepared(
+        CanvasDocumentPreparedEventV4.model_validate(
+            {
+                "protocolVersion": 4,
+                "event": "canvasDocumentPrepared",
+                "sessionId": "session-1",
+                "sequence": 1,
+                "generationId": first_candidate.generation_id,
+                "sceneId": first_candidate.scene_id,
+                "sceneRevision": first_candidate.revision,
+                "svgSha256": first_stored.document.svg_sha256,
+                "manifestSha256": first_stored.document.manifest_sha256,
+                "rendererCapabilityVersion": "ava-svg-renderer-v1",
+                "validatorVersion": "ava-svg-validator-v1",
+            }
+        )
+    )
+    first_active = await coordinator.presented(
+        CanvasPresentedEventV4.model_validate(
+            {
+                "protocolVersion": 4,
+                "event": "canvasPresented",
+                "sessionId": "session-1",
+                "sequence": 2,
+                "generationId": first_candidate.generation_id,
+                "sceneId": first_candidate.scene_id,
+                "sceneRevision": first_candidate.revision,
+                "svgSha256": first_stored.document.svg_sha256,
+                "manifestSha256": first_stored.document.manifest_sha256,
+                "firstRenderedSample": 4_800,
+            }
+        )
+    )
+
+    revised_output = await coordinator.accept_tool_call(
+        source_turn_id="turn-2",
+        call=_call("call_2"),
+        complete_tool=lambda turn, call, output: _record_completion(
+            completions,
+            turn,
+            call,
+            output,
+        ),
+    )
+    await coordinator.wait_for_background_work()
+
+    revision_request = specialist.requests[-1]
+    revised_candidate = coordinator.state.candidate
+    assert revised_output.generation_id == "generation-2"
+    assert revision_request.current_scene_id == first_active.scene_id
+    assert revision_request.current_revision == first_active.revision
+    assert revision_request.current_svg == first_active.document.svg_text
+    assert revision_request.current_svg_sha256 == first_active.document.svg_sha256
+    assert revised_candidate is not None
+    assert revised_candidate.scene_id == first_active.scene_id
+    assert revised_candidate.revision == first_active.revision + 1
+    await coordinator.close()
+
+
 async def test_canvas_lifecycle_telemetry_preserves_generation_identity(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

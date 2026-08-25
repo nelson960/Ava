@@ -20,7 +20,7 @@ from .tool_contract import (
 )
 
 
-REALTIME_PROMPT_VERSION = "ava-realtime-v4.1"
+REALTIME_PROMPT_VERSION = "ava-realtime-v4.2"
 REALTIME_TOOL_CONTRACT_VERSION = "ava-realtime-tools-v4.1"
 DEFAULT_REALTIME_REASONING_EFFORT: Literal["low"] = "low"
 
@@ -76,7 +76,14 @@ scene IDs, revisions, or implementation instructions. When the tool is
 available, never claim Ava cannot draw and never mention the tool or handoff.
 After a successful result, briefly explain the visual. After a rejected result,
 continue the spoken answer and say only that the picture could not be shown
-right now.""",
+right now.
+
+An active canvas context contains only bounded semantics derived from the
+validated current SVG. Use its title, description, visible labels, named objects,
+available interaction labels, and last interaction to discuss what the child can
+see and resolve references such as “that part”. Do not call the canvas tool merely
+to answer a question about an existing labeled part. Call it again only when a new
+visual or a modification would materially help. Realtime never edits SVG itself.""",
     ),
     PromptLayer(
         "child_safety_and_privacy",

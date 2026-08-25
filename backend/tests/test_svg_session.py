@@ -26,6 +26,8 @@ def _generation(
    data-ava-target="rain" aria-label="Show the rain">
   <path d="M450 300 L430 360 M500 300 L480 360" stroke="#358acb"/>
 </g>
+<text id="cloud_label" x="500" y="220">Condensation</text>
+<text id="rain_label" x="500" y="390">Precipitation</text>
 </svg>"""
     return SvgCanvasSpecialistGeneration(
         generation_id=generation_id,
@@ -213,3 +215,83 @@ def test_realtime_context_is_escaped_and_explicitly_untrusted() -> None:
     assert "Cloud &amp; rain" in context
     assert "&lt;gently&gt;" in context
     assert "<target>Rain cloud</target>" in context
+
+
+def test_presented_diagram_context_includes_important_visible_labels() -> None:
+    state = SvgCanvasSessionState()
+    generation = _generation()
+    _prepare_and_schedule(state, generation)
+    state.mark_presented(
+        generation_id=generation.generation_id,
+        svg_sha256=generation.document.svg_sha256,
+        manifest_sha256=generation.document.manifest_sha256,
+        first_rendered_sample=4_800,
+    )
+
+    context = state.render_realtime_context()
+
+    assert "Condensation" in context
+    assert "Precipitation" in context
+    assert "Rain cloud" in context
+    assert "M450 300" not in context
+    assert "stroke" not in context
+
+
+def test_reportable_interaction_enters_realtime_canvas_context() -> None:
+    state = SvgCanvasSessionState()
+    generation = _generation()
+    _prepare_and_schedule(state, generation)
+    active = state.mark_presented(
+        generation_id=generation.generation_id,
+        svg_sha256=generation.document.svg_sha256,
+        manifest_sha256=generation.document.manifest_sha256,
+        first_rendered_sample=4_800,
+    )
+    state.record_interaction(
+        scene_id=active.scene_id,
+        scene_revision=active.revision,
+        interaction_revision=1,
+        svg_sha256=generation.document.svg_sha256,
+        manifest_sha256=generation.document.manifest_sha256,
+        binding_id="select_cloud",
+    )
+
+    context = state.render_realtime_context()
+
+    assert "<last_interaction>" in context
+    assert "<action>select</action>" in context
+    assert "<target>Rain cloud</target>" in context
+
+
+def test_new_canvas_revision_clears_stale_interaction_context() -> None:
+    state = SvgCanvasSessionState()
+    first = _generation("generation_1")
+    _prepare_and_schedule(state, first)
+    active = state.mark_presented(
+        generation_id=first.generation_id,
+        svg_sha256=first.document.svg_sha256,
+        manifest_sha256=first.document.manifest_sha256,
+        first_rendered_sample=4_800,
+    )
+    state.record_interaction(
+        scene_id=active.scene_id,
+        scene_revision=active.revision,
+        interaction_revision=1,
+        svg_sha256=first.document.svg_sha256,
+        manifest_sha256=first.document.manifest_sha256,
+        binding_id="select_cloud",
+    )
+
+    second = _generation("generation_2")
+    _prepare_and_schedule(state, second, source_turn_id="turn_2", sample=9_600)
+    revised = state.mark_presented(
+        generation_id=second.generation_id,
+        svg_sha256=second.document.svg_sha256,
+        manifest_sha256=second.document.manifest_sha256,
+        first_rendered_sample=9_600,
+    )
+
+    assert revised.scene_id == active.scene_id
+    assert revised.revision == active.revision + 1
+    assert state.last_interaction is None
+    assert "<last_interaction>" not in state.render_realtime_context()

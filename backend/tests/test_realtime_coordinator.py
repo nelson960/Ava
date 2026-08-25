@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from ava_backend.canvas.svg_delivery import SvgCanvasDocumentStore
+from ava_backend.canvas.svg_document import SvgDocumentValidator
 from ava_backend.canvas.svg_session import SvgCanvasSessionState
 from ava_backend.canvas.svg_specialist import (
     SvgCanvasSpecialistGeneration,
@@ -104,18 +105,58 @@ class _NoCanvasSpecialist:
         return
 
 
-def _canvas_runtime() -> tuple[SvgCanvasJobCoordinator, ProtocolV4CanvasEventSink]:
+def _canvas_runtime(
+    *,
+    state: SvgCanvasSessionState | None = None,
+) -> tuple[SvgCanvasJobCoordinator, ProtocolV4CanvasEventSink]:
     events = ProtocolV4CanvasEventSink()
     jobs = SvgCanvasJobCoordinator(
         session_id=SESSION_ID,
         age_band=AgeBand.MIDDLE_CHILDHOOD,
         specialist=_NoCanvasSpecialist(),
-        state=SvgCanvasSessionState(),
+        state=state or SvgCanvasSessionState(),
         documents=SvgCanvasDocumentStore(),
         event_sink=events,
         generation_id_factory=lambda: "generation-coordinator",
     )
     return jobs, events
+
+
+def _active_labeled_canvas_state() -> SvgCanvasSessionState:
+    document = SvgDocumentValidator().validate(
+        """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600">
+<title>Water cycle</title><desc>A labeled cycle of water moving through nature.</desc>
+<text id="evaporation_label" x="180" y="420">Evaporation</text>
+<text id="condensation_label" x="500" y="140">Condensation</text>
+<text id="precipitation_label" x="800" y="420">Precipitation</text>
+</svg>"""
+    )
+    generation = SvgCanvasSpecialistGeneration(
+        generation_id="generation-active-context",
+        document=document,
+    )
+    state = SvgCanvasSessionState()
+    state.stage_generation(generation, source_turn_id="turn-canvas-source")
+    state.mark_document_prepared(
+        generation_id=generation.generation_id,
+        svg_sha256=document.svg_sha256,
+        manifest_sha256=document.manifest_sha256,
+        renderer_capability_version=str(
+            document.manifest["rendererCapabilityVersion"]
+        ),
+        validator_version=str(document.manifest["validatorVersion"]),
+    )
+    state.schedule_presentation(
+        generation_id=generation.generation_id,
+        presentation_sample_offset=4_800,
+    )
+    state.mark_presented(
+        generation_id=generation.generation_id,
+        svg_sha256=document.svg_sha256,
+        manifest_sha256=document.manifest_sha256,
+        first_rendered_sample=4_800,
+    )
+    return state
 
 
 def _client(payload: dict[str, object]) -> AvaClientEventUnionV4:
@@ -136,6 +177,7 @@ def _coordinator(
     persistent: bool = False,
     unexpected_rearm: bool = False,
     occurrence_time_factory: Callable[[], datetime] | None = None,
+    canvas_state: SvgCanvasSessionState | None = None,
 ) -> tuple[
     DeterministicRealtimeSessionCoordinator,
     DeterministicRealtimePlanProvider | object,
@@ -150,7 +192,7 @@ def _coordinator(
     )
     resolved_memory = memory or DevelopmentAuthoritativeMemoryStore()
     speech = DeterministicStreamingSpeechSynthesizer(chunk_sample_count=31)
-    jobs, events = _canvas_runtime()
+    jobs, events = _canvas_runtime(state=canvas_state)
 
     def next_id() -> str:
         if unexpected_rearm:
@@ -608,6 +650,30 @@ async def test_committed_turn_is_loaded_into_fresh_session_harness() -> None:
     assert plan.speech in context
     assert coordinator_b.harness.context.included_delivered_turns == 1
     await coordinator_b.close()
+
+
+async def test_existing_labeled_canvas_part_can_be_discussed_without_new_tool_call() -> (
+    None
+):
+    plan = _plan()
+    provider = DeterministicRealtimePlanProvider(
+        plan,
+        child_text="What does condensation mean in that diagram?",
+    )
+    coordinator, _, _, _ = _coordinator(
+        plan=plan,
+        realtime=provider,
+        canvas_state=_active_labeled_canvas_state(),
+    )
+    await _ready(coordinator)
+
+    events = await _complete_delivered_turn(coordinator)
+
+    assert isinstance(events[-1], TurnCompletedEventV4)
+    assert "Condensation" in coordinator.harness.instructions
+    assert provider.completed_canvas_outputs == []
+    assert len(provider.requests) == 1
+    await coordinator.close()
 
 
 async def test_late_turn_a_commit_preserves_cross_turn_memory_chronology() -> None:

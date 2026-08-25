@@ -15,7 +15,7 @@ from ..realtime.tool_contract import (
 )
 from .svg_document import SvgDocumentValidator, ValidatedSvgDocument
 
-SVG_CANVAS_SPECIALIST_PROMPT_VERSION = "ava-svg-canvas-v4.2"
+SVG_CANVAS_SPECIALIST_PROMPT_VERSION = "ava-svg-canvas-v4.3"
 SVG_CANVAS_SPECIALIST_BRIEF_MAX_CHARACTERS = INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS
 
 
@@ -176,6 +176,9 @@ ART DIRECTION
 - Do not draw a border around the entire canvas.
 
 INTERACTION METADATA
+- When interaction_goal is empty, produce a static SVG. Do not invent interaction
+  bindings unless interaction is required for the visual to satisfy the request.
+- When interaction_goal is present, implement only interactions that directly serve that goal.
 - Put each hotspot on the actual visible `<g>` or shape with a unique element `id`.
 - Add `data-ava-binding`, `data-ava-action`, and `aria-label` to that same element.
 - Supported actions are explore, select, submitOutcome, reveal, toggleVisibility,
@@ -184,7 +187,7 @@ INTERACTION METADATA
   comma- or space-separated list of existing element IDs. An explore binding may use
   `data-ava-exclusive="true"` to hide the prior explore details and `data-ava-pulse`
   for existing connector IDs to pulse. submitOutcome also requires `data-ava-value`.
-- Interactions are optional. Never invent one when it does not improve the visual.
+- Interactions are optional. Never add unrelated or merely decorative interactions.
 
 STATIC SECURITY CONTRACT
 - Never use scripts, event handler attributes, foreignObject, HTML, external references,

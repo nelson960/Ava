@@ -57,7 +57,7 @@ def test_v4_prompt_is_conversation_first_and_semantically_canvas_aware() -> None
     instructions = render_stable_instructions()
     normalized = " ".join(instructions.split())
 
-    assert REALTIME_PROMPT_VERSION == "ava-realtime-v4.1"
+    assert REALTIME_PROMPT_VERSION == "ava-realtime-v4.2"
     assert {layer.name for layer in PROMPT_LAYERS} == {
         "identity_and_personality",
         "natural_conversation",
