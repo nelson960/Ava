@@ -1175,9 +1175,13 @@ def test_live_matrix_request_is_strictly_bounded() -> None:
 
 
 @pytest.mark.asyncio
-async def test_canvas_call_gets_one_output_then_tool_disabled_continuation() -> None:
+@pytest.mark.parametrize("operation", ["new", "reviseFocused"])
+async def test_canvas_call_gets_one_output_then_tool_disabled_continuation(
+    operation: str,
+) -> None:
     arguments = json.dumps(
         {
+            "operation": operation,
             "brief": "Show a labeled water cycle with a clear loop.",
             "interactionGoal": "Tap the cloud to reveal precipitation.",
         },
@@ -1221,6 +1225,7 @@ async def test_canvas_call_gets_one_output_then_tool_disabled_continuation() -> 
     ]
     call = received[1]
     assert isinstance(call, RealtimeCanvasToolCall)
+    assert call.request.operation == operation
     assert call.request.brief.startswith("Show a labeled water cycle")
     function_outputs = [
         sent
@@ -1239,10 +1244,20 @@ async def test_canvas_call_gets_one_output_then_tool_disabled_continuation() -> 
 
 
 @pytest.mark.asyncio
-async def test_invalid_canvas_arguments_are_rejected_without_killing_speech() -> None:
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '{"brief":"Show a water cycle."}',
+        '{"operation":"revise","brief":"Show a water cycle."}',
+        '{"operation":"new","brief":42}',
+    ],
+)
+async def test_invalid_canvas_arguments_are_rejected_without_killing_speech(
+    arguments: str,
+) -> None:
     channel, socket = _channel(
         [
-            *_canvas_response_events(arguments='{"brief":42}', preamble="One moment. "),
+            *_canvas_response_events(arguments=arguments, preamble="One moment. "),
             *_text_response_events(
                 response_id=CONTINUATION_RESPONSE_ID,
                 text="I can still explain it with words.",
@@ -1283,7 +1298,7 @@ async def test_invalid_canvas_arguments_are_rejected_without_killing_speech() ->
 
 @pytest.mark.asyncio
 async def test_canvas_function_must_be_completed_exactly_once() -> None:
-    arguments = '{"brief":"Show the moon phases in order."}'
+    arguments = '{"operation":"new","brief":"Show the moon phases in order."}'
     channel, _ = _channel(_canvas_response_events(arguments=arguments))
     iterator = channel.stream_turn(
         harness=_harness(),
@@ -1315,7 +1330,7 @@ async def test_canvas_function_must_be_completed_exactly_once() -> None:
 async def test_cancelling_pending_canvas_returns_rejection_without_continuation() -> (
     None
 ):
-    arguments = '{"brief":"Show a simple solar-system orbit."}'
+    arguments = '{"operation":"new","brief":"Show a simple solar-system orbit."}'
     channel, socket = _channel(_canvas_response_events(arguments=arguments))
     iterator = channel.stream_turn(
         harness=_harness(),
@@ -1348,7 +1363,7 @@ async def test_cancelled_canvas_continuation_cannot_escape_into_next_turn(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.INFO, logger="ava_backend.openai_realtime")
-    arguments = '{"brief":"Show a simple solar-system orbit."}'
+    arguments = '{"operation":"new","brief":"Show a simple solar-system orbit."}'
     channel, socket = _channel(_canvas_response_events(arguments=arguments))
     iterator = channel.stream_turn(
         harness=_harness(),

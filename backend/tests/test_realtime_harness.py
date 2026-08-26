@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 import pytest
+from pydantic import ValidationError
 
 from ava_backend.realtime.harness import (
     PROMPT_LAYERS,
@@ -14,7 +15,10 @@ from ava_backend.realtime.harness import (
     render_stable_instructions,
 )
 from ava_backend.realtime.memory import AuthoritativeMemorySnapshot
-from ava_backend.realtime.tool_contract import INTERACTIVE_CANVAS_TOOL_NAME
+from ava_backend.realtime.tool_contract import (
+    INTERACTIVE_CANVAS_TOOL_NAME,
+    InteractiveCanvasRequest,
+)
 
 
 def _snapshot() -> AuthoritativeMemorySnapshot:
@@ -57,7 +61,8 @@ def test_v4_prompt_is_conversation_first_and_semantically_canvas_aware() -> None
     instructions = render_stable_instructions()
     normalized = " ".join(instructions.split())
 
-    assert REALTIME_PROMPT_VERSION == "ava-realtime-v4.2"
+    assert REALTIME_PROMPT_VERSION == "ava-realtime-v4.3"
+    assert REALTIME_TOOL_CONTRACT_VERSION == "ava-realtime-tools-v4.2"
     assert {layer.name for layer in PROMPT_LAYERS} == {
         "identity_and_personality",
         "natural_conversation",
@@ -70,6 +75,9 @@ def test_v4_prompt_is_conversation_first_and_semantically_canvas_aware() -> None
     assert "semantic and optional" in normalized
     assert "never from isolated words or a keyword list" in normalized
     assert "never claim Ava cannot draw" in normalized
+    assert "operation=new" in normalized
+    assert "operation=reviseFocused" in normalized
+    assert "Merely discussing" in normalized
     assert "function_call_output" not in normalized
     for forbidden in (
         "emit_ava_turn",
@@ -96,13 +104,33 @@ def test_harness_exposes_one_optional_bounded_canvas_tool() -> None:
     parameters = tool["parameters"]
     assert parameters["type"] == "object"
     assert parameters["additionalProperties"] is False
-    assert parameters["required"] == ["brief"]
-    assert set(parameters["properties"]) == {"brief", "interactionGoal"}
+    assert parameters["required"] == ["operation", "brief"]
+    assert set(parameters["properties"]) == {
+        "operation",
+        "brief",
+        "interactionGoal",
+    }
+    operation_schema = parameters["$defs"]["InteractiveCanvasOperation"]
+    assert parameters["properties"]["operation"]["$ref"] == (
+        "#/$defs/InteractiveCanvasOperation"
+    )
+    assert operation_schema["enum"] == [
+        "new",
+        "reviseFocused",
+    ]
     assert parameters["properties"]["brief"]["maxLength"] == 500
     assert parameters["properties"]["interactionGoal"]["anyOf"][0]["maxLength"] == 160
     serialized = str(tool)
     assert "'title':" not in serialized
-    for forbidden_field in ("sceneId", "nodes", "pathData", "rawSvg"):
+    for forbidden_field in (
+        "sceneId",
+        "sceneRevision",
+        "focusedSceneId",
+        "currentSvg",
+        "nodes",
+        "pathData",
+        "rawSvg",
+    ):
         assert forbidden_field not in parameters["properties"]
 
     session = update["session"]
@@ -110,6 +138,34 @@ def test_harness_exposes_one_optional_bounded_canvas_tool() -> None:
     assert [item["name"] for item in session["tools"]] == [INTERACTIVE_CANVAS_TOOL_NAME]
     session["tools"][0]["name"] = "mutated"
     assert harness.tools[0]["name"] == INTERACTIVE_CANVAS_TOOL_NAME
+
+
+@pytest.mark.parametrize("operation", ["new", "reviseFocused"])
+def test_tool_operation_allows_only_exact_enum(operation: str) -> None:
+    request = InteractiveCanvasRequest.model_validate(
+        {
+            "operation": operation,
+            "brief": "Show a clear water cycle.",
+        }
+    )
+
+    assert request.operation == operation
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"brief": "Show a clear water cycle."},
+        {"operation": "revise", "brief": "Show a clear water cycle."},
+        {"operation": "update", "brief": "Show a clear water cycle."},
+        {"operation": "newScene", "brief": "Show a clear water cycle."},
+        {"operation": "", "brief": "Show a clear water cycle."},
+        {"operation": None, "brief": "Show a clear water cycle."},
+    ],
+)
+def test_tool_operation_is_required_and_strict(payload: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        InteractiveCanvasRequest.model_validate(payload)
 
 
 def test_context_is_bounded_and_escapes_untrusted_memory() -> None:

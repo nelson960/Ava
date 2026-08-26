@@ -233,12 +233,18 @@ def _id_factory(values: list[str]):
     return lambda: next(iterator)
 
 
-def _call(call_id: str = "call_1") -> RealtimeCanvasToolCall:
+def _call(
+    call_id: str = "call_1",
+    *,
+    operation: str = "new",
+    brief: str = "Show how clouds make rain.",
+) -> RealtimeCanvasToolCall:
     return RealtimeCanvasToolCall(
         call_id=call_id,
         request=InteractiveCanvasRequest.model_validate(
             {
-                "brief": "Show how clouds make rain.",
+                "operation": operation,
+                "brief": brief,
                 "interactionGoal": "Let the child select the cloud.",
             }
         ),
@@ -274,6 +280,7 @@ async def _accepted_coordinator(
     *,
     state: SvgCanvasSessionState | None = None,
     session_id: str = "session-1",
+    operation: str = "new",
 ):
     specialist = _Specialist()
     sink = _Sink()
@@ -300,7 +307,7 @@ async def _accepted_coordinator(
     )
     output = await coordinator.accept_tool_call(
         source_turn_id="turn-1",
-        call=_call(),
+        call=_call(operation=operation),
         complete_tool=complete,
     )
     await specialist.started.wait()
@@ -471,6 +478,286 @@ async def _commit_shared_workspace_scene(
     assert documents.document_count == 0
     await coordinator.close()
     return active
+
+
+async def test_new_operation_ignores_existing_current_scene() -> None:
+    workspace = SvgCanvasWorkspace()
+    active_a = _commit_scene(
+        workspace,
+        scene_id="scene-A",
+        revision=1,
+        generation_id="generation-A-1",
+        source_turn_id="turn-A-1",
+    )
+    state = SvgCanvasSessionState(workspace=workspace)
+    (
+        coordinator,
+        specialist,
+        _sink,
+        _completions,
+        _output,
+        _documents,
+    ) = await _accepted_coordinator(
+        ["generation-B-1"],
+        state=state,
+        operation="new",
+    )
+    try:
+        request = specialist.requests[-1]
+        assert request.current_scene_id is None
+        assert request.current_revision is None
+        assert request.current_svg is None
+        assert request.current_svg_sha256 is None
+
+        specialist.release.set()
+        await coordinator.wait_for_background_work()
+
+        candidate = state.candidate
+        assert candidate is not None
+        assert candidate.scene_id != active_a.scene_id
+        assert candidate.revision == 1
+        assert candidate.base_scene_id is None
+        assert candidate.base_revision == 0
+    finally:
+        await coordinator.close()
+
+
+async def test_revise_focused_without_current_is_rejected_before_sol() -> None:
+    specialist = _Specialist()
+    sink = _Sink()
+    documents = SvgCanvasDocumentStore()
+    completions: list[tuple[str, str, InteractiveCanvasToolOutputV4]] = []
+    coordinator = SvgCanvasJobCoordinator(
+        session_id="session-empty-revision",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+        specialist=specialist,
+        state=SvgCanvasSessionState(),
+        documents=documents,
+        event_sink=sink,
+        generation_id_factory=lambda: "generation-must-not-be-reserved",
+    )
+    try:
+        output = await coordinator.accept_tool_call(
+            source_turn_id="turn-empty-revision",
+            call=_call(operation="reviseFocused"),
+            complete_tool=lambda turn, call, result: _record_completion(
+                completions,
+                turn,
+                call,
+                result,
+            ),
+        )
+
+        assert output.status == InteractiveCanvasToolStatusV4.REJECTED
+        assert output.generation_id is None
+        assert output.reason == "There is no current canvas to revise."
+        assert completions == [("turn-empty-revision", "call_1", output)]
+        assert specialist.requests == []
+        assert sink.started == []
+        assert sink.available == []
+        assert sink.rejected_calls == [
+            ("call_1", "There is no current canvas to revise.")
+        ]
+        assert coordinator.state.candidate is None
+        assert coordinator.state.workspace.scenes == ()
+        assert documents.document_count == 0
+    finally:
+        await coordinator.close()
+
+
+async def test_consecutive_new_operations_create_distinct_scenes() -> None:
+    generation_ids = ["generation-A", "generation-B", "generation-C"]
+    (
+        coordinator,
+        specialist,
+        sink,
+        completions,
+        _output,
+        documents,
+    ) = await _accepted_coordinator(generation_ids, operation="new")
+    specialist.release.set()
+    await coordinator.wait_for_background_work()
+
+    actives: list[ActiveSvgCanvasScene] = []
+    for index in range(3):
+        if index > 0:
+            await coordinator.accept_tool_call(
+                source_turn_id=f"turn-{index + 1}",
+                call=_call(f"call_{index + 1}", operation="new"),
+                complete_tool=lambda turn, call, result: _record_completion(
+                    completions,
+                    turn,
+                    call,
+                    result,
+                ),
+            )
+            await coordinator.wait_for_background_work()
+        _stored, active = await _activate_current_candidate(
+            coordinator=coordinator,
+            sink=sink,
+            documents=documents,
+            sequence=index * 2 + 1,
+        )
+        actives.append(active)
+
+    assert len({active.scene_id for active in actives}) == 3
+    assert [active.revision for active in actives] == [1, 1, 1]
+    assert [scene.scene_id for scene in coordinator.state.workspace.scenes] == [
+        active.scene_id for active in actives
+    ]
+    assert coordinator.state.workspace.current is actives[-1]
+    assert all(request.current_svg is None for request in specialist.requests)
+    assert documents.document_count == 0
+    await coordinator.close()
+
+
+async def test_new_new_revise_new_semantics() -> None:
+    generation_ids = [
+        "generation-plant",
+        "generation-solar-1",
+        "generation-solar-2",
+        "generation-water",
+    ]
+    (
+        coordinator,
+        specialist,
+        sink,
+        completions,
+        _output,
+        documents,
+    ) = await _accepted_coordinator(generation_ids, operation="new")
+    specialist.release.set()
+    await coordinator.wait_for_background_work()
+
+    _stored_plant, plant = await _activate_current_candidate(
+        coordinator=coordinator,
+        sink=sink,
+        documents=documents,
+        sequence=1,
+    )
+    await coordinator.accept_tool_call(
+        source_turn_id="turn-solar-1",
+        call=_call(
+            "call_solar_1",
+            operation="new",
+            brief="Show the solar system.",
+        ),
+        complete_tool=lambda turn, call, result: _record_completion(
+            completions, turn, call, result
+        ),
+    )
+    await coordinator.wait_for_background_work()
+    _stored_solar, solar_1 = await _activate_current_candidate(
+        coordinator=coordinator,
+        sink=sink,
+        documents=documents,
+        sequence=3,
+    )
+    await coordinator.accept_tool_call(
+        source_turn_id="turn-solar-2",
+        call=_call(
+            "call_solar_2",
+            operation="reviseFocused",
+            brief="Make Earth bigger.",
+        ),
+        complete_tool=lambda turn, call, result: _record_completion(
+            completions, turn, call, result
+        ),
+    )
+    await coordinator.wait_for_background_work()
+    _stored_solar_2, solar_2 = await _activate_current_candidate(
+        coordinator=coordinator,
+        sink=sink,
+        documents=documents,
+        sequence=5,
+    )
+    await coordinator.accept_tool_call(
+        source_turn_id="turn-water",
+        call=_call(
+            "call_water",
+            operation="new",
+            brief="Show the water cycle.",
+        ),
+        complete_tool=lambda turn, call, result: _record_completion(
+            completions, turn, call, result
+        ),
+    )
+    await coordinator.wait_for_background_work()
+    _stored_water, water = await _activate_current_candidate(
+        coordinator=coordinator,
+        sink=sink,
+        documents=documents,
+        sequence=7,
+    )
+
+    assert plant.scene_id != solar_1.scene_id != water.scene_id
+    assert solar_2.scene_id == solar_1.scene_id
+    assert solar_2.revision == 2
+    assert [
+        (scene.scene_id, scene.revision) for scene in coordinator.state.workspace.scenes
+    ] == [
+        (plant.scene_id, 1),
+        (solar_1.scene_id, 2),
+        (water.scene_id, 1),
+    ]
+    assert coordinator.state.workspace.current is water
+    assert specialist.requests[0].current_svg is None
+    assert specialist.requests[1].current_svg is None
+    assert specialist.requests[2].current_scene_id == solar_1.scene_id
+    assert specialist.requests[2].current_revision == 1
+    assert specialist.requests[2].current_svg == solar_1.document.svg_text
+    assert specialist.requests[2].current_svg_sha256 == solar_1.document.svg_sha256
+    assert specialist.requests[3].current_svg is None
+    assert documents.document_count == 0
+    await coordinator.close()
+
+
+async def test_eleven_successful_new_operations_preserve_fifo_cap() -> None:
+    generation_ids = [f"generation-new-{index}" for index in range(1, 12)]
+    (
+        coordinator,
+        specialist,
+        sink,
+        completions,
+        _output,
+        documents,
+    ) = await _accepted_coordinator(generation_ids, operation="new")
+    specialist.release.set()
+    await coordinator.wait_for_background_work()
+
+    activated: list[ActiveSvgCanvasScene] = []
+    for index in range(1, 12):
+        if index > 1:
+            await coordinator.accept_tool_call(
+                source_turn_id=f"turn-new-{index}",
+                call=_call(f"call_new_{index}", operation="new"),
+                complete_tool=lambda turn, call, result: _record_completion(
+                    completions,
+                    turn,
+                    call,
+                    result,
+                ),
+            )
+            await coordinator.wait_for_background_work()
+        _stored, active = await _activate_current_candidate(
+            coordinator=coordinator,
+            sink=sink,
+            documents=documents,
+            sequence=index * 2,
+        )
+        activated.append(active)
+        assert coordinator.state.workspace.scene_count <= 10
+        assert documents.document_count == 0
+
+    assert coordinator.state.workspace.scene_count == 10
+    assert [scene.scene_id for scene in coordinator.state.workspace.scenes] == [
+        scene.scene_id for scene in activated[1:]
+    ]
+    assert all(scene.revision == 1 for scene in coordinator.state.workspace.scenes)
+    assert coordinator.state.workspace.current is activated[-1]
+    assert coordinator.state.workspace.scene(activated[0].scene_id) is None
+    assert all(request.current_svg is None for request in specialist.requests)
+    await coordinator.close()
 
 
 async def test_realtime_tool_completes_before_sol_generation() -> None:
@@ -842,7 +1129,7 @@ async def test_revision_after_renderer_failure_remains_backend_revision() -> Non
 
     output = await coordinator.accept_tool_call(
         source_turn_id="turn-2",
-        call=_call("call_2"),
+        call=_call("call_2", operation="reviseFocused"),
         complete_tool=lambda turn, call, result: _record_completion(
             completions,
             turn,
@@ -930,6 +1217,7 @@ async def test_replacement_session_revision_uses_exact_prior_svg() -> None:
         ["generation-session-2"],
         state=replacement_state,
         session_id="session-canvas-2",
+        operation="reviseFocused",
     )
 
     request = specialist.requests[-1]
@@ -1010,6 +1298,7 @@ async def test_accepted_revision_cannot_silently_rebase() -> None:
         ["generation-X"],
         state=state,
         session_id="session-X",
+        operation="reviseFocused",
     )
     try:
         request = specialist.requests[-1]
@@ -1063,6 +1352,7 @@ async def test_two_coordinators_same_subject_cannot_rebase() -> None:
         ["generation-X"],
         state=state_x,
         session_id="session-X",
+        operation="reviseFocused",
     )
     (
         coordinator_y,
@@ -1075,6 +1365,7 @@ async def test_two_coordinators_same_subject_cannot_rebase() -> None:
         ["generation-Y"],
         state=state_y,
         session_id="session-Y",
+        operation="reviseFocused",
     )
     try:
         for request in (specialist_x.requests[-1], specialist_y.requests[-1]):
@@ -1128,6 +1419,7 @@ async def test_unrelated_current_change_does_not_invalidate_target_base() -> Non
         ["generation-X"],
         state=state,
         session_id="session-X",
+        operation="reviseFocused",
     )
     try:
         _commit_scene(
@@ -1213,6 +1505,7 @@ async def test_reset_during_revision_sol_rejects_late_result() -> None:
         ["generation-X"],
         state=state,
         session_id="session-X",
+        operation="reviseFocused",
     )
     try:
         workspace.clear()
@@ -1367,6 +1660,7 @@ async def test_stale_after_stage_remains_commit_rejected() -> None:
         ["generation-X"],
         state=state,
         session_id="session-X",
+        operation="reviseFocused",
     )
     try:
         specialist.release.set()
@@ -1422,7 +1716,7 @@ async def test_many_successful_revisions_do_not_exhaust_delivery_cache() -> None
         if index > 1:
             output = await coordinator.accept_tool_call(
                 source_turn_id=f"turn-{index}",
-                call=_call(f"call_{index}"),
+                call=_call(f"call_{index}", operation="reviseFocused"),
                 complete_tool=lambda turn, call, result: _record_completion(
                     completions,
                     turn,
@@ -1527,7 +1821,7 @@ async def test_candidate_renderer_failure_remains_non_committing_backend() -> No
     context_before = coordinator.state.render_realtime_context()
     output = await coordinator.accept_tool_call(
         source_turn_id="turn-2",
-        call=_call("call_2"),
+        call=_call("call_2", operation="reviseFocused"),
         complete_tool=lambda turn, call, result: _record_completion(
             completions,
             turn,
@@ -1643,7 +1937,7 @@ async def test_revision_reuses_scene_identity_and_supplies_exact_active_svg() ->
 
     revised_output = await coordinator.accept_tool_call(
         source_turn_id="turn-2",
-        call=_call("call_2"),
+        call=_call("call_2", operation="reviseFocused"),
         complete_tool=lambda turn, call, output: _record_completion(
             completions,
             turn,
@@ -1745,6 +2039,7 @@ async def test_canvas_lifecycle_telemetry_preserves_generation_identity(
         assert event["sessionId"] == "session-1"
         assert event["generationId"] == "generation-1"
         assert event["sourceTurnId"] == "turn-1"
+        assert event["operation"] == "new"
     published = next(
         event for event in telemetry if event["stage"] == "documentPublished"
     )

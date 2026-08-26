@@ -114,6 +114,7 @@ class DeterministicRealtimePlanProvider:
         self._canvas_request = (
             InteractiveCanvasRequest.model_validate(
                 {
+                    "operation": "new",
                     "brief": canvas_brief,
                     "interactionGoal": (
                         "Let the child reveal or select one useful label."

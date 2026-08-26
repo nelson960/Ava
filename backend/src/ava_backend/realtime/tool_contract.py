@@ -16,7 +16,18 @@ INTERACTIVE_CANVAS_GOAL_MAX_CHARACTERS = 160
 _CALL_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
+class InteractiveCanvasOperation(StrEnum):
+    NEW = "new"
+    REVISE_FOCUSED = "reviseFocused"
+
+
 class InteractiveCanvasRequest(RealtimeProtocolModel):
+    operation: InteractiveCanvasOperation = Field(
+        description=(
+            "Use new for a separate visual or different concept. Use "
+            "reviseFocused only to modify the current focused visual."
+        )
+    )
     brief: Annotated[
         NonEmptyText,
         StringConstraints(max_length=INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS),

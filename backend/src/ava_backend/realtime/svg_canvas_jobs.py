@@ -40,6 +40,7 @@ from .events_v4 import (
     CanvasPresentedEventV4,
 )
 from .tool_contract import (
+    InteractiveCanvasOperation,
     InteractiveCanvasToolOutputV4,
     InteractiveCanvasToolStatusV4,
     RealtimeCanvasToolCall,
@@ -121,6 +122,7 @@ class _AcceptedCanvasJob:
 class _CanvasGenerationTrace:
     generation_id: str
     source_turn_id: str
+    operation: InteractiveCanvasOperation
     accepted_at: float
 
 
@@ -180,9 +182,24 @@ class SvgCanvasJobCoordinator:
                         "reason": "another canvas generation is already pending",
                     }
                 )
+            elif (
+                call.request.operation == InteractiveCanvasOperation.REVISE_FOCUSED
+                and self._state.active is None
+            ):
+                output = InteractiveCanvasToolOutputV4.model_validate(
+                    {
+                        "status": InteractiveCanvasToolStatusV4.REJECTED,
+                        "reason": "There is no current canvas to revise.",
+                    }
+                )
             else:
                 generation_id = self._generation_id_factory()
-                active = self._state.active
+                active = (
+                    self._state.active
+                    if call.request.operation
+                    == InteractiveCanvasOperation.REVISE_FOCUSED
+                    else None
+                )
                 accepted_workspace_epoch = self._state.workspace.reset_epoch
                 request = SvgCanvasSpecialistRequest.model_validate(
                     {
@@ -209,12 +226,14 @@ class SvgCanvasJobCoordinator:
                 self._traces[generation_id] = _CanvasGenerationTrace(
                     generation_id=generation_id,
                     source_turn_id=source_turn_id,
+                    operation=call.request.operation,
                     accepted_at=self._monotonic(),
                 )
                 self._log(
                     "accepted",
                     generation_id=generation_id,
                     source_turn_id=source_turn_id,
+                    operation=call.request.operation,
                     baseSceneId=active.scene_id if active else None,
                     baseSceneRevision=active.revision if active else 0,
                     workspaceEpoch=accepted_workspace_epoch,
@@ -773,6 +792,7 @@ class SvgCanvasJobCoordinator:
         }
         trace = self._traces.get(generation_id)
         if trace is not None:
+            context["operation"] = trace.operation
             context["acceptedToStageMs"] = max(
                 0.0, (self._monotonic() - trace.accepted_at) * 1000
             )

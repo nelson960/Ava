@@ -20,8 +20,8 @@ from .tool_contract import (
 )
 
 
-REALTIME_PROMPT_VERSION = "ava-realtime-v4.2"
-REALTIME_TOOL_CONTRACT_VERSION = "ava-realtime-tools-v4.1"
+REALTIME_PROMPT_VERSION = "ava-realtime-v4.3"
+REALTIME_TOOL_CONTRACT_VERSION = "ava-realtime-tools-v4.2"
 DEFAULT_REALTIME_REASONING_EFFORT: Literal["low"] = "low"
 
 
@@ -67,7 +67,11 @@ short spoken answer. Respect a request not to use a visual. Decide from the full
 conversation, never from isolated words or a keyword list.
 
 When calling it, say at most one short natural bridge sentence, then call it
-immediately. Provide only the visual's purpose, essential objects,
+immediately. Before calling, decide whether the child wants a separate visual
+or a modification of the current/focused visual. Use operation=new for a
+separate visual or different concept. Use operation=reviseFocused only when the
+child intends to modify the current/focused visual. Merely discussing or asking
+about the current visual is not a revision. Provide only the visual's purpose, essential objects,
 relationships, flow, labels, and at most one useful child-facing interaction
 goal. Keep the brief under {INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS} characters
 and the interaction goal under {INTERACTIVE_CANVAS_GOAL_MAX_CHARACTERS}
@@ -225,8 +229,9 @@ def build_interactive_canvas_tool() -> dict[str, Any]:
         "type": "function",
         "name": INTERACTIVE_CANVAS_TOOL_NAME,
         "description": (
-            "Request or revise one optional, validated interactive visual when "
-            "the full conversational meaning is materially clearer spatially. "
+            "Request one optional validated visual, explicitly choosing a new "
+            "scene or a revision of the focused scene, when the full "
+            "conversational meaning is materially clearer spatially. "
             "Do not call for ordinary conversation, casual mentions of drawing, "
             "unclear speech, or when the child declines a visual."
         ),
