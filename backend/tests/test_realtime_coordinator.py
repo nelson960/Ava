@@ -139,7 +139,13 @@ def _active_labeled_canvas_state(
         document=document,
     )
     state = SvgCanvasSessionState(workspace=workspace)
-    state.stage_generation(generation, source_turn_id="turn-canvas-source")
+    state.stage_generation(
+        generation,
+        source_turn_id="turn-canvas-source",
+        base_scene_id=None,
+        base_revision=0,
+        workspace_epoch=state.workspace.reset_epoch,
+    )
     state.mark_document_prepared(
         generation_id=generation.generation_id,
         svg_sha256=document.svg_sha256,

@@ -143,7 +143,13 @@ def test_v4_bootstrap_and_independent_exact_document_fetch() -> None:
             document=SvgDocumentValidator().validate(svg),
         )
         state = SvgCanvasSessionState()
-        candidate = state.stage_generation(generation, source_turn_id="turn-v4")
+        candidate = state.stage_generation(
+            generation,
+            source_turn_id="turn-v4",
+            base_scene_id=None,
+            base_revision=0,
+            workspace_epoch=state.workspace.reset_epoch,
+        )
         assert client.portal is not None
         client.portal.call(
             lambda: documents.publish(

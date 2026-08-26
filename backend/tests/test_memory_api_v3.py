@@ -86,8 +86,20 @@ async def test_backend_reset_clears_only_authenticated_subject_workspace() -> No
     workspace_y = workspaces.workspace_for("child:Y")
     active_x = _active_scene("X")
     active_y = _active_scene("Y")
-    workspace_x.commit(active_x, base_scene_id=None, base_revision=0)
-    workspace_y.commit(active_y, base_scene_id=None, base_revision=0)
+    initial_x_epoch = workspace_x.reset_epoch
+    initial_y_epoch = workspace_y.reset_epoch
+    workspace_x.commit(
+        active_x,
+        base_scene_id=None,
+        base_revision=0,
+        workspace_epoch=workspace_x.reset_epoch,
+    )
+    workspace_y.commit(
+        active_y,
+        base_scene_id=None,
+        base_revision=0,
+        workspace_epoch=workspace_y.reset_epoch,
+    )
 
     async with await _client(memory, workspaces) as client:
         response = await client.delete(
@@ -96,8 +108,10 @@ async def test_backend_reset_clears_only_authenticated_subject_workspace() -> No
         )
 
     assert response.status_code == 200
+    assert workspace_x.reset_epoch == initial_x_epoch + 1
     assert workspace_x.current is None
     assert workspace_x.scenes == ()
+    assert workspace_y.reset_epoch == initial_y_epoch
     assert workspace_y.current is active_y
     assert workspace_y.scenes == (active_y,)
 
@@ -106,7 +120,13 @@ async def test_failed_backend_reset_preserves_subject_workspace() -> None:
     workspaces = SvgCanvasWorkspaceStore()
     workspace = workspaces.workspace_for("development:127.0.0.1")
     active = _active_scene("X")
-    workspace.commit(active, base_scene_id=None, base_revision=0)
+    initial_epoch = workspace.reset_epoch
+    workspace.commit(
+        active,
+        base_scene_id=None,
+        base_revision=0,
+        workspace_epoch=workspace.reset_epoch,
+    )
 
     async with await _client(_FailingResetMemoryStore(), workspaces) as client:
         response = await client.delete(
@@ -115,6 +135,7 @@ async def test_failed_backend_reset_preserves_subject_workspace() -> None:
         )
 
     assert response.status_code == 503
+    assert workspace.reset_epoch == initial_epoch
     assert workspace.current is active
     assert workspace.scenes == (active,)
 

@@ -53,6 +53,7 @@ class SvgCanvasCandidate:
     revision: int
     base_scene_id: str | None
     base_revision: int
+    workspace_epoch: int
     document: ValidatedSvgDocument
     status: SvgCandidateStatus = SvgCandidateStatus.DOCUMENT_READY
     presentation_sample_offset: int | None = None
@@ -96,25 +97,45 @@ class SvgCanvasSessionState:
         generation: SvgCanvasSpecialistGeneration,
         *,
         source_turn_id: str,
+        base_scene_id: str | None,
+        base_revision: int,
+        workspace_epoch: int,
     ) -> SvgCanvasCandidate:
         if self._candidate is not None:
             self._fail(
                 SvgCanvasStateErrorCode.CANDIDATE_ALREADY_PENDING,
                 "an SVG canvas candidate is already pending",
             )
-        active = self.active
-        scene_id = (
-            active.scene_id
-            if active is not None
-            else _scene_identifier(generation.generation_id)
-        )
+        if workspace_epoch != self._workspace.reset_epoch:
+            self._fail(
+                SvgCanvasStateErrorCode.CANONICAL_SCENE_CHANGED,
+                "canvas workspace was reset after generation acceptance",
+            )
+        if base_scene_id is None:
+            if base_revision != 0:
+                self._fail(
+                    SvgCanvasStateErrorCode.CANONICAL_SCENE_CHANGED,
+                    "a canvas generation without a base must use revision zero",
+                )
+            scene_id = _scene_identifier(generation.generation_id)
+            revision = 1
+        else:
+            base = self._workspace.scene(base_scene_id)
+            if base is None or base.revision != base_revision:
+                self._fail(
+                    SvgCanvasStateErrorCode.CANONICAL_SCENE_CHANGED,
+                    "canonical SVG canvas changed before generation completed",
+                )
+            scene_id = base_scene_id
+            revision = base_revision + 1
         candidate = SvgCanvasCandidate(
             generation_id=generation.generation_id,
             source_turn_id=source_turn_id,
             scene_id=scene_id,
-            revision=(active.revision + 1 if active is not None else 1),
-            base_scene_id=(active.scene_id if active is not None else None),
-            base_revision=(active.revision if active is not None else 0),
+            revision=revision,
+            base_scene_id=base_scene_id,
+            base_revision=base_revision,
+            workspace_epoch=workspace_epoch,
             document=generation.document,
         )
         self._candidate = candidate
@@ -225,6 +246,7 @@ class SvgCanvasSessionState:
                 activated,
                 base_scene_id=candidate.base_scene_id,
                 base_revision=candidate.base_revision,
+                workspace_epoch=candidate.workspace_epoch,
             )
         except SvgCanvasWorkspaceError as error:
             self._fail(

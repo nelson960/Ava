@@ -113,6 +113,7 @@ class _AcceptedCanvasJob:
     generation_id: str
     source_turn_id: str
     request: SvgCanvasSpecialistRequest
+    accepted_workspace_epoch: int
     task: asyncio.Task[None] | None = None
 
 
@@ -182,6 +183,7 @@ class SvgCanvasJobCoordinator:
             else:
                 generation_id = self._generation_id_factory()
                 active = self._state.active
+                accepted_workspace_epoch = self._state.workspace.reset_epoch
                 request = SvgCanvasSpecialistRequest.model_validate(
                     {
                         "generationId": generation_id,
@@ -201,6 +203,7 @@ class SvgCanvasJobCoordinator:
                     generation_id=generation_id,
                     source_turn_id=source_turn_id,
                     request=request,
+                    accepted_workspace_epoch=accepted_workspace_epoch,
                 )
                 self._jobs[generation_id] = job
                 self._traces[generation_id] = _CanvasGenerationTrace(
@@ -214,6 +217,7 @@ class SvgCanvasJobCoordinator:
                     source_turn_id=source_turn_id,
                     baseSceneId=active.scene_id if active else None,
                     baseSceneRevision=active.revision if active else 0,
+                    workspaceEpoch=accepted_workspace_epoch,
                 )
                 output = InteractiveCanvasToolOutputV4.model_validate(
                     {
@@ -691,6 +695,9 @@ class SvgCanvasJobCoordinator:
                 candidate = self._state.stage_generation(
                     generation,
                     source_turn_id=job.source_turn_id,
+                    base_scene_id=job.request.current_scene_id,
+                    base_revision=job.request.current_revision or 0,
+                    workspace_epoch=job.accepted_workspace_epoch,
                 )
                 publication_started_at = self._monotonic()
                 stored = await self._documents.publish(

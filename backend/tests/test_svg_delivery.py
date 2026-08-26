@@ -25,7 +25,13 @@ def _candidate(generation_id: str = "generation-1"):
         document=SvgDocumentValidator().validate(svg),
     )
     state = SvgCanvasSessionState()
-    return state.stage_generation(generation, source_turn_id="turn-1")
+    return state.stage_generation(
+        generation,
+        source_turn_id="turn-1",
+        base_scene_id=None,
+        base_revision=0,
+        workspace_epoch=state.workspace.reset_epoch,
+    )
 
 
 async def test_store_serves_exact_svg_and_canonical_manifest_on_separate_paths() -> (
@@ -71,6 +77,9 @@ async def test_generation_id_reuse_with_different_document_fails_loudly() -> Non
             document=SvgDocumentValidator().validate(second_svg),
         ),
         source_turn_id="turn-1",
+        base_scene_id=None,
+        base_revision=0,
+        workspace_epoch=second_state.workspace.reset_epoch,
     )
     await store.publish(session_id="session-1", candidate=first)
 

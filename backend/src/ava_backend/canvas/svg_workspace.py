@@ -42,6 +42,11 @@ class SvgCanvasWorkspace:
         self._scenes: list[ActiveSvgCanvasScene] = []
         self._current_scene_id: str | None = None
         self._last_interaction: RecordedSvgCanvasInteraction | None = None
+        self._reset_epoch = 0
+
+    @property
+    def reset_epoch(self) -> int:
+        return self._reset_epoch
 
     @property
     def scenes(self) -> tuple[ActiveSvgCanvasScene, ...]:
@@ -72,7 +77,12 @@ class SvgCanvasWorkspace:
         *,
         base_scene_id: str | None,
         base_revision: int,
+        workspace_epoch: int,
     ) -> ActiveSvgCanvasScene:
+        if workspace_epoch != self._reset_epoch:
+            raise SvgCanvasWorkspaceError(
+                "canonical SVG canvas workspace was reset after generation acceptance"
+            )
         existing_index = next(
             (
                 index
@@ -96,10 +106,20 @@ class SvgCanvasWorkspace:
             return scene
 
         existing = self._scenes[existing_index]
-        if scene is existing and (
-            (scene.revision == 1 and base_scene_id is None and base_revision == 0)
-            or (base_scene_id == scene.scene_id and base_revision == scene.revision - 1)
-        ):
+        if scene.revision == existing.revision:
+            if not _same_committed_scene_identity(existing, scene):
+                raise SvgCanvasWorkspaceError(
+                    "canonical SVG canvas scene revision has conflicting "
+                    "committed identity"
+                )
+            if not _valid_observation_base(
+                scene,
+                base_scene_id=base_scene_id,
+                base_revision=base_revision,
+            ):
+                raise SvgCanvasWorkspaceError(
+                    "canonical SVG canvas observation has invalid base identity"
+                )
             return existing
         if (
             base_scene_id != scene.scene_id
@@ -135,6 +155,7 @@ class SvgCanvasWorkspace:
         self._scenes.clear()
         self._current_scene_id = None
         self._last_interaction = None
+        self._reset_epoch += 1
 
 
 class SvgCanvasWorkspaceStore:
@@ -156,3 +177,29 @@ class SvgCanvasWorkspaceStore:
         workspace = self._workspaces.get(subject)
         if workspace is not None:
             workspace.clear()
+
+
+def _same_committed_scene_identity(
+    existing: ActiveSvgCanvasScene,
+    observed: ActiveSvgCanvasScene,
+) -> bool:
+    return (
+        existing.scene_id == observed.scene_id
+        and existing.revision == observed.revision
+        and existing.generation_id == observed.generation_id
+        and existing.source_turn_id == observed.source_turn_id
+        and existing.document.svg_sha256 == observed.document.svg_sha256
+        and existing.document.manifest_sha256 == observed.document.manifest_sha256
+        and existing.first_rendered_sample == observed.first_rendered_sample
+    )
+
+
+def _valid_observation_base(
+    scene: ActiveSvgCanvasScene,
+    *,
+    base_scene_id: str | None,
+    base_revision: int,
+) -> bool:
+    if scene.revision == 1:
+        return base_scene_id is None and base_revision == 0
+    return base_scene_id == scene.scene_id and base_revision == scene.revision - 1

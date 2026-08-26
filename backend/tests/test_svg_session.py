@@ -5,6 +5,7 @@ import pytest
 from ava_backend.canvas.svg_document import SvgDocumentValidator
 from ava_backend.canvas.svg_session import (
     SvgCandidateStatus,
+    SvgCanvasCandidate,
     SvgCanvasSessionState,
     SvgCanvasStateError,
     SvgCanvasStateErrorCode,
@@ -43,7 +44,7 @@ def _prepare_and_schedule(
     source_turn_id: str = "turn_1",
     sample: int = 4_800,
 ) -> None:
-    state.stage_generation(generation, source_turn_id=source_turn_id)
+    _stage_generation(state, generation, source_turn_id=source_turn_id)
     document = generation.document
     state.mark_document_prepared(
         generation_id=generation.generation_id,
@@ -58,10 +59,26 @@ def _prepare_and_schedule(
     )
 
 
+def _stage_generation(
+    state: SvgCanvasSessionState,
+    generation: SvgCanvasSpecialistGeneration,
+    *,
+    source_turn_id: str,
+) -> SvgCanvasCandidate:
+    active = state.active
+    return state.stage_generation(
+        generation,
+        source_turn_id=source_turn_id,
+        base_scene_id=active.scene_id if active is not None else None,
+        base_revision=active.revision if active is not None else 0,
+        workspace_epoch=state.workspace.reset_epoch,
+    )
+
+
 def test_preload_ack_does_not_activate_candidate() -> None:
     state = SvgCanvasSessionState()
     generation = _generation()
-    candidate = state.stage_generation(generation, source_turn_id="turn_1")
+    candidate = _stage_generation(state, generation, source_turn_id="turn_1")
 
     prepared = state.mark_document_prepared(
         generation_id=generation.generation_id,
@@ -125,7 +142,7 @@ def test_interruption_discards_unpresented_candidate_not_active_scene() -> None:
         first_rendered_sample=4_800,
     )
     second = _generation("generation_2")
-    state.stage_generation(second, source_turn_id="turn_2")
+    _stage_generation(state, second, source_turn_id="turn_2")
 
     discarded = state.discard_candidate_for_interrupted_turn(source_turn_id="turn_2")
 
@@ -138,7 +155,7 @@ def test_interruption_discards_unpresented_candidate_not_active_scene() -> None:
 def test_hash_mismatch_never_prepares_or_activates_document() -> None:
     state = SvgCanvasSessionState()
     generation = _generation()
-    state.stage_generation(generation, source_turn_id="turn_1")
+    _stage_generation(state, generation, source_turn_id="turn_1")
 
     with pytest.raises(SvgCanvasStateError) as raised:
         state.mark_document_prepared(

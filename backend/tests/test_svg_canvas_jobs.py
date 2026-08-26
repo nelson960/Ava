@@ -18,6 +18,7 @@ from ava_backend.canvas.svg_session import (
     SvgCanvasPresentationCue,
     SvgCanvasSessionState,
     SvgCanvasStateError,
+    SvgCanvasStateErrorCode,
 )
 from ava_backend.canvas.svg_specialist import (
     SvgCanvasSpecialistGenerationLimitError,
@@ -25,7 +26,10 @@ from ava_backend.canvas.svg_specialist import (
     SvgCanvasSpecialistRequest,
     SvgCanvasSpecialistUnavailableError,
 )
-from ava_backend.canvas.svg_workspace import SvgCanvasWorkspaceStore
+from ava_backend.canvas.svg_workspace import (
+    SvgCanvasWorkspace,
+    SvgCanvasWorkspaceStore,
+)
 from ava_backend.protocol import AgeBand
 from ava_backend.realtime.events_v4 import (
     CanvasDocumentDiscardReason,
@@ -241,6 +245,30 @@ def _call(call_id: str = "call_1") -> RealtimeCanvasToolCall:
     )
 
 
+def _commit_scene(
+    workspace: SvgCanvasWorkspace,
+    *,
+    scene_id: str,
+    revision: int,
+    generation_id: str,
+    source_turn_id: str,
+) -> ActiveSvgCanvasScene:
+    scene = ActiveSvgCanvasScene(
+        generation_id=generation_id,
+        source_turn_id=source_turn_id,
+        scene_id=scene_id,
+        revision=revision,
+        document=_document(),
+        first_rendered_sample=4_800 * revision,
+    )
+    return workspace.commit(
+        scene,
+        base_scene_id=scene_id if revision > 1 else None,
+        base_revision=revision - 1,
+        workspace_epoch=workspace.reset_epoch,
+    )
+
+
 async def _accepted_coordinator(
     generation_ids: list[str] | None = None,
     *,
@@ -310,6 +338,32 @@ async def _activate_current_candidate(
     sequence: int,
     session_id: str = "session-1",
 ) -> tuple[StoredSvgCanvasDocument, ActiveSvgCanvasScene]:
+    candidate, stored = await _prepare_current_candidate(
+        coordinator=coordinator,
+        sink=sink,
+        documents=documents,
+        sequence=sequence,
+        session_id=session_id,
+    )
+    active = await coordinator.presented(
+        _presented_event(
+            candidate,
+            stored,
+            sequence=sequence + 1,
+            session_id=session_id,
+        )
+    )
+    return stored, active
+
+
+async def _prepare_current_candidate(
+    *,
+    coordinator: SvgCanvasJobCoordinator,
+    sink: _Sink,
+    documents: SvgCanvasDocumentStore,
+    sequence: int,
+    session_id: str = "session-1",
+) -> tuple[SvgCanvasCandidate, StoredSvgCanvasDocument]:
     stored = sink.available[-1]
     candidate = coordinator.state.candidate
     assert candidate is not None
@@ -341,23 +395,30 @@ async def _activate_current_candidate(
             }
         )
     )
-    active = await coordinator.presented(
-        CanvasPresentedEventV4.model_validate(
-            {
-                "protocolVersion": 4,
-                "event": "canvasPresented",
-                "sessionId": session_id,
-                "sequence": sequence + 1,
-                "generationId": candidate.generation_id,
-                "sceneId": candidate.scene_id,
-                "sceneRevision": candidate.revision,
-                "svgSha256": stored.document.svg_sha256,
-                "manifestSha256": stored.document.manifest_sha256,
-                "firstRenderedSample": 4_800,
-            }
-        )
+    return candidate, stored
+
+
+def _presented_event(
+    candidate: SvgCanvasCandidate,
+    stored: StoredSvgCanvasDocument,
+    *,
+    sequence: int,
+    session_id: str = "session-1",
+) -> CanvasPresentedEventV4:
+    return CanvasPresentedEventV4.model_validate(
+        {
+            "protocolVersion": 4,
+            "event": "canvasPresented",
+            "sessionId": session_id,
+            "sequence": sequence,
+            "generationId": candidate.generation_id,
+            "sceneId": candidate.scene_id,
+            "sceneRevision": candidate.revision,
+            "svgSha256": stored.document.svg_sha256,
+            "manifestSha256": stored.document.manifest_sha256,
+            "firstRenderedSample": 4_800,
+        }
     )
-    return stored, active
 
 
 def _runtime_failure_event(
@@ -607,7 +668,7 @@ async def test_prepare_ack_and_sample_cue_still_do_not_activate() -> None:
         sink,
         _completions,
         _output,
-        _documents,
+        documents,
     ) = await _accepted_coordinator()
     specialist.release.set()
     await coordinator.wait_for_background_work()
@@ -650,7 +711,7 @@ async def test_first_frame_ack_activates_and_interactions_use_manifest() -> None
         sink,
         _completions,
         _output,
-        _documents,
+        documents,
     ) = await _accepted_coordinator()
     specialist.release.set()
     await coordinator.wait_for_background_work()
@@ -926,6 +987,421 @@ async def test_coordinator_close_does_not_clear_committed_workspace() -> None:
 
     assert workspace.current is active
     assert workspace.scenes == (active,)
+
+
+async def test_accepted_revision_cannot_silently_rebase() -> None:
+    workspace = SvgCanvasWorkspace()
+    active_a1 = _commit_scene(
+        workspace,
+        scene_id="scene-A",
+        revision=1,
+        generation_id="generation-A-1",
+        source_turn_id="turn-A-1",
+    )
+    state = SvgCanvasSessionState(workspace=workspace)
+    (
+        coordinator,
+        specialist,
+        sink,
+        _completions,
+        _output,
+        documents,
+    ) = await _accepted_coordinator(
+        ["generation-X"],
+        state=state,
+        session_id="session-X",
+    )
+    try:
+        request = specialist.requests[-1]
+        assert request.current_scene_id == active_a1.scene_id
+        assert request.current_revision == active_a1.revision
+        assert request.current_svg == active_a1.document.svg_text
+        assert request.current_svg_sha256 == active_a1.document.svg_sha256
+        active_a2 = _commit_scene(
+            workspace,
+            scene_id="scene-A",
+            revision=2,
+            generation_id="generation-Y",
+            source_turn_id="turn-Y",
+        )
+
+        specialist.release.set()
+        await coordinator.wait_for_background_work()
+
+        assert state.candidate is None
+        assert sink.available == []
+        assert sink.rejected == [
+            ("generation-X", CanvasGenerationRejectionCode.PREPARATION_FAILED)
+        ]
+        assert documents.document_count == 0
+        assert workspace.current is active_a2
+        assert workspace.scene("scene-A") is active_a2
+    finally:
+        await coordinator.close()
+    assert documents.document_count == 0
+
+
+async def test_two_coordinators_same_subject_cannot_rebase() -> None:
+    workspace = SvgCanvasWorkspace()
+    active_a1 = _commit_scene(
+        workspace,
+        scene_id="scene-A",
+        revision=1,
+        generation_id="generation-A-1",
+        source_turn_id="turn-A-1",
+    )
+    state_x = SvgCanvasSessionState(workspace=workspace)
+    state_y = SvgCanvasSessionState(workspace=workspace)
+    (
+        coordinator_x,
+        specialist_x,
+        sink_x,
+        _cx,
+        _ox,
+        documents_x,
+    ) = await _accepted_coordinator(
+        ["generation-X"],
+        state=state_x,
+        session_id="session-X",
+    )
+    (
+        coordinator_y,
+        specialist_y,
+        sink_y,
+        _cy,
+        _oy,
+        documents_y,
+    ) = await _accepted_coordinator(
+        ["generation-Y"],
+        state=state_y,
+        session_id="session-Y",
+    )
+    try:
+        for request in (specialist_x.requests[-1], specialist_y.requests[-1]):
+            assert request.current_scene_id == active_a1.scene_id
+            assert request.current_revision == active_a1.revision
+            assert request.current_svg == active_a1.document.svg_text
+
+        specialist_y.release.set()
+        await coordinator_y.wait_for_background_work()
+        _stored_y, active_y = await _activate_current_candidate(
+            coordinator=coordinator_y,
+            sink=sink_y,
+            documents=documents_y,
+            sequence=1,
+            session_id="session-Y",
+        )
+        assert active_y.scene_id == "scene-A"
+        assert active_y.revision == 2
+
+        specialist_x.release.set()
+        await coordinator_x.wait_for_background_work()
+
+        assert state_x.candidate is None
+        assert sink_x.available == []
+        assert documents_x.document_count == 0
+        assert workspace.current is active_y
+        assert workspace.scene("scene-A") is active_y
+    finally:
+        await coordinator_x.close()
+        await coordinator_y.close()
+
+
+async def test_unrelated_current_change_does_not_invalidate_target_base() -> None:
+    workspace = SvgCanvasWorkspace()
+    active_a1 = _commit_scene(
+        workspace,
+        scene_id="scene-A",
+        revision=1,
+        generation_id="generation-A-1",
+        source_turn_id="turn-A-1",
+    )
+    state = SvgCanvasSessionState(workspace=workspace)
+    (
+        coordinator,
+        specialist,
+        _sink,
+        _completions,
+        _output,
+        documents,
+    ) = await _accepted_coordinator(
+        ["generation-X"],
+        state=state,
+        session_id="session-X",
+    )
+    try:
+        _commit_scene(
+            workspace,
+            scene_id="scene-B",
+            revision=1,
+            generation_id="generation-B-1",
+            source_turn_id="turn-B-1",
+        )
+        specialist.release.set()
+        await coordinator.wait_for_background_work()
+
+        candidate = state.candidate
+        assert candidate is not None
+        assert candidate.scene_id == active_a1.scene_id
+        assert candidate.revision == 2
+        assert candidate.base_scene_id == active_a1.scene_id
+        assert candidate.base_revision == 1
+    finally:
+        await coordinator.close()
+    assert documents.document_count == 0
+
+
+async def test_no_base_generation_remains_distinct() -> None:
+    workspace = SvgCanvasWorkspace()
+    state = SvgCanvasSessionState(workspace=workspace)
+    (
+        coordinator,
+        specialist,
+        _sink,
+        _completions,
+        _output,
+        _documents,
+    ) = await _accepted_coordinator(
+        ["generation-X"],
+        state=state,
+        session_id="session-X",
+    )
+    try:
+        request = specialist.requests[-1]
+        assert request.current_scene_id is None
+        assert request.current_revision is None
+        assert request.current_svg is None
+        active_a1 = _commit_scene(
+            workspace,
+            scene_id="scene-A",
+            revision=1,
+            generation_id="generation-A-1",
+            source_turn_id="turn-A-1",
+        )
+
+        specialist.release.set()
+        await coordinator.wait_for_background_work()
+
+        candidate = state.candidate
+        assert candidate is not None
+        assert candidate.scene_id != active_a1.scene_id
+        assert candidate.revision == 1
+        assert candidate.base_scene_id is None
+        assert candidate.base_revision == 0
+    finally:
+        await coordinator.close()
+
+
+async def test_reset_during_revision_sol_rejects_late_result() -> None:
+    workspace = SvgCanvasWorkspace()
+    _commit_scene(
+        workspace,
+        scene_id="scene-A",
+        revision=1,
+        generation_id="generation-A-1",
+        source_turn_id="turn-A-1",
+    )
+    state = SvgCanvasSessionState(workspace=workspace)
+    (
+        coordinator,
+        specialist,
+        sink,
+        _completions,
+        _output,
+        documents,
+    ) = await _accepted_coordinator(
+        ["generation-X"],
+        state=state,
+        session_id="session-X",
+    )
+    try:
+        workspace.clear()
+        specialist.release.set()
+        await coordinator.wait_for_background_work()
+
+        assert state.candidate is None
+        assert sink.available == []
+        assert sink.rejected == [
+            ("generation-X", CanvasGenerationRejectionCode.PREPARATION_FAILED)
+        ]
+        assert documents.document_count == 0
+        assert workspace.scenes == ()
+        assert workspace.current is None
+    finally:
+        await coordinator.close()
+
+
+async def test_reset_during_no_base_sol_rejects_late_result() -> None:
+    workspace = SvgCanvasWorkspace()
+    state = SvgCanvasSessionState(workspace=workspace)
+    (
+        coordinator,
+        specialist,
+        sink,
+        _completions,
+        _output,
+        documents,
+    ) = await _accepted_coordinator(
+        ["generation-X"],
+        state=state,
+        session_id="session-X",
+    )
+    try:
+        workspace.clear()
+        specialist.release.set()
+        await coordinator.wait_for_background_work()
+
+        assert state.candidate is None
+        assert sink.available == []
+        assert sink.rejected == [
+            ("generation-X", CanvasGenerationRejectionCode.PREPARATION_FAILED)
+        ]
+        assert documents.document_count == 0
+        assert workspace.scenes == ()
+        assert workspace.current is None
+    finally:
+        await coordinator.close()
+    assert documents.document_count == 0
+
+
+async def test_reset_after_candidate_staged_blocks_canvas_presented() -> None:
+    workspace = SvgCanvasWorkspace()
+    state = SvgCanvasSessionState(workspace=workspace)
+    (
+        coordinator,
+        specialist,
+        sink,
+        _completions,
+        _output,
+        documents,
+    ) = await _accepted_coordinator(
+        ["generation-X"],
+        state=state,
+        session_id="session-X",
+    )
+    try:
+        specialist.release.set()
+        await coordinator.wait_for_background_work()
+        candidate, stored = await _prepare_current_candidate(
+            coordinator=coordinator,
+            sink=sink,
+            documents=documents,
+            sequence=1,
+            session_id="session-X",
+        )
+        workspace.clear()
+
+        with pytest.raises(SvgCanvasStateError) as raised:
+            await coordinator.presented(
+                _presented_event(
+                    candidate,
+                    stored,
+                    sequence=2,
+                    session_id="session-X",
+                )
+            )
+
+        assert raised.value.code is SvgCanvasStateErrorCode.CANONICAL_SCENE_CHANGED
+        assert workspace.scenes == ()
+        assert workspace.current is None
+    finally:
+        await coordinator.close()
+    assert documents.document_count == 0
+
+
+async def test_post_reset_generation_uses_new_epoch_normally() -> None:
+    workspace = SvgCanvasWorkspace()
+    workspace.clear()
+    state = SvgCanvasSessionState(workspace=workspace)
+    (
+        coordinator,
+        specialist,
+        sink,
+        _completions,
+        _output,
+        documents,
+    ) = await _accepted_coordinator(
+        ["generation-after-reset"],
+        state=state,
+        session_id="session-after-reset",
+    )
+    try:
+        specialist.release.set()
+        await coordinator.wait_for_background_work()
+        candidate = state.candidate
+        assert candidate is not None
+        assert candidate.workspace_epoch == workspace.reset_epoch
+        _stored, active = await _activate_current_candidate(
+            coordinator=coordinator,
+            sink=sink,
+            documents=documents,
+            sequence=1,
+            session_id="session-after-reset",
+        )
+
+        assert active.scene_id == candidate.scene_id
+        assert active.revision == 1
+        assert workspace.current is active
+    finally:
+        await coordinator.close()
+
+
+async def test_stale_after_stage_remains_commit_rejected() -> None:
+    workspace = SvgCanvasWorkspace()
+    _commit_scene(
+        workspace,
+        scene_id="scene-A",
+        revision=1,
+        generation_id="generation-A-1",
+        source_turn_id="turn-A-1",
+    )
+    state = SvgCanvasSessionState(workspace=workspace)
+    (
+        coordinator,
+        specialist,
+        sink,
+        _completions,
+        _output,
+        documents,
+    ) = await _accepted_coordinator(
+        ["generation-X"],
+        state=state,
+        session_id="session-X",
+    )
+    try:
+        specialist.release.set()
+        await coordinator.wait_for_background_work()
+        candidate, stored = await _prepare_current_candidate(
+            coordinator=coordinator,
+            sink=sink,
+            documents=documents,
+            sequence=1,
+            session_id="session-X",
+        )
+        active_y = _commit_scene(
+            workspace,
+            scene_id="scene-A",
+            revision=2,
+            generation_id="generation-Y",
+            source_turn_id="turn-Y",
+        )
+
+        with pytest.raises(SvgCanvasStateError) as raised:
+            await coordinator.presented(
+                _presented_event(
+                    candidate,
+                    stored,
+                    sequence=2,
+                    session_id="session-X",
+                )
+            )
+
+        assert raised.value.code is SvgCanvasStateErrorCode.CANONICAL_SCENE_CHANGED
+        assert workspace.current is active_y
+        assert workspace.scene("scene-A") is active_y
+    finally:
+        await coordinator.close()
+    assert documents.document_count == 0
 
 
 async def test_many_successful_revisions_do_not_exhaust_delivery_cache() -> None:

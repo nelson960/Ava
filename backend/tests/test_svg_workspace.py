@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from ava_backend.canvas.svg_document import SvgDocumentValidator
@@ -38,6 +40,7 @@ def _commit_new(
         committed,
         base_scene_id=None,
         base_revision=0,
+        workspace_epoch=workspace.reset_epoch,
     )
 
 
@@ -51,6 +54,7 @@ def _commit_revision(
         committed,
         base_scene_id=committed.scene_id,
         base_revision=revision - 1,
+        workspace_epoch=workspace.reset_epoch,
     )
 
 
@@ -96,13 +100,14 @@ def test_stale_revision_cannot_overwrite_shared_workspace() -> None:
     workspace = SvgCanvasWorkspace()
     _commit_new(workspace, "A")
     active_a2 = _commit_revision(workspace, "A", 2)
-    stale_a2 = _scene("A", 2)
+    stale_a2 = replace(_scene("A", 2), generation_id="generation-stale-A-2")
 
     with pytest.raises(SvgCanvasWorkspaceError, match="canonical"):
         workspace.commit(
             stale_a2,
             base_scene_id="scene-A",
             base_revision=1,
+            workspace_epoch=workspace.reset_epoch,
         )
 
     assert workspace.current is active_a2
@@ -117,11 +122,68 @@ def test_exact_commit_observation_is_idempotent_and_views_are_read_only() -> Non
         active,
         base_scene_id=None,
         base_revision=0,
+        workspace_epoch=workspace.reset_epoch,
     )
 
     assert observed is active
     assert workspace.scenes == (active,)
     assert isinstance(workspace.scenes, tuple)
+
+
+def test_reconstructed_exact_commit_is_idempotent() -> None:
+    workspace = SvgCanvasWorkspace()
+    active = _commit_new(workspace, "A")
+    reconstructed = replace(active)
+
+    observed = workspace.commit(
+        reconstructed,
+        base_scene_id=None,
+        base_revision=0,
+        workspace_epoch=workspace.reset_epoch,
+    )
+
+    assert reconstructed is not active
+    assert observed is active
+    assert workspace.scenes == (active,)
+    assert workspace.current is active
+
+
+@pytest.mark.parametrize(
+    "conflicting",
+    [
+        lambda scene: replace(scene, generation_id="generation-conflict"),
+        lambda scene: replace(scene, source_turn_id="turn-conflict"),
+        lambda scene: replace(scene, first_rendered_sample=9_600),
+        lambda scene: replace(scene, document=_scene("changed", 1).document),
+    ],
+)
+def test_same_revision_conflicting_identity_is_rejected(conflicting) -> None:
+    workspace = SvgCanvasWorkspace()
+    active = _commit_new(workspace, "A")
+
+    with pytest.raises(SvgCanvasWorkspaceError, match="identity"):
+        workspace.commit(
+            conflicting(active),
+            base_scene_id=None,
+            base_revision=0,
+            workspace_epoch=workspace.reset_epoch,
+        )
+
+    assert workspace.scenes == (active,)
+    assert workspace.current is active
+
+
+def test_clear_advances_reset_epoch_without_ordinary_commit_changes() -> None:
+    workspace = SvgCanvasWorkspace()
+    initial_epoch = workspace.reset_epoch
+    _commit_new(workspace, "A")
+    _commit_revision(workspace, "A", 2)
+
+    assert workspace.reset_epoch == initial_epoch
+
+    workspace.clear()
+
+    assert workspace.reset_epoch == initial_epoch + 1
 
 
 def test_different_subjects_have_isolated_workspaces() -> None:
