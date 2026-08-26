@@ -349,6 +349,7 @@ class _SettingsDrawerState extends ConsumerState<SettingsDrawer> {
       await ref.read(avaSessionProvider.notifier).disconnect();
       await ref.read(avaMemoryControlProvider).resetConversations();
       await ref.read(studentProvider.notifier).clearConversationHistory();
+      ref.read(avaSvgCanvasSessionHostProvider.notifier).clearWorkspace();
       if (!mounted) return;
       _showMessage('Conversations reset.');
     } catch (error) {

@@ -44,7 +44,8 @@ final class AvaSvgCanvasPanel extends StatelessWidget {
             _documentLayer(
               controller: controller,
               document: document,
-              interactive: identical(document, liveActive),
+              interactive: identical(document, liveActive) &&
+                  (controller?.activeRendererHealthy ?? false),
               candidate: identical(document, candidate),
             ),
           Positioned(

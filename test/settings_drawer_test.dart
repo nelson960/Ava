@@ -1,5 +1,13 @@
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:ava/canvas/ava_svg_canvas_controller.dart';
+import 'package:ava/canvas/ava_svg_canvas_session_host.dart';
+import 'package:ava/models/ava_svg_canvas_protocol.dart';
 import 'package:ava/services/ava_memory_control_service.dart';
 import 'package:ava/services/memory_service.dart';
+import 'package:ava/services/ava_svg_document_service.dart';
 import 'package:ava/state/app_state.dart';
 import 'package:ava/ui/widgets/settings_drawer.dart';
 import 'package:drift/native.dart';
@@ -94,12 +102,15 @@ void main() {
       childMessage: 'Hello Ava',
       avaMessage: 'Hello Ari',
     );
+    final canvasHost = await _retainedCanvasHost();
+    expect(canvasHost.sceneCount, 1);
 
     await tester.pumpWidget(
       ProviderScope(
         overrides: [
           databaseProvider.overrideWithValue(database),
           avaMemoryControlProvider.overrideWithValue(_FakeMemoryControl()),
+          avaSvgCanvasSessionHostProvider.overrideWith((ref) => canvasHost),
         ],
         child: const MaterialApp(
           home: Scaffold(body: SettingsDrawer()),
@@ -124,6 +135,10 @@ void main() {
     expect(profile?.name, 'Ari');
     expect(profile?.mathScore, 5);
     expect(profile?.scienceScore, 6);
+    expect(canvasHost.workspaceDocuments, isEmpty);
+    expect(canvasHost.presentedDocument, isNull);
+    expect(canvasHost.panelVisible, isFalse);
+    expect(canvasHost.canReopen, isFalse);
   });
 
   testWidgets('weekly recap shows bounded topic summaries', (tester) async {
@@ -228,6 +243,71 @@ void main() {
     expect(
         find.textContaining('Could not reset conversations'), findsOneWidget);
   });
+}
+
+const _canvasManifestJson =
+    '{"background":"#dff5ff","bindings":[{"accessibilityLabel":"Rain cloud","action":"select","bindingId":"select-cloud","elementId":"cloud","exclusive":false,"hitTest":"element","pulseIds":[],"revealIds":[],"serverReportable":true,"targetId":"cloud"}],"description":"A cloud turns water vapour into rain.","manifestVersion":"ava-svg-manifest-v1","rendererCapabilityVersion":"ava-svg-renderer-v1","sourceTrust":"modelGeneratedData","title":"Café cloud ☁️","validatorVersion":"ava-svg-validator-v1","viewBox":[0.0,0.0,1000.0,600.0]}';
+
+final class _CanvasLoader implements AvaSvgDocumentLoader {
+  const _CanvasLoader(this.document);
+
+  final AvaValidatedSvgCanvasDocument document;
+
+  @override
+  Future<AvaValidatedSvgCanvasDocument> fetch(
+    AvaSvgCanvasDocumentDescriptorV4 descriptor,
+  ) async {
+    if (descriptor.generationId != document.descriptor.generationId) {
+      throw StateError('Unexpected deterministic canvas generation.');
+    }
+    return document;
+  }
+
+  @override
+  void close() {}
+}
+
+Future<AvaSvgCanvasSessionHost> _retainedCanvasHost() async {
+  final events = (jsonDecode(
+    File('protocol/fixtures/ava_realtime_canvas_events_v4.json')
+        .readAsStringSync(),
+  ) as List)
+      .map((value) => (value as Map).cast<String, Object?>())
+      .toList(growable: false);
+  final descriptor = AvaSvgCanvasDocumentDescriptorV4.fromJson(events[0]);
+  final document = AvaValidatedSvgCanvasDocument.verify(
+    descriptor: descriptor,
+    svgBytes:
+        File('protocol/fixtures/ava_svg_document_v4.svg').readAsBytesSync(),
+    manifestBytes: Uint8List.fromList(utf8.encode(_canvasManifestJson)),
+  );
+  final controller = AvaSvgCanvasController(
+    documents: _CanvasLoader(document),
+    commandSink: (_) {},
+  );
+  final host = AvaSvgCanvasSessionHost()..attach(controller);
+  controller.beginPlaybackClock(descriptor.sourceTurnId);
+  controller.receiveGenerationStarted({
+    'protocolVersion': 4,
+    'event': 'canvasGenerationStarted',
+    'sessionId': 'session-1234',
+    'sequence': 0,
+    'revision': 1,
+    'generationId': descriptor.generationId,
+    'sourceTurnId': descriptor.sourceTurnId,
+  });
+  await controller.receiveDocumentAvailable(events[0]);
+  controller.rendererPrepared();
+  controller.receivePresentationCue(events[1]);
+  controller.updateRenderedSample(
+    turnId: descriptor.sourceTurnId,
+    renderedSample: 4812,
+  );
+  controller.firstFramePresented();
+  controller.receiveActivated(events[2]);
+  host.detach(controller);
+  controller.dispose();
+  return host;
 }
 
 final class _FakeMemoryControl implements AvaMemoryControl {

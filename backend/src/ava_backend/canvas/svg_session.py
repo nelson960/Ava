@@ -276,10 +276,12 @@ class SvgCanvasSessionState:
         self._candidate = None
         return candidate
 
-    def deactivate_active(
+    def require_active_identity(
         self,
         *,
         generation_id: str,
+        scene_id: str,
+        scene_revision: int,
         svg_sha256: str,
         manifest_sha256: str,
     ) -> ActiveSvgCanvasScene:
@@ -287,12 +289,22 @@ class SvgCanvasSessionState:
         if active is None:
             self._fail(
                 SvgCanvasStateErrorCode.NO_ACTIVE_SCENE,
-                "canvas runtime failure requires an active scene",
+                "active canvas identity requires an active scene",
             )
         if active.generation_id != generation_id:
             self._fail(
                 SvgCanvasStateErrorCode.GENERATION_MISMATCH,
-                "canvas runtime failure generation does not match the active scene",
+                "canvas generation does not match the active scene",
+            )
+        if active.scene_id != scene_id:
+            self._fail(
+                SvgCanvasStateErrorCode.SCENE_MISMATCH,
+                "canvas scene does not match the active scene",
+            )
+        if active.revision != scene_revision:
+            self._fail(
+                SvgCanvasStateErrorCode.SCENE_REVISION_MISMATCH,
+                "canvas revision does not match the active scene",
             )
         if (
             active.document.svg_sha256 != svg_sha256
@@ -300,10 +312,8 @@ class SvgCanvasSessionState:
         ):
             self._fail(
                 SvgCanvasStateErrorCode.CONTENT_HASH_MISMATCH,
-                "canvas runtime failure hashes do not match the active scene",
+                "canvas hashes do not match the active scene",
             )
-        self._active = None
-        self._last_interaction = None
         return active
 
     def record_interaction(

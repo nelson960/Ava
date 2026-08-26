@@ -505,29 +505,22 @@ class SvgCanvasJobCoordinator:
         event: CanvasRuntimeFailedEventV4,
     ) -> ActiveSvgCanvasScene:
         async with self._lock:
-            active = self._state.active
-            if active is None or (
-                active.scene_id != event.scene_id
-                or active.revision != event.scene_revision
-            ):
-                raise SvgCanvasStateError(
-                    code=SvgCanvasStateErrorCode.SCENE_MISMATCH,
-                    message="canvas runtime failure scene does not match active state",
-                )
-            discarded = self._state.deactivate_active(
+            active = self._state.require_active_identity(
                 generation_id=event.generation_id,
+                scene_id=event.scene_id,
+                scene_revision=event.scene_revision,
                 svg_sha256=event.svg_sha256,
                 manifest_sha256=event.manifest_sha256,
             )
-        await self._documents.discard(
-            session_id=self._session_id,
-            generation_id=event.generation_id,
-        )
-        await self._event_sink.active_document_discarded(
-            discarded,
-            CanvasDocumentDiscardReason.RENDERER_FAILURE,
-        )
-        return discarded
+            self._log(
+                "runtimeFailed",
+                generation_id=active.generation_id,
+                source_turn_id=active.source_turn_id,
+                sceneId=active.scene_id,
+                sceneRevision=active.revision,
+                failureCode=event.failure_code,
+            )
+        return active
 
     async def interaction(
         self,

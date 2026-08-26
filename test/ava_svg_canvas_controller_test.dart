@@ -8,22 +8,65 @@ import 'package:ava/canvas/ava_svg_canvas_session_host.dart';
 import 'package:ava/canvas/ava_svg_canvas_telemetry.dart';
 import 'package:ava/models/ava_svg_canvas_protocol.dart';
 import 'package:ava/services/ava_svg_document_service.dart';
+import 'package:ava/ui/dashboard/ava_svg_canvas_panel.dart';
+import 'package:ava/ui/dashboard/ava_svg_canvas_view.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 const _manifestJson =
     '{"background":"#dff5ff","bindings":[{"accessibilityLabel":"Rain cloud","action":"select","bindingId":"select-cloud","elementId":"cloud","exclusive":false,"hitTest":"element","pulseIds":[],"revealIds":[],"serverReportable":true,"targetId":"cloud"}],"description":"A cloud turns water vapour into rain.","manifestVersion":"ava-svg-manifest-v1","rendererCapabilityVersion":"ava-svg-renderer-v1","sourceTrust":"modelGeneratedData","title":"Café cloud ☁️","validatorVersion":"ava-svg-validator-v1","viewBox":[0.0,0.0,1000.0,600.0]}';
 
-final class _Loader implements AvaSvgDocumentLoader {
-  _Loader(this.result);
+final class _TestInAppWebViewPlatform extends InAppWebViewPlatform {
+  @override
+  PlatformInAppWebViewWidget createPlatformInAppWebViewWidget(
+    PlatformInAppWebViewWidgetCreationParams params,
+  ) =>
+      _TestPlatformInAppWebViewWidget(params);
+}
 
-  final Future<AvaValidatedSvgCanvasDocument> result;
+final class _TestPlatformInAppWebViewWidget extends PlatformInAppWebViewWidget {
+  _TestPlatformInAppWebViewWidget(super.params) : super.implementation();
+
+  @override
+  Widget build(BuildContext context) => const SizedBox.expand();
+
+  @override
+  T controllerFromPlatform<T>(PlatformInAppWebViewController controller) =>
+      controller as T;
+
+  @override
+  void dispose() {}
+}
+
+final class _Loader implements AvaSvgDocumentLoader {
+  _Loader(this.result) : _documentsByGeneration = null;
+
+  _Loader.documents(Iterable<AvaValidatedSvgCanvasDocument> documents)
+      : result = null,
+        _documentsByGeneration = {
+          for (final document in documents)
+            document.descriptor.generationId: document,
+        };
+
+  final Future<AvaValidatedSvgCanvasDocument>? result;
+  final Map<String, AvaValidatedSvgCanvasDocument>? _documentsByGeneration;
   bool closed = false;
 
   @override
   Future<AvaValidatedSvgCanvasDocument> fetch(
     AvaSvgCanvasDocumentDescriptorV4 descriptor,
-  ) =>
-      result;
+  ) {
+    final documents = _documentsByGeneration;
+    if (documents == null) return result!;
+    final document = documents[descriptor.generationId];
+    if (document == null) {
+      throw StateError(
+        'No deterministic SVG document for ${descriptor.generationId}.',
+      );
+    }
+    return Future.value(document);
+  }
 
   @override
   void close() => closed = true;
@@ -36,6 +79,7 @@ void main() {
   late List<Map<String, Object?>> replacementEvents;
 
   setUpAll(() {
+    InAppWebViewPlatform.instance = _TestInAppWebViewPlatform();
     serverEvents = (jsonDecode(
       File('protocol/fixtures/ava_realtime_canvas_events_v4.json')
           .readAsStringSync(),
@@ -118,6 +162,46 @@ void main() {
     controller.receiveActivated(serverEvents[2]);
     expect(controller.candidate, isNull);
     expect(controller.active?.document, same(document));
+    controller.dispose();
+  });
+
+  test('production_order_initial_activation_populates_workspace', () async {
+    final host = AvaSvgCanvasSessionHost();
+    final controller = AvaSvgCanvasController(
+      documents: _Loader.documents([document]),
+      commandSink: (_) {},
+    );
+    host.attach(controller);
+
+    await _driveActivation(controller, document, serverEvents);
+
+    expect(host.workspaceDocuments, orderedEquals([document]));
+    expect(host.presentedDocument, same(document));
+    host.detach(controller);
+    controller.dispose();
+    host.dispose();
+  });
+
+  test('distinct revision-one scene is admissible after an active scene',
+      () async {
+    final controller = AvaSvgCanvasController(
+      documents: _Loader.documents([document, replacementDocument]),
+      commandSink: (_) {},
+    );
+    await _driveActivation(controller, document, serverEvents);
+
+    controller.beginPlaybackClock(replacementDocument.descriptor.sourceTurnId);
+    _announceGeneration(controller, replacementDocument);
+    await controller.receiveDocumentAvailable(replacementEvents[0]);
+
+    expect(
+      controller.candidate?.descriptor.sceneId,
+      replacementDocument.descriptor.sceneId,
+    );
+    expect(
+      controller.candidate?.descriptor.sceneRevision,
+      replacementDocument.descriptor.sceneRevision,
+    );
     controller.dispose();
   });
 
@@ -522,6 +606,431 @@ void main() {
     host.dispose();
   });
 
+  test('distinct_successful_scenes_accumulate', () async {
+    final documents = _sceneDocuments(document, const ['A', 'B', 'C']);
+    final host = AvaSvgCanvasSessionHost();
+    final controller = await _activateWorkspaceDocuments(host, documents);
+
+    expect(_workspaceSceneIds(host), ['scene-A', 'scene-B', 'scene-C']);
+    expect(host.sceneCount, 3);
+    expect(host.presentedDocument, same(documents[2]));
+    expect(
+      () => host.workspaceDocuments.add(documents.first),
+      throwsUnsupportedError,
+    );
+    host.detach(controller);
+    controller.dispose();
+    host.dispose();
+  });
+
+  test('revision_replaces_existing_scene_without_new_slot', () async {
+    final documents = _sceneDocuments(document, const ['A', 'B', 'C']);
+    final host = AvaSvgCanvasSessionHost();
+    final initialController = await _activateWorkspaceDocuments(
+      host,
+      documents,
+    );
+    host.detach(initialController);
+    initialController.dispose();
+    final revisedA = _sceneDocument(document, 'A', 2);
+    final revisionController = AvaSvgCanvasController(
+      documents: _Loader.documents([documents[0], revisedA]),
+      commandSink: (_) {},
+    );
+    await _driveActivation(
+      revisionController,
+      documents[0],
+      _eventsForDocument(documents[0]),
+    );
+    host.attach(revisionController);
+
+    await _driveActivation(
+      revisionController,
+      revisedA,
+      _eventsForDocument(revisedA),
+    );
+
+    expect(_workspaceSceneRevisions(host), [2, 1, 1]);
+    expect(_workspaceSceneIds(host), ['scene-A', 'scene-B', 'scene-C']);
+    expect(host.sceneCount, 3);
+    expect(host.presentedDocument, same(revisedA));
+    host.detach(revisionController);
+    revisionController.dispose();
+    host.dispose();
+  });
+
+  test('revision_does_not_refresh_fifo_order', () async {
+    final documents = _sceneDocuments(
+      document,
+      const ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'],
+    );
+    final host = AvaSvgCanvasSessionHost();
+    final initialController = await _activateWorkspaceDocuments(
+      host,
+      documents,
+    );
+    host.detach(initialController);
+    initialController.dispose();
+    final revisedA = _sceneDocument(document, 'A', 2);
+    final sceneK = _sceneDocument(document, 'K', 1);
+    final revisionController = AvaSvgCanvasController(
+      documents: _Loader.documents([documents[0], revisedA, sceneK]),
+      commandSink: (_) {},
+    );
+    await _driveActivation(
+      revisionController,
+      documents[0],
+      _eventsForDocument(documents[0]),
+    );
+    host.attach(revisionController);
+    await _driveActivation(
+      revisionController,
+      revisedA,
+      _eventsForDocument(revisedA),
+    );
+
+    await _driveActivation(
+      revisionController,
+      sceneK,
+      _eventsForDocument(sceneK),
+    );
+
+    expect(
+      _workspaceSceneIds(host),
+      const [
+        'scene-B',
+        'scene-C',
+        'scene-D',
+        'scene-E',
+        'scene-F',
+        'scene-G',
+        'scene-H',
+        'scene-I',
+        'scene-J',
+        'scene-K',
+      ],
+    );
+    expect(host.sceneCount, 10);
+    expect(host.presentedDocument, same(sceneK));
+    host.detach(revisionController);
+    revisionController.dispose();
+    host.dispose();
+  });
+
+  test('eleventh_successful_scene_evicts_oldest', () async {
+    final documents = _sceneDocuments(
+      document,
+      const ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K'],
+    );
+    final host = AvaSvgCanvasSessionHost();
+    final controller = AvaSvgCanvasController(
+      documents: _Loader.documents(documents),
+      commandSink: (_) {},
+    );
+    host.attach(controller);
+    for (final canvas in documents.take(10)) {
+      await _driveActivation(controller, canvas, _eventsForDocument(canvas));
+    }
+    expect(host.sceneCount, 10);
+
+    await _driveActivation(
+      controller,
+      documents[10],
+      _eventsForDocument(documents[10]),
+    );
+
+    expect(host.sceneCount, 10);
+    expect(
+      _workspaceSceneIds(host),
+      const [
+        'scene-B',
+        'scene-C',
+        'scene-D',
+        'scene-E',
+        'scene-F',
+        'scene-G',
+        'scene-H',
+        'scene-I',
+        'scene-J',
+        'scene-K',
+      ],
+    );
+    expect(host.presentedDocument, same(documents[10]));
+    host.detach(controller);
+    controller.dispose();
+    host.dispose();
+  });
+
+  test('failed_eleventh_candidate_does_not_evict', () async {
+    final documents = _sceneDocuments(
+      document,
+      const ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K'],
+    );
+    final host = AvaSvgCanvasSessionHost();
+    final controller = AvaSvgCanvasController(
+      documents: _Loader.documents(documents),
+      commandSink: (_) {},
+    );
+    host.attach(controller);
+    for (final canvas in documents.take(10)) {
+      await _driveActivation(controller, canvas, _eventsForDocument(canvas));
+    }
+    final retainedBefore = host.workspaceDocuments;
+    final presentedBefore = host.presentedDocument;
+    final failed = documents[10];
+    controller.beginPlaybackClock(failed.descriptor.sourceTurnId);
+    _announceGeneration(controller, failed);
+    await controller.receiveDocumentAvailable(_eventsForDocument(failed)[0]);
+
+    await controller.rendererFailed(
+      'SVG renderer rejected the candidate.',
+      generationId: failed.descriptor.generationId,
+    );
+
+    expect(host.workspaceDocuments, orderedEquals(retainedBefore));
+    expect(host.presentedDocument, same(presentedBefore));
+    expect(host.sceneCount, 10);
+    host.detach(controller);
+    controller.dispose();
+    host.dispose();
+  });
+
+  test('pending_candidate_never_enters_workspace', () async {
+    final documents = _sceneDocuments(document, const ['A', 'B']);
+    final host = AvaSvgCanvasSessionHost();
+    final controller = AvaSvgCanvasController(
+      documents: _Loader.documents(documents),
+      commandSink: (_) {},
+    );
+    host.attach(controller);
+    await _driveActivation(
+      controller,
+      documents[0],
+      _eventsForDocument(documents[0]),
+    );
+
+    final candidate = documents[1];
+    final events = _eventsForDocument(candidate);
+    controller.beginPlaybackClock(candidate.descriptor.sourceTurnId);
+    _announceGeneration(controller, candidate);
+    await controller.receiveDocumentAvailable(events[0]);
+    controller.rendererPrepared();
+    controller.receivePresentationCue(events[1]);
+    controller.updateRenderedSample(
+      turnId: candidate.descriptor.sourceTurnId,
+      renderedSample: 4812,
+    );
+    controller.firstFramePresented();
+
+    expect(
+      controller.candidate?.phase,
+      AvaSvgCanvasCandidatePhase.awaitingActivation,
+    );
+    expect(host.workspaceDocuments, orderedEquals([documents[0]]));
+    expect(host.presentedDocument, same(documents[0]));
+    host.detach(controller);
+    controller.dispose();
+    host.dispose();
+  });
+
+  test('runtime_detach_preserves_entire_workspace', () async {
+    final documents = _sceneDocuments(document, const ['A', 'B', 'C']);
+    final host = AvaSvgCanvasSessionHost();
+    final controller = await _activateWorkspaceDocuments(host, documents);
+    host.dismissPanel();
+
+    host.detach(controller);
+    controller.dispose();
+
+    expect(host.workspaceDocuments, orderedEquals(documents));
+    expect(host.presentedDocument, same(documents[2]));
+    expect(host.panelVisible, isFalse);
+    expect(host.canReopen, isTrue);
+    host.reopenPanel();
+    expect(host.panelVisible, isTrue);
+    host.dispose();
+  });
+
+  test('blank_new_runtime_preserves_workspace', () async {
+    final documents = _sceneDocuments(document, const ['A', 'B', 'C']);
+    final host = AvaSvgCanvasSessionHost();
+    final oldController = await _activateWorkspaceDocuments(host, documents);
+    host.detach(oldController);
+    oldController.dispose();
+    final blankController = AvaSvgCanvasController(
+      documents: _Loader.documents(const []),
+      commandSink: (_) {},
+    );
+
+    host.attach(blankController);
+
+    expect(host.workspaceDocuments, orderedEquals(documents));
+    expect(host.presentedDocument, same(documents[2]));
+    expect(host.sceneCount, 3);
+    host.detach(blankController);
+    blankController.dispose();
+    host.dispose();
+  });
+
+  test('exact_repeated_active_observation_is_idempotent', () async {
+    final documents = _sceneDocuments(
+      document,
+      const ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'],
+    );
+    final host = AvaSvgCanvasSessionHost();
+    final controller = await _activateWorkspaceDocuments(host, documents);
+    final retainedBefore = host.workspaceDocuments;
+    final presentedBefore = host.presentedDocument;
+    var presentedTransitions = 0;
+    host.addListener(() {
+      if (!identical(host.presentedDocument, presentedBefore)) {
+        presentedTransitions += 1;
+      }
+    });
+    final pending = _sceneDocument(document, 'K', 1);
+
+    _announceGeneration(controller, pending);
+    controller.receiveRejected({
+      'generationId': pending.descriptor.generationId,
+      'sourceTurnId': pending.descriptor.sourceTurnId,
+      'rejectionCode': 'cancelled',
+      'message': 'The optional candidate was cancelled.',
+    });
+
+    expect(host.workspaceDocuments, orderedEquals(retainedBefore));
+    expect(host.presentedDocument, same(presentedBefore));
+    expect(host.sceneCount, 10);
+    expect(presentedTransitions, 0);
+    host.detach(controller);
+    controller.dispose();
+    host.dispose();
+  });
+
+  test('invalid_new_scene_revision_is_rejected', () async {
+    final sceneA = _sceneDocument(document, 'A', 1);
+    final invalidB = _sceneDocument(document, 'B', 2);
+    final host = AvaSvgCanvasSessionHost();
+    final controller = AvaSvgCanvasController(
+      documents: _Loader.documents([sceneA, invalidB]),
+      commandSink: (_) {},
+    );
+    host.attach(controller);
+    await _driveActivation(controller, sceneA, _eventsForDocument(sceneA));
+    controller.beginPlaybackClock(invalidB.descriptor.sourceTurnId);
+    _announceGeneration(controller, invalidB);
+
+    await expectLater(
+      controller.receiveDocumentAvailable(_eventsForDocument(invalidB)[0]),
+      throwsFormatException,
+    );
+
+    expect(host.workspaceDocuments, orderedEquals([sceneA]));
+    expect(host.presentedDocument, same(sceneA));
+    host.detach(controller);
+    controller.dispose();
+    host.dispose();
+  });
+
+  test('stale_existing_scene_revision_is_not_committed', () async {
+    final sceneA = _sceneDocument(document, 'A', 1);
+    final sceneB = _sceneDocument(document, 'B', 1);
+    final revisedA = _sceneDocument(document, 'A', 2);
+    final host = AvaSvgCanvasSessionHost();
+    final initialController = await _activateWorkspaceDocuments(
+      host,
+      [sceneA, sceneB],
+    );
+    host.detach(initialController);
+    initialController.dispose();
+    final revisionController = AvaSvgCanvasController(
+      documents: _Loader.documents([sceneA, revisedA]),
+      commandSink: (_) {},
+    );
+    await _driveActivation(
+      revisionController,
+      sceneA,
+      _eventsForDocument(sceneA),
+    );
+    host.attach(revisionController);
+    await _driveActivation(
+      revisionController,
+      revisedA,
+      _eventsForDocument(revisedA),
+    );
+    host.detach(revisionController);
+    revisionController.dispose();
+    final staleController = AvaSvgCanvasController(
+      documents: _Loader.documents([sceneA]),
+      commandSink: (_) {},
+    );
+    await _driveActivation(
+      staleController,
+      sceneA,
+      _eventsForDocument(sceneA),
+    );
+
+    expect(() => host.attach(staleController), throwsStateError);
+    expect(_workspaceSceneIds(host), ['scene-A', 'scene-B']);
+    expect(_workspaceSceneRevisions(host), [2, 1]);
+    expect(host.presentedDocument, same(revisedA));
+    expect(host.controller, isNull);
+    staleController.dispose();
+    host.dispose();
+  });
+
+  test('workspace_never_exceeds_ten_scenes', () async {
+    final initial = _sceneDocuments(
+      document,
+      const ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'],
+    );
+    final revisedJ = _sceneDocument(document, 'J', 2);
+    final additional = _sceneDocuments(document, const ['K', 'L', 'M']);
+    final sequence = [...initial, revisedJ, ...additional];
+    final host = AvaSvgCanvasSessionHost();
+    final controller = AvaSvgCanvasController(
+      documents: _Loader.documents(sequence),
+      commandSink: (_) {},
+    );
+    host.attach(controller);
+
+    for (final canvas in sequence) {
+      await _driveActivation(controller, canvas, _eventsForDocument(canvas));
+      expect(host.sceneCount, lessThanOrEqualTo(10));
+    }
+
+    expect(host.sceneCount, 10);
+    expect(_workspaceSceneIds(host), isNot(contains('scene-A')));
+    expect(_workspaceSceneIds(host), isNot(contains('scene-B')));
+    expect(_workspaceSceneIds(host), isNot(contains('scene-C')));
+    expect(_workspaceSceneIds(host),
+        containsAll(['scene-K', 'scene-L', 'scene-M']));
+    host.detach(controller);
+    controller.dispose();
+    host.dispose();
+  });
+
+  test('explicit_workspace_clear_removes_all_scenes', () async {
+    final documents = _sceneDocuments(document, const ['A', 'B', 'C']);
+    final host = AvaSvgCanvasSessionHost();
+    final controller = await _activateWorkspaceDocuments(host, documents);
+    host.dismissPanel();
+    var notifications = 0;
+    host.addListener(() => notifications += 1);
+
+    host.clearWorkspace();
+
+    expect(host.workspaceDocuments, isEmpty);
+    expect(host.sceneCount, 0);
+    expect(host.presentedDocument, isNull);
+    expect(host.panelVisible, isFalse);
+    expect(host.canReopen, isFalse);
+    expect(host.panelDismissed, isFalse);
+    expect(notifications, 1);
+    host.detach(controller);
+    controller.dispose();
+    host.dispose();
+  });
+
   test('discard ignores a late fetch result and never presents it', () async {
     final completer = Completer<AvaValidatedSvgCanvasDocument>();
     final commands = <AvaSvgCanvasClientCommand>[];
@@ -566,18 +1075,142 @@ void main() {
     controller.dispose();
   });
 
-  test('active renderer failure deactivates locally and reports backend',
-      () async {
+  test('active_renderer_failure_preserves_flutter_committed_scene', () async {
     final commands = <AvaSvgCanvasClientCommand>[];
-    final controller = await _activate(document, serverEvents, commands);
+    final host = AvaSvgCanvasSessionHost();
+    final controller = AvaSvgCanvasController(
+      documents: _Loader.documents([document]),
+      commandSink: commands.add,
+    );
+    host.attach(controller);
+    await _driveActivation(controller, document, serverEvents);
+    commands.clear();
+    final activeBefore = controller.active;
+    expect(controller.activeRendererHealthy, isTrue);
 
     await controller.rendererFailed('SVG renderer process terminated.');
+    await controller.rendererFailed('SVG renderer process terminated.');
 
-    expect(controller.active, isNull);
+    expect(controller.active, same(activeBefore));
+    expect(controller.active?.document, same(document));
+    expect(controller.activeRendererHealthy, isFalse);
+    expect(host.workspaceDocuments, orderedEquals([document]));
+    expect(host.presentedDocument, same(document));
+    expect(host.sceneCount, 1);
     expect(controller.lastIssue?.code, 'rendererTerminated');
-    expect(commands.last.type, AvaSvgCanvasCommandType.canvasRuntimeFailed);
-    expect(commands.last.fields['failureCode'], 'rendererTerminated');
+    expect(commands, hasLength(1));
+    expect(commands.single.type, AvaSvgCanvasCommandType.canvasRuntimeFailed);
+    expect(commands.single.fields['failureCode'], 'rendererTerminated');
+    controller.reportBinding(document.manifest.bindings['select-cloud']!);
+    expect(commands, hasLength(1));
+    host.detach(controller);
     controller.dispose();
+    host.dispose();
+  });
+
+  test('revision_after_renderer_failure_remains_valid_in_flutter', () async {
+    final revised = _documentWithIdentity(
+      document,
+      generationId: 'generation-revision-after-renderer-failure',
+      sourceTurnId: 'turn-revision-after-renderer-failure',
+      sceneId: document.descriptor.sceneId,
+      sceneRevision: document.descriptor.sceneRevision + 1,
+    );
+    final host = AvaSvgCanvasSessionHost();
+    final controller = AvaSvgCanvasController(
+      documents: _Loader.documents([document, revised]),
+      commandSink: (_) {},
+    );
+    host.attach(controller);
+    await _driveActivation(controller, document, serverEvents);
+    await controller.rendererFailed('SVG renderer process terminated.');
+
+    await _driveActivation(
+      controller,
+      revised,
+      _eventsForDocument(revised),
+    );
+
+    expect(controller.active?.document, same(revised));
+    expect(controller.active?.document.descriptor.sceneId,
+        document.descriptor.sceneId);
+    expect(controller.active?.document.descriptor.sceneRevision, 2);
+    expect(controller.activeRendererHealthy, isTrue);
+    expect(host.workspaceDocuments, orderedEquals([revised]));
+    expect(host.presentedDocument, same(revised));
+    host.detach(controller);
+    controller.dispose();
+    host.dispose();
+  });
+
+  test('candidate_renderer_failure_remains_non_committing_in_flutter',
+      () async {
+    final candidate = _sceneDocument(document, 'B', 1);
+    final commands = <AvaSvgCanvasClientCommand>[];
+    final host = AvaSvgCanvasSessionHost();
+    final controller = AvaSvgCanvasController(
+      documents: _Loader.documents([document, candidate]),
+      commandSink: commands.add,
+    );
+    host.attach(controller);
+    await _driveActivation(controller, document, serverEvents);
+    final activeBefore = controller.active;
+    final workspaceBefore = host.workspaceDocuments;
+    controller.beginPlaybackClock(candidate.descriptor.sourceTurnId);
+    _announceGeneration(controller, candidate);
+    await controller.receiveDocumentAvailable(_eventsForDocument(candidate)[0]);
+
+    await controller.rendererFailed(
+      'SVG renderer rejected the candidate.',
+      generationId: candidate.descriptor.generationId,
+    );
+
+    expect(controller.candidate, isNull);
+    expect(controller.active, same(activeBefore));
+    expect(host.workspaceDocuments, orderedEquals(workspaceBefore));
+    expect(host.presentedDocument, same(document));
+    expect(commands.last.type, AvaSvgCanvasCommandType.canvasPreparationFailed);
+    host.detach(controller);
+    controller.dispose();
+    host.dispose();
+  });
+
+  testWidgets(
+      'detached_presented_canvas_panel_is_renderable_without_controller',
+      (tester) async {
+    final commands = <AvaSvgCanvasClientCommand>[];
+    final host = AvaSvgCanvasSessionHost();
+    final controller = AvaSvgCanvasController(
+      documents: _Loader.documents([document]),
+      commandSink: commands.add,
+    );
+    host.attach(controller);
+    await _driveActivation(controller, document, serverEvents);
+    host.detach(controller);
+    controller.dispose();
+    commands.clear();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SizedBox(
+          width: 600,
+          height: 400,
+          child: AvaSvgCanvasPanel(host: host),
+        ),
+      ),
+    );
+
+    final view = tester.widget<AvaSvgCanvasView>(
+      find.byType(AvaSvgCanvasView),
+    );
+    expect(view.document, same(document));
+    view.onPrepared();
+    view.onFirstFramePresented();
+    view.onBinding(document.manifest.bindings['select-cloud']!);
+    view.onError('Detached renderer diagnostic.');
+    await tester.pump();
+    expect(commands, isEmpty);
+    host.dispose();
   });
 
   test('rendered sample clock cannot move backwards', () {
@@ -711,6 +1344,25 @@ Future<AvaSvgCanvasController> _activate(
   return controller;
 }
 
+Future<AvaSvgCanvasController> _activateWorkspaceDocuments(
+  AvaSvgCanvasSessionHost host,
+  List<AvaValidatedSvgCanvasDocument> documents,
+) async {
+  final controller = AvaSvgCanvasController(
+    documents: _Loader.documents(documents),
+    commandSink: (_) {},
+  );
+  host.attach(controller);
+  for (final document in documents) {
+    await _driveActivation(
+      controller,
+      document,
+      _eventsForDocument(document),
+    );
+  }
+  return controller;
+}
+
 Future<void> _driveActivation(
   AvaSvgCanvasController controller,
   AvaValidatedSvgCanvasDocument document,
@@ -774,6 +1426,37 @@ AvaValidatedSvgCanvasDocument _documentWithIdentity(
     manifestBytes: source.manifestBytes,
   );
 }
+
+AvaValidatedSvgCanvasDocument _sceneDocument(
+  AvaValidatedSvgCanvasDocument source,
+  String sceneName,
+  int sceneRevision,
+) =>
+    _documentWithIdentity(
+      source,
+      generationId: 'generation-$sceneName-r$sceneRevision',
+      sourceTurnId: 'turn-$sceneName-r$sceneRevision',
+      sceneId: 'scene-$sceneName',
+      sceneRevision: sceneRevision,
+    );
+
+List<AvaValidatedSvgCanvasDocument> _sceneDocuments(
+  AvaValidatedSvgCanvasDocument source,
+  List<String> sceneNames,
+) =>
+    sceneNames
+        .map((sceneName) => _sceneDocument(source, sceneName, 1))
+        .toList(growable: false);
+
+List<String> _workspaceSceneIds(AvaSvgCanvasSessionHost host) =>
+    host.workspaceDocuments
+        .map((document) => document.descriptor.sceneId)
+        .toList(growable: false);
+
+List<int> _workspaceSceneRevisions(AvaSvgCanvasSessionHost host) =>
+    host.workspaceDocuments
+        .map((document) => document.descriptor.sceneRevision)
+        .toList(growable: false);
 
 List<Map<String, Object?>> _eventsForDocument(
   AvaValidatedSvgCanvasDocument document,

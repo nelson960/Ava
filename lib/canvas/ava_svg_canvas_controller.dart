@@ -146,6 +146,7 @@ final class AvaSvgCanvasController extends ChangeNotifier {
   int _lastRenderedSample = 0;
   final Map<String, int> _renderedSamplesByTurn = {};
   int _interactionRevision = 0;
+  String? _failedActiveRendererGenerationId;
   bool _closed = false;
   ({String generationId, Duration startedAt})? _rendererPreparation;
   ({String generationId, Duration startedAt})? _presentationRequest;
@@ -154,6 +155,12 @@ final class AvaSvgCanvasController extends ChangeNotifier {
   AvaSvgCanvasCandidateState? get candidate => _candidate;
   AvaSvgCanvasActiveState? get active => _active;
   AvaSvgCanvasIssue? get lastIssue => _lastIssue;
+  bool get activeRendererHealthy {
+    final activeGenerationId = _active?.document.descriptor.generationId;
+    return activeGenerationId != null &&
+        _failedActiveRendererGenerationId != activeGenerationId;
+  }
+
   String? get previousRenderedSampleTurnId => _previousRenderedSampleTurnId;
   String? get renderedSampleTurnId => _renderedSampleTurnId;
 
@@ -237,10 +244,16 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     final active = _active;
     if (active != null) {
       final activeDescriptor = active.document.descriptor;
-      if (descriptor.sceneId != activeDescriptor.sceneId ||
-          descriptor.sceneRevision != activeDescriptor.sceneRevision + 1) {
+      final revisesActiveScene =
+          descriptor.sceneId == activeDescriptor.sceneId &&
+              descriptor.sceneRevision == activeDescriptor.sceneRevision + 1;
+      final startsDistinctScene =
+          descriptor.sceneId != activeDescriptor.sceneId &&
+              descriptor.sceneRevision == 1;
+      if (!revisesActiveScene && !startsDistinctScene) {
         throw const FormatException(
-          'Canvas candidate does not revise the active scene monotonically.',
+          'Canvas candidate must revise the active scene monotonically or '
+          'start a distinct scene at revision 1.',
         );
       }
     } else if (descriptor.sceneRevision != 1) {
@@ -514,6 +527,7 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     _candidate = null;
     _generation = null;
     _interactionRevision = 0;
+    _failedActiveRendererGenerationId = null;
     _recordDescriptor(
       'canvas.activation.completed',
       document.descriptor,
@@ -526,7 +540,9 @@ final class AvaSvgCanvasController extends ChangeNotifier {
   void reportBinding(AvaSvgInteractionBinding binding) {
     _ensureOpen();
     final active = _active;
-    if (active == null || !binding.serverReportable) return;
+    if (active == null || !activeRendererHealthy || !binding.serverReportable) {
+      return;
+    }
     final canonical = active.document.manifest.bindings[binding.bindingId];
     if (!identical(canonical, binding)) {
       throw StateError('SVG binding does not belong to the active manifest.');
@@ -574,9 +590,13 @@ final class AvaSvgCanvasController extends ChangeNotifier {
       return;
     }
     final descriptor = active.document.descriptor;
-    _active = null;
+    if (_failedActiveRendererGenerationId == descriptor.generationId) return;
+    final failureCode = message.contains('terminated')
+        ? 'rendererTerminated'
+        : 'rendererRejected';
+    _failedActiveRendererGenerationId = descriptor.generationId;
     _lastIssue = AvaSvgCanvasIssue(
-      code: 'rendererTerminated',
+      code: failureCode,
       message: _boundedMessage(message),
       generationId: descriptor.generationId,
     );
@@ -585,9 +605,7 @@ final class AvaSvgCanvasController extends ChangeNotifier {
         AvaSvgCanvasCommandType.canvasRuntimeFailed,
         {
           ..._identityFields(descriptor),
-          'failureCode': message.contains('terminated')
-              ? 'rendererTerminated'
-              : 'rendererRejected',
+          'failureCode': failureCode,
           'message': _boundedMessage(message),
         },
         telemetryGenerationId: descriptor.generationId,
@@ -616,6 +634,9 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     }
     if (_active?.document.descriptor.generationId == generationId) {
       _active = null;
+      if (_failedActiveRendererGenerationId == generationId) {
+        _failedActiveRendererGenerationId = null;
+      }
     }
     final sourceTurnId = event['sourceTurnId'];
     if (sourceTurnId is String) {
