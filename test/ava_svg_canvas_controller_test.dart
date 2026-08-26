@@ -1009,11 +1009,33 @@ void main() {
     host.dispose();
   });
 
-  test('explicit_workspace_clear_removes_all_scenes', () async {
+  test('clear_workspace_requires_detached_controller', () async {
     final documents = _sceneDocuments(document, const ['A', 'B', 'C']);
     final host = AvaSvgCanvasSessionHost();
     final controller = await _activateWorkspaceDocuments(host, documents);
     host.dismissPanel();
+    final workspaceBefore = host.workspaceDocuments;
+    final presentedBefore = host.presentedDocument;
+
+    expect(host.clearWorkspace, throwsStateError);
+
+    expect(host.workspaceDocuments, orderedEquals(workspaceBefore));
+    expect(host.presentedDocument, same(presentedBefore));
+    expect(host.controller, same(controller));
+    expect(host.panelVisible, isFalse);
+    expect(host.canReopen, isTrue);
+    expect(host.panelDismissed, isTrue);
+    host.detach(controller);
+    controller.dispose();
+    host.dispose();
+  });
+
+  test('clear_workspace_after_detach_succeeds', () async {
+    final documents = _sceneDocuments(document, const ['A', 'B', 'C']);
+    final host = AvaSvgCanvasSessionHost();
+    final controller = await _activateWorkspaceDocuments(host, documents);
+    host.dismissPanel();
+    host.detach(controller);
     var notifications = 0;
     host.addListener(() => notifications += 1);
 
@@ -1026,7 +1048,6 @@ void main() {
     expect(host.canReopen, isFalse);
     expect(host.panelDismissed, isFalse);
     expect(notifications, 1);
-    host.detach(controller);
     controller.dispose();
     host.dispose();
   });

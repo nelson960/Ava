@@ -216,7 +216,10 @@ async def test_v4_coordinator_runs_exact_svg_lifecycle_without_pcm_interleaving(
     )
     assert state.active is not None
     assert state.active.first_rendered_sample >= 0
-    assert documents.document_count == 1
+    assert state.active.document.svg_text == (
+        FIXTURE_ROOT / "ava_svg_document_v4.svg"
+    ).read_text(encoding="utf-8")
+    assert documents.document_count == 0
     assert len(realtime.prepared_session_updates) == 2
 
     for index, frame in enumerate(frames):

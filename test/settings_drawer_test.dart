@@ -104,6 +104,7 @@ void main() {
     );
     final canvasHost = await _retainedCanvasHost();
     expect(canvasHost.sceneCount, 1);
+    expect(canvasHost.controller, isNull);
 
     await tester.pumpWidget(
       ProviderScope(
@@ -137,6 +138,7 @@ void main() {
     expect(profile?.scienceScore, 6);
     expect(canvasHost.workspaceDocuments, isEmpty);
     expect(canvasHost.presentedDocument, isNull);
+    expect(canvasHost.controller, isNull);
     expect(canvasHost.panelVisible, isFalse);
     expect(canvasHost.canReopen, isFalse);
   });

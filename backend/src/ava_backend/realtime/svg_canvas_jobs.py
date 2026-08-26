@@ -482,6 +482,10 @@ class SvgCanvasJobCoordinator:
             )
             self._traces.pop(active.generation_id, None)
             raise
+        await self._documents.discard(
+            session_id=self._session_id,
+            generation_id=active.generation_id,
+        )
         trace = self._traces.get(active.generation_id)
         accepted_to_activation_ms = (
             max(0.0, (self._monotonic() - trace.accepted_at) * 1000)

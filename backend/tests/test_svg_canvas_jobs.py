@@ -152,6 +152,7 @@ class _Sink:
         ] = []
         self.rejected_calls: list[tuple[str, str]] = []
         self.interaction_rejections: list[SvgCanvasStateError] = []
+        self.activation_failure: Exception | None = None
 
     async def generation_started(
         self,
@@ -172,6 +173,8 @@ class _Sink:
         self.cues.append((candidate, cue))
 
     async def activated(self, active: ActiveSvgCanvasScene) -> None:
+        if self.activation_failure is not None:
+            raise self.activation_failure
         self.activations.append(active)
 
     async def document_discarded(
@@ -237,7 +240,9 @@ def _call(call_id: str = "call_1") -> RealtimeCanvasToolCall:
     )
 
 
-async def _accepted_coordinator():
+async def _accepted_coordinator(
+    generation_ids: list[str] | None = None,
+):
     specialist = _Specialist()
     sink = _Sink()
     documents = SvgCanvasDocumentStore()
@@ -257,7 +262,9 @@ async def _accepted_coordinator():
         state=SvgCanvasSessionState(),
         documents=documents,
         event_sink=sink,
-        generation_id_factory=_id_factory(["generation-1", "generation-2"]),
+        generation_id_factory=_id_factory(
+            generation_ids or ["generation-1", "generation-2"]
+        ),
     )
     output = await coordinator.accept_tool_call(
         source_turn_id="turn-1",
@@ -279,9 +286,32 @@ async def _activated_coordinator():
     ) = await _accepted_coordinator()
     specialist.release.set()
     await coordinator.wait_for_background_work()
-    stored = sink.available[0]
+    stored, active = await _activate_current_candidate(
+        coordinator=coordinator,
+        sink=sink,
+        documents=documents,
+        sequence=1,
+    )
+    return coordinator, specialist, sink, completions, documents, stored, active
+
+
+async def _activate_current_candidate(
+    *,
+    coordinator: SvgCanvasJobCoordinator,
+    sink: _Sink,
+    documents: SvgCanvasDocumentStore,
+    sequence: int,
+) -> tuple[StoredSvgCanvasDocument, ActiveSvgCanvasScene]:
+    stored = sink.available[-1]
     candidate = coordinator.state.candidate
     assert candidate is not None
+    assert (
+        await documents.get(
+            session_id="session-1",
+            generation_id=candidate.generation_id,
+        )
+        == stored
+    )
     await coordinator.request_presentation(
         generation_id=candidate.generation_id,
         presentation_sample_offset=4_800,
@@ -292,7 +322,7 @@ async def _activated_coordinator():
                 "protocolVersion": 4,
                 "event": "canvasDocumentPrepared",
                 "sessionId": "session-1",
-                "sequence": 1,
+                "sequence": sequence,
                 "generationId": candidate.generation_id,
                 "sceneId": candidate.scene_id,
                 "sceneRevision": candidate.revision,
@@ -309,7 +339,7 @@ async def _activated_coordinator():
                 "protocolVersion": 4,
                 "event": "canvasPresented",
                 "sessionId": "session-1",
-                "sequence": 2,
+                "sequence": sequence + 1,
                 "generationId": candidate.generation_id,
                 "sceneId": candidate.scene_id,
                 "sceneRevision": candidate.revision,
@@ -319,7 +349,7 @@ async def _activated_coordinator():
             }
         )
     )
-    return coordinator, specialist, sink, completions, documents, stored, active
+    return stored, active
 
 
 def _runtime_failure_event(
@@ -662,13 +692,12 @@ async def test_active_renderer_failure_preserves_backend_committed_scene() -> No
 
     assert reported is active
     assert coordinator.state.active is active
-    assert (
+    with pytest.raises(SvgDocumentNotFoundError):
         await documents.get(
             session_id="session-1",
             generation_id=active.generation_id,
         )
-        == stored
-    )
+    assert coordinator.state.active.document is stored.document
     assert sink.active_discarded == []
     assert sink.discarded == []
     await coordinator.close()
@@ -729,6 +758,137 @@ async def test_revision_after_renderer_failure_remains_backend_revision() -> Non
     await coordinator.close()
 
 
+async def test_successful_activation_retires_delivery_cache_entry() -> None:
+    (
+        coordinator,
+        _specialist,
+        _sink,
+        _completions,
+        documents,
+        stored,
+        active,
+    ) = await _activated_coordinator()
+
+    assert coordinator.state.active is active
+    assert active.document is stored.document
+    assert active.document.svg_text == stored.document.svg_text
+    assert coordinator.state.render_realtime_context()
+    with pytest.raises(SvgDocumentNotFoundError):
+        await documents.get(
+            session_id="session-1",
+            generation_id=active.generation_id,
+        )
+    await coordinator.close()
+
+
+async def test_many_successful_revisions_do_not_exhaust_delivery_cache() -> None:
+    generation_ids = [f"generation-{index}" for index in range(1, 13)]
+    (
+        coordinator,
+        specialist,
+        sink,
+        completions,
+        _output,
+        documents,
+    ) = await _accepted_coordinator(generation_ids)
+    specialist.release.set()
+    await coordinator.wait_for_background_work()
+
+    active: ActiveSvgCanvasScene | None = None
+    for index, generation_id in enumerate(generation_ids, start=1):
+        if index > 1:
+            output = await coordinator.accept_tool_call(
+                source_turn_id=f"turn-{index}",
+                call=_call(f"call_{index}"),
+                complete_tool=lambda turn, call, result: _record_completion(
+                    completions,
+                    turn,
+                    call,
+                    result,
+                ),
+            )
+            assert output.generation_id == generation_id
+            await coordinator.wait_for_background_work()
+            assert sink.rejected == []
+        _stored, active = await _activate_current_candidate(
+            coordinator=coordinator,
+            sink=sink,
+            documents=documents,
+            sequence=index * 2,
+        )
+        assert active.revision == index
+
+    assert active is not None
+    assert active.revision == 12
+    assert coordinator.state.active is active
+    assert coordinator.state.active.document.svg_text == _document().svg_text
+    assert coordinator.state.active.document.svg_sha256 == _document().svg_sha256
+    assert documents.document_count == 0
+    assert len(sink.activations) == 12
+    assert sink.rejected == []
+    await coordinator.close()
+
+
+async def test_delivery_document_remains_available_before_activation() -> None:
+    (
+        coordinator,
+        specialist,
+        sink,
+        _completions,
+        _output,
+        documents,
+    ) = await _accepted_coordinator()
+    specialist.release.set()
+    await coordinator.wait_for_background_work()
+    candidate = coordinator.state.candidate
+    stored = sink.available[-1]
+
+    assert candidate is not None
+    assert coordinator.state.active is None
+    assert (
+        await documents.get(
+            session_id="session-1",
+            generation_id=candidate.generation_id,
+        )
+        == stored
+    )
+    await coordinator.close()
+
+
+async def test_activation_delivery_failure_keeps_delivery_entry_until_cleanup() -> None:
+    (
+        coordinator,
+        specialist,
+        sink,
+        _completions,
+        _output,
+        documents,
+    ) = await _accepted_coordinator()
+    specialist.release.set()
+    await coordinator.wait_for_background_work()
+    sink.activation_failure = RuntimeError("activation delivery failed")
+    stored = sink.available[-1]
+
+    with pytest.raises(RuntimeError, match="activation delivery failed"):
+        await _activate_current_candidate(
+            coordinator=coordinator,
+            sink=sink,
+            documents=documents,
+            sequence=1,
+        )
+
+    assert coordinator.state.active is not None
+    assert (
+        await documents.get(
+            session_id="session-1",
+            generation_id=stored.generation_id,
+        )
+        == stored
+    )
+    await coordinator.close()
+    assert documents.document_count == 0
+
+
 async def test_candidate_renderer_failure_remains_non_committing_backend() -> None:
     (
         coordinator,
@@ -739,6 +899,7 @@ async def test_candidate_renderer_failure_remains_non_committing_backend() -> No
         stored,
         active,
     ) = await _activated_coordinator()
+    context_before = coordinator.state.render_realtime_context()
     output = await coordinator.accept_tool_call(
         source_turn_id="turn-2",
         call=_call("call_2"),
@@ -774,13 +935,13 @@ async def test_candidate_renderer_failure_remains_non_committing_backend() -> No
     assert output.generation_id == discarded.generation_id
     assert coordinator.state.candidate is None
     assert coordinator.state.active is active
-    assert (
+    with pytest.raises(SvgDocumentNotFoundError):
         await documents.get(
             session_id="session-1",
             generation_id=active.generation_id,
         )
-        == stored
-    )
+    assert coordinator.state.active.document is stored.document
+    assert coordinator.state.render_realtime_context() == context_before
     with pytest.raises(SvgDocumentNotFoundError):
         await documents.get(
             session_id="session-1",
@@ -801,7 +962,7 @@ async def test_revision_reuses_scene_identity_and_supplies_exact_active_svg() ->
         sink,
         completions,
         _output,
-        _documents,
+        documents,
     ) = await _accepted_coordinator()
     specialist.release.set()
     await coordinator.wait_for_background_work()
@@ -845,6 +1006,11 @@ async def test_revision_reuses_scene_identity_and_supplies_exact_active_svg() ->
             }
         )
     )
+    with pytest.raises(SvgDocumentNotFoundError):
+        await documents.get(
+            session_id="session-1",
+            generation_id=first_active.generation_id,
+        )
 
     revised_output = await coordinator.accept_tool_call(
         source_turn_id="turn-2",

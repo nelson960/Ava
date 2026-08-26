@@ -71,6 +71,12 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
   }
 
   void clearWorkspace() {
+    if (_controller != null) {
+      throw StateError(
+        'Canvas workspace can be cleared only after the realtime '
+        'controller is detached.',
+      );
+    }
     if (_workspaceDocuments.isEmpty &&
         _presentedDocument == null &&
         !_panelDismissed &&
