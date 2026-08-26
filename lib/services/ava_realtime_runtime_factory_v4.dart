@@ -102,6 +102,7 @@ final class AvaRealtimeRuntimeFactoryV4 implements AvaRealtimeRuntimeBuilder {
         volume: volume,
         cancelRequestIdFactory: _cancelRequestIdFactory,
         canvasTelemetry: canvasTelemetry,
+        retainedSceneRevision: _canvasHost.retainedSceneRevision,
         onCanvasClosed: _canvasHost.detach,
         trace: trace,
         onMicrophoneTrackChanged: onMicrophoneTrackChanged,

@@ -11,6 +11,7 @@ import pytest
 from ava_backend.canvas.svg_delivery import SvgCanvasDocumentStore
 from ava_backend.canvas.svg_document import SvgDocumentValidator
 from ava_backend.canvas.svg_session import SvgCanvasSessionState
+from ava_backend.canvas.svg_workspace import SvgCanvasWorkspace
 from ava_backend.canvas.svg_specialist import (
     SvgCanvasSpecialistGeneration,
     SvgCanvasSpecialistRequest,
@@ -122,7 +123,9 @@ def _canvas_runtime(
     return jobs, events
 
 
-def _active_labeled_canvas_state() -> SvgCanvasSessionState:
+def _active_labeled_canvas_state(
+    workspace: SvgCanvasWorkspace | None = None,
+) -> SvgCanvasSessionState:
     document = SvgDocumentValidator().validate(
         """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600">
 <title>Water cycle</title><desc>A labeled cycle of water moving through nature.</desc>
@@ -135,15 +138,13 @@ def _active_labeled_canvas_state() -> SvgCanvasSessionState:
         generation_id="generation-active-context",
         document=document,
     )
-    state = SvgCanvasSessionState()
+    state = SvgCanvasSessionState(workspace=workspace)
     state.stage_generation(generation, source_turn_id="turn-canvas-source")
     state.mark_document_prepared(
         generation_id=generation.generation_id,
         svg_sha256=document.svg_sha256,
         manifest_sha256=document.manifest_sha256,
-        renderer_capability_version=str(
-            document.manifest["rendererCapabilityVersion"]
-        ),
+        renderer_capability_version=str(document.manifest["rendererCapabilityVersion"]),
         validator_version=str(document.manifest["validatorVersion"]),
     )
     state.schedule_presentation(
@@ -157,6 +158,29 @@ def _active_labeled_canvas_state() -> SvgCanvasSessionState:
         first_rendered_sample=4_800,
     )
     return state
+
+
+async def test_replacement_session_initial_context_contains_committed_canvas() -> None:
+    workspace = SvgCanvasWorkspace()
+    first_state = _active_labeled_canvas_state(workspace)
+    expected_context = first_state.render_realtime_context()
+    replacement_state = SvgCanvasSessionState(workspace=workspace)
+    coordinator, realtime, _speech, _memory = _coordinator(
+        canvas_state=replacement_state,
+    )
+
+    await coordinator.negotiate(offer_sdp=DETERMINISTIC_AUDIO_OFFER_SDP)
+
+    assert expected_context
+    assert replacement_state.render_realtime_context() == expected_context
+    assert expected_context in coordinator.harness.instructions
+    assert isinstance(realtime, DeterministicRealtimePlanProvider)
+    session = realtime.prepared_session_updates[0]["session"]
+    assert isinstance(session, dict)
+    instructions = session["instructions"]
+    assert isinstance(instructions, str)
+    assert expected_context in instructions
+    await coordinator.close()
 
 
 def _client(payload: dict[str, object]) -> AvaClientEventUnionV4:

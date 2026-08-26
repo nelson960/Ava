@@ -27,6 +27,7 @@ from .canvas.svg_document import (
     SVG_VALIDATOR_VERSION,
 )
 from .canvas.svg_specialist import SVG_CANVAS_SPECIALIST_PROMPT_VERSION
+from .canvas.svg_workspace import SvgCanvasWorkspaceStore
 from .diagnostics import (
     RuntimeDiagnostics,
     configure_persistent_development_logging,
@@ -98,6 +99,7 @@ def create_app(
     authenticator: RequestAuthenticator | None = None,
     realtime_v4_coordinator_factory: RealtimeCoordinatorFactoryV4 | None = None,
     svg_document_store: SvgCanvasDocumentStore | None = None,
+    svg_canvas_workspaces: SvgCanvasWorkspaceStore | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings()
     runtime_diagnostics = RuntimeDiagnostics.capture()
@@ -169,6 +171,7 @@ def create_app(
             max(1, resolved_settings.realtime_max_sessions * 2),
         ),
     )
+    resolved_svg_canvas_workspaces = svg_canvas_workspaces or SvgCanvasWorkspaceStore()
     if (
         realtime_v4_coordinator_factory is None
         and resolved_settings.openai_api_key is not None
@@ -183,6 +186,7 @@ def create_app(
             settings=resolved_settings,
             memory=resolved_authoritative_memory,
             documents=resolved_svg_documents,
+            canvas_workspaces=resolved_svg_canvas_workspaces,
         )
     realtime_v4_sessions: RealtimeSessionRegistry | None = None
     if realtime_v4_coordinator_factory is not None:
@@ -204,6 +208,7 @@ def create_app(
         app.router.add_event_handler("shutdown", realtime_v4_sessions.close)
     app.state.realtime_v4_sessions = realtime_v4_sessions
     app.state.svg_canvas_documents = resolved_svg_documents
+    app.state.svg_canvas_workspaces = resolved_svg_canvas_workspaces
     app.state.realtime_websocket_bridge_v4 = AvaRealtimeWebSocketBridgeV4(
         session_timeout_seconds=resolved_settings.realtime_max_session_seconds,
     )
@@ -488,6 +493,7 @@ def create_app(
                 code=ErrorCode.MEMORY_UNAVAILABLE,
                 message="Ava's conversation memory is temporarily unavailable.",
             )
+        app.state.svg_canvas_workspaces.clear_subject(client.subject)
         return JSONResponse(
             status_code=200,
             content=receipt.model_dump(mode="json", by_alias=True),

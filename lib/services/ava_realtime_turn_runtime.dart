@@ -61,6 +61,7 @@ final class AvaRealtimeTurnRuntime {
     required double volume,
     required String Function() cancelRequestIdFactory,
     AvaSvgCanvasTelemetrySink? canvasTelemetry,
+    AvaRetainedSceneRevisionLookup? retainedSceneRevision,
     void Function(AvaSvgCanvasController controller)? onCanvasClosed,
     AvaRealtimeTrace? trace,
     void Function(bool enabled)? onMicrophoneTrackChanged,
@@ -84,6 +85,7 @@ final class AvaRealtimeTurnRuntime {
       documents: documents,
       commandSink: _enqueueCanvasCommand,
       telemetry: canvasTelemetry,
+      retainedSceneRevision: retainedSceneRevision,
     );
     if (volume < 0 || volume > 1) {
       throw RangeError.range(volume, 0, 1, 'volume');

@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:ava/canvas/ava_svg_canvas_controller.dart';
 import 'package:ava/canvas/ava_svg_canvas_session_host.dart';
 import 'package:ava/config/ava_backend_configuration.dart';
 import 'package:ava/models/ava_realtime_protocol.dart';
@@ -89,6 +90,60 @@ void main() {
     expect(raw.closed, isTrue);
     expect(media.closed, isTrue);
   });
+
+  test('runtime_factory_uses_application_workspace_lookup', () async {
+    final retained = _canvasDocument(
+      generationId: 'generation-retained',
+      sourceTurnId: 'turn-retained',
+      sceneRevision: 1,
+    );
+    final revised = _canvasDocument(
+      generationId: 'generation-revised',
+      sourceTurnId: 'turn-revised',
+      sceneRevision: 2,
+    );
+    final host = AvaSvgCanvasSessionHost();
+    final owner = AvaSvgCanvasController(
+      documents: _Loader(retained),
+      commandSink: (_) {},
+    );
+    host.attach(owner);
+    await _activateCanvas(owner, retained);
+    host.detach(owner);
+    owner.dispose();
+
+    final bootstrapTransport = _BootstrapTransport();
+    final media = DeterministicAvaRealtimeMediaSession(offerSdp: _offerSdp);
+    final raw = DeterministicAvaRealtimeRawTransportV4(const []);
+    final factory = AvaRealtimeRuntimeFactoryV4(
+      bootstrapService: AvaRealtimeBootstrapService(
+        configuration: AvaBackendConfiguration.parse(
+          'https://ava.example.test',
+        ),
+        transport: bootstrapTransport,
+      ),
+      mediaConnector: (_) async => media,
+      transportConnector: (_) async => raw,
+      documentLoaderFactory: (_, __) => _Loader(revised),
+      canvasHost: host,
+      speechOutput: const _NoopPcmOutput(),
+      presentation: AvaRealtimePresentationController(),
+      cancelRequestIdFactory: () => 'cancel-v4-factory-replacement',
+    );
+    addTearDown(factory.close);
+    addTearDown(host.dispose);
+    final runtime = await factory.create(
+      ageBand: AvaRealtimeAgeBand.middleChildhood,
+      volume: 0.8,
+    );
+
+    await _activateCanvas(runtime.canvasController, revised);
+
+    expect(host.sceneCount, 1);
+    expect(host.workspaceDocuments, orderedEquals([revised]));
+    expect(host.presentedDocument, same(revised));
+    await runtime.close();
+  });
 }
 
 final class _BootstrapTransport implements AvaRealtimeBootstrapTransport {
@@ -143,16 +198,92 @@ final class _BootstrapTransport implements AvaRealtimeBootstrapTransport {
 }
 
 final class _Loader implements AvaSvgDocumentLoader {
+  _Loader([this.document]);
+
+  final AvaValidatedSvgCanvasDocument? document;
   bool closed = false;
 
   @override
   Future<AvaValidatedSvgCanvasDocument> fetch(
     AvaSvgCanvasDocumentDescriptorV4 descriptor,
-  ) =>
-      throw StateError('The factory test does not request a canvas document.');
+  ) async {
+    final resolved = document;
+    if (resolved == null ||
+        resolved.descriptor.generationId != descriptor.generationId) {
+      throw StateError('The factory test did not expect this canvas document.');
+    }
+    return resolved;
+  }
 
   @override
   void close() => closed = true;
+}
+
+const _canvasManifestJson =
+    '{"background":"#dff5ff","bindings":[{"accessibilityLabel":"Rain cloud","action":"select","bindingId":"select-cloud","elementId":"cloud","exclusive":false,"hitTest":"element","pulseIds":[],"revealIds":[],"serverReportable":true,"targetId":"cloud"}],"description":"A cloud turns water vapour into rain.","manifestVersion":"ava-svg-manifest-v1","rendererCapabilityVersion":"ava-svg-renderer-v1","sourceTrust":"modelGeneratedData","title":"Café cloud ☁️","validatorVersion":"ava-svg-validator-v1","viewBox":[0.0,0.0,1000.0,600.0]}';
+
+AvaValidatedSvgCanvasDocument _canvasDocument({
+  required String generationId,
+  required String sourceTurnId,
+  required int sceneRevision,
+}) {
+  final fixture = (jsonDecode(
+    File('protocol/fixtures/ava_realtime_canvas_events_v4.json')
+        .readAsStringSync(),
+  ) as List)
+      .first as Map;
+  final descriptor = AvaSvgCanvasDocumentDescriptorV4.fromJson({
+    ...fixture.cast<String, Object?>(),
+    'generationId': generationId,
+    'sourceTurnId': sourceTurnId,
+    'sceneId': 'scene-retained',
+    'sceneRevision': sceneRevision,
+  });
+  return AvaValidatedSvgCanvasDocument.verify(
+    descriptor: descriptor,
+    svgBytes:
+        File('protocol/fixtures/ava_svg_document_v4.svg').readAsBytesSync(),
+    manifestBytes: Uint8List.fromList(utf8.encode(_canvasManifestJson)),
+  );
+}
+
+Future<void> _activateCanvas(
+  AvaSvgCanvasController controller,
+  AvaValidatedSvgCanvasDocument document,
+) async {
+  final descriptor = document.descriptor;
+  final events = (jsonDecode(
+    File('protocol/fixtures/ava_realtime_canvas_events_v4.json')
+        .readAsStringSync(),
+  ) as List)
+      .map((value) => (value as Map).cast<String, Object?>())
+      .toList(growable: false);
+  Map<String, Object?> withIdentity(Map<String, Object?> event) => {
+        ...event,
+        'generationId': descriptor.generationId,
+        'sourceTurnId': descriptor.sourceTurnId,
+        'sceneId': descriptor.sceneId,
+        'sceneRevision': descriptor.sceneRevision,
+      };
+  controller.beginPlaybackClock(descriptor.sourceTurnId);
+  controller.receiveGenerationStarted({
+    'protocolVersion': 4,
+    'event': 'canvasGenerationStarted',
+    'sessionId': 'session-v4-factory',
+    'sequence': 0,
+    'revision': 1,
+    'generationId': descriptor.generationId,
+    'sourceTurnId': descriptor.sourceTurnId,
+  });
+  await controller.receiveDocumentAvailable(withIdentity(events[0]));
+  controller.rendererPrepared();
+  controller.receivePresentationCue(withIdentity(events[1]));
+  controller.updateRenderedSample(
+    turnId: descriptor.sourceTurnId,
+    renderedSample: 4812,
+  );
+  controller.firstFramePresented();
+  controller.receiveActivated(withIdentity(events[2]));
 }
 
 final class _NoopPcmOutput implements PcmSpeechOutputService {

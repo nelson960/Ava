@@ -21,6 +21,15 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
   AvaValidatedSvgCanvasDocument? get presentedDocument => _presentedDocument;
   bool get panelDismissed => _panelDismissed;
 
+  int? retainedSceneRevision(String sceneId) {
+    for (final document in _workspaceDocuments) {
+      if (document.descriptor.sceneId == sceneId) {
+        return document.descriptor.sceneRevision;
+      }
+    }
+    return null;
+  }
+
   bool get panelVisible {
     if (_panelDismissed) return false;
     return _presentedDocument != null ||

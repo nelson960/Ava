@@ -10,6 +10,7 @@ from ava_backend.canvas.svg_session import (
     SvgCanvasStateErrorCode,
 )
 from ava_backend.canvas.svg_specialist import SvgCanvasSpecialistGeneration
+from ava_backend.canvas.svg_workspace import SvgCanvasWorkspace
 
 
 def _generation(
@@ -261,6 +262,32 @@ def test_reportable_interaction_enters_realtime_canvas_context() -> None:
     assert "<last_interaction>" in context
     assert "<action>select</action>" in context
     assert "<target>Rain cloud</target>" in context
+
+
+def test_interaction_context_survives_session_state_replacement() -> None:
+    workspace = SvgCanvasWorkspace()
+    state = SvgCanvasSessionState(workspace=workspace)
+    generation = _generation()
+    _prepare_and_schedule(state, generation)
+    active = state.mark_presented(
+        generation_id=generation.generation_id,
+        svg_sha256=generation.document.svg_sha256,
+        manifest_sha256=generation.document.manifest_sha256,
+        first_rendered_sample=4_800,
+    )
+    recorded = state.record_interaction(
+        scene_id=active.scene_id,
+        scene_revision=active.revision,
+        interaction_revision=1,
+        svg_sha256=generation.document.svg_sha256,
+        manifest_sha256=generation.document.manifest_sha256,
+        binding_id="select_cloud",
+    )
+
+    replacement = SvgCanvasSessionState(workspace=workspace)
+
+    assert replacement.last_interaction is recorded
+    assert "<target>Rain cloud</target>" in replacement.render_realtime_context()
 
 
 def test_new_canvas_revision_clears_stale_interaction_context() -> None:

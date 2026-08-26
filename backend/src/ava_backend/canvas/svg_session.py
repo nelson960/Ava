@@ -8,6 +8,12 @@ from typing import NoReturn
 
 from .svg_document import SvgInteractionBinding, ValidatedSvgDocument
 from .svg_specialist import SvgCanvasSpecialistGeneration
+from .svg_workspace import (
+    ActiveSvgCanvasScene,
+    RecordedSvgCanvasInteraction,
+    SvgCanvasWorkspace,
+    SvgCanvasWorkspaceError,
+)
 
 _MAX_REALTIME_CANVAS_CONTEXT_CHARACTERS = 2_400
 
@@ -53,16 +59,6 @@ class SvgCanvasCandidate:
 
 
 @dataclass(frozen=True, slots=True)
-class ActiveSvgCanvasScene:
-    generation_id: str
-    source_turn_id: str
-    scene_id: str
-    revision: int
-    document: ValidatedSvgDocument
-    first_rendered_sample: int
-
-
-@dataclass(frozen=True, slots=True)
 class SvgCanvasPresentationCue:
     generation_id: str
     scene_id: str
@@ -72,27 +68,16 @@ class SvgCanvasPresentationCue:
     manifest_sha256: str
 
 
-@dataclass(frozen=True, slots=True)
-class RecordedSvgCanvasInteraction:
-    scene_id: str
-    scene_revision: int
-    interaction_revision: int
-    svg_sha256: str
-    manifest_sha256: str
-    binding_id: str
-    action: str
-    target_id: str
-    accessibility_label: str
-    declared_value: str | None
-
-
 class SvgCanvasSessionState:
-    """Canonical SVG state for one persistent Realtime conversation session."""
+    """Session-local candidate state backed by a committed canvas workspace."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, workspace: SvgCanvasWorkspace | None = None) -> None:
         self._candidate: SvgCanvasCandidate | None = None
-        self._active: ActiveSvgCanvasScene | None = None
-        self._last_interaction: RecordedSvgCanvasInteraction | None = None
+        self._workspace = workspace or SvgCanvasWorkspace()
+
+    @property
+    def workspace(self) -> SvgCanvasWorkspace:
+        return self._workspace
 
     @property
     def candidate(self) -> SvgCanvasCandidate | None:
@@ -100,11 +85,11 @@ class SvgCanvasSessionState:
 
     @property
     def active(self) -> ActiveSvgCanvasScene | None:
-        return self._active
+        return self._workspace.current
 
     @property
     def last_interaction(self) -> RecordedSvgCanvasInteraction | None:
-        return self._last_interaction
+        return self._workspace.last_interaction
 
     def stage_generation(
         self,
@@ -117,7 +102,7 @@ class SvgCanvasSessionState:
                 SvgCanvasStateErrorCode.CANDIDATE_ALREADY_PENDING,
                 "an SVG canvas candidate is already pending",
             )
-        active = self._active
+        active = self.active
         scene_id = (
             active.scene_id
             if active is not None
@@ -227,17 +212,6 @@ class SvgCanvasSessionState:
             svg_sha256=svg_sha256,
             manifest_sha256=manifest_sha256,
         )
-        active = self._active
-        active_scene_id = active.scene_id if active is not None else None
-        active_revision = active.revision if active is not None else 0
-        if (
-            active_scene_id != candidate.base_scene_id
-            or active_revision != candidate.base_revision
-        ):
-            self._fail(
-                SvgCanvasStateErrorCode.CANONICAL_SCENE_CHANGED,
-                "canonical SVG canvas changed before presentation completed",
-            )
         activated = ActiveSvgCanvasScene(
             generation_id=candidate.generation_id,
             source_turn_id=candidate.source_turn_id,
@@ -246,9 +220,18 @@ class SvgCanvasSessionState:
             document=candidate.document,
             first_rendered_sample=first_rendered_sample,
         )
-        self._active = activated
+        try:
+            self._workspace.commit(
+                activated,
+                base_scene_id=candidate.base_scene_id,
+                base_revision=candidate.base_revision,
+            )
+        except SvgCanvasWorkspaceError as error:
+            self._fail(
+                SvgCanvasStateErrorCode.CANONICAL_SCENE_CHANGED,
+                str(error),
+            )
         self._candidate = None
-        self._last_interaction = None
         return activated
 
     def discard_candidate(
@@ -285,7 +268,7 @@ class SvgCanvasSessionState:
         svg_sha256: str,
         manifest_sha256: str,
     ) -> ActiveSvgCanvasScene:
-        active = self._active
+        active = self.active
         if active is None:
             self._fail(
                 SvgCanvasStateErrorCode.NO_ACTIVE_SCENE,
@@ -326,7 +309,7 @@ class SvgCanvasSessionState:
         manifest_sha256: str,
         binding_id: str,
     ) -> RecordedSvgCanvasInteraction:
-        active = self._active
+        active = self.active
         if active is None:
             self._fail(
                 SvgCanvasStateErrorCode.NO_ACTIVE_SCENE,
@@ -351,8 +334,8 @@ class SvgCanvasSessionState:
                 "canvas interaction content hashes do not match the active scene",
             )
         previous_revision = (
-            self._last_interaction.interaction_revision
-            if self._last_interaction is not None
+            self.last_interaction.interaction_revision
+            if self.last_interaction is not None
             else 0
         )
         if interaction_revision <= previous_revision:
@@ -376,14 +359,16 @@ class SvgCanvasSessionState:
             binding,
             interaction_revision=interaction_revision,
         )
-        self._last_interaction = recorded
-        return recorded
+        try:
+            return self._workspace.record_interaction(recorded)
+        except SvgCanvasWorkspaceError as error:
+            self._fail(SvgCanvasStateErrorCode.CANONICAL_SCENE_CHANGED, str(error))
 
     def render_realtime_context(self) -> str:
-        active = self._active
+        active = self.active
         if active is None:
             return ""
-        interaction = self._last_interaction
+        interaction = self.last_interaction
         interaction_xml = ""
         if interaction is not None:
             interaction_xml = (
@@ -420,18 +405,14 @@ class SvgCanvasSessionState:
         )
         selected: list[str] = []
         for item in semantic_items:
-            semantic_xml = (
-                f"<semantics>{''.join((*selected, item))}</semantics>"
-            )
+            semantic_xml = f"<semantics>{''.join((*selected, item))}</semantics>"
             if (
                 len(prefix) + len(semantic_xml) + len(suffix)
                 > _MAX_REALTIME_CANVAS_CONTEXT_CHARACTERS
             ):
                 break
             selected.append(item)
-        semantic_xml = (
-            f"<semantics>{''.join(selected)}</semantics>" if selected else ""
-        )
+        semantic_xml = f"<semantics>{''.join(selected)}</semantics>" if selected else ""
         return f"{prefix}{semantic_xml}{suffix}"
 
     def _require_candidate(self, generation_id: str) -> SvgCanvasCandidate:

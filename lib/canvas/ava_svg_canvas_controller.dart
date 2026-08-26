@@ -121,20 +121,25 @@ typedef AvaSvgCanvasCommandSink = FutureOr<void> Function(
   AvaSvgCanvasClientCommand command,
 );
 
+typedef AvaRetainedSceneRevisionLookup = int? Function(String sceneId);
+
 final class AvaSvgCanvasController extends ChangeNotifier {
   AvaSvgCanvasController({
     required AvaSvgDocumentLoader documents,
     required AvaSvgCanvasCommandSink commandSink,
     AvaSvgCanvasTelemetrySink? telemetry,
+    AvaRetainedSceneRevisionLookup? retainedSceneRevision,
   })  : _documents = documents,
         _commandSink = commandSink,
-        _telemetry = telemetry {
+        _telemetry = telemetry,
+        _retainedSceneRevision = retainedSceneRevision ?? _unretainedScene {
     _clock.start();
   }
 
   final AvaSvgDocumentLoader _documents;
   final AvaSvgCanvasCommandSink _commandSink;
   final AvaSvgCanvasTelemetrySink? _telemetry;
+  final AvaRetainedSceneRevisionLookup _retainedSceneRevision;
   final Stopwatch _clock = Stopwatch();
   AvaSvgCanvasGenerationState? _generation;
   AvaSvgCanvasCandidateState? _candidate;
@@ -241,22 +246,26 @@ final class AvaSvgCanvasController extends ChangeNotifier {
       );
     }
     _recordDescriptor('canvas.document.available_received', descriptor);
-    final active = _active;
-    if (active != null) {
-      final activeDescriptor = active.document.descriptor;
-      final revisesActiveScene =
-          descriptor.sceneId == activeDescriptor.sceneId &&
-              descriptor.sceneRevision == activeDescriptor.sceneRevision + 1;
-      final startsDistinctScene =
-          descriptor.sceneId != activeDescriptor.sceneId &&
-              descriptor.sceneRevision == 1;
-      if (!revisesActiveScene && !startsDistinctScene) {
-        throw const FormatException(
-          'Canvas candidate must revise the active scene monotonically or '
-          'start a distinct scene at revision 1.',
-        );
-      }
-    } else if (descriptor.sceneRevision != 1) {
+    final activeDescriptor = _active?.document.descriptor;
+    final retainedRevision = _retainedSceneRevision(descriptor.sceneId);
+    if (activeDescriptor?.sceneId == descriptor.sceneId &&
+        retainedRevision != null &&
+        activeDescriptor!.sceneRevision != retainedRevision) {
+      throw StateError(
+        'The live canvas and retained workspace disagree on scene revision.',
+      );
+    }
+    final knownRevision = retainedRevision ??
+        (activeDescriptor?.sceneId == descriptor.sceneId
+            ? activeDescriptor?.sceneRevision
+            : null);
+    if (knownRevision != null &&
+        descriptor.sceneRevision != knownRevision + 1) {
+      throw const FormatException(
+        'Canvas candidate must monotonically revise its retained scene.',
+      );
+    }
+    if (knownRevision == null && descriptor.sceneRevision != 1) {
       throw const FormatException(
         'First canvas candidate must have sceneRevision 1.',
       );
@@ -904,6 +913,8 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     );
   }
 }
+
+int? _unretainedScene(String sceneId) => null;
 
 Map<String, Object?> _identityFields(
   AvaSvgCanvasDocumentDescriptorV4 descriptor,

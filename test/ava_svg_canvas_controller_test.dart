@@ -872,6 +872,118 @@ void main() {
     host.dispose();
   });
 
+  test('fresh_controller_accepts_retained_scene_revision', () async {
+    final sceneA = _sceneDocument(document, 'A', 1);
+    final revisedA = _sceneDocument(document, 'A', 2);
+    final host = AvaSvgCanvasSessionHost();
+    final firstController = AvaSvgCanvasController(
+      documents: _Loader.documents([sceneA]),
+      commandSink: (_) {},
+      retainedSceneRevision: host.retainedSceneRevision,
+    );
+    host.attach(firstController);
+    await _driveActivation(
+      firstController,
+      sceneA,
+      _eventsForDocument(sceneA),
+    );
+    host.detach(firstController);
+    firstController.dispose();
+
+    final replacementController = AvaSvgCanvasController(
+      documents: _Loader.documents([revisedA]),
+      commandSink: (_) {},
+      retainedSceneRevision: host.retainedSceneRevision,
+    );
+    host.attach(replacementController);
+    await _driveActivation(
+      replacementController,
+      revisedA,
+      _eventsForDocument(revisedA),
+    );
+
+    expect(host.sceneCount, 1);
+    expect(host.workspaceDocuments, orderedEquals([revisedA]));
+    expect(host.presentedDocument, same(revisedA));
+    host.detach(replacementController);
+    replacementController.dispose();
+    host.dispose();
+  });
+
+  test('fresh_controller_rejects_unseen_revision_two', () async {
+    final unseenRevision = _sceneDocument(document, 'X', 2);
+    final host = AvaSvgCanvasSessionHost();
+    final controller = AvaSvgCanvasController(
+      documents: _Loader.documents([unseenRevision]),
+      commandSink: (_) {},
+      retainedSceneRevision: host.retainedSceneRevision,
+    );
+    host.attach(controller);
+    _announceGeneration(controller, unseenRevision);
+
+    await expectLater(
+      controller
+          .receiveDocumentAvailable(_eventsForDocument(unseenRevision)[0]),
+      throwsFormatException,
+    );
+
+    expect(controller.candidate, isNull);
+    expect(host.sceneCount, 0);
+    host.detach(controller);
+    controller.dispose();
+    host.dispose();
+  });
+
+  test('retained_revision_must_be_monotonic', () async {
+    final sceneA = _sceneDocument(document, 'A', 1);
+    final revisedA = _sceneDocument(document, 'A', 2);
+    final host = AvaSvgCanvasSessionHost();
+    final owner = AvaSvgCanvasController(
+      documents: _Loader.documents([sceneA, revisedA]),
+      commandSink: (_) {},
+      retainedSceneRevision: host.retainedSceneRevision,
+    );
+    host.attach(owner);
+    await _driveActivation(owner, sceneA, _eventsForDocument(sceneA));
+    await _driveActivation(owner, revisedA, _eventsForDocument(revisedA));
+    host.detach(owner);
+    owner.dispose();
+
+    for (final revision in [1, 2, 4]) {
+      final rejected = _sceneDocument(document, 'A', revision);
+      final controller = AvaSvgCanvasController(
+        documents: _Loader.documents([rejected]),
+        commandSink: (_) {},
+        retainedSceneRevision: host.retainedSceneRevision,
+      );
+      host.attach(controller);
+      _announceGeneration(controller, rejected);
+      await expectLater(
+        controller.receiveDocumentAvailable(_eventsForDocument(rejected)[0]),
+        throwsFormatException,
+      );
+      expect(controller.candidate, isNull);
+      host.detach(controller);
+      controller.dispose();
+    }
+
+    final revisionThree = _sceneDocument(document, 'A', 3);
+    final accepted = AvaSvgCanvasController(
+      documents: _Loader.documents([revisionThree]),
+      commandSink: (_) {},
+      retainedSceneRevision: host.retainedSceneRevision,
+    );
+    host.attach(accepted);
+    _announceGeneration(accepted, revisionThree);
+    await accepted
+        .receiveDocumentAvailable(_eventsForDocument(revisionThree)[0]);
+
+    expect(accepted.candidate?.document, same(revisionThree));
+    host.detach(accepted);
+    accepted.dispose();
+    host.dispose();
+  });
+
   test('exact_repeated_active_observation_is_idempotent', () async {
     final documents = _sceneDocuments(
       document,

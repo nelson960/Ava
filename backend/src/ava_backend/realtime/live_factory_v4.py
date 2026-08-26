@@ -5,6 +5,7 @@ from uuid import uuid4
 from ..canvas.svg_delivery import SvgCanvasDocumentStore
 from ..canvas.svg_session import SvgCanvasSessionState
 from ..canvas.svg_specialist import SvgCanvasSpecialist
+from ..canvas.svg_workspace import SvgCanvasWorkspaceStore
 from ..config import AvaEnvironment, RealtimeDeliveryMode, Settings
 from ..protocol import AgeBand
 from ..providers.elevenlabs_realtime_speech import (
@@ -31,6 +32,7 @@ class LiveRealtimeCoordinatorFactoryV4:
         settings: Settings,
         memory: AuthoritativeMemoryStore,
         documents: SvgCanvasDocumentStore,
+        canvas_workspaces: SvgCanvasWorkspaceStore,
     ) -> None:
         delivery_mode = settings.realtime_delivery_mode
         if delivery_mode is RealtimeDeliveryMode.DISABLED:
@@ -45,6 +47,7 @@ class LiveRealtimeCoordinatorFactoryV4:
         self._settings = settings
         self._memory = memory
         self._documents = documents
+        self._canvas_workspaces = canvas_workspaces
         self._api_key = settings.require_openai_api_key()
 
     def create(
@@ -80,7 +83,9 @@ class LiveRealtimeCoordinatorFactoryV4:
             session_id=session_id,
             safety_identifier=safety_id,
         )
-        state = SvgCanvasSessionState()
+        state = SvgCanvasSessionState(
+            workspace=self._canvas_workspaces.workspace_for(subject)
+        )
         canvas_events = ProtocolV4CanvasEventSink()
         jobs = SvgCanvasJobCoordinator(
             session_id=session_id,
