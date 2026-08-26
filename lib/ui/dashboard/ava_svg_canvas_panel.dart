@@ -20,13 +20,14 @@ final class AvaSvgCanvasPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final controller = host.controller;
-    if (controller == null) return const SizedBox.shrink();
-    final active = controller.active?.document;
-    final candidate = controller.candidate?.document;
+    final presented = host.presentedDocument;
+    final liveActive = controller?.active?.document;
+    final candidate = controller?.candidate?.document;
     final documents = <AvaValidatedSvgCanvasDocument>[
-      if (active != null) active,
+      if (presented != null) presented,
       if (candidate != null &&
-          candidate.descriptor.generationId != active?.descriptor.generationId)
+          candidate.descriptor.generationId !=
+              presented?.descriptor.generationId)
         candidate,
     ];
     if (documents.isEmpty) return const SizedBox.shrink();
@@ -43,7 +44,7 @@ final class AvaSvgCanvasPanel extends StatelessWidget {
             _documentLayer(
               controller: controller,
               document: document,
-              active: identical(document, active),
+              interactive: identical(document, liveActive),
               candidate: identical(document, candidate),
             ),
           Positioned(
@@ -69,38 +70,59 @@ final class AvaSvgCanvasPanel extends StatelessWidget {
   }
 
   Widget _documentLayer({
-    required AvaSvgCanvasController controller,
+    required AvaSvgCanvasController? controller,
     required AvaValidatedSvgCanvasDocument document,
-    required bool active,
+    required bool interactive,
     required bool candidate,
   }) {
     final generationId = document.descriptor.generationId;
+    AvaSvgCanvasController? liveController() {
+      if (controller == null || !identical(host.controller, controller)) {
+        return null;
+      }
+      return controller;
+    }
+
     return KeyedSubtree(
       key: ValueKey('svg-canvas-$generationId'),
       child: IgnorePointer(
-        ignoring: !active,
+        ignoring: !interactive,
         child: AvaSvgCanvasView(
           document: document,
-          present: candidate && controller.shouldPresentCandidate,
+          present:
+              !candidate || (liveController()?.shouldPresentCandidate ?? false),
           onPrepared: () {
-            final state = controller.candidate;
+            final ownedController = liveController();
+            if (ownedController == null) return;
+            final state = ownedController.candidate;
             if (state?.descriptor.generationId == generationId &&
                 state?.phase == AvaSvgCanvasCandidatePhase.rendererPreparing) {
-              controller.rendererPrepared();
+              ownedController.rendererPrepared();
             }
           },
           onFirstFramePresented: () {
-            final state = controller.candidate;
+            final ownedController = liveController();
+            if (!candidate || ownedController == null) return;
+            final state = ownedController.candidate;
             if (state?.descriptor.generationId == generationId &&
                 state?.phase ==
                     AvaSvgCanvasCandidatePhase.presentationRequested) {
-              controller.firstFramePresented();
+              ownedController.firstFramePresented();
             }
           },
-          onBinding: controller.reportBinding,
+          onBinding: (binding) {
+            final ownedController = liveController();
+            if (interactive && ownedController != null) {
+              ownedController.reportBinding(binding);
+            }
+          },
           onError: (message) {
+            final ownedController = liveController();
+            if ((!candidate && !interactive) || ownedController == null) {
+              return;
+            }
             unawaited(
-              controller.rendererFailed(
+              ownedController.rendererFailed(
                 message,
                 generationId: generationId,
               ),

@@ -1,25 +1,27 @@
 import 'package:flutter/foundation.dart';
 
+import '../models/ava_svg_canvas_protocol.dart';
 import 'ava_svg_canvas_controller.dart';
 
-/// Stable UI owner for the SVG controller attached to the current realtime
-/// session. A new authenticated session always replaces the previous scene.
+/// Application-level owner of the presented SVG and the controller attached
+/// to the current realtime session.
 final class AvaSvgCanvasSessionHost extends ChangeNotifier {
   AvaSvgCanvasController? _controller;
+  AvaValidatedSvgCanvasDocument? _presentedDocument;
   bool _panelDismissed = false;
   String? _lastPresentationGeneration;
 
   AvaSvgCanvasController? get controller => _controller;
+  AvaValidatedSvgCanvasDocument? get presentedDocument => _presentedDocument;
   bool get panelDismissed => _panelDismissed;
 
   bool get panelVisible {
-    final controller = _controller;
-    if (controller == null || _panelDismissed) return false;
-    return controller.active != null || controller.shouldPresentCandidate;
+    if (_panelDismissed) return false;
+    return _presentedDocument != null ||
+        _controller?.shouldPresentCandidate == true;
   }
 
-  bool get canReopen =>
-      _panelDismissed && _controller?.active?.document != null;
+  bool get canReopen => _panelDismissed && _presentedDocument != null;
 
   bool get generating {
     final candidate = _controller?.candidate;
@@ -30,19 +32,22 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
   void attach(AvaSvgCanvasController controller) {
     if (identical(_controller, controller)) return;
     final previous = _controller;
-    if (previous != null) previous.removeListener(_handleControllerChanged);
+    if (previous != null) {
+      _retainPresentedDocument(previous);
+      previous.removeListener(_handleControllerChanged);
+    }
     _controller = controller;
-    _panelDismissed = false;
     _lastPresentationGeneration = null;
+    _retainPresentedDocument(controller);
     controller.addListener(_handleControllerChanged);
     notifyListeners();
   }
 
   void detach(AvaSvgCanvasController controller) {
     if (!identical(_controller, controller)) return;
+    _retainPresentedDocument(controller);
     controller.removeListener(_handleControllerChanged);
     _controller = null;
-    _panelDismissed = false;
     _lastPresentationGeneration = null;
     notifyListeners();
   }
@@ -60,8 +65,11 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
   }
 
   void _handleControllerChanged() {
-    final candidate = _controller?.candidate;
-    if (candidate != null && _controller!.shouldPresentCandidate) {
+    final controller = _controller;
+    if (controller == null) return;
+    _retainPresentedDocument(controller);
+    final candidate = controller.candidate;
+    if (candidate != null && controller.shouldPresentCandidate) {
       final generation = candidate.descriptor.generationId;
       if (_lastPresentationGeneration != generation) {
         _lastPresentationGeneration = generation;
@@ -71,10 +79,16 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     notifyListeners();
   }
 
+  void _retainPresentedDocument(AvaSvgCanvasController controller) {
+    final active = controller.active?.document;
+    if (active != null) _presentedDocument = active;
+  }
+
   @override
   void dispose() {
     _controller?.removeListener(_handleControllerChanged);
     _controller = null;
+    _presentedDocument = null;
     super.dispose();
   }
 }

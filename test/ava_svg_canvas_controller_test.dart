@@ -32,6 +32,8 @@ final class _Loader implements AvaSvgDocumentLoader {
 void main() {
   late List<Map<String, Object?>> serverEvents;
   late AvaValidatedSvgCanvasDocument document;
+  late AvaValidatedSvgCanvasDocument replacementDocument;
+  late List<Map<String, Object?>> replacementEvents;
 
   setUpAll(() {
     serverEvents = (jsonDecode(
@@ -48,6 +50,14 @@ void main() {
           File('protocol/fixtures/ava_svg_document_v4.svg').readAsBytesSync(),
       manifestBytes: Uint8List.fromList(utf8.encode(_manifestJson)),
     );
+    replacementDocument = _documentWithIdentity(
+      document,
+      generationId: 'generation-replacement',
+      sourceTurnId: 'turn-replacement',
+      sceneId: 'scene-replacement',
+      sceneRevision: 1,
+    );
+    replacementEvents = _eventsForDocument(replacementDocument);
   });
 
   test('preload, cue, first frame, and activation remain distinct', () async {
@@ -322,6 +332,196 @@ void main() {
     controller.dispose();
   });
 
+  test('active_canvas_survives_runtime_detach', () async {
+    final controller = await _activate(document, serverEvents, []);
+    final host = AvaSvgCanvasSessionHost()..attach(controller);
+
+    expect(_documentForDisplay(host), same(document));
+    expect(host.panelVisible, isTrue);
+
+    host.detach(controller);
+    controller.dispose();
+
+    expect(host.controller, isNull);
+    expect(_documentForDisplay(host), same(document));
+    expect(host.panelVisible, isTrue);
+    expect(host.canReopen, isFalse);
+    host.dispose();
+  });
+
+  test('dismissed_active_canvas_remains_reopenable_after_detach', () async {
+    final controller = await _activate(document, serverEvents, []);
+    final host = AvaSvgCanvasSessionHost()..attach(controller);
+
+    host.dismissPanel();
+    expect(host.panelVisible, isFalse);
+    expect(host.canReopen, isTrue);
+
+    host.detach(controller);
+    controller.dispose();
+
+    expect(host.panelVisible, isFalse);
+    expect(host.canReopen, isTrue);
+    host.reopenPanel();
+    expect(host.panelVisible, isTrue);
+    expect(_documentForDisplay(host), same(document));
+    host.dispose();
+  });
+
+  test('blank_new_runtime_does_not_erase_retained_canvas', () async {
+    final oldController = await _activate(document, serverEvents, []);
+    final host = AvaSvgCanvasSessionHost()..attach(oldController);
+    host.detach(oldController);
+    oldController.dispose();
+    final newController = AvaSvgCanvasController(
+      documents: _Loader(Future.value(replacementDocument)),
+      commandSink: (_) {},
+    );
+
+    host.attach(newController);
+
+    expect(host.controller, same(newController));
+    expect(newController.active, isNull);
+    expect(_documentForDisplay(host), same(document));
+    expect(host.panelVisible, isTrue);
+    host.detach(newController);
+    newController.dispose();
+    host.dispose();
+  });
+
+  test('failed_new_candidate_does_not_replace_retained_canvas', () async {
+    final oldController = await _activate(document, serverEvents, []);
+    final host = AvaSvgCanvasSessionHost()..attach(oldController);
+    host.detach(oldController);
+    oldController.dispose();
+    final fetched = Completer<AvaValidatedSvgCanvasDocument>();
+    final commands = <AvaSvgCanvasClientCommand>[];
+    final newController = AvaSvgCanvasController(
+      documents: _Loader(fetched.future),
+      commandSink: commands.add,
+    );
+    host.attach(newController);
+
+    _announceGeneration(newController, replacementDocument);
+    expect(host.generating, isTrue);
+    expect(_documentForDisplay(host), same(document));
+    final loading = newController.receiveDocumentAvailable(
+      replacementEvents[0],
+    );
+    expect(
+      newController.candidate?.phase,
+      AvaSvgCanvasCandidatePhase.fetching,
+    );
+    expect(_documentForDisplay(host), same(document));
+    fetched.complete(replacementDocument);
+    await loading;
+    expect(
+      newController.candidate?.phase,
+      AvaSvgCanvasCandidatePhase.rendererPreparing,
+    );
+    expect(_documentForDisplay(host), same(document));
+
+    await newController.rendererFailed(
+      'SVG renderer rejected the replacement.',
+      generationId: replacementDocument.descriptor.generationId,
+    );
+
+    expect(newController.candidate, isNull);
+    expect(_documentForDisplay(host), same(document));
+    expect(host.panelVisible, isTrue);
+    expect(commands.last.type, AvaSvgCanvasCommandType.canvasPreparationFailed);
+    host.detach(newController);
+    newController.dispose();
+    host.dispose();
+  });
+
+  test('successful_new_activation_atomically_replaces_retained_canvas',
+      () async {
+    final oldController = await _activate(document, serverEvents, []);
+    final host = AvaSvgCanvasSessionHost()..attach(oldController);
+    host.detach(oldController);
+    oldController.dispose();
+    final newController = AvaSvgCanvasController(
+      documents: _Loader(Future.value(replacementDocument)),
+      commandSink: (_) {},
+    );
+    final displayedTransitions = <AvaValidatedSvgCanvasDocument?>[];
+    var previous = _documentForDisplay(host);
+    host.addListener(() {
+      final next = _documentForDisplay(host);
+      if (!identical(previous, next)) {
+        displayedTransitions.add(next);
+        previous = next;
+      }
+    });
+
+    host.attach(newController);
+    expect(_documentForDisplay(host), same(document));
+    await _driveActivation(
+      newController,
+      replacementDocument,
+      replacementEvents,
+    );
+
+    expect(_documentForDisplay(host), same(replacementDocument));
+    expect(displayedTransitions, [replacementDocument]);
+    host.detach(newController);
+    newController.dispose();
+    host.dispose();
+  });
+
+  test('runtime_local_pending_state_does_not_survive_detach', () async {
+    final oldController = await _activate(document, serverEvents, []);
+    final host = AvaSvgCanvasSessionHost()..attach(oldController);
+    host.detach(oldController);
+    oldController.dispose();
+    final fetched = Completer<AvaValidatedSvgCanvasDocument>();
+    final commands = <AvaSvgCanvasClientCommand>[];
+    final pendingController = AvaSvgCanvasController(
+      documents: _Loader(fetched.future),
+      commandSink: commands.add,
+    );
+    host.attach(pendingController);
+    _announceGeneration(pendingController, replacementDocument);
+    final loading = pendingController.receiveDocumentAvailable(
+      replacementEvents[0],
+    );
+    expect(
+      pendingController.candidate?.phase,
+      AvaSvgCanvasCandidatePhase.fetching,
+    );
+
+    host.detach(pendingController);
+    pendingController.dispose();
+    fetched.complete(replacementDocument);
+    await loading;
+
+    expect(host.controller, isNull);
+    expect(host.generating, isFalse);
+    expect(_documentForDisplay(host), same(document));
+    expect(host.panelVisible, isTrue);
+    expect(commands, isEmpty);
+    host.dispose();
+  });
+
+  test('retained_canvas_does_not_emit_through_disposed_runtime', () async {
+    final commands = <AvaSvgCanvasClientCommand>[];
+    final controller = await _activate(document, serverEvents, commands);
+    final host = AvaSvgCanvasSessionHost()..attach(controller);
+    commands.clear();
+
+    host.detach(controller);
+    controller.dispose();
+    host.dismissPanel();
+    expect(host.canReopen, isTrue);
+    host.reopenPanel();
+
+    expect(_documentForDisplay(host), same(document));
+    expect(host.controller, isNull);
+    expect(commands, isEmpty);
+    host.dispose();
+  });
+
   test('discard ignores a late fetch result and never presents it', () async {
     final completer = Completer<AvaValidatedSvgCanvasDocument>();
     final commands = <AvaSvgCanvasClientCommand>[];
@@ -507,6 +707,15 @@ Future<AvaSvgCanvasController> _activate(
     documents: _Loader(Future.value(document)),
     commandSink: commands.add,
   );
+  await _driveActivation(controller, document, events);
+  return controller;
+}
+
+Future<void> _driveActivation(
+  AvaSvgCanvasController controller,
+  AvaValidatedSvgCanvasDocument document,
+  List<Map<String, Object?>> events,
+) async {
   controller.beginPlaybackClock(document.descriptor.sourceTurnId);
   _announceGeneration(controller, document);
   await controller.receiveDocumentAvailable(events[0]);
@@ -518,7 +727,6 @@ Future<AvaSvgCanvasController> _activate(
   );
   controller.firstFramePresented();
   controller.receiveActivated(events[2]);
-  return controller;
 }
 
 void _announceGeneration(
@@ -534,4 +742,84 @@ void _announceGeneration(
     'generationId': document.descriptor.generationId,
     'sourceTurnId': document.descriptor.sourceTurnId,
   });
+}
+
+AvaValidatedSvgCanvasDocument? _documentForDisplay(
+  AvaSvgCanvasSessionHost host,
+) =>
+    host.presentedDocument;
+
+AvaValidatedSvgCanvasDocument _documentWithIdentity(
+  AvaValidatedSvgCanvasDocument source, {
+  required String generationId,
+  required String sourceTurnId,
+  required String sceneId,
+  required int sceneRevision,
+}) {
+  final descriptor = AvaSvgCanvasDocumentDescriptorV4(
+    generationId: generationId,
+    sourceTurnId: sourceTurnId,
+    sceneId: sceneId,
+    sceneRevision: sceneRevision,
+    svgPath: '/canvas-documents/$generationId/svg',
+    manifestPath: '/canvas-documents/$generationId/manifest',
+    svgSha256: source.descriptor.svgSha256,
+    manifestSha256: source.descriptor.manifestSha256,
+    svgByteLength: source.descriptor.svgByteLength,
+    manifestByteLength: source.descriptor.manifestByteLength,
+  );
+  return AvaValidatedSvgCanvasDocument.verify(
+    descriptor: descriptor,
+    svgBytes: source.svgBytes,
+    manifestBytes: source.manifestBytes,
+  );
+}
+
+List<Map<String, Object?>> _eventsForDocument(
+  AvaValidatedSvgCanvasDocument document,
+) {
+  final descriptor = document.descriptor;
+  final identity = <String, Object?>{
+    'generationId': descriptor.generationId,
+    'sourceTurnId': descriptor.sourceTurnId,
+    'sceneId': descriptor.sceneId,
+    'sceneRevision': descriptor.sceneRevision,
+    'svgSha256': descriptor.svgSha256,
+    'manifestSha256': descriptor.manifestSha256,
+  };
+  return [
+    {
+      'protocolVersion': 4,
+      'event': 'canvasDocumentAvailable',
+      'sessionId': 'session-replacement',
+      'sequence': 0,
+      'revision': 1,
+      ...identity,
+      'svgPath': descriptor.svgPath,
+      'manifestPath': descriptor.manifestPath,
+      'svgByteLength': descriptor.svgByteLength,
+      'manifestByteLength': descriptor.manifestByteLength,
+      'rendererCapabilityVersion': avaSvgRendererCapabilityVersion,
+      'validatorVersion': avaSvgValidatorVersion,
+      'manifestVersion': avaSvgManifestVersion,
+    },
+    {
+      'protocolVersion': 4,
+      'event': 'canvasPresentationCue',
+      'sessionId': 'session-replacement',
+      'sequence': 1,
+      'revision': 2,
+      ...identity,
+      'presentationSampleOffset': 4800,
+    },
+    {
+      'protocolVersion': 4,
+      'event': 'canvasActivated',
+      'sessionId': 'session-replacement',
+      'sequence': 2,
+      'revision': 3,
+      ...identity,
+      'firstRenderedSample': 4812,
+    },
+  ];
 }
