@@ -20,13 +20,31 @@ from ava_backend.providers.openai_svg_canvas_provider import (
 )
 
 
-def _svg(*, label: str = "Cloud") -> str:
+def _svg(*, label: str = "Cloud", interaction_mode: str = "select") -> str:
+    if interaction_mode in {"select", "explore"}:
+        binding = (
+        '<ellipse id="cloud" data-ava-binding="select_cloud" aria-label="Cloud" '
+        'cx="500" cy="250" rx="160" ry="70" fill="#dff5ff"/>\n'
+        )
+    elif interaction_mode == "steps":
+        binding = (
+            '<g id="cloud_1" data-ava-binding="cloud_1" data-ava-step="1" '
+            'aria-label="Cloud begins"><circle cx="400" cy="250" r="50"/></g>\n'
+            '<g id="cloud_2" data-ava-binding="cloud_2" data-ava-step="2" '
+            'aria-label="Cloud grows"><circle cx="600" cy="250" r="70"/></g>\n'
+        )
+    else:
+        binding = (
+            '<ellipse id="cloud" cx="500" cy="250" rx="160" ry="70" '
+            'fill="#dff5ff"/>\n'
+        )
     return (
         "\n"
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600">\n'
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" '
+        f'data-ava-interaction-mode="{interaction_mode}">\n'
         f"<title>{label} ☁️</title>\n"
         "<desc>A soft cloud floating over a blue landscape.</desc>\n"
-        '<ellipse id="cloud" cx="500" cy="250" rx="160" ry="70" fill="#dff5ff"/>\n'
+        f"{binding}"
         "</svg>\n"
     )
 
@@ -222,6 +240,7 @@ def _request(**changes: object) -> SvgCanvasSpecialistRequest:
         "generationId": "generation_1",
         "sourceTurnId": "turn_1",
         "brief": "Show how a cloud forms.",
+        "interactionMode": "select",
         "interactionGoal": "Let the child select the cloud.",
         "ageBand": "middleChildhood",
     }
@@ -288,7 +307,7 @@ async def test_provider_uses_sol_raw_responses_and_preserves_exact_svg() -> None
 
 
 async def test_absent_interaction_goal_prefers_a_static_svg() -> None:
-    svg = _svg(label="Static cloud")
+    svg = _svg(label="Static cloud", interaction_mode="none")
     client = _Client([_response(svg)])
     provider = OpenAISvgCanvasSpecialist(
         Settings(environment=AvaEnvironment.TEST, openai_canvas_max_quality_repairs=0),
@@ -297,20 +316,23 @@ async def test_absent_interaction_goal_prefers_a_static_svg() -> None:
         client=client,  # type: ignore[arg-type]
     )
 
-    generation = await provider.generate(_request(interactionGoal=None))
+    generation = await provider.generate(
+        _request(interactionMode="none", interactionGoal=None)
+    )
 
     assert generation.document.bindings == {}
     instructions = client.responses.arguments[0]["instructions"]
     assert isinstance(instructions, str)
-    assert "When interaction_goal is empty, produce a static SVG" in instructions
+    assert "`none` is static" in instructions
 
 
 async def test_explicit_interaction_goal_allows_only_goal_serving_bindings() -> None:
     svg = (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600">'
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" '
+        'data-ava-interaction-mode="select">'
         "<title>Cloud</title><desc>Select the cloud to discuss rain.</desc>"
         '<g id="cloud" data-ava-binding="select_cloud" '
-        'data-ava-action="select" aria-label="Rain cloud">'
+        'aria-label="Rain cloud">'
         '<ellipse cx="500" cy="250" rx="160" ry="70"/></g></svg>'
     )
     client = _Client([_response(svg)])
@@ -328,7 +350,65 @@ async def test_explicit_interaction_goal_allows_only_goal_serving_bindings() -> 
     assert tuple(generation.document.bindings) == ("select_cloud",)
     instructions = client.responses.arguments[0]["instructions"]
     assert isinstance(instructions, str)
-    assert "implement only interactions that directly serve that goal" in instructions
+    assert "`select` uses 1-32 visible choices" in instructions
+
+
+@pytest.mark.parametrize(
+    ("requested_mode", "returned_mode", "goal"),
+    [
+        ("none", "select", None),
+        ("explore", "none", "Let the child explore the cloud."),
+        ("select", "explore", "Let the child select the cloud."),
+        ("steps", "select", "Let the child move through cloud stages."),
+    ],
+)
+async def test_requested_interaction_mode_must_match_validated_svg(
+    requested_mode: str,
+    returned_mode: str,
+    goal: str | None,
+) -> None:
+    client = _Client([_response(_svg(interaction_mode=returned_mode))])
+    provider = OpenAISvgCanvasSpecialist(
+        Settings(environment=AvaEnvironment.TEST, openai_canvas_max_quality_repairs=0),
+        session_id="session_mode_mismatch",
+        safety_identifier="ava_test_user_mode_mismatch",
+        client=client,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(SvgCanvasSpecialistInvalidError, match="interactionModeMismatch"):
+        await provider.generate(
+            _request(interactionMode=requested_mode, interactionGoal=goal)
+        )
+
+
+async def test_interaction_mode_mismatch_uses_existing_quality_repair() -> None:
+    client = _Client(
+        [
+            _response(_svg(interaction_mode="none"), request_id="resp_bad_mode"),
+            _response(
+                _svg(interaction_mode="explore"),
+                request_id="resp_repaired_mode",
+            ),
+        ]
+    )
+    provider = OpenAISvgCanvasSpecialist(
+        Settings(environment=AvaEnvironment.TEST, openai_canvas_max_quality_repairs=1),
+        session_id="session_mode_repair",
+        safety_identifier="ava_test_user_mode_repair",
+        client=client,  # type: ignore[arg-type]
+    )
+
+    generation = await provider.generate(
+        _request(
+            interactionMode="explore",
+            interactionGoal="Let the child explore the cloud.",
+        )
+    )
+
+    assert generation.document.interaction_mode == "explore"
+    assert len(client.responses.arguments) == 2
+    repair_input = client.responses.arguments[1]["input"]
+    assert "interactionModeMismatch" in str(repair_input)
 
 
 def test_exact_extractor_allows_reasoning_but_does_not_join_text() -> None:

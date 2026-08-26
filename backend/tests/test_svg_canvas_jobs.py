@@ -50,9 +50,10 @@ from ava_backend.realtime.tool_contract import (
 
 
 def _document():
-    svg = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600">
+    svg = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600"
+ data-ava-interaction-mode="select">
 <title>Cloud</title><desc>A rain cloud.</desc>
-<g id="cloud" data-ava-binding="select-cloud" data-ava-action="select"
+<g id="cloud" data-ava-binding="select-cloud"
  aria-label="Rain cloud"><ellipse cx="500" cy="220" rx="140" ry="60"/></g>
 </svg>"""
     return SvgDocumentValidator().validate(svg)
@@ -245,6 +246,7 @@ def _call(
             {
                 "operation": operation,
                 "brief": brief,
+                "interactionMode": "select",
                 "interactionGoal": "Let the child select the cloud.",
             }
         ),
@@ -397,8 +399,8 @@ async def _prepare_current_candidate(
                 "sceneRevision": candidate.revision,
                 "svgSha256": stored.document.svg_sha256,
                 "manifestSha256": stored.document.manifest_sha256,
-                "rendererCapabilityVersion": "ava-svg-renderer-v1",
-                "validatorVersion": "ava-svg-validator-v1",
+                "rendererCapabilityVersion": "ava-svg-renderer-v2",
+                "validatorVersion": "ava-svg-validator-v2",
             }
         )
     )
@@ -900,8 +902,8 @@ async def test_presentation_anchor_can_arrive_before_sol_document() -> None:
                 "sceneRevision": candidate.revision,
                 "svgSha256": stored.document.svg_sha256,
                 "manifestSha256": stored.document.manifest_sha256,
-                "rendererCapabilityVersion": "ava-svg-renderer-v1",
-                "validatorVersion": "ava-svg-validator-v1",
+                "rendererCapabilityVersion": "ava-svg-renderer-v2",
+                "validatorVersion": "ava-svg-validator-v2",
             }
         )
     )
@@ -981,8 +983,8 @@ async def test_prepare_ack_and_sample_cue_still_do_not_activate() -> None:
             "sceneRevision": candidate.revision,
             "svgSha256": stored.document.svg_sha256,
             "manifestSha256": stored.document.manifest_sha256,
-            "rendererCapabilityVersion": "ava-svg-renderer-v1",
-            "validatorVersion": "ava-svg-validator-v1",
+            "rendererCapabilityVersion": "ava-svg-renderer-v2",
+            "validatorVersion": "ava-svg-validator-v2",
         }
     )
     await coordinator.document_prepared(prepared)
@@ -1021,8 +1023,8 @@ async def test_first_frame_ack_activates_and_interactions_use_manifest() -> None
                 "sceneRevision": candidate.revision,
                 "svgSha256": stored.document.svg_sha256,
                 "manifestSha256": stored.document.manifest_sha256,
-                "rendererCapabilityVersion": "ava-svg-renderer-v1",
-                "validatorVersion": "ava-svg-validator-v1",
+                "rendererCapabilityVersion": "ava-svg-renderer-v2",
+                "validatorVersion": "ava-svg-validator-v2",
             }
         )
     )
@@ -1908,8 +1910,8 @@ async def test_revision_reuses_scene_identity_and_supplies_exact_active_svg() ->
                 "sceneRevision": first_candidate.revision,
                 "svgSha256": first_stored.document.svg_sha256,
                 "manifestSha256": first_stored.document.manifest_sha256,
-                "rendererCapabilityVersion": "ava-svg-renderer-v1",
-                "validatorVersion": "ava-svg-validator-v1",
+                "rendererCapabilityVersion": "ava-svg-renderer-v2",
+                "validatorVersion": "ava-svg-validator-v2",
             }
         )
     )
@@ -1996,8 +1998,8 @@ async def test_canvas_lifecycle_telemetry_preserves_generation_identity(
                     "sceneRevision": candidate.revision,
                     "svgSha256": stored.document.svg_sha256,
                     "manifestSha256": stored.document.manifest_sha256,
-                    "rendererCapabilityVersion": "ava-svg-renderer-v1",
-                    "validatorVersion": "ava-svg-validator-v1",
+                    "rendererCapabilityVersion": "ava-svg-renderer-v2",
+                    "validatorVersion": "ava-svg-validator-v2",
                 }
             )
         )

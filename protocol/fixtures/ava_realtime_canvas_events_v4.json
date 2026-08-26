@@ -11,13 +11,13 @@
     "sceneRevision": 1,
     "svgPath": "/v4/realtime/sessions/session-1234/canvas-documents/generation-1234/svg",
     "manifestPath": "/v4/realtime/sessions/session-1234/canvas-documents/generation-1234/manifest",
-    "svgSha256": "32972b9caf71c3cda6b6b3c7582558e4eaa4c9fe4428e1082ea9c33a4e768aca",
-    "manifestSha256": "b0870e34f26d7226659d2a3b806e16d4ae2292cdf257e8c08518b82dc1e08d20",
-    "svgByteLength": 384,
-    "manifestByteLength": 531,
-    "rendererCapabilityVersion": "ava-svg-renderer-v1",
-    "validatorVersion": "ava-svg-validator-v1",
-    "manifestVersion": "ava-svg-manifest-v1"
+    "svgSha256": "de5b2d4eefbfeaeb9e645080011eb1d7ee6d5fc4e266e831a607b29a75673d29",
+    "manifestSha256": "7edea9e743ba888a3ae9918addb1375ddd43b86a7bccaa820b9c59d08e678c3a",
+    "svgByteLength": 394,
+    "manifestByteLength": 464,
+    "rendererCapabilityVersion": "ava-svg-renderer-v2",
+    "validatorVersion": "ava-svg-validator-v2",
+    "manifestVersion": "ava-svg-manifest-v2"
   },
   {
     "protocolVersion": 4,
@@ -30,8 +30,8 @@
     "sceneId": "scene-1234",
     "sceneRevision": 1,
     "presentationSampleOffset": 4800,
-    "svgSha256": "32972b9caf71c3cda6b6b3c7582558e4eaa4c9fe4428e1082ea9c33a4e768aca",
-    "manifestSha256": "b0870e34f26d7226659d2a3b806e16d4ae2292cdf257e8c08518b82dc1e08d20"
+    "svgSha256": "de5b2d4eefbfeaeb9e645080011eb1d7ee6d5fc4e266e831a607b29a75673d29",
+    "manifestSha256": "7edea9e743ba888a3ae9918addb1375ddd43b86a7bccaa820b9c59d08e678c3a"
   },
   {
     "protocolVersion": 4,
@@ -44,8 +44,8 @@
     "sceneId": "scene-1234",
     "sceneRevision": 1,
     "firstRenderedSample": 4812,
-    "svgSha256": "32972b9caf71c3cda6b6b3c7582558e4eaa4c9fe4428e1082ea9c33a4e768aca",
-    "manifestSha256": "b0870e34f26d7226659d2a3b806e16d4ae2292cdf257e8c08518b82dc1e08d20"
+    "svgSha256": "de5b2d4eefbfeaeb9e645080011eb1d7ee6d5fc4e266e831a607b29a75673d29",
+    "manifestSha256": "7edea9e743ba888a3ae9918addb1375ddd43b86a7bccaa820b9c59d08e678c3a"
   },
   {
     "protocolVersion": 4,

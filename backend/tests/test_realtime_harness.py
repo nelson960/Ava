@@ -61,8 +61,8 @@ def test_v4_prompt_is_conversation_first_and_semantically_canvas_aware() -> None
     instructions = render_stable_instructions()
     normalized = " ".join(instructions.split())
 
-    assert REALTIME_PROMPT_VERSION == "ava-realtime-v4.3"
-    assert REALTIME_TOOL_CONTRACT_VERSION == "ava-realtime-tools-v4.2"
+    assert REALTIME_PROMPT_VERSION == "ava-realtime-v4.4"
+    assert REALTIME_TOOL_CONTRACT_VERSION == "ava-realtime-tools-v4.3"
     assert {layer.name for layer in PROMPT_LAYERS} == {
         "identity_and_personality",
         "natural_conversation",
@@ -104,10 +104,11 @@ def test_harness_exposes_one_optional_bounded_canvas_tool() -> None:
     parameters = tool["parameters"]
     assert parameters["type"] == "object"
     assert parameters["additionalProperties"] is False
-    assert parameters["required"] == ["operation", "brief"]
+    assert parameters["required"] == ["operation", "brief", "interactionMode"]
     assert set(parameters["properties"]) == {
         "operation",
         "brief",
+        "interactionMode",
         "interactionGoal",
     }
     operation_schema = parameters["$defs"]["InteractiveCanvasOperation"]
@@ -146,6 +147,7 @@ def test_tool_operation_allows_only_exact_enum(operation: str) -> None:
         {
             "operation": operation,
             "brief": "Show a clear water cycle.",
+            "interactionMode": "none",
         }
     )
 
@@ -164,6 +166,49 @@ def test_tool_operation_allows_only_exact_enum(operation: str) -> None:
     ],
 )
 def test_tool_operation_is_required_and_strict(payload: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        InteractiveCanvasRequest.model_validate(payload)
+
+
+@pytest.mark.parametrize("interaction_mode", ["none", "explore", "select", "steps"])
+def test_interaction_mode_is_required_and_exact(interaction_mode: str) -> None:
+    payload: dict[str, object] = {
+        "operation": "new",
+        "brief": "Show a clear water cycle.",
+        "interactionMode": interaction_mode,
+    }
+    if interaction_mode != "none":
+        payload["interactionGoal"] = "Let the child use the visual meaningfully."
+
+    request = InteractiveCanvasRequest.model_validate(payload)
+
+    assert request.interaction_mode == interaction_mode
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"operation": "new", "brief": "Show a clear water cycle."},
+        {
+            "operation": "new",
+            "brief": "Show a clear water cycle.",
+            "interactionMode": "none",
+            "interactionGoal": "Let the child tap the cloud.",
+        },
+        {
+            "operation": "new",
+            "brief": "Show a clear water cycle.",
+            "interactionMode": "explore",
+        },
+        {
+            "operation": "new",
+            "brief": "Show a clear water cycle.",
+            "interactionMode": "reveal",
+            "interactionGoal": "Reveal the cloud.",
+        },
+    ],
+)
+def test_interaction_mode_and_goal_are_atomic(payload: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         InteractiveCanvasRequest.model_validate(payload)
 

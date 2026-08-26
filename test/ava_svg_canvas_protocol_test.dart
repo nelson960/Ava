@@ -6,7 +6,7 @@ import 'package:ava/models/ava_svg_canvas_protocol.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 const _manifestJson =
-    '{"background":"#dff5ff","bindings":[{"accessibilityLabel":"Rain cloud","action":"select","bindingId":"select-cloud","elementId":"cloud","exclusive":false,"hitTest":"element","pulseIds":[],"revealIds":[],"serverReportable":true,"targetId":"cloud"}],"description":"A cloud turns water vapour into rain.","manifestVersion":"ava-svg-manifest-v1","rendererCapabilityVersion":"ava-svg-renderer-v1","sourceTrust":"modelGeneratedData","title":"Café cloud ☁️","validatorVersion":"ava-svg-validator-v1","viewBox":[0.0,0.0,1000.0,600.0]}';
+    '{"background":"#dff5ff","bindings":[{"accessibilityLabel":"Rain cloud","bindingId":"select-cloud","elementId":"cloud","revealIds":[],"targetId":"cloud"}],"description":"A cloud turns water vapour into rain.","interactionMode":"select","manifestVersion":"ava-svg-manifest-v2","rendererCapabilityVersion":"ava-svg-renderer-v2","sourceTrust":"modelGeneratedData","title":"Café cloud ☁️","validatorVersion":"ava-svg-validator-v2","viewBox":[0.0,0.0,1000.0,600.0]}';
 
 void main() {
   late Map<String, Object?> descriptorJson;
@@ -40,10 +40,8 @@ void main() {
     expect(document.svgText.endsWith('</svg>\n'), isTrue);
     expect(document.manifest.title, 'Café cloud ☁️');
     expect(document.manifest.bindings.entries.single.key, 'select-cloud');
-    expect(
-      document.manifest.bindings['select-cloud']!.serverReportable,
-      isTrue,
-    );
+    expect(document.manifest.interactionMode, AvaSvgInteractionMode.select);
+    expect(document.manifest.bindings['select-cloud']!.stepIndex, isNull);
   });
 
   test('one changed SVG byte fails content identity', () {
@@ -78,12 +76,12 @@ void main() {
     );
   });
 
-  test('manifest server-reportable flag is derived, never trusted', () {
+  test('legacy generic binding metadata is rejected', () {
     final manifest = (jsonDecode(_manifestJson) as Map).cast<String, Object?>();
     final bindings = manifest['bindings']! as List;
     final binding = Map<String, Object?>.of(
       (bindings.single as Map).cast<String, Object?>(),
-    )..['serverReportable'] = false;
+    )..['action'] = 'select';
     manifest['bindings'] = [binding];
     final invalidManifestBytes = Uint8List.fromList(
       utf8.encode(jsonEncode(manifest)),
@@ -95,6 +93,96 @@ void main() {
       // assertion for the semantic trust boundary.
     });
     expect(descriptor.manifestByteLength, invalidManifestBytes.length);
+
+    expect(
+      () => AvaSvgCanvasManifest.fromJson(manifest),
+      throwsFormatException,
+    );
+  });
+
+  test('none mode requires an empty binding set', () {
+    final manifest = (jsonDecode(_manifestJson) as Map).cast<String, Object?>()
+      ..['interactionMode'] = 'none'
+      ..['bindings'] = <Object?>[];
+
+    final parsed = AvaSvgCanvasManifest.fromJson(manifest);
+
+    expect(parsed.interactionMode, AvaSvgInteractionMode.none);
+    expect(parsed.bindings, isEmpty);
+  });
+
+  test('explore mode accepts deterministic reveal targets', () {
+    final manifest = (jsonDecode(_manifestJson) as Map).cast<String, Object?>()
+      ..['interactionMode'] = 'explore'
+      ..['bindings'] = [
+        {
+          'accessibilityLabel': 'Explore the cloud',
+          'bindingId': 'explore-cloud',
+          'elementId': 'cloud',
+          'revealIds': ['rain-detail'],
+          'targetId': 'cloud',
+        },
+      ];
+
+    final parsed = AvaSvgCanvasManifest.fromJson(manifest);
+
+    expect(parsed.interactionMode, AvaSvgInteractionMode.explore);
+    expect(parsed.bindings['explore-cloud']!.revealIds, ['rain-detail']);
+  });
+
+  test('select mode rejects reveal metadata', () {
+    final manifest = (jsonDecode(_manifestJson) as Map).cast<String, Object?>();
+    final binding = Map<String, Object?>.of(
+      ((manifest['bindings']! as List).single as Map).cast<String, Object?>(),
+    )..['revealIds'] = ['rain-detail'];
+    manifest['bindings'] = [binding];
+
+    expect(
+      () => AvaSvgCanvasManifest.fromJson(manifest),
+      throwsFormatException,
+    );
+  });
+
+  test('steps mode requires two or more contiguous unique indexes', () {
+    final manifest = (jsonDecode(_manifestJson) as Map).cast<String, Object?>()
+      ..['interactionMode'] = 'steps'
+      ..['bindings'] = [
+        {
+          'accessibilityLabel': 'Egg stage',
+          'bindingId': 'step-egg',
+          'elementId': 'egg',
+          'revealIds': <Object?>[],
+          'stepIndex': 1,
+          'targetId': 'egg',
+        },
+        {
+          'accessibilityLabel': 'Caterpillar stage',
+          'bindingId': 'step-caterpillar',
+          'elementId': 'caterpillar',
+          'revealIds': <Object?>[],
+          'stepIndex': 2,
+          'targetId': 'caterpillar',
+        },
+      ];
+
+    final parsed = AvaSvgCanvasManifest.fromJson(manifest);
+
+    expect(parsed.interactionMode, AvaSvgInteractionMode.steps);
+    expect(parsed.bindings['step-caterpillar']!.stepIndex, 2);
+
+    final skipped =
+        (jsonDecode(jsonEncode(manifest)) as Map).cast<String, Object?>();
+    final skippedBindings = skipped['bindings']! as List;
+    (skippedBindings[1] as Map)['stepIndex'] = 3;
+    expect(
+      () => AvaSvgCanvasManifest.fromJson(skipped),
+      throwsFormatException,
+    );
+  });
+
+  test('unknown interaction mode is rejected without fallback', () {
+    final manifest = (jsonDecode(_manifestJson) as Map).cast<String, Object?>()
+      ..['interactionMode'] = 'interactive';
 
     expect(
       () => AvaSvgCanvasManifest.fromJson(manifest),

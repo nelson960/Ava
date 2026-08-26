@@ -206,6 +206,7 @@ class SvgCanvasJobCoordinator:
                         "generationId": generation_id,
                         "sourceTurnId": source_turn_id,
                         "brief": call.request.brief,
+                        "interactionMode": call.request.interaction_mode,
                         "interactionGoal": call.request.interaction_goal,
                         "ageBand": self._age_band,
                         "currentSceneId": active.scene_id if active else None,

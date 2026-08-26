@@ -268,6 +268,8 @@ class _OpenAIRealtimeEventChannel:
         self._closed = False
         self._active_turn_id: str | None = None
         self._active_response_id: str | None = None
+        self._awaiting_response_trigger_turn_id: str | None = None
+        self._interaction_response_turn_id: str | None = None
         self._response_owner_by_id: dict[str, str | None] = {}
         self._late_cancel_error_expected = False
         self._prepared_session_update: str | None = None
@@ -429,6 +431,8 @@ class _OpenAIRealtimeEventChannel:
             self._index_input_lifecycle(event)
         response_id = _response_id_from_event(event)
         if response_id is not None and event_type.startswith("response."):
+            if event_type == "response.created":
+                self._awaiting_response_trigger_turn_id = None
             if response_id not in self._response_owner_by_id:
                 # The session receiver observes provider identity before a
                 # turn consumer necessarily reaches the event. Keep the
@@ -443,6 +447,11 @@ class _OpenAIRealtimeEventChannel:
         if event_type == "input_audio_buffer.speech_stopped" and item_id_value is None:
             return
         item_id = _required_string(event, "item_id")
+        if event_type in {
+            "input_audio_buffer.speech_started",
+            "input_audio_buffer.committed",
+        }:
+            self._awaiting_response_trigger_turn_id = None
         if (
             event_type in _INPUT_TRANSCRIPTION_PROGRESS_EVENT_TYPES
             or event_type
@@ -538,6 +547,8 @@ class _OpenAIRealtimeEventChannel:
 
         self._active_turn_id = turn_id
         self._active_response_id = None
+        self._awaiting_response_trigger_turn_id = turn_id
+        self._interaction_response_turn_id = None
         self.last_usage = None
         self.last_response_id = None
         self.last_first_delta_ms = None
@@ -595,6 +606,7 @@ class _OpenAIRealtimeEventChannel:
             if response_completed:
                 self._active_turn_id = None
                 self._active_response_id = None
+                self._awaiting_response_trigger_turn_id = None
 
     async def complete_canvas_tool(
         self,
@@ -649,6 +661,48 @@ class _OpenAIRealtimeEventChannel:
         self._completed_canvas_call_ids.add(call_id)
         self._pending_canvas_call_id = None
 
+    async def request_canvas_interaction_response(self, *, turn_id: str) -> bool:
+        if not turn_id.strip():
+            raise ValueError("turn_id cannot be empty")
+        if (
+            self._closed
+            or self._active_turn_id != turn_id
+            or self._awaiting_response_trigger_turn_id != turn_id
+            or self._active_response_id is not None
+            or self._pending_canvas_call_id is not None
+            or any(owner is None for owner in self._input_item_turn_ids.values())
+            or any(owner == turn_id for owner in self._input_item_turn_ids.values())
+            or any(owner is None for owner in self._response_owner_by_id.values())
+        ):
+            return False
+        self._awaiting_response_trigger_turn_id = None
+        self._interaction_response_turn_id = turn_id
+        await self._send_json(
+            {
+                "type": "response.create",
+                "response": {
+                    "output_modalities": ["text"],
+                    "tool_choice": "none",
+                    "max_output_tokens": self._max_output_tokens,
+                    "instructions": (
+                        "Respond naturally to the latest validated canvas "
+                        "interaction in the installed canvas context. Keep it "
+                        "brief and use plain speakable text with no Markdown. "
+                        "Do not call tools or mention implementation."
+                    ),
+                },
+            }
+        )
+        _log_response_diagnostic(
+            "openai_realtime_canvas_interaction_response_requested",
+            event_type="response.create",
+            consumer_turn_id=turn_id,
+            consumer_phase="canvasInteraction",
+            active_turn_id=self._active_turn_id,
+            active_response_id=self._active_response_id,
+        )
+        return True
+
     async def prepare(self, *, harness: RealtimeHarness) -> None:
         """Prepare the sideband before Flutter is told to unmute the mic."""
 
@@ -702,6 +756,8 @@ class _OpenAIRealtimeEventChannel:
             raise ValueError("turn_id cannot be empty")
         if turn_id in self._cancelled_turn_ids:
             return
+        if self._awaiting_response_trigger_turn_id == turn_id:
+            self._awaiting_response_trigger_turn_id = None
         cancelled_pending_canvas = (
             not self._closed
             and self._active_turn_id == turn_id
@@ -742,12 +798,22 @@ class _OpenAIRealtimeEventChannel:
     async def _cancel_and_drain_active_response(self) -> None:
         """Restore the persistent socket to an exact response boundary."""
 
+        cancelled_turn_id = self._active_turn_id
+        if cancelled_turn_id is None:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI cancellation requires an active Ava turn"
+            )
         response_id = self._active_response_id
         cancel_not_active_received = False
+        cancel_not_active_before_response_created = False
+        pending_interaction_create = (
+            response_id is None
+            and self._interaction_response_turn_id == cancelled_turn_id
+        )
         if response_id is not None:
             self._admit_response(
                 response_id=response_id,
-                turn_id=self._active_turn_id or "",
+                turn_id=cancelled_turn_id,
             )
         await self._send_json({"type": "response.cancel"})
         deferred_events: list[dict[str, object]] = []
@@ -777,6 +843,19 @@ class _OpenAIRealtimeEventChannel:
                         # in-transit response.done, but it cannot transfer or
                         # settle that response's ownership boundary.
                         continue
+                    if pending_interaction_create:
+                        cancel_not_active_received = True
+                        cancel_not_active_before_response_created = True
+                        _log_response_diagnostic(
+                            "openai_realtime_cancel_not_active_pending_create",
+                            event=event,
+                            response_owner_turn_id=cancelled_turn_id,
+                            consumer_turn_id=cancelled_turn_id,
+                            consumer_phase="cancellation",
+                            active_turn_id=self._active_turn_id,
+                            active_response_id=self._active_response_id,
+                        )
+                        continue
                     LOGGER.info(
                         "openai_realtime_cancel_already_settled turn_id=%s "
                         "response_id=%s",
@@ -797,9 +876,13 @@ class _OpenAIRealtimeEventChannel:
                 response_id = candidate
                 self._admit_response(
                     response_id=candidate,
-                    turn_id=self._active_turn_id or "",
+                    turn_id=cancelled_turn_id,
                 )
                 self._active_response_id = candidate
+                pending_interaction_create = False
+                if cancel_not_active_before_response_created:
+                    await self._send_json({"type": "response.cancel"})
+                    cancel_not_active_received = False
                 continue
             if event_type == "response.done":
                 completed_response_id = _nested_string(event, "response", "id")
@@ -812,7 +895,7 @@ class _OpenAIRealtimeEventChannel:
                         "OpenAI completed response without a response ID"
                     )
                 owner = self._response_owner_by_id.get(completed_response_id)
-                if owner != self._active_turn_id:
+                if owner != cancelled_turn_id:
                     raise OpenAIRealtimeProtocolError(
                         "OpenAI completed response belongs to a different Ava turn"
                     )
@@ -836,6 +919,8 @@ class _OpenAIRealtimeEventChannel:
                 self._late_cancel_error_expected = (
                     status == "completed" and not cancel_not_active_received
                 )
+                if self._interaction_response_turn_id == cancelled_turn_id:
+                    self._interaction_response_turn_id = None
                 self._active_response_id = None
                 self._active_turn_id = None
                 return
@@ -1209,6 +1294,8 @@ class _OpenAIRealtimeEventChannel:
         if self._closed:
             return
         self._closed = True
+        self._awaiting_response_trigger_turn_id = None
+        self._interaction_response_turn_id = None
         try:
             await self._socket.close(code=1000, reason="Ava session closed")
         finally:
@@ -1302,6 +1389,7 @@ class _OpenAIRealtimeEventChannel:
                     continue
 
                 if event_type == "response.created":
+                    self._awaiting_response_trigger_turn_id = None
                     if not response_expected:
                         trigger_started = monotonic()
                     response_expected = True
@@ -1339,6 +1427,10 @@ class _OpenAIRealtimeEventChannel:
                     item = _mapping(event.get("item"), "response output item")
                     if item.get("type") != "function_call":
                         continue
+                    if self._interaction_response_turn_id == turn_id:
+                        raise OpenAIRealtimeProtocolError(
+                            "OpenAI canvas interaction response attempted a tool call"
+                        )
                     function_item_count += 1
                     if function_item_count > 1 or continuation or canvas_called:
                         raise OpenAIRealtimeProtocolError(
@@ -1353,6 +1445,10 @@ class _OpenAIRealtimeEventChannel:
                     continue
 
                 if event_type == "response.function_call_arguments.delta":
+                    if self._interaction_response_turn_id == turn_id:
+                        raise OpenAIRealtimeProtocolError(
+                            "OpenAI canvas interaction response attempted a tool call"
+                        )
                     delta = _required_string(event, "delta", allow_empty=True)
                     candidate_call_id = _required_string(event, "call_id")
                     candidate_response_id = _required_string(event, "response_id")
@@ -1382,6 +1478,10 @@ class _OpenAIRealtimeEventChannel:
                     continue
 
                 if event_type == "response.function_call_arguments.done":
+                    if self._interaction_response_turn_id == turn_id:
+                        raise OpenAIRealtimeProtocolError(
+                            "OpenAI canvas interaction response attempted a tool call"
+                        )
                     candidate_name = _required_string(event, "name")
                     candidate_call_id = _required_string(event, "call_id")
                     candidate_response_id = _required_string(event, "response_id")
@@ -1429,6 +1529,10 @@ class _OpenAIRealtimeEventChannel:
                             "OpenAI response contains multiple function calls"
                         )
                     if function_items:
+                        if self._interaction_response_turn_id == turn_id:
+                            raise OpenAIRealtimeProtocolError(
+                                "OpenAI canvas interaction response attempted a tool call"
+                            )
                         if continuation or canvas_called:
                             raise OpenAIRealtimeProtocolError(
                                 "OpenAI continuation attempted another canvas call"
@@ -1531,6 +1635,8 @@ class _OpenAIRealtimeEventChannel:
                     self.last_response_id = completed_response_id
                     self.last_usage = accumulated_usage
                     self.last_completed_ms = (monotonic() - trigger_started) * 1000
+                    if self._interaction_response_turn_id == turn_id:
+                        self._interaction_response_turn_id = None
                     return
 
                 if event_type in _RESPONSE_TRIGGER_EVENT_TYPES:
@@ -1838,6 +1944,11 @@ class OpenAIRealtimeProviderSession:
             turn_id=turn_id,
             call_id=call_id,
             output=output,
+        )
+
+    async def request_canvas_interaction_response(self, *, turn_id: str) -> bool:
+        return await self._require_channel().request_canvas_interaction_response(
+            turn_id=turn_id
         )
 
     async def child_transcript(self, *, turn_id: str) -> str | None:

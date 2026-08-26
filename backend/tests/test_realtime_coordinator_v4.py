@@ -124,8 +124,8 @@ async def test_v4_coordinator_runs_exact_svg_lifecycle_without_pcm_interleaving(
             0,
             {
                 "event": "clientReady",
-                "rendererCapabilityVersion": "ava-svg-renderer-v1",
-                "validatorVersion": "ava-svg-validator-v1",
+                "rendererCapabilityVersion": "ava-svg-renderer-v2",
+                "validatorVersion": "ava-svg-validator-v2",
             },
         )
     )

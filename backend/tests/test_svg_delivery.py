@@ -15,7 +15,8 @@ from ava_backend.canvas.svg_specialist import SvgCanvasSpecialistGeneration
 
 def _candidate(generation_id: str = "generation-1"):
     svg = (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600">'
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" '
+        'data-ava-interaction-mode="none">'
         "<title>Exact cloud</title><desc>A cloud.</desc>"
         '<ellipse cx="500" cy="250" rx="120" ry="60" fill="#fff"/>'
         "</svg>\n"
@@ -66,7 +67,8 @@ async def test_generation_id_reuse_with_different_document_fails_loudly() -> Non
     first = _candidate()
     second_state = SvgCanvasSessionState()
     second_svg = (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600">'
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" '
+        'data-ava-interaction-mode="none">'
         "<title>Different</title><desc>A different cloud.</desc>"
         '<circle cx="500" cy="250" r="80"/>'
         "</svg>"

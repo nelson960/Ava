@@ -36,7 +36,6 @@ class SvgCanvasStateErrorCode(StrEnum):
     SCENE_REVISION_MISMATCH = "sceneRevisionMismatch"
     INTERACTION_REVISION_STALE = "interactionRevisionStale"
     BINDING_UNKNOWN = "bindingUnknown"
-    BINDING_LOCAL_ONLY = "bindingLocalOnly"
 
 
 class SvgCanvasStateError(ValueError):
@@ -371,11 +370,6 @@ class SvgCanvasSessionState:
                 SvgCanvasStateErrorCode.BINDING_UNKNOWN,
                 f'canvas binding "{binding_id}" does not exist',
             )
-        if not binding.is_server_reportable:
-            self._fail(
-                SvgCanvasStateErrorCode.BINDING_LOCAL_ONLY,
-                f'canvas binding "{binding_id}" is local-only and must not be sent',
-            )
         recorded = _recorded_interaction(
             active,
             binding,
@@ -393,16 +387,22 @@ class SvgCanvasSessionState:
         interaction = self.last_interaction
         interaction_xml = ""
         if interaction is not None:
+            step_attribute = (
+                f' step_index="{interaction.step_index}"'
+                if interaction.step_index is not None
+                else ""
+            )
             interaction_xml = (
-                "<last_interaction>"
-                f"<action>{escape(interaction.action)}</action>"
+                f'<last_interaction mode="{escape(interaction.interaction_mode)}"'
+                f"{step_attribute}>"
                 f"<target>{escape(interaction.accessibility_label)}</target>"
                 "</last_interaction>"
             )
         prefix = (
             '<canvas_context trust="untrusted_model_generated_data" '
             f'scene_id="{escape(active.scene_id)}" revision="{active.revision}" '
-            f'svg_sha256="{active.document.svg_sha256}">'
+            f'svg_sha256="{active.document.svg_sha256}" '
+            f'interaction_mode="{escape(active.document.interaction_mode.value)}">'
             f"<title>{escape(active.document.title)}</title>"
             f"<description>{escape(active.document.description)}</description>"
             f"{interaction_xml}"
@@ -417,13 +417,12 @@ class SvgCanvasSessionState:
             for label in active.document.named_objects
         )
         semantic_items.extend(
-            f'<item kind="interaction" action="{escape(binding.action)}">'
+            f'<item kind="interaction" mode="{escape(active.document.interaction_mode.value)}">'
             f"{escape(binding.accessibility_label)}</item>"
             for binding in sorted(
                 active.document.bindings.values(),
                 key=lambda item: item.binding_id,
             )
-            if binding.is_server_reportable
         )
         selected: list[str] = []
         for item in semantic_items:
@@ -485,8 +484,8 @@ def _recorded_interaction(
         svg_sha256=active.document.svg_sha256,
         manifest_sha256=active.document.manifest_sha256,
         binding_id=binding.binding_id,
-        action=binding.action,
+        interaction_mode=active.document.interaction_mode.value,
         target_id=binding.target_id,
         accessibility_label=binding.accessibility_label,
-        declared_value=binding.declared_value,
+        step_index=binding.step_index,
     )

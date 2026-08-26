@@ -358,9 +358,39 @@ class DeterministicRealtimeSessionCoordinator:
             await self._refresh_canvas_context()
             return
         if isinstance(event, CanvasInteractionEventV4):
+            interaction_turn_id = self._turn_id
             interaction = await self._canvas_jobs.interaction(event)
             if interaction is not None:
                 await self._refresh_canvas_context()
+                if self._turn_id != interaction_turn_id or self._terminal:
+                    LOGGER.info(
+                        "canvas_interaction_response_suppressed_after_turn_advance "
+                        "session_id=%s interaction_turn_id=%s current_turn_id=%s "
+                        "current_turn_terminal=%s scene_id=%s scene_revision=%s "
+                        "interaction_revision=%s",
+                        self._session_id,
+                        interaction_turn_id,
+                        self._turn_id,
+                        self._terminal,
+                        interaction.scene_id,
+                        interaction.scene_revision,
+                        interaction.interaction_revision,
+                    )
+                    return
+                triggered = await self._realtime.request_canvas_interaction_response(
+                    turn_id=interaction_turn_id
+                )
+                LOGGER.info(
+                    "canvas_interaction_response_decided session_id=%s turn_id=%s "
+                    "scene_id=%s scene_revision=%s interaction_revision=%s "
+                    "triggered=%s",
+                    self._session_id,
+                    interaction_turn_id,
+                    interaction.scene_id,
+                    interaction.scene_revision,
+                    interaction.interaction_revision,
+                    triggered,
+                )
             return
 
         if self._is_late_terminal_playback_control(event):
@@ -1150,9 +1180,8 @@ class DeterministicRealtimeSessionCoordinator:
     async def _refresh_canvas_context(self) -> None:
         """Install canonical semantic canvas context for the next response.
 
-        This is a session update only. It never starts a model response and it
-        is called only for server-resolved explore/select/submitOutcome
-        bindings.
+        This is a session update only. The validated-interaction caller may
+        separately request one idle response after the update is installed.
         """
 
         async with self._canvas_context_lock:

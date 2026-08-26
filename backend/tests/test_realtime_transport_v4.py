@@ -118,7 +118,7 @@ def test_v4_bootstrap_and_independent_exact_document_fetch() -> None:
         assert bootstrap["protocolVersion"] == 4
         assert bootstrap["canvasToken"]
         assert bootstrap["canvasDocumentBaseUrl"].endswith("/canvas-documents")
-        assert bootstrap["rendererCapabilityVersion"] == "ava-svg-renderer-v1"
+        assert bootstrap["rendererCapabilityVersion"] == "ava-svg-renderer-v2"
 
         negotiated = client.post(
             f"/v4/realtime/sessions/{bootstrap['sessionId']}/webrtc",
@@ -133,7 +133,8 @@ def test_v4_bootstrap_and_independent_exact_document_fetch() -> None:
         assert negotiated.text == DETERMINISTIC_AUDIO_ANSWER_SDP
 
         svg = (
-            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600">'
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" '
+            'data-ava-interaction-mode="none">'
             "<title>Exact cloud</title><desc>A cloud.</desc>"
             '<ellipse cx="500" cy="250" rx="120" ry="60"/>'
             "</svg>\n"

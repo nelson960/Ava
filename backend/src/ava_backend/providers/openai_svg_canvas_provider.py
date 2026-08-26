@@ -237,6 +237,11 @@ class OpenAISvgCanvasSpecialist:
                             "Responses text deltas do not match terminal output text",
                         )
                     document = self._validator.validate(svg_text)
+                    if document.interaction_mode.value != request.interaction_mode:
+                        raise SvgDocumentValidationError(
+                            "interactionModeMismatch",
+                            "validated SVG interaction mode does not match the request",
+                        )
                 except _ResponseShapeError as error:
                     self._log(
                         "validationCompleted",

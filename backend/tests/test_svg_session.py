@@ -17,14 +17,15 @@ from ava_backend.canvas.svg_workspace import SvgCanvasWorkspace
 def _generation(
     generation_id: str = "generation_1",
 ) -> SvgCanvasSpecialistGeneration:
-    svg = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600">
+    svg = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600"
+ data-ava-interaction-mode="explore">
 <title>Cloud &amp; rain</title>
 <desc>A cloud &lt;gently&gt; releases rain.</desc>
-<g id="cloud" data-ava-binding="select_cloud" data-ava-action="select"
+<g id="cloud" data-ava-binding="select_cloud"
    data-ava-target="cloud" aria-label="Rain cloud">
   <ellipse cx="500" cy="220" rx="140" ry="60" fill="#dff5ff"/>
 </g>
-<g id="rain" data-ava-binding="show_rain" data-ava-action="reveal"
+<g id="rain" data-ava-binding="show_rain"
    data-ava-target="rain" aria-label="Show the rain">
   <path d="M450 300 L430 360 M500 300 L480 360" stroke="#358acb"/>
 </g>
@@ -174,7 +175,7 @@ def test_hash_mismatch_never_prepares_or_activates_document() -> None:
     assert state.active is None
 
 
-def test_only_declared_server_binding_can_cross_control_channel() -> None:
+def test_only_declared_binding_can_cross_control_channel() -> None:
     state = SvgCanvasSessionState()
     generation = _generation()
     _prepare_and_schedule(state, generation)
@@ -196,6 +197,8 @@ def test_only_declared_server_binding_can_cross_control_channel() -> None:
 
     assert recorded.target_id == "cloud"
     assert recorded.accessibility_label == "Rain cloud"
+    assert recorded.interaction_mode == "explore"
+    assert recorded.step_index is None
     with pytest.raises(SvgCanvasStateError) as raised:
         state.record_interaction(
             scene_id=active.scene_id,
@@ -203,9 +206,9 @@ def test_only_declared_server_binding_can_cross_control_channel() -> None:
             interaction_revision=2,
             svg_sha256=generation.document.svg_sha256,
             manifest_sha256=generation.document.manifest_sha256,
-            binding_id="show_rain",
+            binding_id="missing_binding",
         )
-    assert raised.value.code is SvgCanvasStateErrorCode.BINDING_LOCAL_ONLY
+    assert raised.value.code is SvgCanvasStateErrorCode.BINDING_UNKNOWN
 
 
 def test_realtime_context_is_escaped_and_explicitly_untrusted() -> None:
@@ -233,6 +236,46 @@ def test_realtime_context_is_escaped_and_explicitly_untrusted() -> None:
     assert "Cloud &amp; rain" in context
     assert "&lt;gently&gt;" in context
     assert "<target>Rain cloud</target>" in context
+
+
+def test_steps_interaction_records_typed_step_and_preserves_scene_identity() -> None:
+    svg = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600"
+ data-ava-interaction-mode="steps">
+<title>Butterfly life cycle</title><desc>Two ordered life-cycle stages.</desc>
+<g id="egg" data-ava-binding="egg" data-ava-step="1" aria-label="Egg stage"/>
+<g id="caterpillar" data-ava-binding="caterpillar" data-ava-step="2"
+ aria-label="Caterpillar stage"/>
+</svg>"""
+    generation = SvgCanvasSpecialistGeneration(
+        generation_id="generation_steps",
+        document=SvgDocumentValidator().validate(svg),
+    )
+    state = SvgCanvasSessionState()
+    _prepare_and_schedule(state, generation)
+    active = state.mark_presented(
+        generation_id=generation.generation_id,
+        svg_sha256=generation.document.svg_sha256,
+        manifest_sha256=generation.document.manifest_sha256,
+        first_rendered_sample=4_800,
+    )
+    before = (state.workspace.scene_count, active.scene_id, active.revision)
+
+    recorded = state.record_interaction(
+        scene_id=active.scene_id,
+        scene_revision=active.revision,
+        interaction_revision=1,
+        svg_sha256=generation.document.svg_sha256,
+        manifest_sha256=generation.document.manifest_sha256,
+        binding_id="caterpillar",
+    )
+
+    assert recorded.interaction_mode == "steps"
+    assert recorded.step_index == 2
+    assert (state.workspace.scene_count, state.active.scene_id, state.active.revision) == before
+    context = state.render_realtime_context()
+    assert 'interaction_mode="steps"' in context
+    assert '<last_interaction mode="steps" step_index="2">' in context
+    assert "Caterpillar stage" in context
 
 
 def test_presented_diagram_context_includes_important_visible_labels() -> None:
@@ -276,8 +319,7 @@ def test_reportable_interaction_enters_realtime_canvas_context() -> None:
 
     context = state.render_realtime_context()
 
-    assert "<last_interaction>" in context
-    assert "<action>select</action>" in context
+    assert '<last_interaction mode="explore">' in context
     assert "<target>Rain cloud</target>" in context
 
 

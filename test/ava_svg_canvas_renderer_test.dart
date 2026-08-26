@@ -7,7 +7,7 @@ import 'package:ava/models/ava_svg_canvas_protocol.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 const _manifestJson =
-    '{"background":"#dff5ff","bindings":[{"accessibilityLabel":"Rain cloud","action":"select","bindingId":"select-cloud","elementId":"cloud","exclusive":false,"hitTest":"element","pulseIds":[],"revealIds":[],"serverReportable":true,"targetId":"cloud"}],"description":"A cloud turns water vapour into rain.","manifestVersion":"ava-svg-manifest-v1","rendererCapabilityVersion":"ava-svg-renderer-v1","sourceTrust":"modelGeneratedData","title":"Café cloud ☁️","validatorVersion":"ava-svg-validator-v1","viewBox":[0.0,0.0,1000.0,600.0]}';
+    '{"background":"#dff5ff","bindings":[{"accessibilityLabel":"Rain cloud","bindingId":"select-cloud","elementId":"cloud","revealIds":[],"targetId":"cloud"}],"description":"A cloud turns water vapour into rain.","interactionMode":"select","manifestVersion":"ava-svg-manifest-v2","rendererCapabilityVersion":"ava-svg-renderer-v2","sourceTrust":"modelGeneratedData","title":"Café cloud ☁️","validatorVersion":"ava-svg-validator-v2","viewBox":[0.0,0.0,1000.0,600.0]}';
 
 void main() {
   late AvaValidatedSvgCanvasDocument document;
@@ -64,6 +64,57 @@ void main() {
       contains("bridge('binding_handler', {bindingId: binding.bindingId})"),
     );
     expect(html, isNot(contains('{bindingId: binding.bindingId, label:')));
+  });
+
+  test('typed runtime has persistent explore and select state', () {
+    final html = const AvaSvgCanvasHtmlRenderer().build(
+      document: document,
+      preparedHandler: 'prepared_handler',
+      presentedHandler: 'presented_handler',
+      bindingHandler: 'binding_handler',
+      errorHandler: 'error_handler',
+    );
+
+    expect(html, contains('let selectedBindingId = null'));
+    expect(html, contains("interactionMode === 'explore'"));
+    expect(html, contains('previous.binding.revealIds'));
+    expect(html, contains('selectedBindingId = binding.bindingId'));
+    expect(html, contains("classList.add('ava-selected')"));
+    expect(html, contains('new ResizeObserver(queueRebuild)'));
+  });
+
+  test('steps use renderer-owned controls and do not report initial state', () {
+    final html = const AvaSvgCanvasHtmlRenderer().build(
+      document: document,
+      preparedHandler: 'prepared_handler',
+      presentedHandler: 'presented_handler',
+      bindingHandler: 'binding_handler',
+      errorHandler: 'error_handler',
+    );
+
+    expect(html, contains("back.textContent = 'Back'"));
+    expect(html, contains("next.textContent = 'Next'"));
+    expect(html, contains("currentStep + ' / ' + stepBindings.length"));
+    expect(html, contains('applyStep(currentStep + 1, true)'));
+    expect(html, contains('applyStep(currentStep - 1, true)'));
+    expect(html, contains("applyStep(1, false)"));
+    expect(html, contains("if (interactionMode !== 'steps')"));
+  });
+
+  test('legacy generic action runtime is absent', () {
+    final html = const AvaSvgCanvasHtmlRenderer().build(
+      document: document,
+      preparedHandler: 'prepared_handler',
+      presentedHandler: 'presented_handler',
+      bindingHandler: 'binding_handler',
+      errorHandler: 'error_handler',
+    );
+
+    expect(html, isNot(contains('binding.action')));
+    expect(html, isNot(contains('binding.pulse')));
+    expect(html, isNot(contains('binding.exclusive')));
+    expect(html, isNot(contains('binding.serverReportable')));
+    expect(html, isNot(contains('binding.declaredValue')));
   });
 
   test('bridge parser accepts one object and rejects additional arguments', () {

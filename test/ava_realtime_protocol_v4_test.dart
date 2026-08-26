@@ -62,7 +62,7 @@ void main() {
     ).toJson();
     expect(translated['protocolVersion'], 4);
     expect(translated['sequence'], 0);
-    expect(translated['rendererCapabilityVersion'], 'ava-svg-renderer-v1');
+    expect(translated['rendererCapabilityVersion'], 'ava-svg-renderer-v2');
 
     final playback = AvaRealtimeClientEventV4.playbackStarted(
       sessionId: 'session-1234',

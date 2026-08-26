@@ -73,9 +73,9 @@ def _canvas_available():
             "manifestSha256": "b" * 64,
             "svgByteLength": 4096,
             "manifestByteLength": 512,
-            "rendererCapabilityVersion": "ava-svg-renderer-v1",
-            "validatorVersion": "ava-svg-validator-v1",
-            "manifestVersion": "ava-svg-manifest-v1",
+            "rendererCapabilityVersion": "ava-svg-renderer-v2",
+            "validatorVersion": "ava-svg-validator-v2",
+            "manifestVersion": "ava-svg-manifest-v2",
         }
     )
 

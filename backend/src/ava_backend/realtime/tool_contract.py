@@ -21,6 +21,13 @@ class InteractiveCanvasOperation(StrEnum):
     REVISE_FOCUSED = "reviseFocused"
 
 
+class InteractiveCanvasMode(StrEnum):
+    NONE = "none"
+    EXPLORE = "explore"
+    SELECT = "select"
+    STEPS = "steps"
+
+
 class InteractiveCanvasRequest(RealtimeProtocolModel):
     operation: InteractiveCanvasOperation = Field(
         description=(
@@ -38,6 +45,13 @@ class InteractiveCanvasRequest(RealtimeProtocolModel):
             "styles, code, scene IDs, or revisions."
         )
     )
+    interaction_mode: InteractiveCanvasMode = Field(
+        description=(
+            "Use none for a static visual, explore for tapping parts to learn, "
+            "select for choosing one visible option, or steps for ordered "
+            "Back/Next progression."
+        )
+    )
     interaction_goal: (
         Annotated[
             NonEmptyText,
@@ -51,6 +65,17 @@ class InteractiveCanvasRequest(RealtimeProtocolModel):
             "or selecting one meaningful part. Do not specify implementation."
         ),
     )
+
+    @model_validator(mode="after")
+    def interaction_fields_are_atomic(self) -> InteractiveCanvasRequest:
+        if self.interaction_mode == InteractiveCanvasMode.NONE:
+            if self.interaction_goal is not None:
+                raise ValueError("interactionMode none cannot include interactionGoal")
+        elif self.interaction_goal is None:
+            raise ValueError(
+                "interactive canvas modes require a non-empty interactionGoal"
+            )
+        return self
 
 
 class InteractiveCanvasToolStatus(StrEnum):

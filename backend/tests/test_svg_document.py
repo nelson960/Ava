@@ -15,8 +15,13 @@ from ava_backend.canvas.svg_document import (
 
 
 def _document(body: str, *, root_attributes: str = "") -> str:
+    interaction_mode = (
+        "" if "data-ava-interaction-mode" in root_attributes
+        else 'data-ava-interaction-mode="none"'
+    )
     return (
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" {root_attributes}>'
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" '
+        f'{interaction_mode} {root_attributes}>'
         "<title>Water cycle</title>"
         "<desc>How water moves between the sky and the ground.</desc>"
         f"{body}"
@@ -27,7 +32,8 @@ def _document(body: str, *, root_attributes: str = "") -> str:
 def test_validator_preserves_exact_provider_unicode_bytes() -> None:
     svg = (
         "\n"
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600">\n'
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" '
+        'data-ava-interaction-mode="none">\n'
         "  <title>Café water cycle ☁️</title>\n"
         "  <desc>Evaporation → clouds → rain.</desc>\n"
         '  <path id="river" d="M 10 500 C 200 450 700 550 990 490" '
@@ -54,13 +60,15 @@ def test_validator_builds_deterministic_content_bound_manifest() -> None:
           </linearGradient>
           <filter id="soft_shadow"><feDropShadow dx="0" dy="3" stdDeviation="4"/></filter>
         </defs>
-        <g id="cloud" data-ava-binding="cloud_select" data-ava-action="select"
+        <g id="cloud" data-ava-binding="cloud_select"
            data-ava-target="cloud" aria-label="Explore the rain cloud"
            fill="url(#water_gradient)" filter="url(#soft_shadow)">
           <ellipse cx="500" cy="180" rx="150" ry="65"/>
         </g>
         """,
-        root_attributes='data-ava-background="#dff5ff"',
+        root_attributes=(
+            'data-ava-background="#dff5ff" data-ava-interaction-mode="select"'
+        ),
     )
 
     first = SvgDocumentValidator().validate(svg)
@@ -76,14 +84,9 @@ def test_validator_builds_deterministic_content_bound_manifest() -> None:
     assert manifest["bindings"] == [
         {
             "accessibilityLabel": "Explore the rain cloud",
-            "action": "select",
             "bindingId": "cloud_select",
             "elementId": "cloud",
-            "exclusive": False,
-            "hitTest": "element",
-            "pulseIds": [],
             "revealIds": [],
-            "serverReportable": True,
             "targetId": "cloud",
         }
     ]
@@ -97,9 +100,10 @@ def test_validator_derives_only_bounded_visible_semantics_deterministically() ->
           <text id="evaporation">Evaporation</text>
           <text id="hidden_label" display="none">Internal note</text>
         </g>
-        <g id="cloud" data-ava-binding="select_cloud" data-ava-action="select"
+        <g id="cloud" data-ava-binding="select_cloud"
            aria-label="Rain cloud"><circle cx="500" cy="150" r="50"/></g>
-        """
+        """,
+        root_attributes='data-ava-interaction-mode="select"',
     )
 
     first = SvgDocumentValidator().validate(svg)
@@ -171,7 +175,8 @@ def test_validator_rejects_reference_cycles() -> None:
 
 def test_validator_requires_accessible_interaction_metadata() -> None:
     svg = _document(
-        '<g id="cloud" data-ava-binding="cloud_select" data-ava-action="select"/>'
+        '<g id="cloud" data-ava-binding="cloud_select"/>'
+        , root_attributes='data-ava-interaction-mode="select"'
     )
 
     with pytest.raises(SvgDocumentValidationError) as raised:
@@ -182,8 +187,9 @@ def test_validator_requires_accessible_interaction_metadata() -> None:
 
 def test_validator_requires_binding_targets_to_exist() -> None:
     svg = _document(
-        '<g id="cloud" data-ava-binding="cloud_reveal" data-ava-action="reveal" '
-        'data-ava-reveal="rain" aria-label="Show rain"/>'
+        '<g id="cloud" data-ava-binding="cloud_reveal" '
+        'data-ava-reveal="rain" aria-label="Show rain"/>',
+        root_attributes='data-ava-interaction-mode="explore"',
     )
 
     with pytest.raises(SvgDocumentValidationError) as raised:
@@ -192,29 +198,27 @@ def test_validator_requires_binding_targets_to_exist() -> None:
     assert raised.value.code == "bindingTargetMissing"
 
 
-def test_explore_manifest_declares_exclusive_reveals_and_connector_pulses() -> None:
+def test_explore_manifest_declares_reveals() -> None:
     svg = _document(
         """
-        <path id="connector" d="M100 100 L200 200"/>
         <g id="details" display="none"><rect x="200" y="200" width="100" height="50"/></g>
-        <g id="cloud" data-ava-binding="explore_cloud" data-ava-action="explore"
+        <g id="cloud" data-ava-binding="explore_cloud"
           data-ava-target="cloud" data-ava-reveal="details"
-          data-ava-pulse="connector" data-ava-exclusive="true"
           aria-label="Explore the cloud"><circle cx="100" cy="100" r="40"/></g>
-        """
+        """,
+        root_attributes='data-ava-interaction-mode="explore"',
     )
 
     document = SvgDocumentValidator().validate(svg)
     binding = document.bindings["explore_cloud"]
 
-    assert binding.exclusive is True
     assert binding.reveal_ids == ("details",)
-    assert binding.pulse_ids == ("connector",)
 
 
 def test_title_and_description_must_be_unique_direct_root_children() -> None:
     svg = (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600">'
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" '
+        'data-ava-interaction-mode="none">'
         "<g><title>Nested</title></g><desc>Description</desc>"
         "</svg>"
     )
@@ -233,5 +237,140 @@ def test_capability_manifest_is_versioned_and_bounded() -> None:
     assert "script" not in manifest["allowedElements"]
     assert "viewBox" in manifest["allowedAttributes"]
     assert "foo" not in manifest["allowedAttributes"]
-    assert manifest["allowedDataAttributePrefix"] == "data-ava-"
+    assert manifest["allowedDataAttributes"] == [
+        "data-ava-background",
+        "data-ava-binding",
+        "data-ava-interaction-mode",
+        "data-ava-reveal",
+        "data-ava-step",
+        "data-ava-target",
+    ]
     assert manifest["limits"]["bytes"] > 0
+
+
+def test_none_document_rejects_bindings() -> None:
+    svg = _document(
+        '<g id="cloud" data-ava-binding="cloud" aria-label="Cloud"/>',
+        root_attributes='data-ava-interaction-mode="none"',
+    )
+
+    with pytest.raises(SvgDocumentValidationError) as raised:
+        SvgDocumentValidator().validate(svg)
+
+    assert raised.value.code == "interactionModeBindingsInvalid"
+
+
+def test_explore_document_builds_typed_binding_without_action() -> None:
+    svg = _document(
+        '<g id="detail" display="none"><text>Cloud detail</text></g>'
+        '<g id="cloud" data-ava-binding="cloud" data-ava-target="cloud" '
+        'data-ava-reveal="detail" aria-label="Cloud"/>',
+        root_attributes='data-ava-interaction-mode="explore"',
+    )
+
+    document = SvgDocumentValidator().validate(svg)
+
+    assert document.interaction_mode == "explore"
+    assert document.bindings["cloud"].reveal_ids == ("detail",)
+    assert "action" not in document.manifest["bindings"][0]
+
+
+def test_unknown_interaction_mode_is_rejected() -> None:
+    with pytest.raises(SvgDocumentValidationError) as raised:
+        SvgDocumentValidator().validate(
+            _document("", root_attributes='data-ava-interaction-mode="quiz"')
+        )
+
+    assert raised.value.code == "interactionModeInvalid"
+
+
+def test_static_document_has_exact_empty_binding_manifest() -> None:
+    document = SvgDocumentValidator().validate(
+        _document(
+            '<text id="label" x="20" y="40">Static label</text>',
+            root_attributes='data-ava-interaction-mode="none"',
+        )
+    )
+
+    assert document.interaction_mode == "none"
+    assert document.bindings == {}
+    assert document.manifest["interactionMode"] == "none"
+    assert document.manifest["bindings"] == []
+
+
+def test_select_document_rejects_reveal_metadata() -> None:
+    svg = _document(
+        '<g id="detail"/><g id="cloud" data-ava-binding="cloud" '
+        'data-ava-reveal="detail" aria-label="Cloud"/>',
+        root_attributes='data-ava-interaction-mode="select"',
+    )
+
+    with pytest.raises(SvgDocumentValidationError) as raised:
+        SvgDocumentValidator().validate(svg)
+
+    assert raised.value.code == "interactionModeBindingsInvalid"
+
+
+def test_steps_require_unique_contiguous_indexes() -> None:
+    valid = _document(
+        '<g id="egg" data-ava-binding="egg" data-ava-step="1" '
+        'aria-label="Egg stage"/>'
+        '<g id="larva" data-ava-binding="larva" data-ava-step="2" '
+        'aria-label="Larva stage"/>',
+        root_attributes='data-ava-interaction-mode="steps"',
+    )
+    document = SvgDocumentValidator().validate(valid)
+    assert [binding.step_index for binding in document.bindings.values()] == [1, 2]
+
+    for body in (
+        '<g id="egg" data-ava-binding="egg" data-ava-step="1" '
+        'aria-label="Egg stage"/>',
+        '<g id="egg" data-ava-binding="egg" data-ava-step="1" '
+        'aria-label="Egg stage"/><g id="larva" data-ava-binding="larva" '
+        'data-ava-step="3" aria-label="Larva stage"/>',
+        '<g id="egg" data-ava-binding="egg" data-ava-step="1" '
+        'aria-label="Egg stage"/><g id="larva" data-ava-binding="larva" '
+        'data-ava-step="1" aria-label="Larva stage"/>',
+    ):
+        with pytest.raises(SvgDocumentValidationError) as raised:
+            SvgDocumentValidator().validate(
+                _document(
+                    body,
+                    root_attributes='data-ava-interaction-mode="steps"',
+                )
+            )
+        assert raised.value.code == "interactionModeBindingsInvalid"
+
+
+def test_explore_document_rejects_step_metadata() -> None:
+    with pytest.raises(SvgDocumentValidationError) as raised:
+        SvgDocumentValidator().validate(
+            _document(
+                '<g id="cloud" data-ava-binding="cloud" data-ava-step="1" '
+                'aria-label="Cloud"/>',
+                root_attributes='data-ava-interaction-mode="explore"',
+            )
+        )
+
+    assert raised.value.code == "interactionModeBindingsInvalid"
+
+
+@pytest.mark.parametrize(
+    "attribute",
+    [
+        'data-ava-action="select"',
+        'data-ava-pulse="connector"',
+        'data-ava-exclusive="true"',
+        'data-ava-value="cloud"',
+    ],
+)
+def test_legacy_generic_interaction_attributes_are_rejected(attribute: str) -> None:
+    with pytest.raises(SvgDocumentValidationError) as raised:
+        SvgDocumentValidator().validate(
+            _document(
+                f'<g id="cloud" {attribute} aria-label="Cloud"/>',
+                root_attributes='data-ava-interaction-mode="none"',
+            )
+        )
+
+    assert raised.value.code == "attributeForbidden"

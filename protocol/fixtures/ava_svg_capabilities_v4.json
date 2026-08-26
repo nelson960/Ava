@@ -97,7 +97,14 @@
     "y1",
     "y2"
   ],
-  "allowedDataAttributePrefix": "data-ava-",
+  "allowedDataAttributes": [
+    "data-ava-background",
+    "data-ava-binding",
+    "data-ava-interaction-mode",
+    "data-ava-reveal",
+    "data-ava-step",
+    "data-ava-target"
+  ],
   "allowedElements": [
     "circle",
     "clipPath",
@@ -130,15 +137,11 @@
     "tspan",
     "use"
   ],
-  "allowedInteractionActions": [
-    "dragWithin",
+  "allowedInteractionModes": [
+    "none",
     "explore",
-    "focus",
-    "reset",
-    "reveal",
     "select",
-    "submitOutcome",
-    "toggleVisibility"
+    "steps"
   ],
   "allowedStyleProperties": [
     "alignment-baseline",
@@ -193,7 +196,7 @@
     "referenceDepth": 20,
     "references": 768
   },
-  "manifestVersion": "ava-svg-manifest-v1",
-  "rendererCapabilityVersion": "ava-svg-renderer-v1",
-  "validatorVersion": "ava-svg-validator-v1"
+  "manifestVersion": "ava-svg-manifest-v2",
+  "rendererCapabilityVersion": "ava-svg-renderer-v2",
+  "validatorVersion": "ava-svg-validator-v2"
 }

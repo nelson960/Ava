@@ -15,7 +15,8 @@ from ava_backend.canvas.svg_workspace import (
 
 def _scene(scene: str, revision: int) -> ActiveSvgCanvasScene:
     document = SvgDocumentValidator().validate(
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600">'
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" '
+        'data-ava-interaction-mode="none">'
         f"<title>Scene {scene} revision {revision}</title>"
         f"<desc>Exact committed scene {scene} revision {revision}.</desc>"
         f'<text id="label-{scene}" x="100" y="100">{scene}{revision}</text>'

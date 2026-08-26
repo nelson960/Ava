@@ -27,10 +27,12 @@ from ava_backend.realtime.events_v4 import (
     AudioChunkEventV4,
     AudioMetadataEventV4,
     AvaClientEventUnionV4,
+    CanvasInteractionEventV4,
     MemoryPersistenceFailedEventV4,
     SegmentReadyEventV4,
     TurnCancelledEventV4,
     TurnCompletedEventV4,
+    TurnCreatedEventV4,
     TurnFailedEventV4,
     TurnPhaseChangedEventV4,
 )
@@ -106,6 +108,21 @@ class _NoCanvasSpecialist:
         return
 
 
+class _BlockingCanvasInteractionJobs:
+    def __init__(self, delegate: SvgCanvasJobCoordinator) -> None:
+        self._delegate = delegate
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def interaction(self, event: CanvasInteractionEventV4):  # type: ignore[no-untyped-def]
+        self.started.set()
+        await self.release.wait()
+        return await self._delegate.interaction(event)
+
+    def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+        return getattr(self._delegate, name)
+
+
 def _canvas_runtime(
     *,
     state: SvgCanvasSessionState | None = None,
@@ -127,10 +144,14 @@ def _active_labeled_canvas_state(
     workspace: SvgCanvasWorkspace | None = None,
 ) -> SvgCanvasSessionState:
     document = SvgDocumentValidator().validate(
-        """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600">
+        """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600"
+ data-ava-interaction-mode="explore">
 <title>Water cycle</title><desc>A labeled cycle of water moving through nature.</desc>
 <text id="evaporation_label" x="180" y="420">Evaporation</text>
-<text id="condensation_label" x="500" y="140">Condensation</text>
+<g id="condensation" data-ava-binding="explore_condensation"
+ data-ava-target="condensation" aria-label="Explore condensation">
+  <text id="condensation_label" x="500" y="140">Condensation</text>
+</g>
 <text id="precipitation_label" x="800" y="420">Precipitation</text>
 </svg>"""
     )
@@ -259,8 +280,8 @@ async def _ready(coordinator: DeterministicRealtimeSessionCoordinator) -> None:
             {
                 "event": "clientReady",
                 "sequence": 0,
-                "rendererCapabilityVersion": "ava-svg-renderer-v1",
-                "validatorVersion": "ava-svg-validator-v1",
+                "rendererCapabilityVersion": "ava-svg-renderer-v2",
+                "validatorVersion": "ava-svg-validator-v2",
             }
         )
     )
@@ -566,6 +587,8 @@ class _CrossTurnTranscriptRealtimeProvider(DeterministicRealtimePlanProvider):
 
 async def _complete_delivered_turn(
     coordinator: DeterministicRealtimeSessionCoordinator,
+    *,
+    first_client_sequence: int = 1,
 ) -> list[object]:
     events: list[object] = []
     async for frame in coordinator.frames():
@@ -577,7 +600,7 @@ async def _complete_delivered_turn(
                 _client(
                     {
                         "event": "playbackStarted",
-                        "sequence": 1,
+                        "sequence": first_client_sequence,
                         "turnId": TURN_ID,
                         "streamId": STREAM_ID,
                         "renderedSampleCount": 0,
@@ -592,7 +615,7 @@ async def _complete_delivered_turn(
                 _client(
                     {
                         "event": "playbackProgress",
-                        "sequence": 2,
+                        "sequence": first_client_sequence + 1,
                         "turnId": TURN_ID,
                         "streamId": STREAM_ID,
                         "renderedSampleCount": coordinator.received_sample_count,
@@ -601,6 +624,50 @@ async def _complete_delivered_turn(
                 )
             )
     return events
+
+
+async def _complete_first_persistent_turn_and_rearm(
+    coordinator: DeterministicRealtimeSessionCoordinator,
+) -> None:
+    frames = coordinator.frames()
+    try:
+        async for frame in frames:
+            if not isinstance(frame, AvaServerControlFrameV4):
+                continue
+            event = frame.event
+            if isinstance(event, AudioMetadataEventV4):
+                await coordinator.receive(
+                    _client(
+                        {
+                            "event": "playbackStarted",
+                            "sequence": 2,
+                            "turnId": TURN_ID,
+                            "streamId": STREAM_ID,
+                            "renderedSampleCount": 0,
+                        }
+                    )
+                )
+            if (
+                isinstance(event, TurnPhaseChangedEventV4)
+                and event.phase == SpeechPhase.SPEAKING
+            ):
+                await coordinator.receive(
+                    _client(
+                        {
+                            "event": "playbackProgress",
+                            "sequence": 3,
+                            "turnId": TURN_ID,
+                            "streamId": STREAM_ID,
+                            "renderedSampleCount": coordinator.received_sample_count,
+                            "bufferedSampleCount": 0,
+                        }
+                    )
+                )
+            if isinstance(event, TurnCreatedEventV4) and event.turn_id != TURN_ID:
+                return
+        raise AssertionError("persistent coordinator did not rearm the next turn")
+    finally:
+        await frames.aclose()
 
 
 async def test_late_owned_transcription_commits_delivered_turn_exactly_once() -> None:
@@ -703,6 +770,179 @@ async def test_existing_labeled_canvas_part_can_be_discussed_without_new_tool_ca
     assert "Condensation" in coordinator.harness.instructions
     assert provider.completed_canvas_outputs == []
     assert len(provider.requests) == 1
+    await coordinator.close()
+
+
+async def test_valid_canvas_interaction_refreshes_context_before_one_response() -> None:
+    state = _active_labeled_canvas_state()
+    active = state.active
+    assert active is not None
+    provider = DeterministicRealtimePlanProvider(_plan())
+    coordinator, _, _, _ = _coordinator(
+        realtime=provider,
+        canvas_state=state,
+    )
+    await _ready(coordinator)
+
+    await coordinator.receive(
+        _client(
+            {
+                "event": "canvasInteraction",
+                "sequence": 1,
+                "sceneId": active.scene_id,
+                "sceneRevision": active.revision,
+                "interactionRevision": 1,
+                "svgSha256": active.document.svg_sha256,
+                "manifestSha256": active.document.manifest_sha256,
+                "bindingId": "explore_condensation",
+            }
+        )
+    )
+
+    assert provider.canvas_interaction_response_turn_ids == [TURN_ID]
+    assert len(provider.canvas_interaction_response_session_updates) == 1
+    session = provider.canvas_interaction_response_session_updates[0]["session"]
+    assert isinstance(session, dict)
+    instructions = session["instructions"]
+    assert isinstance(instructions, str)
+    assert '<canvas_context trust="untrusted_model_generated_data"' in instructions
+    assert 'interaction_mode="explore"' in instructions
+    assert '<last_interaction mode="explore">' in instructions
+    assert '<target>Explore condensation</target>' in instructions
+    await coordinator.close()
+
+
+async def test_interaction_context_refresh_spanning_rearm_never_attaches_to_new_turn() -> (
+    None
+):
+    state = _active_labeled_canvas_state()
+    active = state.active
+    assert active is not None
+    provider = DeterministicRealtimePlanProvider(_plan())
+    coordinator, _, _, _ = _coordinator(
+        realtime=provider,
+        persistent=True,
+        canvas_state=state,
+    )
+    blocking_jobs = _BlockingCanvasInteractionJobs(coordinator._canvas_jobs)
+    coordinator._canvas_jobs = blocking_jobs  # type: ignore[assignment]
+    await _ready(coordinator)
+
+    interaction = asyncio.create_task(
+        coordinator.receive(
+            _client(
+                {
+                    "event": "canvasInteraction",
+                    "sequence": 1,
+                    "sceneId": active.scene_id,
+                    "sceneRevision": active.revision,
+                    "interactionRevision": 1,
+                    "svgSha256": active.document.svg_sha256,
+                    "manifestSha256": active.document.manifest_sha256,
+                    "bindingId": "explore_condensation",
+                }
+            )
+        )
+    )
+    await blocking_jobs.started.wait()
+
+    await _complete_first_persistent_turn_and_rearm(coordinator)
+    assert coordinator._turn_id == "turn-coordinator-2"
+    blocking_jobs.release.set()
+    await interaction
+
+    assert state.last_interaction is not None
+    assert state.last_interaction.binding_id == "explore_condensation"
+    assert provider.canvas_interaction_response_turn_ids == []
+    instructions = provider.prepared_session_updates[-1]["session"]
+    assert isinstance(instructions, dict)
+    installed = instructions["instructions"]
+    assert isinstance(installed, str)
+    assert '<last_interaction mode="explore">' in installed
+    await coordinator.close()
+
+
+async def test_rejected_canvas_interaction_does_not_request_response() -> None:
+    state = _active_labeled_canvas_state()
+    active = state.active
+    assert active is not None
+    provider = DeterministicRealtimePlanProvider(_plan())
+    coordinator, _, _, _ = _coordinator(
+        realtime=provider,
+        canvas_state=state,
+    )
+    await _ready(coordinator)
+
+    await coordinator.receive(
+        _client(
+            {
+                "event": "canvasInteraction",
+                "sequence": 1,
+                "sceneId": active.scene_id,
+                "sceneRevision": active.revision,
+                "interactionRevision": 1,
+                "svgSha256": active.document.svg_sha256,
+                "manifestSha256": active.document.manifest_sha256,
+                "bindingId": "unknown_binding",
+            }
+        )
+    )
+
+    emitted = await coordinator._canvas_events.next_payload()
+    assert emitted["event"] == "interactionRejected"
+    assert emitted["bindingId"] == "unknown_binding"
+    assert provider.canvas_interaction_response_turn_ids == []
+    await coordinator.close()
+
+
+async def test_idle_interaction_response_uses_existing_speech_pipeline_without_memory() -> (
+    None
+):
+    state = _active_labeled_canvas_state()
+    active = state.active
+    assert active is not None
+    provider = DeterministicRealtimePlanProvider(
+        _plan(),
+        child_text=None,
+        wait_for_canvas_interaction_response=True,
+    )
+    memory = DevelopmentAuthoritativeMemoryStore()
+    coordinator, _, speech, _ = _coordinator(
+        realtime=provider,
+        memory=memory,
+        canvas_state=state,
+    )
+    await _ready(coordinator)
+    delivery = asyncio.create_task(
+        _complete_delivered_turn(coordinator, first_client_sequence=2)
+    )
+    await provider.turn_stream_started.wait()
+
+    await coordinator.receive(
+        _client(
+            {
+                "event": "canvasInteraction",
+                "sequence": 1,
+                "sceneId": active.scene_id,
+                "sceneRevision": active.revision,
+                "interactionRevision": 1,
+                "svgSha256": active.document.svg_sha256,
+                "manifestSha256": active.document.manifest_sha256,
+                "bindingId": "explore_condensation",
+            }
+        )
+    )
+    events = await delivery
+
+    assert isinstance(events[-1], TurnCompletedEventV4)
+    assert events[-1].delivered_text == _plan().speech
+    assert speech.synthesized_segment_ids
+    assert provider.canvas_interaction_response_turn_ids == [TURN_ID]
+    snapshot = await memory.load_snapshot(
+        subject="child:coordinator",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+    )
+    assert snapshot.delivered_turns == []
     await coordinator.close()
 
 
@@ -864,8 +1104,8 @@ async def test_client_ready_and_sequence_contract_fails_loudly() -> None:
                 {
                     "event": "clientReady",
                     "sequence": 1,
-                    "rendererCapabilityVersion": "ava-svg-renderer-v1",
-                    "validatorVersion": "ava-svg-validator-v1",
+                    "rendererCapabilityVersion": "ava-svg-renderer-v2",
+                    "validatorVersion": "ava-svg-validator-v2",
                 }
             )
         )
@@ -877,8 +1117,8 @@ async def test_client_ready_and_sequence_contract_fails_loudly() -> None:
                 {
                     "event": "clientReady",
                     "sequence": 1,
-                    "rendererCapabilityVersion": "ava-svg-renderer-v1",
-                    "validatorVersion": "ava-svg-validator-v1",
+                    "rendererCapabilityVersion": "ava-svg-renderer-v2",
+                    "validatorVersion": "ava-svg-validator-v2",
                 }
             )
         )

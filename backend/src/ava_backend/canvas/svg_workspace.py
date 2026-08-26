@@ -23,10 +23,10 @@ class RecordedSvgCanvasInteraction:
     svg_sha256: str
     manifest_sha256: str
     binding_id: str
-    action: str
+    interaction_mode: str
     target_id: str
     accessibility_label: str
-    declared_value: str | None
+    step_index: int | None
 
 
 class SvgCanvasWorkspaceError(ValueError):

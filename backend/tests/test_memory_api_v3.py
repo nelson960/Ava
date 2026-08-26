@@ -164,9 +164,9 @@ async def test_readiness_checks_configured_authoritative_memory() -> None:
     payload = response.json()
     assert payload["status"] == "ready"
     assert payload["protocolVersion"] == 3
-    assert payload["promptVersion"] == "ava-realtime-v4.3"
-    assert payload["toolContractVersion"] == "ava-realtime-tools-v4.2"
-    assert payload["canvasSpecialistVersion"] == "ava-svg-canvas-v4.3"
+    assert payload["promptVersion"] == "ava-realtime-v4.4"
+    assert payload["toolContractVersion"] == "ava-realtime-tools-v4.3"
+    assert payload["canvasSpecialistVersion"] == "ava-svg-canvas-v4.4"
     assert payload["build"]["version"] == "0.1.0"
     assert payload["build"]["instanceId"].startswith("instance-")
     assert payload["build"]["sourceRevision"].startswith("sha256:")
@@ -176,7 +176,8 @@ async def test_readiness_checks_configured_authoritative_memory() -> None:
 
 def _active_scene(label: str) -> ActiveSvgCanvasScene:
     document = SvgDocumentValidator().validate(
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600">'
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" '
+        'data-ava-interaction-mode="none">'
         f"<title>Scene {label}</title><desc>Subject canvas {label}.</desc>"
         "</svg>"
     )

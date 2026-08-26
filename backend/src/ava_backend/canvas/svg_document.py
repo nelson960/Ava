@@ -6,6 +6,7 @@ import re
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from dataclasses import dataclass
+from enum import StrEnum
 from hashlib import sha256
 from types import MappingProxyType
 from typing import Final, Mapping, NoReturn
@@ -14,9 +15,9 @@ SVG_NAMESPACE: Final = "http://www.w3.org/2000/svg"
 XLINK_NAMESPACE: Final = "http://www.w3.org/1999/xlink"
 XML_NAMESPACE: Final = "http://www.w3.org/XML/1998/namespace"
 
-SVG_VALIDATOR_VERSION: Final = "ava-svg-validator-v1"
-SVG_RENDERER_CAPABILITY_VERSION: Final = "ava-svg-renderer-v1"
-SVG_MANIFEST_VERSION: Final = "ava-svg-manifest-v1"
+SVG_VALIDATOR_VERSION: Final = "ava-svg-validator-v2"
+SVG_RENDERER_CAPABILITY_VERSION: Final = "ava-svg-renderer-v2"
+SVG_MANIFEST_VERSION: Final = "ava-svg-manifest-v2"
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]{0,95}$")
 _NUMBER = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][-+]?\d+)?")
@@ -185,6 +186,16 @@ _ALLOWED_ATTRIBUTES: Final = frozenset(
         "flood-opacity",
     }
 )
+_ALLOWED_DATA_ATTRIBUTES: Final = frozenset(
+    {
+        "data-ava-background",
+        "data-ava-interaction-mode",
+        "data-ava-binding",
+        "data-ava-target",
+        "data-ava-reveal",
+        "data-ava-step",
+    }
+)
 _ALLOWED_STYLE_PROPERTIES: Final = frozenset(
     {
         "alignment-baseline",
@@ -240,19 +251,11 @@ _REFERENCE_ATTRIBUTES: Final = frozenset(
         "stroke",
     }
 )
-_PROVIDER_INTERACTION_ACTIONS: Final = frozenset(
-    {
-        "dragWithin",
-        "explore",
-        "focus",
-        "reset",
-        "reveal",
-        "select",
-        "submitOutcome",
-        "toggleVisibility",
-    }
-)
-_SERVER_INTERACTION_ACTIONS: Final = frozenset({"explore", "select", "submitOutcome"})
+class SvgInteractionMode(StrEnum):
+    NONE = "none"
+    EXPLORE = "explore"
+    SELECT = "select"
+    STEPS = "steps"
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,34 +283,22 @@ class SvgValidationLimits:
 @dataclass(frozen=True, slots=True)
 class SvgInteractionBinding:
     binding_id: str
-    action: str
     element_id: str
     target_id: str
     accessibility_label: str
     reveal_ids: tuple[str, ...] = ()
-    pulse_ids: tuple[str, ...] = ()
-    exclusive: bool = False
-    declared_value: str | None = None
-
-    @property
-    def is_server_reportable(self) -> bool:
-        return self.action in _SERVER_INTERACTION_ACTIONS
+    step_index: int | None = None
 
     def as_json(self) -> dict[str, object]:
         value: dict[str, object] = {
-            "action": self.action,
             "accessibilityLabel": self.accessibility_label,
             "bindingId": self.binding_id,
             "elementId": self.element_id,
-            "exclusive": self.exclusive,
-            "hitTest": "element",
             "revealIds": list(self.reveal_ids),
-            "pulseIds": list(self.pulse_ids),
-            "serverReportable": self.is_server_reportable,
             "targetId": self.target_id,
         }
-        if self.declared_value is not None:
-            value["declaredValue"] = self.declared_value
+        if self.step_index is not None:
+            value["stepIndex"] = self.step_index
         return value
 
 
@@ -321,6 +312,7 @@ class ValidatedSvgDocument:
     manifest_sha256: str
     title: str
     description: str
+    interaction_mode: SvgInteractionMode
     visible_text_labels: tuple[str, ...]
     named_objects: tuple[str, ...]
     view_box: tuple[float, float, float, float]
@@ -368,6 +360,19 @@ class SvgDocumentValidator:
         if _local_element_name(root.tag) != "svg":
             self._fail("invalidRoot", "SVG root element must be <svg>")
         self._validate_element_namespace(root.tag)
+        interaction_mode_text = root.attrib.get("data-ava-interaction-mode")
+        if interaction_mode_text is None:
+            self._fail(
+                "interactionModeInvalid",
+                "SVG root requires a supported data-ava-interaction-mode",
+            )
+        try:
+            interaction_mode = SvgInteractionMode(interaction_mode_text)
+        except ValueError:
+            self._fail(
+                "interactionModeInvalid",
+                "SVG root requires a supported data-ava-interaction-mode",
+            )
         direct_titles = [
             child for child in root if _local_element_name(child.tag) == "title"
         ]
@@ -459,7 +464,9 @@ class SvgDocumentValidator:
                         "eventHandlerForbidden",
                         f"event attribute {name!r} is forbidden",
                     )
-                if not (name in _ALLOWED_ATTRIBUTES or name.startswith("data-ava-")):
+                if not (
+                    name in _ALLOWED_ATTRIBUTES or name in _ALLOWED_DATA_ATTRIBUTES
+                ):
                     self._fail(
                         "attributeForbidden", f"SVG attribute {name!r} is not allowed"
                     )
@@ -544,6 +551,14 @@ class SvgDocumentValidator:
                     self._fail(
                         "tooManyBindings", "SVG exceeds the interaction binding limit"
                     )
+            elif any(
+                name in attributes
+                for name in ("data-ava-target", "data-ava-reveal", "data-ava-step")
+            ):
+                self._fail(
+                    "bindingMetadataWithoutBinding",
+                    "SVG interaction metadata requires data-ava-binding",
+                )
 
             children = list(element)
             for child_index, child in reversed(list(enumerate(children))):
@@ -568,6 +583,7 @@ class SvgDocumentValidator:
             self._fail("referenceMissing", f"SVG references unknown id {missing[0]!r}")
         self._validate_reference_graph(reference_graph, id_to_node)
         self._validate_binding_targets(bindings, ids)
+        self._validate_interaction_mode(interaction_mode, bindings)
 
         background = root.attrib.get("data-ava-background")
         if background is not None and len(background) > 96:
@@ -581,6 +597,7 @@ class SvgDocumentValidator:
                 )
             ],
             "description": description,
+            "interactionMode": interaction_mode,
             "manifestVersion": SVG_MANIFEST_VERSION,
             "rendererCapabilityVersion": SVG_RENDERER_CAPABILITY_VERSION,
             "sourceTrust": "modelGeneratedData",
@@ -603,6 +620,7 @@ class SvgDocumentValidator:
             manifest_sha256=sha256(manifest_bytes).hexdigest(),
             title=title,
             description=description,
+            interaction_mode=interaction_mode,
             visible_text_labels=tuple(visible_text_labels),
             named_objects=tuple(named_objects),
             view_box=view_box,
@@ -613,9 +631,9 @@ class SvgDocumentValidator:
         limits = self._limits
         return {
             "allowedAttributes": sorted(_ALLOWED_ATTRIBUTES),
-            "allowedDataAttributePrefix": "data-ava-",
+            "allowedDataAttributes": sorted(_ALLOWED_DATA_ATTRIBUTES),
             "allowedElements": sorted(_ALLOWED_ELEMENTS),
-            "allowedInteractionActions": sorted(_PROVIDER_INTERACTION_ACTIONS),
+            "allowedInteractionModes": [mode.value for mode in SvgInteractionMode],
             "allowedStyleProperties": sorted(_ALLOWED_STYLE_PROPERTIES),
             "limits": {
                 "attributes": limits.max_total_attributes,
@@ -647,11 +665,6 @@ class SvgDocumentValidator:
                 "bindingElementMissingId",
                 f"binding {binding_id!r} requires an element id",
             )
-        action = attributes.get("data-ava-action")
-        if action not in _PROVIDER_INTERACTION_ACTIONS:
-            self._fail(
-                "bindingActionInvalid", f"binding {binding_id!r} has an invalid action"
-            )
         accessibility_label = attributes.get("aria-label", "")
         accessibility_label = self._validate_semantic_text(
             accessibility_label,
@@ -664,44 +677,87 @@ class SvgDocumentValidator:
         reveal_ids = tuple(filter(None, re.split(r"[\s,]+", reveal_text)))
         for reveal_id in reveal_ids:
             self._validate_identifier(reveal_id, label="binding reveal id")
-        pulse_text = attributes.get("data-ava-pulse", "")
-        pulse_ids = tuple(filter(None, re.split(r"[\s,]+", pulse_text)))
-        for pulse_id in pulse_ids:
-            self._validate_identifier(pulse_id, label="binding pulse id")
-        exclusive_text = attributes.get("data-ava-exclusive")
-        if exclusive_text not in {None, "true", "false"}:
-            self._fail(
-                "bindingExclusiveInvalid",
-                f"binding {binding_id!r} data-ava-exclusive must be true or false",
-            )
-        exclusive = exclusive_text == "true"
-        if action != "explore" and (pulse_ids or exclusive_text is not None):
-            self._fail(
-                "bindingExploreMetadataInvalid",
-                f"binding {binding_id!r} uses explore-only metadata",
-            )
-        declared_value = attributes.get("data-ava-value")
-        if action == "submitOutcome" and not declared_value:
-            self._fail(
-                "bindingValueMissing", f"binding {binding_id!r} requires data-ava-value"
-            )
-        if declared_value is not None:
-            declared_value = self._validate_semantic_text(
-                declared_value,
-                label=f"binding {binding_id!r} value",
-                maximum=160,
-            )
+        step_text = attributes.get("data-ava-step")
+        step_index: int | None = None
+        if step_text is not None:
+            if not step_text.isascii() or not step_text.isdigit():
+                self._fail(
+                    "bindingStepInvalid",
+                    f"binding {binding_id!r} data-ava-step must be an integer",
+                )
+            step_index = int(step_text)
+            if not 1 <= step_index <= 12:
+                self._fail(
+                    "bindingStepInvalid",
+                    f"binding {binding_id!r} data-ava-step is out of range",
+                )
         return SvgInteractionBinding(
             binding_id=binding_id,
-            action=action,
             element_id=element_id,
             target_id=target_id,
             accessibility_label=accessibility_label,
             reveal_ids=reveal_ids,
-            pulse_ids=pulse_ids,
-            exclusive=exclusive,
-            declared_value=declared_value,
+            step_index=step_index,
         )
+
+    def _validate_interaction_mode(
+        self,
+        mode: SvgInteractionMode,
+        bindings: Mapping[str, SvgInteractionBinding],
+    ) -> None:
+        values = tuple(bindings.values())
+        if mode is SvgInteractionMode.NONE:
+            if values:
+                self._fail(
+                    "interactionModeBindingsInvalid",
+                    "interaction mode none cannot declare bindings",
+                )
+            return
+        if not values:
+            self._fail(
+                "interactionModeBindingsInvalid",
+                f"interaction mode {mode.value} requires bindings",
+            )
+        if mode is SvgInteractionMode.EXPLORE:
+            if any(binding.step_index is not None for binding in values):
+                self._fail(
+                    "interactionModeBindingsInvalid",
+                    "explore bindings cannot declare steps",
+                )
+            return
+        if mode is SvgInteractionMode.SELECT:
+            if any(
+                binding.step_index is not None or binding.reveal_ids
+                for binding in values
+            ):
+                self._fail(
+                    "interactionModeBindingsInvalid",
+                    "select bindings cannot declare steps or reveals",
+                )
+            return
+        if len(values) < 2 or len(values) > 12:
+            self._fail(
+                "interactionModeBindingsInvalid",
+                "steps mode requires between 2 and 12 bindings",
+            )
+        if any(binding.reveal_ids for binding in values):
+            self._fail(
+                "interactionModeBindingsInvalid",
+                "steps bindings cannot declare reveals",
+            )
+        indexes: list[int] = []
+        for binding in values:
+            if binding.step_index is None:
+                self._fail(
+                    "interactionModeBindingsInvalid",
+                    "steps bindings require unique contiguous indexes from 1",
+                )
+            indexes.append(binding.step_index)
+        if sorted(indexes) != list(range(1, len(indexes) + 1)):
+            self._fail(
+                "interactionModeBindingsInvalid",
+                "steps bindings require unique contiguous indexes from 1",
+            )
 
     def _validate_element_namespace(self, raw_name: str) -> None:
         namespace = _namespace(raw_name)
@@ -813,7 +869,6 @@ class SvgDocumentValidator:
             missing = {
                 binding.target_id,
                 *binding.reveal_ids,
-                *binding.pulse_ids,
             } - ids
             if missing:
                 self._fail(

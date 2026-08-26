@@ -173,9 +173,9 @@ final class _BootstrapTransport implements AvaRealtimeBootstrapTransport {
       'webrtcToken': 'webrtc-token-value',
       'canvasToken': 'canvas-token-value',
       'expiresAt': '2026-08-21T12:00:00Z',
-      'rendererCapabilityVersion': 'ava-svg-renderer-v1',
-      'validatorVersion': 'ava-svg-validator-v1',
-      'manifestVersion': 'ava-svg-manifest-v1',
+      'rendererCapabilityVersion': 'ava-svg-renderer-v2',
+      'validatorVersion': 'ava-svg-validator-v2',
+      'manifestVersion': 'ava-svg-manifest-v2',
       'limits': {
         'maxTurnSeconds': 90,
         'maxResponseCharacters': 1800,
@@ -220,7 +220,7 @@ final class _Loader implements AvaSvgDocumentLoader {
 }
 
 const _canvasManifestJson =
-    '{"background":"#dff5ff","bindings":[{"accessibilityLabel":"Rain cloud","action":"select","bindingId":"select-cloud","elementId":"cloud","exclusive":false,"hitTest":"element","pulseIds":[],"revealIds":[],"serverReportable":true,"targetId":"cloud"}],"description":"A cloud turns water vapour into rain.","manifestVersion":"ava-svg-manifest-v1","rendererCapabilityVersion":"ava-svg-renderer-v1","sourceTrust":"modelGeneratedData","title":"Café cloud ☁️","validatorVersion":"ava-svg-validator-v1","viewBox":[0.0,0.0,1000.0,600.0]}';
+    '{"background":"#dff5ff","bindings":[{"accessibilityLabel":"Rain cloud","bindingId":"select-cloud","elementId":"cloud","revealIds":[],"targetId":"cloud"}],"description":"A cloud turns water vapour into rain.","interactionMode":"select","manifestVersion":"ava-svg-manifest-v2","rendererCapabilityVersion":"ava-svg-renderer-v2","sourceTrust":"modelGeneratedData","title":"Café cloud ☁️","validatorVersion":"ava-svg-validator-v2","viewBox":[0.0,0.0,1000.0,600.0]}';
 
 AvaValidatedSvgCanvasDocument _canvasDocument({
   required String generationId,

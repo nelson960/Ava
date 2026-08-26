@@ -156,9 +156,9 @@ final class _CountingBootstrapTransport
         'maxAudioChunkBytes': 192000,
         'playbackProgressIntervalMs': 250,
       },
-      'rendererCapabilityVersion': 'ava-svg-renderer-v1',
-      'validatorVersion': 'ava-svg-validator-v1',
-      'manifestVersion': 'ava-svg-manifest-v1',
+      'rendererCapabilityVersion': 'ava-svg-renderer-v2',
+      'validatorVersion': 'ava-svg-validator-v2',
+      'manifestVersion': 'ava-svg-manifest-v2',
     };
     return AvaRealtimeBootstrapResponse(
       statusCode: HttpStatus.created,

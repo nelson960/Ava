@@ -150,9 +150,9 @@ class CanvasDocumentAvailableEventV4(AvaServerEventV4):
     manifest_sha256: Sha256Digest
     svg_byte_length: int = Field(gt=0, le=262_144)
     manifest_byte_length: int = Field(gt=0, le=65_536)
-    renderer_capability_version: Literal["ava-svg-renderer-v1"]
-    validator_version: Literal["ava-svg-validator-v1"]
-    manifest_version: Literal["ava-svg-manifest-v1"]
+    renderer_capability_version: Literal["ava-svg-renderer-v2"]
+    validator_version: Literal["ava-svg-validator-v2"]
+    manifest_version: Literal["ava-svg-manifest-v2"]
 
 
 class CanvasPresentationCueEventV4(AvaServerEventV4):
@@ -330,8 +330,8 @@ class AvaClientEventV4(RealtimeProtocolModel):
 
 class ClientReadyEventV4(AvaClientEventV4):
     event: Literal[AvaClientEventTypeV4.CLIENT_READY]
-    renderer_capability_version: Literal["ava-svg-renderer-v1"]
-    validator_version: Literal["ava-svg-validator-v1"]
+    renderer_capability_version: Literal["ava-svg-renderer-v2"]
+    validator_version: Literal["ava-svg-validator-v2"]
 
 
 class PlaybackStartedEventV4(AvaClientEventV4):
@@ -364,8 +364,8 @@ class CanvasDocumentPreparedEventV4(AvaClientEventV4):
     scene_revision: int = Field(ge=1, le=10_001)
     svg_sha256: Sha256Digest
     manifest_sha256: Sha256Digest
-    renderer_capability_version: Literal["ava-svg-renderer-v1"]
-    validator_version: Literal["ava-svg-validator-v1"]
+    renderer_capability_version: Literal["ava-svg-renderer-v2"]
+    validator_version: Literal["ava-svg-validator-v2"]
 
 
 class CanvasPreparationFailureCode(StrEnum):
@@ -470,9 +470,9 @@ class AvaSessionBootstrapV4(RealtimeProtocolModel):
     webrtc_token: Annotated[NonEmptyText, StringConstraints(max_length=2_048)]
     canvas_token: Annotated[NonEmptyText, StringConstraints(max_length=2_048)]
     expires_at: Annotated[NonEmptyText, StringConstraints(max_length=64)]
-    renderer_capability_version: Literal["ava-svg-renderer-v1"]
-    validator_version: Literal["ava-svg-validator-v1"]
-    manifest_version: Literal["ava-svg-manifest-v1"]
+    renderer_capability_version: Literal["ava-svg-renderer-v2"]
+    validator_version: Literal["ava-svg-validator-v2"]
+    manifest_version: Literal["ava-svg-manifest-v2"]
     limits: AvaSessionLimitsV4
 
     @model_validator(mode="after")

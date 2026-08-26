@@ -96,6 +96,7 @@ class DeterministicRealtimePlanProvider:
         child_text: str | None = "Deterministic child turn.",
         canvas_brief: str | None = None,
         rejected_canvas_reason: str | None = None,
+        wait_for_canvas_interaction_response: bool = False,
         chunk_sizes: Iterable[int] = (17, 5, 43, 2),
     ) -> None:
         normalized_child_text = child_text.strip() if child_text is not None else None
@@ -116,6 +117,7 @@ class DeterministicRealtimePlanProvider:
                 {
                     "operation": "new",
                     "brief": canvas_brief,
+                    "interactionMode": "explore",
                     "interactionGoal": (
                         "Let the child reveal or select one useful label."
                     ),
@@ -126,6 +128,9 @@ class DeterministicRealtimePlanProvider:
         )
         self._child_text = normalized_child_text
         self._rejected_canvas_reason = rejected_canvas_reason
+        self._wait_for_canvas_interaction_response = (
+            wait_for_canvas_interaction_response
+        )
         self._chunk_sizes = tuple(chunk_sizes)
         if not self._chunk_sizes or any(size <= 0 for size in self._chunk_sizes):
             raise ValueError("fake Realtime chunk sizes must be positive")
@@ -137,6 +142,12 @@ class DeterministicRealtimePlanProvider:
         self.completed_canvas_outputs: list[
             InteractiveCanvasToolOutput | InteractiveCanvasToolOutputV4
         ] = []
+        self.canvas_interaction_response_turn_ids: list[str] = []
+        self.canvas_interaction_response_session_updates: list[
+            dict[str, object]
+        ] = []
+        self.turn_stream_started = asyncio.Event()
+        self._canvas_interaction_response_requested = asyncio.Event()
         self._pending_call_id: str | None = None
         self._input_events: asyncio.Queue[RealtimeProviderInputEvent] = asyncio.Queue()
         self._input_item_turn_ids: dict[str, str | None] = {}
@@ -219,6 +230,9 @@ class DeterministicRealtimePlanProvider:
         return pending
 
     async def _stream(self) -> AsyncIterator[RealtimeProviderTurnEvent]:
+        self.turn_stream_started.set()
+        if self._wait_for_canvas_interaction_response:
+            await self._canvas_interaction_response_requested.wait()
         for index, speech in enumerate(self._speech_segments):
             stream = DeterministicArgumentDeltaStream(
                 speech + (" " if index < len(self._speech_segments) - 1 else ""),
@@ -256,6 +270,22 @@ class DeterministicRealtimePlanProvider:
             raise RuntimeError("fake canvas completion does not match pending call")
         self.completed_canvas_outputs.append(output)
         await asyncio.sleep(0)
+
+    async def request_canvas_interaction_response(self, *, turn_id: str) -> bool:
+        if not turn_id:
+            raise ValueError("turn_id cannot be empty")
+        if self._canvas_interaction_response_requested.is_set():
+            return False
+        self.canvas_interaction_response_turn_ids.append(turn_id)
+        if not self.prepared_session_updates:
+            raise AssertionError(
+                "canvas interaction response requires a prepared session update"
+            )
+        self.canvas_interaction_response_session_updates.append(
+            self.prepared_session_updates[-1]
+        )
+        self._canvas_interaction_response_requested.set()
+        return True
 
     async def cancel(self, *, turn_id: str) -> None:
         if turn_id not in self.cancelled_turn_ids:

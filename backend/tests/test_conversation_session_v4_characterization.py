@@ -322,8 +322,8 @@ class _V4ConversationScenario:
         await self.send(
             {
                 "event": "clientReady",
-                "rendererCapabilityVersion": "ava-svg-renderer-v1",
-                "validatorVersion": "ava-svg-validator-v1",
+                "rendererCapabilityVersion": "ava-svg-renderer-v2",
+                "validatorVersion": "ava-svg-validator-v2",
             }
         )
         self._frame_stream = self.coordinator.frames().__aiter__()

@@ -549,7 +549,7 @@ final class AvaSvgCanvasController extends ChangeNotifier {
   void reportBinding(AvaSvgInteractionBinding binding) {
     _ensureOpen();
     final active = _active;
-    if (active == null || !activeRendererHealthy || !binding.serverReportable) {
+    if (active == null || !activeRendererHealthy) {
       return;
     }
     final canonical = active.document.manifest.bindings[binding.bindingId];

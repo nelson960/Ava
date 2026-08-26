@@ -3,81 +3,44 @@ import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 
-const avaSvgRendererCapabilityVersion = 'ava-svg-renderer-v1';
-const avaSvgValidatorVersion = 'ava-svg-validator-v1';
-const avaSvgManifestVersion = 'ava-svg-manifest-v1';
+const avaSvgRendererCapabilityVersion = 'ava-svg-renderer-v2';
+const avaSvgValidatorVersion = 'ava-svg-validator-v2';
+const avaSvgManifestVersion = 'ava-svg-manifest-v2';
 const avaSvgMaximumDocumentBytes = 262144;
 const avaSvgMaximumManifestBytes = 65536;
 
 final RegExp _identifier = RegExp(r'^[A-Za-z][A-Za-z0-9._:-]{0,95}$');
 final RegExp _sha256 = RegExp(r'^[a-f0-9]{64}$');
 
-enum AvaSvgInteractionAction {
-  dragWithin,
-  explore,
-  focus,
-  reset,
-  reveal,
-  select,
-  submitOutcome,
-  toggleVisibility,
-}
+enum AvaSvgInteractionMode { none, explore, select, steps }
 
 final class AvaSvgInteractionBinding {
   const AvaSvgInteractionBinding({
     required this.bindingId,
-    required this.action,
     required this.elementId,
     required this.targetId,
     required this.accessibilityLabel,
     required this.revealIds,
-    required this.pulseIds,
-    required this.exclusive,
-    required this.serverReportable,
-    this.declaredValue,
+    this.stepIndex,
   });
 
   final String bindingId;
-  final AvaSvgInteractionAction action;
   final String elementId;
   final String targetId;
   final String accessibilityLabel;
   final List<String> revealIds;
-  final List<String> pulseIds;
-  final bool exclusive;
-  final bool serverReportable;
-  final String? declaredValue;
+  final int? stepIndex;
 
   factory AvaSvgInteractionBinding.fromJson(Map<String, Object?> json) {
     final expected = <String>{
-      'action',
       'accessibilityLabel',
       'bindingId',
       'elementId',
-      'exclusive',
-      'hitTest',
-      'pulseIds',
       'revealIds',
-      'serverReportable',
       'targetId',
-      if (json.containsKey('declaredValue')) 'declaredValue',
+      if (json.containsKey('stepIndex')) 'stepIndex',
     };
     _requireExactKeys(json, expected, 'SVG interaction binding');
-    if (json['hitTest'] != 'element') {
-      throw const FormatException(
-        'SVG interaction binding.hitTest must be element.',
-      );
-    }
-    final actionName =
-        _requiredString(json, 'action', 'SVG interaction binding');
-    final action = AvaSvgInteractionAction.values
-        .where((candidate) => candidate.name == actionName)
-        .firstOrNull;
-    if (action == null) {
-      throw const FormatException(
-        'SVG interaction binding.action is unsupported.',
-      );
-    }
     final bindingId = _requiredIdentifier(
       json,
       'bindingId',
@@ -113,72 +76,20 @@ final class AvaSvgInteractionBinding {
       }
       return value;
     }).toList(growable: false);
-    final rawPulseIds = json['pulseIds'];
-    if (rawPulseIds is! List || rawPulseIds.length > 32) {
+    final stepIndex = json['stepIndex'];
+    if (stepIndex != null &&
+        (stepIndex is! int || stepIndex < 1 || stepIndex > 12)) {
       throw const FormatException(
-        'SVG interaction binding.pulseIds must be a bounded list.',
-      );
-    }
-    final pulseIds = rawPulseIds.map((value) {
-      if (value is! String || !_identifier.hasMatch(value)) {
-        throw const FormatException(
-          'SVG interaction binding.pulseIds contains an invalid ID.',
-        );
-      }
-      return value;
-    }).toList(growable: false);
-    final exclusive = json['exclusive'];
-    if (exclusive is! bool ||
-        (action != AvaSvgInteractionAction.explore &&
-            (exclusive || pulseIds.isNotEmpty))) {
-      throw const FormatException(
-        'SVG interaction binding.exclusive metadata is invalid.',
-      );
-    }
-    final serverReportable = json['serverReportable'];
-    if (serverReportable is! bool) {
-      throw const FormatException(
-        'SVG interaction binding.serverReportable must be boolean.',
-      );
-    }
-    final expectedServerReportable = switch (action) {
-      AvaSvgInteractionAction.explore ||
-      AvaSvgInteractionAction.select ||
-      AvaSvgInteractionAction.submitOutcome =>
-        true,
-      _ => false,
-    };
-    if (serverReportable != expectedServerReportable) {
-      throw const FormatException(
-        'SVG interaction binding.serverReportable disagrees with action.',
-      );
-    }
-    final declaredValue = json['declaredValue'];
-    if (declaredValue != null &&
-        (declaredValue is! String ||
-            declaredValue.isEmpty ||
-            declaredValue.length > 160)) {
-      throw const FormatException(
-        'SVG interaction binding.declaredValue is invalid.',
-      );
-    }
-    if (action == AvaSvgInteractionAction.submitOutcome &&
-        declaredValue == null) {
-      throw const FormatException(
-        'submitOutcome binding requires declaredValue.',
+        'SVG interaction binding.stepIndex is invalid.',
       );
     }
     return AvaSvgInteractionBinding(
       bindingId: bindingId,
-      action: action,
       elementId: elementId,
       targetId: targetId,
       accessibilityLabel: label,
       revealIds: List.unmodifiable(revealIds),
-      pulseIds: List.unmodifiable(pulseIds),
-      exclusive: exclusive,
-      serverReportable: serverReportable,
-      declaredValue: declaredValue as String?,
+      stepIndex: stepIndex as int?,
     );
   }
 }
@@ -189,6 +100,7 @@ final class AvaSvgCanvasManifest {
     required this.description,
     required this.background,
     required this.viewBox,
+    required this.interactionMode,
     required Map<String, AvaSvgInteractionBinding> bindings,
   }) : bindings = Map.unmodifiable(bindings);
 
@@ -196,6 +108,7 @@ final class AvaSvgCanvasManifest {
   final String description;
   final String? background;
   final List<double> viewBox;
+  final AvaSvgInteractionMode interactionMode;
   final Map<String, AvaSvgInteractionBinding> bindings;
 
   factory AvaSvgCanvasManifest.fromJson(Map<String, Object?> json) {
@@ -205,6 +118,7 @@ final class AvaSvgCanvasManifest {
         'background',
         'bindings',
         'description',
+        'interactionMode',
         'manifestVersion',
         'rendererCapabilityVersion',
         'sourceTrust',
@@ -269,13 +183,69 @@ final class AvaSvgCanvasManifest {
         throw const FormatException('SVG manifest binding ID is duplicated.');
       }
     }
+    final modeName = _requiredString(json, 'interactionMode', 'SVG manifest');
+    final interactionMode = AvaSvgInteractionMode.values
+        .where((candidate) => candidate.name == modeName)
+        .firstOrNull;
+    if (interactionMode == null) {
+      throw const FormatException(
+          'SVG manifest.interactionMode is unsupported.');
+    }
+    _validateInteractionMode(interactionMode, bindings.values);
     return AvaSvgCanvasManifest(
       title: title,
       description: description,
       background: background as String?,
       viewBox: List.unmodifiable(viewBox),
+      interactionMode: interactionMode,
       bindings: bindings,
     );
+  }
+}
+
+void _validateInteractionMode(
+  AvaSvgInteractionMode mode,
+  Iterable<AvaSvgInteractionBinding> bindings,
+) {
+  final values = bindings.toList(growable: false);
+  switch (mode) {
+    case AvaSvgInteractionMode.none:
+      if (values.isNotEmpty) {
+        throw const FormatException(
+            'Static SVG manifest cannot contain bindings.');
+      }
+      return;
+    case AvaSvgInteractionMode.explore:
+      if (values.isEmpty ||
+          values.any((binding) => binding.stepIndex != null)) {
+        throw const FormatException(
+            'Explore SVG manifest bindings are invalid.');
+      }
+      return;
+    case AvaSvgInteractionMode.select:
+      if (values.isEmpty ||
+          values.any(
+            (binding) =>
+                binding.stepIndex != null || binding.revealIds.isNotEmpty,
+          )) {
+        throw const FormatException(
+            'Select SVG manifest bindings are invalid.');
+      }
+      return;
+    case AvaSvgInteractionMode.steps:
+      final indexes = values.map((binding) => binding.stepIndex).toList()
+        ..sort(
+          (left, right) => (left ?? 0).compareTo(right ?? 0),
+        );
+      if (values.length < 2 ||
+          values.length > 12 ||
+          values.any((binding) => binding.revealIds.isNotEmpty) ||
+          indexes.asMap().entries.any(
+                (entry) => entry.value != entry.key + 1,
+              )) {
+        throw const FormatException('Steps SVG manifest bindings are invalid.');
+      }
+      return;
   }
 }
 

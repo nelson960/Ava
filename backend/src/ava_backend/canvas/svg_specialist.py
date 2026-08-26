@@ -12,10 +12,11 @@ from ..realtime.common import NonEmptyText, ProtocolIdentifier, RealtimeProtocol
 from ..realtime.tool_contract import (
     INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS,
     INTERACTIVE_CANVAS_GOAL_MAX_CHARACTERS,
+    InteractiveCanvasMode,
 )
 from .svg_document import SvgDocumentValidator, ValidatedSvgDocument
 
-SVG_CANVAS_SPECIALIST_PROMPT_VERSION = "ava-svg-canvas-v4.3"
+SVG_CANVAS_SPECIALIST_PROMPT_VERSION = "ava-svg-canvas-v4.4"
 SVG_CANVAS_SPECIALIST_BRIEF_MAX_CHARACTERS = INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS
 
 
@@ -61,6 +62,7 @@ class SvgCanvasSpecialistRequest(RealtimeProtocolModel):
         NonEmptyText,
         StringConstraints(max_length=SVG_CANVAS_SPECIALIST_BRIEF_MAX_CHARACTERS),
     ]
+    interaction_mode: InteractiveCanvasMode
     interaction_goal: (
         Annotated[
             NonEmptyText,
@@ -77,7 +79,7 @@ class SvgCanvasSpecialistRequest(RealtimeProtocolModel):
     ) = None
 
     @model_validator(mode="after")
-    def current_scene_fields_are_atomic(self) -> SvgCanvasSpecialistRequest:
+    def fields_are_atomic(self) -> SvgCanvasSpecialistRequest:
         values = (
             self.current_scene_id,
             self.current_revision,
@@ -90,6 +92,13 @@ class SvgCanvasSpecialistRequest(RealtimeProtocolModel):
             raise ValueError(
                 "currentSceneId, currentRevision, currentSvg, and "
                 "currentSvgSha256 must be supplied together"
+            )
+        if self.interaction_mode == InteractiveCanvasMode.NONE:
+            if self.interaction_goal is not None:
+                raise ValueError("interactionMode none cannot include interactionGoal")
+        elif self.interaction_goal is None:
+            raise ValueError(
+                "interactive canvas modes require a non-empty interactionGoal"
             )
         return self
 
@@ -108,7 +117,8 @@ class SvgCanvasSpecialistRequest(RealtimeProtocolModel):
             f'<canvas_request generation_id="{escape(self.generation_id)}" '
             f'age_band="{escape(str(self.age_band))}">\n'
             f"<brief>{escape(self.brief)}</brief>\n"
-            f"<interaction_goal>{escape(self.interaction_goal or '')}</interaction_goal>\n"
+            f'<interaction mode="{escape(str(self.interaction_mode))}">'
+            f"{escape(self.interaction_goal or '')}</interaction>\n"
             f"{current}"
             "</canvas_request>"
         )
@@ -176,24 +186,23 @@ ART DIRECTION
 - Do not draw a border around the entire canvas.
 
 INTERACTION METADATA
-- When interaction_goal is empty, produce a static SVG. Do not invent interaction
-  bindings unless interaction is required for the visual to satisfy the request.
-- When interaction_goal is present, implement only interactions that directly serve that goal.
-- Put each hotspot on the actual visible `<g>` or shape with a unique element `id`.
-- Add `data-ava-binding`, `data-ava-action`, and `aria-label` to that same element.
-- Supported actions are explore, select, submitOutcome, reveal, toggleVisibility,
-  dragWithin, reset, and focus.
-- `data-ava-target` defaults to the hotspot's element ID. Use `data-ava-reveal` for a
-  comma- or space-separated list of existing element IDs. An explore binding may use
-  `data-ava-exclusive="true"` to hide the prior explore details and `data-ava-pulse`
-  for existing connector IDs to pulse. submitOutcome also requires `data-ava-value`.
-- Interactions are optional. Never add unrelated or merely decorative interactions.
+- Copy the requested mode exactly to the SVG root as `data-ava-interaction-mode`.
+- `none` is static and has no bindings or step metadata.
+- `explore` uses 1-32 visible hotspots with unique `id`, `data-ava-binding`,
+  `aria-label`, optional `data-ava-target`, and optional `data-ava-reveal` IDs.
+- `select` uses 1-32 visible choices with unique `id`, `data-ava-binding`,
+  `aria-label`, and optional `data-ava-target`; it has no reveals.
+- `steps` uses 2-12 ordered groups with unique `id`, `data-ava-binding`,
+  `data-ava-step="1"` through N, and `aria-label`. Flutter supplies Back/Next
+  controls; never draw navigation controls in the SVG.
+- Flutter owns all deterministic interaction behavior. Do not add JavaScript,
+  event handlers, spoken responses, action types, or unrelated interactions.
 
 STATIC SECURITY CONTRACT
 - Never use scripts, event handler attributes, foreignObject, HTML, external references,
   remote or embedded assets, links, animation elements, or a `<style>` element.
-- Use only attributes listed in `allowedAttributes`, attributes beginning with the declared
-  `allowedDataAttributePrefix`, local `#id` references, and allowlisted inline style properties.
+- Use only attributes listed in `allowedAttributes` or `allowedDataAttributes`, local
+  `#id` references, and allowlisted inline style properties.
 - The document is accepted or rejected exactly as returned; Ava will never repair,
   normalize, reserialize, or silently remove part of it.
 

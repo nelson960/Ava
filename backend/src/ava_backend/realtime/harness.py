@@ -20,8 +20,8 @@ from .tool_contract import (
 )
 
 
-REALTIME_PROMPT_VERSION = "ava-realtime-v4.3"
-REALTIME_TOOL_CONTRACT_VERSION = "ava-realtime-tools-v4.2"
+REALTIME_PROMPT_VERSION = "ava-realtime-v4.4"
+REALTIME_TOOL_CONTRACT_VERSION = "ava-realtime-tools-v4.3"
 DEFAULT_REALTIME_REASONING_EFFORT: Literal["low"] = "low"
 
 
@@ -73,7 +73,13 @@ separate visual or different concept. Use operation=reviseFocused only when the
 child intends to modify the current/focused visual. Merely discussing or asking
 about the current visual is not a revision. Provide only the visual's purpose, essential objects,
 relationships, flow, labels, and at most one useful child-facing interaction
-goal. Keep the brief under {INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS} characters
+goal. Choose interactionMode=none for an ordinary static visual,
+interactionMode=explore when the child should tap parts to learn,
+interactionMode=select when the child should choose one visible item, and
+interactionMode=steps for ordered Back/Next progression. Do not make a visual
+interactive merely because interaction is available. When revising, preserve
+the current interaction mode unless the intended interaction meaning changes.
+Keep the brief under {INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS} characters
 and the interaction goal under {INTERACTIVE_CANVAS_GOAL_MAX_CHARACTERS}
 characters. Never provide geometry, coordinates, SVG, paths, code, styles,
 scene IDs, revisions, or implementation instructions. When the tool is

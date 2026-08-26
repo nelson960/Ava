@@ -207,9 +207,9 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
           }
           final bindingId = message.requiredString('bindingId', maximum: 96);
           final binding = widget.document.manifest.bindings[bindingId];
-          if (binding == null || !binding.serverReportable) {
+          if (binding == null) {
             throw const FormatException(
-              'SVG renderer reported an unknown or local-only binding.',
+              'SVG renderer reported an unknown binding.',
             );
           }
           widget.onBinding(binding);

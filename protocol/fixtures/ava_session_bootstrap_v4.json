@@ -8,9 +8,9 @@
   "webrtcToken": "webrtc-token-value",
   "canvasToken": "canvas-token-value",
   "expiresAt": "2026-08-21T12:00:00Z",
-  "rendererCapabilityVersion": "ava-svg-renderer-v1",
-  "validatorVersion": "ava-svg-validator-v1",
-  "manifestVersion": "ava-svg-manifest-v1",
+  "rendererCapabilityVersion": "ava-svg-renderer-v2",
+  "validatorVersion": "ava-svg-validator-v2",
+  "manifestVersion": "ava-svg-manifest-v2",
   "limits": {
     "maxTurnSeconds": 90,
     "maxResponseCharacters": 1800,

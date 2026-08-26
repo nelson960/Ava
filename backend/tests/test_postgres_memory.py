@@ -180,8 +180,8 @@ async def test_fake_realtime_tts_delivery_pipeline_commits_to_postgres() -> None
                     "sessionId": session_id,
                     "event": "clientReady",
                     "sequence": 0,
-                    "rendererCapabilityVersion": "ava-svg-renderer-v1",
-                    "validatorVersion": "ava-svg-validator-v1",
+                    "rendererCapabilityVersion": "ava-svg-renderer-v2",
+                    "validatorVersion": "ava-svg-validator-v2",
                 }
             )
         )

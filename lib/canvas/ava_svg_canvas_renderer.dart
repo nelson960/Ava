@@ -68,10 +68,11 @@ body{opacity:0;background:$background}
 #ava-host svg{display:block;width:100%;height:100%}
 #ava-overlay{pointer-events:none}
 .ava-hit{position:absolute;box-sizing:border-box;min-width:44px;min-height:44px;border:0;padding:0;background:transparent;pointer-events:auto;touch-action:none;-webkit-tap-highlight-color:transparent}
-.ava-hit.ava-feedback{border:2px solid rgba(33,126,132,.5);border-radius:14px;background:rgba(255,255,255,.12);animation:ava-pulse .55s ease-out}
-.ava-connector-pulse{animation:ava-connector-pulse .65s ease-out}
-@keyframes ava-pulse{0%{transform:scale(.92);opacity:.5}100%{transform:scale(1.08);opacity:0}}
-@keyframes ava-connector-pulse{0%,100%{opacity:1}50%{opacity:.28}}
+.ava-hit.ava-selected{border:3px solid rgba(33,126,132,.9);border-radius:14px;background:rgba(255,255,255,.2)}
+.ava-step-controls{position:absolute;left:50%;bottom:12px;transform:translateX(-50%);display:flex;align-items:center;gap:10px;padding:6px 10px;border-radius:18px;background:rgba(255,255,255,.92);pointer-events:auto}
+.ava-step-controls button{min-width:44px;min-height:44px;border:0;border-radius:14px;background:#d7eeee;color:#173d40;font:600 15px system-ui}
+.ava-step-controls button:disabled{opacity:.38}
+.ava-step-count{min-width:52px;text-align:center;color:#173d40;font:600 14px system-ui}
 </style></head><body>
 <div id="ava-host" aria-label="${_escapeHtmlAttribute(document.manifest.title)}"></div>
 <div id="ava-overlay"></div>
@@ -100,8 +101,9 @@ body{opacity:0;background:$background}
     const svg = document.importNode(parsed.documentElement, true);
     host.replaceChildren(svg);
     const bindings = new Map();
-    const original = new Map();
-    let selectedExplore = null;
+    const interactionMode = manifest.interactionMode;
+    let selectedBindingId = null;
+    let currentStep = 1;
     let presented = false;
     let rebuildQueued = false;
 
@@ -111,28 +113,12 @@ body{opacity:0;background:$background}
         throw new Error('bindingElementMismatch');
       }
       bindings.set(binding.bindingId, {binding, element});
-      for (const id of [binding.elementId, binding.targetId, ...binding.revealIds, ...binding.pulseIds]) {
+      for (const id of [binding.elementId, binding.targetId, ...binding.revealIds]) {
         const node = svg.querySelector('#' + CSS.escape(id));
         if (!node) throw new Error('bindingTargetMissing');
-        if (!original.has(id)) {
-          original.set(id, {
-            display: node.style.display,
-            visibility: node.style.visibility,
-            transform: node.getAttribute('transform')
-          });
-        }
       }
     }
 
-    const restore = (id) => {
-      const node = svg.querySelector('#' + CSS.escape(id));
-      const saved = original.get(id);
-      if (!node || !saved) return;
-      node.style.display = saved.display;
-      node.style.visibility = saved.visibility;
-      if (saved.transform === null) node.removeAttribute('transform');
-      else node.setAttribute('transform', saved.transform);
-    };
     const show = (id) => {
       const node = svg.querySelector('#' + CSS.escape(id));
       if (!node) return;
@@ -143,98 +129,71 @@ body{opacity:0;background:$background}
       const node = svg.querySelector('#' + CSS.escape(id));
       if (node) node.style.display = 'none';
     };
-    const report = (binding) => {
-      if (binding.serverReportable) {
-        bridge('$bindingHandler', {bindingId: binding.bindingId});
-      }
-    };
-    const feedback = (button) => {
-      button.classList.remove('ava-feedback');
-      void button.offsetWidth;
-      button.classList.add('ava-feedback');
-      setTimeout(() => button.classList.remove('ava-feedback'), 600);
-    };
-    const activate = (record, button) => {
+    const report = (binding) => bridge('$bindingHandler', {bindingId: binding.bindingId});
+    const activate = (record) => {
       const binding = record.binding;
-      if (binding.action === 'reset') {
-        for (const id of original.keys()) restore(id);
-        selectedExplore = null;
-      } else if (binding.action === 'toggleVisibility') {
-        const target = svg.querySelector('#' + CSS.escape(binding.targetId));
-        if (target) target.style.display = target.style.display === 'none' ? '' : 'none';
-      } else {
-        if (binding.action === 'explore' && binding.exclusive && selectedExplore && selectedExplore !== binding.bindingId) {
-          const previous = bindings.get(selectedExplore);
+      if (interactionMode === 'explore') {
+        if (selectedBindingId && selectedBindingId !== binding.bindingId) {
+          const previous = bindings.get(selectedBindingId);
           if (previous) for (const id of previous.binding.revealIds) hide(id);
         }
         for (const id of binding.revealIds) show(id);
-        for (const id of binding.pulseIds) {
-          const connector = svg.querySelector('#' + CSS.escape(id));
-          if (!connector) continue;
-          connector.classList.remove('ava-connector-pulse');
-          void connector.getBoundingClientRect();
-          connector.classList.add('ava-connector-pulse');
-          setTimeout(() => connector.classList.remove('ava-connector-pulse'), 700);
-        }
-        if (binding.action === 'explore') selectedExplore = binding.bindingId;
       }
-      feedback(button);
+      selectedBindingId = binding.bindingId;
       report(binding);
       queueRebuild();
     };
-    const toSvgPoint = (x, y) => {
-      const point = svg.createSVGPoint();
-      point.x = x; point.y = y;
-      const matrix = svg.getScreenCTM();
-      return matrix ? point.matrixTransform(matrix.inverse()) : point;
+    const stepBindings = [...bindings.values()]
+      .filter((record) => Number.isInteger(record.binding.stepIndex))
+      .sort((left, right) => left.binding.stepIndex - right.binding.stepIndex);
+    const applyStep = (step, shouldReport) => {
+      if (interactionMode !== 'steps' || step < 1 || step > stepBindings.length) return;
+      currentStep = step;
+      for (const record of stepBindings) {
+        if (record.binding.stepIndex === currentStep) show(record.binding.elementId);
+        else hide(record.binding.elementId);
+      }
+      selectedBindingId = stepBindings[currentStep - 1].binding.bindingId;
+      if (shouldReport) report(stepBindings[currentStep - 1].binding);
+      queueRebuild();
     };
 
     const rebuild = () => {
       rebuildQueued = false;
       overlay.replaceChildren();
-      for (const record of bindings.values()) {
-        const rect = record.element.getBoundingClientRect();
-        if (!Number.isFinite(rect.left) || !Number.isFinite(rect.top)) continue;
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.className = 'ava-hit';
-        button.setAttribute('aria-label', record.binding.accessibilityLabel);
-        button.dataset.bindingId = record.binding.bindingId;
-        const width = Math.max(44, rect.width);
-        const height = Math.max(44, rect.height);
-        button.style.left = (rect.left + rect.width / 2 - width / 2) + 'px';
-        button.style.top = (rect.top + rect.height / 2 - height / 2) + 'px';
-        button.style.width = width + 'px';
-        button.style.height = height + 'px';
-        if (record.binding.action === 'dragWithin') {
-          let drag = null;
-          button.addEventListener('pointerdown', (event) => {
-            button.setPointerCapture(event.pointerId);
-            drag = {start: toSvgPoint(event.clientX, event.clientY), moved:false};
-          });
-          button.addEventListener('pointermove', (event) => {
-            if (!drag) return;
-            const current = toSvgPoint(event.clientX, event.clientY);
-            const dx = current.x - drag.start.x;
-            const dy = current.y - drag.start.y;
-            const saved = original.get(record.binding.targetId);
-            const target = svg.querySelector('#' + CSS.escape(record.binding.targetId));
-            if (!target || !saved) return;
-            const prefix = saved.transform ? saved.transform + ' ' : '';
-            target.setAttribute('transform', prefix + 'translate(' + dx + ' ' + dy + ')');
-            button.style.transform = 'translate(' + (event.clientX - rect.left - rect.width / 2) + 'px,' + (event.clientY - rect.top - rect.height / 2) + 'px)';
-            drag.moved = true;
-          });
-          button.addEventListener('pointerup', () => {
-            if (drag && drag.moved) { feedback(button); report(record.binding); }
-            drag = null;
-            queueRebuild();
-          });
-          button.addEventListener('pointercancel', () => { drag = null; queueRebuild(); });
-        } else {
-          button.addEventListener('click', () => activate(record, button));
+      if (interactionMode !== 'steps') {
+        for (const record of bindings.values()) {
+          const rect = record.element.getBoundingClientRect();
+          if (!Number.isFinite(rect.left) || !Number.isFinite(rect.top)) continue;
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'ava-hit';
+          button.setAttribute('aria-label', record.binding.accessibilityLabel);
+          button.dataset.bindingId = record.binding.bindingId;
+          const width = Math.max(44, rect.width);
+          const height = Math.max(44, rect.height);
+          button.style.left = (rect.left + rect.width / 2 - width / 2) + 'px';
+          button.style.top = (rect.top + rect.height / 2 - height / 2) + 'px';
+          button.style.width = width + 'px';
+          button.style.height = height + 'px';
+          if (record.binding.bindingId === selectedBindingId) button.classList.add('ava-selected');
+          button.addEventListener('click', () => activate(record));
+          overlay.appendChild(button);
         }
-        overlay.appendChild(button);
+      }
+      if (interactionMode === 'steps') {
+        const controls = document.createElement('div');
+        controls.className = 'ava-step-controls';
+        const back = document.createElement('button');
+        back.type = 'button'; back.textContent = 'Back'; back.disabled = currentStep === 1;
+        back.addEventListener('click', () => applyStep(currentStep - 1, true));
+        const count = document.createElement('span');
+        count.className = 'ava-step-count'; count.textContent = currentStep + ' / ' + stepBindings.length;
+        const next = document.createElement('button');
+        next.type = 'button'; next.textContent = 'Next'; next.disabled = currentStep === stepBindings.length;
+        next.addEventListener('click', () => applyStep(currentStep + 1, true));
+        controls.append(back, count, next);
+        overlay.appendChild(controls);
       }
     };
     function queueRebuild() {
@@ -243,6 +202,7 @@ body{opacity:0;background:$background}
       requestAnimationFrame(rebuild);
     }
     new ResizeObserver(queueRebuild).observe(host);
+    if (interactionMode === 'steps') applyStep(1, false);
     queueRebuild();
     requestAnimationFrame(() => requestAnimationFrame(() => {
       bridge('$preparedHandler', {svgSha256:svgHash, manifestSha256:manifestHash});
