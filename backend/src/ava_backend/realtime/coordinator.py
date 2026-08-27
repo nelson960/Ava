@@ -1082,6 +1082,7 @@ class DeterministicRealtimeSessionCoordinator:
             self._cancellation_requested.wait(),
             name="ava-turn-server-preemption",
         )
+        waiting_for_client_cancellation = False
         try:
             while not self._terminal:
                 input_task = self._active_provider_input_task
@@ -1099,22 +1100,36 @@ class DeterministicRealtimeSessionCoordinator:
                     self._active_provider_input_task = None
                     if self._classify_provider_input(input_event):
                         self._cancellation_requested.set()
-                        yield self._provider_interrupt_requested_frame()
+                        if not waiting_for_client_cancellation:
+                            waiting_for_client_cancellation = True
+                            yield self._provider_interrupt_requested_frame()
                     else:
                         self._start_provider_input_observer()
                     continue
 
                 if preemption_task is not None and preemption_task in done:
+                    preemption_task.result()
+                    preemption_task = None
                     reason = self._server_preemption_reason
-                    if reason is not None:
+                    if reason is not None and not waiting_for_client_cancellation:
+                        waiting_for_client_cancellation = True
                         yield self._interrupt_requested_frame(
                             stream_id=self._stream_id,
                             reason=reason,
                         )
-                        preemption_task = None
+                    elif reason is None and self._cancel_event is not None:
+                        waiting_for_client_cancellation = True
+                    elif not waiting_for_client_cancellation:
+                        raise CoordinatorStateError(
+                            "speaking cancellation signal has no owning input, "
+                            "server preemption, or client cancellation"
+                        )
+                    if control_task is not None and not control_task.done():
                         continue
 
                 assert control_task is not None
+                if not control_task.done():
+                    continue
                 try:
                     control = control_task.result()
                 except QueueClosed:
@@ -1126,7 +1141,8 @@ class DeterministicRealtimeSessionCoordinator:
                     return
                 if isinstance(control, PlaybackProgressEventV4):
                     if (
-                        control.rendered_sample_count == self.received_sample_count
+                        not waiting_for_client_cancellation
+                        and control.rendered_sample_count == self.received_sample_count
                         and control.buffered_sample_count == 0
                     ):
                         async for frame in self._complete_frames(

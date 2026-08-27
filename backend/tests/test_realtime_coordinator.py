@@ -145,6 +145,26 @@ class _BlockingInteractionContextProvider(DeterministicRealtimePlanProvider):
         return triggered
 
 
+class _InteractionThenChildRealtimeProvider(DeterministicRealtimePlanProvider):
+    """Wait for an interaction response on turn one, then serve child turn two."""
+
+    def __init__(self, plan: AvaTurnPlan) -> None:
+        super().__init__(
+            plan,
+            child_text=None,
+            wait_for_canvas_interaction_response=True,
+        )
+        self.input_observed = asyncio.Event()
+
+    async def next_input_event(self) -> RealtimeProviderInputEvent:
+        event = await super().next_input_event()
+        self.input_observed.set()
+        return event
+
+    def serve_future_child_turns(self) -> None:
+        self._wait_for_canvas_interaction_response = False
+
+
 def _canvas_runtime(
     *,
     state: SvgCanvasSessionState | None = None,
@@ -358,6 +378,16 @@ async def _ready(coordinator: DeterministicRealtimeSessionCoordinator) -> None:
             }
         )
     )
+
+
+async def _advance_ready_callbacks(*, rounds: int = 12) -> None:
+    """Advance already-ready tasks without sleeps or wall-clock timeouts."""
+
+    loop = asyncio.get_running_loop()
+    for _ in range(rounds):
+        checkpoint: asyncio.Future[None] = loop.create_future()
+        loop.call_soon(checkpoint.set_result, None)
+        await checkpoint
 
 
 async def test_coordinator_streams_seven_phrases_pcm_and_memory_directly_as_v4() -> (
@@ -1103,6 +1133,15 @@ async def test_tap_during_interaction_speech_rearms_only_latest_reaction() -> No
                 }
             )
         )
+        speaking_reached = False
+        async for frame in frames:
+            if isinstance(frame, AvaServerControlFrameV4) and isinstance(
+                frame.event, TurnPhaseChangedEventV4
+            ):
+                if frame.event.phase == SpeechPhase.SPEAKING:
+                    speaking_reached = True
+                    break
+        assert speaking_reached
         await coordinator.receive(
             _client(
                 {
@@ -1127,6 +1166,8 @@ async def test_tap_during_interaction_speech_rearms_only_latest_reaction() -> No
                 break
         assert interrupted is not None
         assert interrupted.stream_id == STREAM_ID
+        assert interrupted.reason == "canvasInteractionSuperseded"
+        interruptions = [interrupted]
         await coordinator.receive(
             _client(
                 {
@@ -1155,6 +1196,9 @@ async def test_tap_during_interaction_speech_rearms_only_latest_reaction() -> No
         async for frame in frames:
             if not isinstance(frame, AvaServerControlFrameV4):
                 continue
+            if isinstance(frame.event, InterruptRequestedEventV4):
+                interruptions.append(frame.event)
+                continue
             if (
                 isinstance(frame.event, AudioMetadataEventV4)
                 and frame.event.turn_id == "turn-coordinator-2"
@@ -1163,6 +1207,7 @@ async def test_tap_during_interaction_speech_rearms_only_latest_reaction() -> No
                 break
 
         assert replacement_metadata is not None
+        assert len(interruptions) == 1
         assert state.last_interaction is not None
         assert state.last_interaction.interaction_revision == 2
         assert state.last_interaction.binding_id == "explore_wall"
@@ -1178,6 +1223,161 @@ async def test_tap_during_interaction_speech_rearms_only_latest_reaction() -> No
         assert isinstance(instructions, str)
         assert "<target>Explore cell wall</target>" in instructions
         assert "<target>Explore nucleus</target>" not in instructions
+    finally:
+        await frames.aclose()
+        await coordinator.close()
+
+
+async def test_child_speech_during_canvas_fade_does_not_repeat_interruption() -> None:
+    state = _active_multi_binding_canvas_state()
+    active = state.active
+    assert active is not None
+    provider = _InteractionThenChildRealtimeProvider(_plan())
+    coordinator, _, _, _ = _coordinator(
+        realtime=provider,
+        persistent=True,
+        canvas_state=state,
+    )
+    await _ready(coordinator)
+    frames = coordinator.frames()
+    try:
+        await coordinator.receive(
+            _client(
+                {
+                    "event": "canvasInteraction",
+                    "sequence": 1,
+                    "sceneId": active.scene_id,
+                    "sceneRevision": active.revision,
+                    "interactionRevision": 1,
+                    "svgSha256": active.document.svg_sha256,
+                    "manifestSha256": active.document.manifest_sha256,
+                    "bindingId": "explore_nucleus",
+                }
+            )
+        )
+
+        first_metadata: AudioMetadataEventV4 | None = None
+        async for frame in frames:
+            if isinstance(frame, AvaServerControlFrameV4) and isinstance(
+                frame.event, AudioMetadataEventV4
+            ):
+                first_metadata = frame.event
+                break
+        assert first_metadata is not None
+        await coordinator.receive(
+            _client(
+                {
+                    "event": "playbackStarted",
+                    "sequence": 2,
+                    "turnId": TURN_ID,
+                    "streamId": STREAM_ID,
+                    "renderedSampleCount": 0,
+                }
+            )
+        )
+        speaking_reached = False
+        async for frame in frames:
+            if isinstance(frame, AvaServerControlFrameV4) and isinstance(
+                frame.event, TurnPhaseChangedEventV4
+            ):
+                if frame.event.phase == SpeechPhase.SPEAKING:
+                    speaking_reached = True
+                    break
+        assert speaking_reached
+        await coordinator.receive(
+            _client(
+                {
+                    "event": "canvasInteraction",
+                    "sequence": 3,
+                    "sceneId": active.scene_id,
+                    "sceneRevision": active.revision,
+                    "interactionRevision": 2,
+                    "svgSha256": active.document.svg_sha256,
+                    "manifestSha256": active.document.manifest_sha256,
+                    "bindingId": "explore_wall",
+                }
+            )
+        )
+
+        first_interrupt: InterruptRequestedEventV4 | None = None
+        async for frame in frames:
+            if isinstance(frame, AvaServerControlFrameV4) and isinstance(
+                frame.event, InterruptRequestedEventV4
+            ):
+                first_interrupt = frame.event
+                break
+        assert first_interrupt is not None
+        assert first_interrupt.reason == "canvasInteractionSuperseded"
+
+        provider.emit_input_event(
+            RealtimeProviderInputEvent(
+                event_type="input_audio_buffer.speech_started",
+                item_id="item-child-during-canvas-fade",
+                audio_start_ms=925,
+            )
+        )
+        provider.serve_future_child_turns()
+        pending = asyncio.create_task(anext(frames))
+        await provider.input_observed.wait()
+        await _advance_ready_callbacks()
+        assert not pending.done(), (
+            "child speech during an existing fade emitted a second interruption "
+            "instead of waiting for authoritative client cancellation"
+        )
+
+        await coordinator.receive(
+            _client(
+                {
+                    "event": "playbackStopped",
+                    "sequence": 4,
+                    "turnId": TURN_ID,
+                    "streamId": STREAM_ID,
+                    "renderedSampleCount": 0,
+                    "reason": "canvasInteractionSuperseded",
+                }
+            )
+        )
+        await coordinator.receive(
+            _client(
+                {
+                    "event": "cancelTurn",
+                    "sequence": 5,
+                    "turnId": TURN_ID,
+                    "requestId": "cancel-canvas-then-child",
+                    "reason": "canvasInteractionSuperseded",
+                }
+            )
+        )
+
+        first_after_cancel = await pending
+        controls: list[object] = []
+        if isinstance(first_after_cancel, AvaServerControlFrameV4):
+            controls.append(first_after_cancel.event)
+        replacement_metadata: AudioMetadataEventV4 | None = None
+        async for frame in frames:
+            if not isinstance(frame, AvaServerControlFrameV4):
+                continue
+            controls.append(frame.event)
+            if (
+                isinstance(frame.event, AudioMetadataEventV4)
+                and frame.event.turn_id == "turn-coordinator-2"
+            ):
+                replacement_metadata = frame.event
+                break
+
+        assert replacement_metadata is not None
+        assert (
+            provider.input_item_owner(item_id="item-child-during-canvas-fade")
+            == "turn-coordinator-2"
+        )
+        assert state.last_interaction is not None
+        assert state.last_interaction.interaction_revision == 2
+        assert state.last_interaction.binding_id == "explore_wall"
+        assert provider.canvas_interaction_response_turn_ids == [TURN_ID]
+        assert not any(
+            isinstance(event, InterruptRequestedEventV4) for event in controls
+        )
+        assert not any(isinstance(event, TurnFailedEventV4) for event in controls)
     finally:
         await frames.aclose()
         await coordinator.close()

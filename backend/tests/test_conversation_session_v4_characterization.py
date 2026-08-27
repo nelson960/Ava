@@ -30,6 +30,7 @@ from ava_backend.realtime.events_v4 import (
     AudioMetadataEventV4,
     AvaClientEventUnionV4,
     AvaServerEventTypeV4,
+    CancelTurnEventV4,
     CanvasDocumentAvailableEventV4,
     CanvasRejectedEventV4,
     InterruptRequestedEventV4,
@@ -331,6 +332,52 @@ class _BoundaryGatedSpeech(DeterministicStreamingSpeechSynthesizer):
             yield SynthesizedAudioChunk(bytes(16))
         finally:
             self._event(self.iterator_closed, segment.id).set()
+
+
+class _DelayedCancelAdmissionQueue:
+    """Hold one validated cancel after receive() sets the shared cancel event."""
+
+    def __init__(self, delegate: object) -> None:
+        self._delegate = delegate
+        self._pending_cancel: CancelTurnEventV4 | None = None
+        self.cancel_delayed = asyncio.Event()
+
+    @property
+    def item_count(self) -> int:
+        return cast(int, getattr(self._delegate, "item_count"))
+
+    def put_nowait(self, event: AvaClientEventUnionV4) -> None:
+        if isinstance(event, CancelTurnEventV4):
+            if self._pending_cancel is not None:
+                raise AssertionError("only one delayed cancel is supported")
+            self._pending_cancel = event
+            self.cancel_delayed.set()
+            return
+        getattr(self._delegate, "put_nowait")(event)
+
+    async def get(self) -> AvaClientEventUnionV4:
+        return cast(AvaClientEventUnionV4, await getattr(self._delegate, "get")())
+
+    def release_cancel(self) -> None:
+        pending = self._pending_cancel
+        if pending is None:
+            return
+        self._pending_cancel = None
+        getattr(self._delegate, "put_nowait")(pending)
+
+    def close(self) -> None:
+        self.release_cancel()
+        getattr(self._delegate, "close")()
+
+
+async def _advance_ready_callbacks(*, rounds: int = 12) -> None:
+    """Advance already-ready tasks without a sleep or wall-clock timeout."""
+
+    loop = asyncio.get_running_loop()
+    for _ in range(rounds):
+        checkpoint: asyncio.Future[None] = loop.create_future()
+        loop.call_soon(checkpoint.set_result, None)
+        await checkpoint
 
 
 class _FailingMemory(DevelopmentAuthoritativeMemoryStore):
@@ -906,6 +953,238 @@ async def test_speech_started_during_second_phrase_cancels_without_later_pcm() -
             speech.first_chunk_emitted,
             second_segment_id,
         ).is_set()
+    finally:
+        await scenario.close()
+
+
+@pytest.mark.asyncio
+async def test_speaking_provider_interrupt_waits_for_existing_control_consumer() -> (
+    None
+):
+    provider = _OwnedInputRealtimeProvider(
+        _plan(),
+        originating_item_ids=("item-live-origin", "item-live-child-next"),
+    )
+    scenario = _V4ConversationScenario(
+        session_id="session-v4-live-speaking-race",
+        turn_ids=("turn-v4-live-a", "turn-v4-live-b"),
+        realtime=provider,
+    )
+    try:
+        await scenario.start()
+        speaking = await scenario.read_to_speaking()
+        await provider.wait_until_input_observed(item_id="item-live-origin")
+        provider.emit_speech_started(
+            item_id="item-live-child-next",
+            audio_start_ms=910,
+        )
+        interrupt = cast(
+            InterruptRequestedEventV4,
+            await scenario.read_until(
+                lambda event: isinstance(event, InterruptRequestedEventV4)
+            ),
+        )
+
+        pending = asyncio.create_task(scenario.next_frame())
+        await _advance_ready_callbacks()
+        assert not pending.done(), (
+            "speaking arbitration terminated before Flutter supplied its "
+            "authoritative cancellation"
+        )
+
+        assert scenario.active_stream_id is not None
+        rendered_sample = max(1, scenario.received_samples // 2)
+        await scenario.send(
+            {
+                "event": "playbackStopped",
+                "turnId": speaking.turn_id,
+                "streamId": scenario.active_stream_id,
+                "renderedSampleCount": rendered_sample,
+                "reason": "providerSpeechStarted",
+            }
+        )
+        await scenario.send(
+            {
+                "event": "cancelTurn",
+                "turnId": speaking.turn_id,
+                "requestId": "cancel-live-speaking-race",
+                "reason": "providerSpeechStarted",
+            }
+        )
+        first_after_interrupt = await pending
+        assert isinstance(first_after_interrupt, AvaServerControlFrameV4)
+        assert isinstance(first_after_interrupt.event, TurnPhaseChangedEventV4)
+        assert first_after_interrupt.event.phase == SpeechPhase.CANCELLING
+        terminal = cast(
+            TurnCancelledEventV4,
+            await scenario.read_until(
+                lambda event: isinstance(event, TurnCancelledEventV4)
+            ),
+        )
+        created_b = cast(
+            TurnCreatedEventV4,
+            await scenario.read_until(
+                lambda event: isinstance(event, TurnCreatedEventV4)
+                and event.turn_id == "turn-v4-live-b"
+            ),
+        )
+        await scenario.read_until(
+            lambda event: isinstance(event, TurnPhaseChangedEventV4)
+            and event.turn_id == "turn-v4-live-b"
+            and event.phase == SpeechPhase.PLANNING
+        )
+
+        assert interrupt.reason == "providerSpeechStarted"
+        assert terminal.delivered_sample_count == rendered_sample
+        assert created_b.turn_id == "turn-v4-live-b"
+        assert provider.input_item_owner(item_id="item-live-child-next") == (
+            "turn-v4-live-b"
+        )
+        assert (
+            len(
+                [
+                    event
+                    for event in scenario.controls
+                    if isinstance(event, InterruptRequestedEventV4)
+                ]
+            )
+            == 1
+        )
+        assert not any(
+            isinstance(event, TurnFailedEventV4) for event in scenario.controls
+        )
+    finally:
+        await scenario.close()
+
+
+@pytest.mark.asyncio
+async def test_speaking_client_cancel_waits_for_delayed_queue_admission() -> None:
+    scenario = _V4ConversationScenario(
+        session_id="session-v4-delayed-client-cancel",
+        turn_ids=("turn-v4-delayed-client-cancel",),
+    )
+    delayed = _DelayedCancelAdmissionQueue(scenario.coordinator._controls)
+    scenario.coordinator._controls = delayed  # type: ignore[assignment]
+    try:
+        await scenario.start()
+        speaking = await scenario.read_to_speaking()
+        pending = asyncio.create_task(scenario.next_frame())
+        await _advance_ready_callbacks()
+        assert not pending.done()
+        await scenario.send(
+            {
+                "event": "cancelTurn",
+                "turnId": speaking.turn_id,
+                "requestId": "cancel-delayed-admission",
+                "reason": "userStopped",
+            }
+        )
+        await delayed.cancel_delayed.wait()
+
+        await _advance_ready_callbacks()
+        assert not pending.done(), (
+            "shared cancellation wakeup read a pending control task before "
+            "CancelTurn queue admission"
+        )
+
+        delayed.release_cancel()
+        first = await pending
+        assert isinstance(first, AvaServerControlFrameV4)
+        assert isinstance(first.event, TurnPhaseChangedEventV4)
+        assert first.event.phase == SpeechPhase.CANCELLING
+        terminal = cast(
+            TurnCancelledEventV4,
+            await scenario.read_until(
+                lambda event: isinstance(event, TurnCancelledEventV4)
+            ),
+        )
+        assert terminal.reason == "userStopped"
+        assert not any(
+            isinstance(event, InterruptRequestedEventV4) for event in scenario.controls
+        )
+        assert not any(
+            isinstance(event, TurnFailedEventV4) for event in scenario.controls
+        )
+    finally:
+        delayed.release_cancel()
+        await scenario.close()
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_speech_started_and_playback_control_are_consumed_once() -> (
+    None
+):
+    provider = _OwnedInputRealtimeProvider(
+        _plan(),
+        originating_item_ids=("item-simultaneous-origin",),
+    )
+    scenario = _V4ConversationScenario(
+        session_id="session-v4-simultaneous-speaking",
+        turn_ids=("turn-v4-simultaneous-speaking",),
+        realtime=provider,
+    )
+    try:
+        await scenario.start()
+        speaking = await scenario.read_to_speaking()
+        assert scenario.active_stream_id is not None
+        await provider.wait_until_input_observed(item_id="item-simultaneous-origin")
+        provider.emit_speech_started(
+            item_id="item-simultaneous-child",
+            audio_start_ms=920,
+        )
+        progress_sample = max(1, scenario.received_samples // 3)
+        await scenario.send(
+            {
+                "event": "playbackProgress",
+                "turnId": speaking.turn_id,
+                "streamId": scenario.active_stream_id,
+                "renderedSampleCount": progress_sample,
+                "bufferedSampleCount": 0,
+            }
+        )
+        interrupt = cast(
+            InterruptRequestedEventV4,
+            await scenario.read_until(
+                lambda event: isinstance(event, InterruptRequestedEventV4)
+            ),
+        )
+        await scenario.send(
+            {
+                "event": "playbackStopped",
+                "turnId": speaking.turn_id,
+                "streamId": scenario.active_stream_id,
+                "renderedSampleCount": progress_sample,
+                "reason": "providerSpeechStarted",
+            }
+        )
+        await scenario.send(
+            {
+                "event": "cancelTurn",
+                "turnId": speaking.turn_id,
+                "requestId": "cancel-simultaneous-speaking",
+                "reason": "providerSpeechStarted",
+            }
+        )
+        terminal = cast(
+            TurnCancelledEventV4,
+            await scenario.read_until(
+                lambda event: isinstance(event, TurnCancelledEventV4)
+            ),
+        )
+
+        assert interrupt.reason == "providerSpeechStarted"
+        assert terminal.delivered_sample_count == progress_sample
+        assert scenario.coordinator._controls.item_count == 0
+        assert (
+            len(
+                [
+                    event
+                    for event in scenario.controls
+                    if isinstance(event, InterruptRequestedEventV4)
+                ]
+            )
+            == 1
+        )
     finally:
         await scenario.close()
 
