@@ -357,7 +357,8 @@ async def test_early_terminal_observer_cannot_consume_next_turn_input() -> None:
                         event_type="input_audio_buffer.speech_started",
                         item_id="item-next-turn",
                         audio_start_ms=0,
-                    )
+                    ),
+                    owner_turn_id="turn-observer-2",
                 )
                 emitted_next_turn_input = True
             if (

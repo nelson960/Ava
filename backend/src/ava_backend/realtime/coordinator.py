@@ -7,8 +7,9 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import monotonic
-from typing import TypeAlias, cast
+from typing import TypeAlias, TypeVar, cast
 
+from ..canvas.svg_workspace import RecordedSvgCanvasInteraction
 from ..diagnostics import new_failure_id
 from ..protocol import AgeBand
 from .bounded_queue import BoundedAsyncQueue, QueueClosed
@@ -89,6 +90,7 @@ class CoordinatorStateError(RuntimeError):
 
 IdentifierFactory: TypeAlias = Callable[[], str]
 OccurrenceTimeFactory: TypeAlias = Callable[[], datetime]
+_WorkResult = TypeVar("_WorkResult")
 
 
 def _utc_now() -> datetime:
@@ -100,6 +102,7 @@ class _PlanningState:
     canvas_started: float | None = None
     canvas_call_id: str | None = None
     canvas_generation_id: str | None = None
+    first_text_delta_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +217,16 @@ class DeterministicRealtimeSessionCoordinator:
         self._pending_provider_input_item_ids: set[str] = set()
         self._interrupt_signalled_item_ids: set[str] = set()
         self._interruption_provider_item_id: str | None = None
+        self._interruption_provider_audio_start_ms: int | None = None
+        self._provider_speech_started_observed_at: float | None = None
+        self._preemption_requested_at: float | None = None
+        self._latest_canvas_interaction_intent: (
+            RecordedSvgCanvasInteraction | None
+        ) = None
+        self._canvas_interaction_response_task: asyncio.Task[None] | None = None
+        self._canvas_interaction_response_wakeup = asyncio.Event()
+        self._canvas_interaction_response_turn_id: str | None = None
+        self._server_preemption_reason: str | None = None
 
     @property
     def harness(self) -> RealtimeHarness:
@@ -358,39 +371,18 @@ class DeterministicRealtimeSessionCoordinator:
             await self._refresh_canvas_context()
             return
         if isinstance(event, CanvasInteractionEventV4):
-            interaction_turn_id = self._turn_id
             interaction = await self._canvas_jobs.interaction(event)
             if interaction is not None:
-                await self._refresh_canvas_context()
-                if self._turn_id != interaction_turn_id or self._terminal:
-                    LOGGER.info(
-                        "canvas_interaction_response_suppressed_after_turn_advance "
-                        "session_id=%s interaction_turn_id=%s current_turn_id=%s "
-                        "current_turn_terminal=%s scene_id=%s scene_revision=%s "
-                        "interaction_revision=%s",
-                        self._session_id,
-                        interaction_turn_id,
-                        self._turn_id,
-                        self._terminal,
-                        interaction.scene_id,
-                        interaction.scene_revision,
-                        interaction.interaction_revision,
+                self._latest_canvas_interaction_intent = interaction
+                self._canvas_interaction_response_wakeup.set()
+                self._ensure_canvas_interaction_response_worker()
+                if self._canvas_interaction_response_turn_id == self._turn_id or (
+                    self._machine.snapshot.phase
+                    in {SpeechPhase.SYNTHESIZING, SpeechPhase.SPEAKING}
+                ):
+                    self._request_server_preemption(
+                        reason="canvasInteractionSuperseded"
                     )
-                    return
-                triggered = await self._realtime.request_canvas_interaction_response(
-                    turn_id=interaction_turn_id
-                )
-                LOGGER.info(
-                    "canvas_interaction_response_decided session_id=%s turn_id=%s "
-                    "scene_id=%s scene_revision=%s interaction_revision=%s "
-                    "triggered=%s",
-                    self._session_id,
-                    interaction_turn_id,
-                    interaction.scene_id,
-                    interaction.scene_revision,
-                    interaction.interaction_revision,
-                    triggered,
-                )
             return
 
         if self._is_late_terminal_playback_control(event):
@@ -568,8 +560,15 @@ class DeterministicRealtimeSessionCoordinator:
 
     async def _conversation_frames(self) -> AsyncIterator[AvaServerOutboundFrameV4]:
         while not self._closed:
-            async for frame in self._one_turn_frames():
-                yield frame
+            turn_frames = self._one_turn_frames()
+            try:
+                async for frame in turn_frames:
+                    yield frame
+            finally:
+                await cast(
+                    AsyncGenerator[AvaServerOutboundFrameV4, None],
+                    turn_frames,
+                ).aclose()
             if not self._persistent or self._closed or not self._session_reusable:
                 if self._persistent and not self._session_reusable:
                     LOGGER.warning(
@@ -588,11 +587,12 @@ class DeterministicRealtimeSessionCoordinator:
         parser = StreamingSpeechParser()
         ledger = DeliveredTextLedger()
         pending_binary_pcm = False
+        turn_frames = self._one_turn_frames_impl(
+            parser=parser,
+            ledger=ledger,
+        )
         try:
-            async for frame in self._one_turn_frames_impl(
-                parser=parser,
-                ledger=ledger,
-            ):
+            async for frame in turn_frames:
                 if isinstance(frame, AvaServerControlFrameV4) and isinstance(
                     frame.event,
                     AudioChunkEventV4,
@@ -666,6 +666,10 @@ class DeterministicRealtimeSessionCoordinator:
                 delivered_text=ledger.delivered_text(delivered_samples),
             )
         finally:
+            await cast(
+                AsyncGenerator[AvaServerOutboundFrameV4, None],
+                turn_frames,
+            ).aclose()
             # The provider-input observer is turn-owned. It starts before
             # planning, so every turn exit must join it -- including an empty
             # provider response that returns before the playback-loop cleanup.
@@ -720,21 +724,15 @@ class DeterministicRealtimeSessionCoordinator:
         self._pending_provider_input_item_ids.clear()
         self._interrupt_signalled_item_ids.clear()
         self._interruption_provider_item_id = None
+        self._interruption_provider_audio_start_ms = None
+        self._provider_speech_started_observed_at = None
+        self._preemption_requested_at = None
 
         # Keep a provider-input observer alive before planning/synthesis. The
         # sideband reader is session-owned, while this turn observer owns only
         # the indexed input lifecycle; it must not wait until playback starts
         # and miss a VAD signal that arrived during synthesis.
-        next_input_event = getattr(self._realtime, "next_input_event", None)
-        input_task: asyncio.Task[RealtimeProviderInputEvent] | None = (
-            asyncio.create_task(
-                next_input_event(),
-                name="ava-provider-input-observer",
-            )
-            if callable(next_input_event)
-            else None
-        )
-        self._active_provider_input_task = input_task
+        self._start_provider_input_observer()
 
         plan: _TurnResult | None = None
         synthesis_started = False
@@ -758,10 +756,22 @@ class DeterministicRealtimeSessionCoordinator:
             )
         )
         self._active_planning_task = planning_task
+        provider_preempted = False
 
         try:
             while True:
-                update = await planning_updates.get()
+                update_task = asyncio.create_task(
+                    planning_updates.get(),
+                    name="ava-planning-phrase-boundary",
+                )
+                provider_preempted = await self._provider_input_preempts_work(
+                    update_task
+                )
+                if provider_preempted:
+                    update_task.cancel()
+                    await asyncio.gather(update_task, return_exceptions=True)
+                    break
+                update = update_task.result()
                 if update is None:
                     break
                 if not planning_started:
@@ -777,6 +787,28 @@ class DeterministicRealtimeSessionCoordinator:
 
                 segment = update
                 if ledger.segment_count == 0:
+                    first_delta_at = planning_state.first_text_delta_at
+                    if first_delta_at is not None:
+                        elapsed_ms = max(
+                            0.0,
+                            (monotonic() - first_delta_at) * 1000,
+                        )
+                        LOGGER.info(
+                            "realtime_latency session_id=%s turn_id=%s "
+                            "stage=first_text_delta_to_first_speech_phrase "
+                            "elapsed_ms=%.2f",
+                            self._session_id,
+                            self._turn_id,
+                            elapsed_ms,
+                            extra={
+                                "ava_context": {
+                                    "sessionId": self._session_id,
+                                    "turnId": self._turn_id,
+                                    "stage": "firstTextDeltaToFirstSpeechPhrase",
+                                    "elapsedMs": elapsed_ms,
+                                }
+                            },
+                        )
                     LOGGER.info(
                         "realtime_turn_stage session_id=%s turn_id=%s "
                         "stage=segment.first elapsed_ms=%.2f",
@@ -836,8 +868,18 @@ class DeterministicRealtimeSessionCoordinator:
                     break
                 if self._cancel_event is not None:
                     break
+                if self._provider_preemption_pending:
+                    provider_preempted = True
+                    break
+                if self._server_preemption_reason is not None:
+                    break
 
-            if provider_error is not None or self._cancel_event is not None:
+            if (
+                provider_error is not None
+                or self._cancel_event is not None
+                or provider_preempted
+                or self._server_preemption_reason is not None
+            ):
                 await self._cancel_planning_work(
                     planning_task=planning_task,
                 )
@@ -898,6 +940,44 @@ class DeterministicRealtimeSessionCoordinator:
                 ),
                 False,
             )
+
+        if provider_preempted:
+            if self._audio_metadata_sent:
+                yield self._provider_interrupt_requested_frame()
+                async for frame in self._await_client_cancellation_after_interruption(
+                    plan=plan,
+                    ledger=ledger,
+                ):
+                    yield frame
+            else:
+                async for frame in self._cancel_frames(
+                    plan=plan,
+                    ledger=ledger,
+                    reason="providerSpeechStarted",
+                ):
+                    yield frame
+            return
+
+        server_preemption_reason = self._server_preemption_reason
+        if server_preemption_reason is not None:
+            if self._audio_metadata_sent:
+                yield self._interrupt_requested_frame(
+                    stream_id=self._stream_id,
+                    reason=server_preemption_reason,
+                )
+                async for frame in self._await_client_cancellation_after_interruption(
+                    plan=plan,
+                    ledger=ledger,
+                ):
+                    yield frame
+            else:
+                async for frame in self._cancel_frames(
+                    plan=plan,
+                    ledger=ledger,
+                    reason=server_preemption_reason,
+                ):
+                    yield frame
+            return
 
         if self._cancel_event is not None:
             async for frame in self._cancel_frames(
@@ -998,10 +1078,17 @@ class DeterministicRealtimeSessionCoordinator:
             self._controls.get(),
             name="ava-turn-playback-control",
         )
+        preemption_task: asyncio.Task[bool] | None = asyncio.create_task(
+            self._cancellation_requested.wait(),
+            name="ava-turn-server-preemption",
+        )
         try:
             while not self._terminal:
+                input_task = self._active_provider_input_task
                 wait_tasks = {
-                    task for task in (control_task, input_task) if task is not None
+                    task
+                    for task in (control_task, input_task, preemption_task)
+                    if task is not None
                 }
                 done, _ = await asyncio.wait(
                     wait_tasks,
@@ -1009,76 +1096,23 @@ class DeterministicRealtimeSessionCoordinator:
                 )
                 if input_task is not None and input_task in done:
                     input_event = input_task.result()
-                    self._pending_provider_input_item_ids.add(input_event.item_id)
-                    if input_event.event_type == "input_audio_buffer.speech_started":
-                        owner_turn_id = self._realtime.input_item_owner(
-                            item_id=input_event.item_id
-                        )
-                        if owner_turn_id == self._turn_id:
-                            LOGGER.info(
-                                "realtime_originating_input_ignored session_id=%s "
-                                "turn_id=%s provider_input_item_id=%s",
-                                self._session_id,
-                                self._turn_id,
-                                input_event.item_id,
-                            )
-                        elif owner_turn_id is not None:
-                            LOGGER.info(
-                                "realtime_stale_input_ignored session_id=%s "
-                                "turn_id=%s owner_turn_id=%s "
-                                "provider_input_item_id=%s",
-                                self._session_id,
-                                self._turn_id,
-                                owner_turn_id,
-                                input_event.item_id,
-                            )
-                        elif (
-                            input_event.item_id
-                            not in self._interrupt_signalled_item_ids
-                        ):
-                            self._interrupt_signalled_item_ids.add(input_event.item_id)
-                            if self._interruption_provider_item_id is None:
-                                self._interruption_provider_item_id = (
-                                    input_event.item_id
-                                )
-                            LOGGER.info(
-                                "realtime_interruption_requested session_id=%s "
-                                "turn_id=%s stream_id=%s provider_input_item_id=%s "
-                                "audio_start_ms=%s",
-                                self._session_id,
-                                self._turn_id,
-                                self._stream_id,
-                                input_event.item_id,
-                                input_event.audio_start_ms,
-                                extra={
-                                    "ava_context": {
-                                        "sessionId": self._session_id,
-                                        "turnId": self._turn_id,
-                                        "streamId": self._stream_id,
-                                        "providerInputItemId": input_event.item_id,
-                                        "providerAudioStartMs": (
-                                            input_event.audio_start_ms
-                                        ),
-                                        "interruptionReason": (
-                                            "providerSpeechStarted"
-                                        ),
-                                    }
-                                },
-                            )
-                            yield self._interrupt_requested_frame(
-                                stream_id=self._stream_id,
-                                reason="providerSpeechStarted",
-                            )
-                    if not callable(next_input_event):
-                        raise CoordinatorStateError(
-                            "provider input observer disappeared during playback"
-                        )
-                    input_task = asyncio.create_task(
-                        next_input_event(),
-                        name="ava-provider-input-observer",
-                    )
-                    self._active_provider_input_task = input_task
+                    self._active_provider_input_task = None
+                    if self._classify_provider_input(input_event):
+                        self._cancellation_requested.set()
+                        yield self._provider_interrupt_requested_frame()
+                    else:
+                        self._start_provider_input_observer()
                     continue
+
+                if preemption_task is not None and preemption_task in done:
+                    reason = self._server_preemption_reason
+                    if reason is not None:
+                        yield self._interrupt_requested_frame(
+                            stream_id=self._stream_id,
+                            reason=reason,
+                        )
+                        preemption_task = None
+                        continue
 
                 assert control_task is not None
                 try:
@@ -1106,15 +1140,14 @@ class DeterministicRealtimeSessionCoordinator:
                     name="ava-turn-playback-control",
                 )
         finally:
-            for task in (control_task, input_task):
+            for task in (control_task, preemption_task):
                 if task is not None and not task.done():
                     task.cancel()
             await asyncio.gather(
-                *(task for task in (control_task, input_task) if task is not None),
+                *(task for task in (control_task, preemption_task) if task is not None),
                 return_exceptions=True,
             )
-            if self._active_provider_input_task is input_task:
-                self._active_provider_input_task = None
+            await self._cancel_provider_input_observer()
 
     async def _prepare_next_turn(self) -> None:
         if not self._terminal:
@@ -1159,13 +1192,20 @@ class DeterministicRealtimeSessionCoordinator:
         self._stopped_sample_count = None
         self._cancel_event = None
         self._cancellation_requested = asyncio.Event()
+        self._server_preemption_reason = None
+        self._canvas_interaction_response_turn_id = None
         self._interruption_provider_item_id = None
+        self._interruption_provider_audio_start_ms = None
+        self._provider_speech_started_observed_at = None
+        self._preemption_requested_at = None
         self._terminal = False
         self._canvas_status = "notRequested"
         self._terminal_failure_code = None
         self._last_failure_id = None
         self._last_failure_component = None
         self._last_error = None
+        if self._latest_canvas_interaction_intent is not None:
+            self._canvas_interaction_response_wakeup.set()
         LOGGER.info(
             "realtime_turn_rearmed session_id=%s turn_id=%s prompt_version=%s "
             "tool_contract_version=%s "
@@ -1211,6 +1251,143 @@ class DeterministicRealtimeSessionCoordinator:
         context = self._canvas_jobs.state.render_realtime_context()
         return context or None
 
+    def _ensure_canvas_interaction_response_worker(self) -> None:
+        task = self._canvas_interaction_response_task
+        if task is not None and not task.done():
+            return
+        self._canvas_interaction_response_task = asyncio.create_task(
+            self._run_canvas_interaction_response_worker(),
+            name="ava-canvas-interaction-response",
+        )
+
+    async def _run_canvas_interaction_response_worker(self) -> None:
+        while not self._closed:
+            await self._canvas_interaction_response_wakeup.wait()
+            self._canvas_interaction_response_wakeup.clear()
+            while not self._closed:
+                interaction = self._latest_canvas_interaction_intent
+                if interaction is None:
+                    break
+                try:
+                    await self._refresh_canvas_context()
+                    if not self._is_latest_canvas_interaction(interaction):
+                        continue
+                    turn_id = await self._interaction_response_ready_turn(
+                        interaction
+                    )
+                    if turn_id is None:
+                        break
+                    if not self._is_latest_canvas_interaction(interaction):
+                        continue
+                    self._canvas_interaction_response_turn_id = turn_id
+                    triggered = await self._realtime.request_canvas_interaction_response(
+                        turn_id=turn_id
+                    )
+                    superseded = not self._is_latest_canvas_interaction(interaction)
+                    if not triggered:
+                        self._canvas_interaction_response_turn_id = None
+                        break
+                    if superseded:
+                        self._request_server_preemption(
+                            reason="canvasInteractionSuperseded"
+                        )
+                    else:
+                        self._latest_canvas_interaction_intent = None
+                    LOGGER.info(
+                        "canvas_interaction_response_decided session_id=%s "
+                        "turn_id=%s scene_id=%s scene_revision=%s "
+                        "interaction_revision=%s triggered=%s superseded=%s",
+                        self._session_id,
+                        turn_id,
+                        interaction.scene_id,
+                        interaction.scene_revision,
+                        interaction.interaction_revision,
+                        triggered,
+                        superseded,
+                    )
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    LOGGER.exception(
+                        "canvas_interaction_response_failed session_id=%s "
+                        "scene_id=%s scene_revision=%s interaction_revision=%s",
+                        self._session_id,
+                        interaction.scene_id,
+                        interaction.scene_revision,
+                        interaction.interaction_revision,
+                    )
+                    if self._is_latest_canvas_interaction(interaction):
+                        self._latest_canvas_interaction_intent = None
+                    self._canvas_interaction_response_turn_id = None
+                    break
+
+    async def _interaction_response_ready_turn(
+        self,
+        interaction: RecordedSvgCanvasInteraction,
+    ) -> str | None:
+        while not self._closed and self._is_latest_canvas_interaction(interaction):
+            if self._terminal:
+                self._canvas_interaction_response_wakeup.clear()
+                await self._canvas_interaction_response_wakeup.wait()
+                self._canvas_interaction_response_wakeup.clear()
+                continue
+            turn_id = self._turn_id
+            readiness = asyncio.create_task(
+                self._realtime.wait_until_canvas_interaction_response_ready(
+                    turn_id=turn_id
+                ),
+                name="ava-canvas-interaction-response-ready",
+            )
+            changed = asyncio.create_task(
+                self._canvas_interaction_response_wakeup.wait(),
+                name="ava-canvas-interaction-response-changed",
+            )
+            try:
+                done, _ = await asyncio.wait(
+                    {readiness, changed},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if changed in done:
+                    self._canvas_interaction_response_wakeup.clear()
+                    readiness.cancel()
+                    await asyncio.gather(readiness, return_exceptions=True)
+                    continue
+                changed.cancel()
+                await asyncio.gather(changed, return_exceptions=True)
+                if readiness.result() and self._turn_id == turn_id and not self._terminal:
+                    return turn_id
+                return None
+            finally:
+                for task in (readiness, changed):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(readiness, changed, return_exceptions=True)
+        return None
+
+    def _is_latest_canvas_interaction(
+        self,
+        interaction: RecordedSvgCanvasInteraction,
+    ) -> bool:
+        latest = self._latest_canvas_interaction_intent
+        return latest is not None and (
+            latest.scene_id,
+            latest.scene_revision,
+            latest.interaction_revision,
+        ) == (
+            interaction.scene_id,
+            interaction.scene_revision,
+            interaction.interaction_revision,
+        )
+
+    def _request_server_preemption(self, *, reason: str) -> None:
+        if self._terminal:
+            return
+        if self._server_preemption_reason is None:
+            self._server_preemption_reason = reason
+            self._preemption_requested_at = monotonic()
+        self._cancellation_requested.set()
+
     async def _produce_plan(
         self,
         *,
@@ -1221,6 +1398,8 @@ class DeterministicRealtimeSessionCoordinator:
         try:
             async for event in self._turn_events_until_cancelled():
                 if isinstance(event, RealtimeSpeechTextDelta):
+                    if event.delta and state.first_text_delta_at is None:
+                        state.first_text_delta_at = monotonic()
                     for segment in parser.feed(event.delta):
                         await updates.put(segment)
                     continue
@@ -1387,6 +1566,179 @@ class DeterministicRealtimeSessionCoordinator:
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
+    @property
+    def _provider_preemption_pending(self) -> bool:
+        return (
+            self._interruption_provider_item_id is not None
+            and self._cancel_event is None
+            and self._cancellation_requested.is_set()
+        )
+
+    def _start_provider_input_observer(self) -> None:
+        if self._active_provider_input_task is not None:
+            raise CoordinatorStateError(
+                "provider input observer already owns this turn boundary"
+            )
+        self._active_provider_input_task = asyncio.create_task(
+            self._realtime.next_input_event(),
+            name="ava-provider-input-observer",
+        )
+
+    async def _provider_input_preempts_work(
+        self,
+        work_task: asyncio.Task[_WorkResult],
+    ) -> bool:
+        """Give an explicitly unowned speech-start priority over pending work."""
+
+        while True:
+            input_task = self._active_provider_input_task
+            if input_task is None:
+                await work_task
+                return False
+            try:
+                done, _ = await asyncio.wait(
+                    {work_task, input_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if input_task not in done:
+                    return False
+                self._active_provider_input_task = None
+                input_event = input_task.result()
+                if self._classify_provider_input(input_event):
+                    self._cancellation_requested.set()
+                    return True
+                self._start_provider_input_observer()
+                if work_task in done:
+                    return False
+            except BaseException:
+                if not work_task.done():
+                    work_task.cancel()
+                await asyncio.gather(work_task, return_exceptions=True)
+                raise
+
+    def _classify_provider_input(
+        self,
+        input_event: RealtimeProviderInputEvent,
+    ) -> bool:
+        self._pending_provider_input_item_ids.add(input_event.item_id)
+        if input_event.event_type != "input_audio_buffer.speech_started":
+            return False
+        owner_turn_id = self._realtime.input_item_owner(item_id=input_event.item_id)
+        if owner_turn_id == self._turn_id:
+            LOGGER.info(
+                "realtime_originating_input_ignored session_id=%s turn_id=%s "
+                "provider_input_item_id=%s",
+                self._session_id,
+                self._turn_id,
+                input_event.item_id,
+            )
+            return False
+        if owner_turn_id is not None:
+            LOGGER.info(
+                "realtime_stale_input_ignored session_id=%s turn_id=%s "
+                "owner_turn_id=%s provider_input_item_id=%s",
+                self._session_id,
+                self._turn_id,
+                owner_turn_id,
+                input_event.item_id,
+            )
+            return False
+        if input_event.item_id in self._interrupt_signalled_item_ids:
+            return False
+        self._interrupt_signalled_item_ids.add(input_event.item_id)
+        if self._interruption_provider_item_id is None:
+            self._interruption_provider_item_id = input_event.item_id
+            self._interruption_provider_audio_start_ms = input_event.audio_start_ms
+            self._provider_speech_started_observed_at = monotonic()
+            self._preemption_requested_at = self._provider_speech_started_observed_at
+        self._latest_canvas_interaction_intent = None
+        self._canvas_interaction_response_wakeup.set()
+        LOGGER.info(
+            "realtime_child_intent_observed session_id=%s turn_id=%s "
+            "provider_input_item_id=%s audio_start_ms=%s",
+            self._session_id,
+            self._turn_id,
+            input_event.item_id,
+            input_event.audio_start_ms,
+            extra={
+                "ava_context": {
+                    "sessionId": self._session_id,
+                    "turnId": self._turn_id,
+                    "providerInputItemId": input_event.item_id,
+                    "providerAudioStartMs": input_event.audio_start_ms,
+                }
+            },
+        )
+        return True
+
+    def _provider_interrupt_requested_frame(self) -> AvaServerControlFrameV4:
+        observed_at = self._provider_speech_started_observed_at
+        elapsed_ms = (
+            max(0.0, (monotonic() - observed_at) * 1000)
+            if observed_at is not None
+            else None
+        )
+        LOGGER.info(
+            "realtime_interruption_requested session_id=%s turn_id=%s "
+            "stream_id=%s provider_input_item_id=%s audio_start_ms=%s",
+            self._session_id,
+            self._turn_id,
+            self._stream_id,
+            self._interruption_provider_item_id,
+            self._interruption_provider_audio_start_ms,
+            extra={
+                "ava_context": {
+                    "sessionId": self._session_id,
+                    "turnId": self._turn_id,
+                    "streamId": self._stream_id,
+                    "providerInputItemId": self._interruption_provider_item_id,
+                    "providerAudioStartMs": (
+                        self._interruption_provider_audio_start_ms
+                    ),
+                    "interruptionReason": "providerSpeechStarted",
+                }
+            },
+        )
+        LOGGER.info(
+            "realtime_latency session_id=%s turn_id=%s "
+            "stage=provider_speech_started_to_interrupt_requested "
+            "elapsed_ms=%s provider_input_item_id=%s",
+            self._session_id,
+            self._turn_id,
+            f"{elapsed_ms:.2f}" if elapsed_ms is not None else None,
+            self._interruption_provider_item_id,
+            extra={
+                "ava_context": {
+                    "sessionId": self._session_id,
+                    "turnId": self._turn_id,
+                    "stage": "providerSpeechStartedToInterruptRequested",
+                    "elapsedMs": elapsed_ms,
+                    "providerInputItemId": self._interruption_provider_item_id,
+                }
+            },
+        )
+        return self._interrupt_requested_frame(
+            stream_id=self._stream_id,
+            reason="providerSpeechStarted",
+        )
+
+    async def _await_client_cancellation_after_interruption(
+        self,
+        *,
+        plan: _TurnResult | None,
+        ledger: DeliveredTextLedger,
+    ) -> AsyncIterator[AvaServerOutboundFrameV4]:
+        while True:
+            try:
+                control = await self._controls.get()
+            except QueueClosed:
+                return
+            if not isinstance(control, CancelTurnEventV4):
+                continue
+            async for frame in self._cancel_frames(plan=plan, ledger=ledger):
+                yield frame
+            return
+
     async def _turn_events_until_cancelled(
         self,
     ) -> AsyncIterator[RealtimeProviderTurnEvent]:
@@ -1444,6 +1796,13 @@ class DeterministicRealtimeSessionCoordinator:
         if self._closed:
             return
         self._closed = True
+        interaction_task = self._canvas_interaction_response_task
+        self._canvas_interaction_response_task = None
+        self._canvas_interaction_response_wakeup.set()
+        if interaction_task is not None and not interaction_task.done():
+            interaction_task.cancel()
+        if interaction_task is not None:
+            await asyncio.gather(interaction_task, return_exceptions=True)
         await self._cancel_active_turn_work()
         memory_tasks = tuple(self._memory_commit_tasks.values())
         for task in memory_tasks:
@@ -1525,10 +1884,72 @@ class DeterministicRealtimeSessionCoordinator:
                 next_item = asyncio.create_task(_next_speech_item(speech_items))
                 cancellation = asyncio.create_task(self._cancellation_requested.wait())
                 try:
-                    done, _ = await asyncio.wait(
-                        {next_item, cancellation},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
+                    while True:
+                        input_task = self._active_provider_input_task
+                        wait_tasks: set[asyncio.Task[object]] = {
+                            cast(asyncio.Task[object], next_item),
+                            cast(asyncio.Task[object], cancellation),
+                        }
+                        if input_task is not None:
+                            wait_tasks.add(cast(asyncio.Task[object], input_task))
+                        done, _ = await asyncio.wait(
+                            wait_tasks,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if input_task is not None and input_task in done:
+                            self._active_provider_input_task = None
+                            input_event = input_task.result()
+                            if self._classify_provider_input(input_event):
+                                self._cancellation_requested.set()
+                                try:
+                                    await self._speech.cancel(turn_id=turn_id)
+                                finally:
+                                    requested_at = self._preemption_requested_at
+                                    elapsed_ms = (
+                                        max(
+                                            0.0,
+                                            (monotonic() - requested_at) * 1000,
+                                        )
+                                        if requested_at is not None
+                                        else None
+                                    )
+                                    LOGGER.info(
+                                        "realtime_latency session_id=%s turn_id=%s "
+                                        "stage=preemption_to_elevenlabs_cancelled "
+                                        "elapsed_ms=%s",
+                                        self._session_id,
+                                        turn_id,
+                                        (
+                                            f"{elapsed_ms:.2f}"
+                                            if elapsed_ms is not None
+                                            else None
+                                        ),
+                                        extra={
+                                            "ava_context": {
+                                                "sessionId": self._session_id,
+                                                "turnId": turn_id,
+                                                "stage": (
+                                                    "preemptionToElevenLabsCancelled"
+                                                ),
+                                                "elapsedMs": elapsed_ms,
+                                            }
+                                        },
+                                    )
+                                    next_item.cancel()
+                                    cancellation.cancel()
+                                    await asyncio.gather(
+                                        next_item,
+                                        cancellation,
+                                        return_exceptions=True,
+                                    )
+                                return
+                            self._start_provider_input_observer()
+                            if (
+                                next_item not in done
+                                and cancellation not in done
+                            ):
+                                continue
+                        break
                 except BaseException:
                     next_item.cancel()
                     cancellation.cancel()
@@ -1608,10 +2029,14 @@ class DeterministicRealtimeSessionCoordinator:
         *,
         plan: _TurnResult | None,
         ledger: DeliveredTextLedger,
+        reason: str | None = None,
     ) -> AsyncIterator[AvaServerOutboundFrameV4]:
         cancel = self._cancel_event
-        if cancel is None:
-            raise CoordinatorStateError("cancellation frames require cancelTurn")
+        cancellation_reason = reason or (cancel.reason if cancel is not None else None)
+        if cancellation_reason is None:
+            raise CoordinatorStateError(
+                "cancellation frames require a client cancel or provider preemption"
+            )
         yield self._phase_frame(SpeechPhase.CANCELLING)
         await self._realtime.cancel(turn_id=self._turn_id)
         await self._speech.cancel(turn_id=self._turn_id)
@@ -1656,7 +2081,7 @@ class DeterministicRealtimeSessionCoordinator:
                 "event": "turnCancelled",
                 "deliveredSampleCount": delivered_samples,
                 "deliveredText": delivered_text,
-                "reason": cancel.reason,
+                "reason": cancellation_reason,
             }
         )
 
@@ -2058,6 +2483,9 @@ class DeterministicRealtimeSessionCoordinator:
             if self._negotiated_call is not None
             else None
         )
+        cancellation_reason = payload.get("reason")
+        if cancellation_reason is None and self._cancel_event is not None:
+            cancellation_reason = self._cancel_event.reason
         LOGGER.info(
             "realtime_turn_terminal session_id=%s turn_id=%s terminal=%s "
             "failure_id=%s failure_component=%s failure_code=%s "
@@ -2074,7 +2502,7 @@ class DeterministicRealtimeSessionCoordinator:
             provider_response_id,
             provider_call_id,
             self._interruption_provider_item_id,
-            self._cancel_event.reason if self._cancel_event is not None else None,
+            cancellation_reason,
             self._canvas_status,
             extra={
                 "ava_context": {
@@ -2087,11 +2515,7 @@ class DeterministicRealtimeSessionCoordinator:
                     "providerResponseId": provider_response_id,
                     "providerCallId": provider_call_id,
                     "providerInputItemId": self._interruption_provider_item_id,
-                    "cancellationReason": (
-                        self._cancel_event.reason
-                        if self._cancel_event is not None
-                        else None
-                    ),
+                    "cancellationReason": cancellation_reason,
                     "canvasStatus": self._canvas_status,
                 }
             },

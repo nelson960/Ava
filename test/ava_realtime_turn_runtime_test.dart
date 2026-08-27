@@ -22,6 +22,95 @@ const _offerSdp = 'v=0\r\n'
     'm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n';
 
 void main() {
+  test(
+      'interruptRequested during synthesizing uses existing fade-stop after metadata',
+      () async {
+    final transport = DeterministicAvaRealtimeRawTransportV4([
+      ..._preamble(),
+      _control({
+        'protocolVersion': 4,
+        'event': 'interruptRequested',
+        'sessionId': _sessionId,
+        'turnId': _turnId,
+        'sequence': 7,
+        'revision': 4,
+        'streamId': _streamId,
+        'reason': 'providerSpeechStarted',
+      }),
+      _control({
+        'protocolVersion': 4,
+        'event': 'turnPhaseChanged',
+        'sessionId': _sessionId,
+        'turnId': _turnId,
+        'sequence': 8,
+        'revision': 5,
+        'phase': 'cancelling',
+      }),
+      _control({
+        'protocolVersion': 4,
+        'event': 'turnCancelled',
+        'sessionId': _sessionId,
+        'turnId': _turnId,
+        'sequence': 9,
+        'revision': 6,
+        'deliveredSampleCount': 0,
+        'deliveredText': '',
+        'reason': 'providerSpeechStarted',
+      }),
+    ]);
+    final output = _RecordingPcmOutput();
+    final runtime = _runtimeWith(transport: transport, output: output);
+
+    await expectLater(
+      runtime.run(),
+      throwsA(isA<AvaRealtimeRuntimeException>()),
+    );
+
+    expect(output.fadeStopCalls, 1);
+    expect(output.finishCalls, 0);
+    expect(
+      transport.sentEvents.map((event) => event.toJson()['event']),
+      containsAllInOrder(['playbackStarted', 'playbackStopped', 'cancelTurn']),
+    );
+    expect(
+      transport.sentEvents
+          .where((event) => event.toJson()['event'] == 'playbackStopped')
+          .single
+          .toJson()['renderedSampleCount'],
+      0,
+    );
+    await runtime.close();
+  });
+
+  test('interruptRequested before audioMetadata remains invalid', () async {
+    final frames = <AvaRealtimeInboundFrameV4>[
+      ..._preamble().take(6),
+      _control({
+        'protocolVersion': 4,
+        'event': 'interruptRequested',
+        'sessionId': _sessionId,
+        'turnId': _turnId,
+        'sequence': 6,
+        'revision': 4,
+        'streamId': _streamId,
+        'reason': 'providerSpeechStarted',
+      }),
+    ];
+    final runtime = _runtime(frames);
+
+    await expectLater(
+      runtime.run(),
+      throwsA(
+        isA<AvaRealtimeStateException>().having(
+          (error) => error.message,
+          'message',
+          contains('audioMetadata'),
+        ),
+      ),
+    );
+    await runtime.close();
+  });
+
   test('turnCreated cannot replace an active V4 turn', () async {
     final runtime = _runtime([
       ..._preamble().take(2),
@@ -144,6 +233,15 @@ void main() {
 }
 
 AvaRealtimeTurnRuntime _runtime(List<AvaRealtimeInboundFrameV4> frames) =>
+    _runtimeWith(
+      transport: DeterministicAvaRealtimeRawTransportV4(frames),
+      output: _RecordingPcmOutput(),
+    );
+
+AvaRealtimeTurnRuntime _runtimeWith({
+  required DeterministicAvaRealtimeRawTransportV4 transport,
+  required _RecordingPcmOutput output,
+}) =>
     AvaRealtimeTurnRuntime(
       sessionId: _sessionId,
       limits: const AvaSessionLimitsV4(
@@ -155,9 +253,9 @@ AvaRealtimeTurnRuntime _runtime(List<AvaRealtimeInboundFrameV4> frames) =>
         playbackProgressIntervalMs: 100,
       ),
       mediaSession: DeterministicAvaRealtimeMediaSession(offerSdp: _offerSdp),
-      transport: DeterministicAvaRealtimeRawTransportV4(frames),
+      transport: transport,
       documents: const _UnexpectedDocumentLoader(),
-      speechOutput: _RecordingPcmOutput(),
+      speechOutput: output,
       presentation: AvaRealtimePresentationController(),
       volume: 0.8,
       cancelRequestIdFactory: () => 'cancel-runtime-v4',
@@ -268,6 +366,9 @@ final class _UnexpectedDocumentLoader implements AvaSvgDocumentLoader {
 }
 
 final class _RecordingPcmOutput implements PcmSpeechOutputService {
+  int fadeStopCalls = 0;
+  int finishCalls = 0;
+
   @override
   Future<void> append(
       {required String turnId, required Uint8List audio}) async {}
@@ -276,12 +377,16 @@ final class _RecordingPcmOutput implements PcmSpeechOutputService {
   Future<PcmStopResult> fadeOutAndStop({
     required String turnId,
     Duration fadeDuration = const Duration(milliseconds: 80),
-  }) async =>
-      const PcmStopResult(renderedSampleCount: 0);
+  }) async {
+    fadeStopCalls += 1;
+    return const PcmStopResult(renderedSampleCount: 0);
+  }
 
   @override
-  Future<PcmStopResult> finish({required String turnId}) async =>
-      const PcmStopResult(renderedSampleCount: 0);
+  Future<PcmStopResult> finish({required String turnId}) async {
+    finishCalls += 1;
+    return const PcmStopResult(renderedSampleCount: 0);
+  }
 
   @override
   Future<Duration> position({required String turnId}) async => Duration.zero;

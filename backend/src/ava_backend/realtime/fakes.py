@@ -148,6 +148,8 @@ class DeterministicRealtimePlanProvider:
         ] = []
         self.turn_stream_started = asyncio.Event()
         self._canvas_interaction_response_requested = asyncio.Event()
+        self._interaction_response_readiness_changed = asyncio.Event()
+        self._active_turn_id: str | None = None
         self._pending_call_id: str | None = None
         self._input_events: asyncio.Queue[RealtimeProviderInputEvent] = asyncio.Queue()
         self._input_item_turn_ids: dict[str, str | None] = {}
@@ -179,7 +181,20 @@ class DeterministicRealtimePlanProvider:
                 session_update=harness.session_update(),
             )
         )
-        return self._stream()
+        self._canvas_interaction_response_requested.clear()
+        self._active_turn_id = turn_id
+        self._interaction_response_readiness_changed.set()
+
+        async def _owned_stream() -> AsyncIterator[RealtimeProviderTurnEvent]:
+            try:
+                async for event in self._stream():
+                    yield event
+            finally:
+                if self._active_turn_id == turn_id:
+                    self._active_turn_id = None
+                    self._interaction_response_readiness_changed.set()
+
+        return _owned_stream()
 
     async def prepare(self, *, harness: RealtimeHarness) -> None:
         if self.closed:
@@ -274,7 +289,10 @@ class DeterministicRealtimePlanProvider:
     async def request_canvas_interaction_response(self, *, turn_id: str) -> bool:
         if not turn_id:
             raise ValueError("turn_id cannot be empty")
-        if self._canvas_interaction_response_requested.is_set():
+        if (
+            self._active_turn_id != turn_id
+            or self._canvas_interaction_response_requested.is_set()
+        ):
             return False
         self.canvas_interaction_response_turn_ids.append(turn_id)
         if not self.prepared_session_updates:
@@ -285,14 +303,39 @@ class DeterministicRealtimePlanProvider:
             self.prepared_session_updates[-1]
         )
         self._canvas_interaction_response_requested.set()
+        self._interaction_response_readiness_changed.set()
         return True
+
+    async def wait_until_canvas_interaction_response_ready(
+        self,
+        *,
+        turn_id: str,
+    ) -> bool:
+        if not turn_id:
+            raise ValueError("turn_id cannot be empty")
+        while not self.closed and turn_id not in self.cancelled_turn_ids:
+            if (
+                self._active_turn_id == turn_id
+                and not self._canvas_interaction_response_requested.is_set()
+            ):
+                return True
+            self._interaction_response_readiness_changed.clear()
+            if (
+                self._active_turn_id == turn_id
+                and not self._canvas_interaction_response_requested.is_set()
+            ):
+                return True
+            await self._interaction_response_readiness_changed.wait()
+        return False
 
     async def cancel(self, *, turn_id: str) -> None:
         if turn_id not in self.cancelled_turn_ids:
             self.cancelled_turn_ids.append(turn_id)
+            self._interaction_response_readiness_changed.set()
 
     async def close(self) -> None:
         self.closed = True
+        self._interaction_response_readiness_changed.set()
 
 
 class DeterministicStreamingSpeechSynthesizer:

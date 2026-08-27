@@ -4,7 +4,9 @@ import asyncio
 import base64
 import binascii
 import json
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from time import monotonic
 from typing import Protocol
 from urllib.parse import quote, urlencode, urlsplit
 
@@ -28,6 +30,8 @@ _ELEVENLABS_WEBSOCKET_ORIGIN = "wss://api.elevenlabs.io"
 _SAMPLE_RATE_HZ = 24_000
 _MAX_PROVIDER_EVENT_BYTES = 4 * 1024 * 1024
 _MAX_PCM_CHUNK_BYTES = 192_000
+
+LOGGER = logging.getLogger("ava_backend.elevenlabs_realtime_speech")
 
 
 class ElevenLabsInputStreamingError(ValueError):
@@ -198,6 +202,7 @@ class ElevenLabsInputStreamingSynthesizer:
         text_cursor = 0
         yielded_audio = False
         saw_final = False
+        phrase_submitted_at: float | None = None
         try:
             socket = await self._connector(
                 url,
@@ -243,6 +248,7 @@ class ElevenLabsInputStreamingSynthesizer:
                     separators=(",", ":"),
                 )
             )
+            phrase_submitted_at = monotonic()
             await socket.send('{"text":""}')
 
             while True:
@@ -280,6 +286,27 @@ class ElevenLabsInputStreamingSynthesizer:
                 if not pcm or len(pcm) % 2:
                     raise ElevenLabsInputStreamingError(
                         "ElevenLabs returned invalid PCM16 audio"
+                    )
+                if not yielded_audio and phrase_submitted_at is not None:
+                    elapsed_ms = max(
+                        0.0,
+                        (monotonic() - phrase_submitted_at) * 1000,
+                    )
+                    LOGGER.info(
+                        "elevenlabs_realtime_latency turn_id=%s segment_id=%s "
+                        "stage=phrase_submitted_to_first_audio "
+                        "elapsed_ms=%.2f",
+                        turn_id,
+                        segment.id,
+                        elapsed_ms,
+                        extra={
+                            "ava_context": {
+                                "turnId": turn_id,
+                                "segmentId": segment.id,
+                                "stage": "phraseSubmittedToFirstAudio",
+                                "elapsedMs": elapsed_ms,
+                            }
+                        },
                     )
                 alignment = message.alignment
                 if alignment is not None:

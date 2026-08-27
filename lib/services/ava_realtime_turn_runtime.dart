@@ -343,7 +343,9 @@ final class AvaRealtimeTurnRuntime {
 
     final turnId = _requireTurnId();
     if (_playbackStarted && _streamId != null) {
+      final fadeStopwatch = Stopwatch()..start();
       final stopped = await _speechOutput.fadeOutAndStop(turnId: turnId);
+      fadeStopwatch.stop();
       _finalRenderedSampleCount = stopped.renderedSampleCount;
       _traceFirstRenderedSample(stopped.renderedSampleCount);
       _trace?.mark(
@@ -354,6 +356,10 @@ final class AvaRealtimeTurnRuntime {
           // The wire reason is intentionally extensible; do not copy that
           // caller-provided text into telemetry.
           termination: 'interrupted',
+          extra: {
+            'fadeOutAndStopDurationMs':
+                fadeStopwatch.elapsedMicroseconds / 1000,
+          },
         ),
       );
       _presentation.updatePlaybackClock(
@@ -938,6 +944,7 @@ final class AvaRealtimeTurnRuntime {
     required String turnId,
     required int renderedSampleCount,
     required String termination,
+    Map<String, Object?> extra = const {},
   }) =>
       {
         'turnId': turnId,
@@ -948,6 +955,7 @@ final class AvaRealtimeTurnRuntime {
         'segmentCount': _speechSegmentCount,
         'speechCharacterCount': _speechCharacterCount,
         'termination': termination,
+        ...extra,
       };
 
   void _traceFirstRenderedSample(int renderedSampleCount) {
@@ -1115,9 +1123,10 @@ final class AvaRealtimeTurnRuntime {
         _requireAudioStream(event.streamId);
         break;
       case AvaRealtimeServerEventTypeV4.interruptRequested:
-        if (phase != AvaRealtimeTurnPhase.speaking) {
+        if (phase != AvaRealtimeTurnPhase.synthesizing &&
+            phase != AvaRealtimeTurnPhase.speaking) {
           throw const AvaRealtimeStateException(
-            'interruptRequested requires speaking.',
+            'interruptRequested requires synthesizing or speaking.',
           );
         }
         _requireAudioStream(event.streamId);

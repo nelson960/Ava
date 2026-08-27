@@ -194,8 +194,10 @@ class RealtimeTurnStateMachine:
             return
 
         if isinstance(event, InterruptRequestedEventV4):
-            if phase != SpeechPhase.SPEAKING:
-                raise RealtimeStateError("interruptRequested requires speaking phase")
+            if phase not in {SpeechPhase.SYNTHESIZING, SpeechPhase.SPEAKING}:
+                raise RealtimeStateError(
+                    "interruptRequested requires synthesizing or speaking phase"
+                )
             self._require_audio_stream(event.stream_id)
             return
 

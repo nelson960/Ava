@@ -128,6 +128,14 @@ class RealtimeProviderSession(Protocol):
         """Trigger one idle semantic response without inventing child input."""
         ...
 
+    async def wait_until_canvas_interaction_response_ready(
+        self,
+        *,
+        turn_id: str,
+    ) -> bool:
+        """Wait until the exact turn can safely own an interaction response."""
+        ...
+
     async def child_transcript(self, *, turn_id: str) -> str | None: ...
 
     async def cancel(self, *, turn_id: str) -> None: ...

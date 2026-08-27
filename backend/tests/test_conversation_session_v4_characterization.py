@@ -18,9 +18,14 @@ from ava_backend.canvas.svg_specialist import (
 from ava_backend.protocol import AgeBand
 from ava_backend.realtime.coordinator import DeterministicRealtimeSessionCoordinator
 from ava_backend.realtime.coordinator_v4 import ProtocolV4CanvasEventSink
-from ava_backend.realtime.delivery import SynthesizedSpeechItem
+from ava_backend.realtime.delivery import (
+    SynthesizedAlignmentBatch,
+    SynthesizedAudioChunk,
+    SynthesizedSpeechItem,
+)
 from ava_backend.realtime.events_v4 import (
     AVA_CLIENT_EVENT_ADAPTER_V4,
+    AlignmentBatchEventV4,
     AudioChunkEventV4,
     AudioMetadataEventV4,
     AvaClientEventUnionV4,
@@ -29,6 +34,7 @@ from ava_backend.realtime.events_v4 import (
     CanvasRejectedEventV4,
     InterruptRequestedEventV4,
     MemoryPersistenceFailedEventV4,
+    SegmentReadyEventV4,
     TurnCancelledEventV4,
     TurnCompletedEventV4,
     TurnCreatedEventV4,
@@ -46,7 +52,11 @@ from ava_backend.realtime.provider_session import (
     RealtimeProviderInputEvent,
     RealtimeProviderTurnEvent,
 )
-from ava_backend.realtime.speech_contract import SpeechPhase, SpeechPhrase
+from ava_backend.realtime.speech_contract import (
+    SpeechAlignment,
+    SpeechPhase,
+    SpeechPhrase,
+)
 from ava_backend.realtime.svg_canvas_jobs import SvgCanvasJobCoordinator
 from ava_backend.realtime.websocket_v4 import (
     AvaServerControlFrameV4,
@@ -140,6 +150,7 @@ class _OwnedInputRealtimeProvider(DeterministicRealtimePlanProvider):
         )
         self._owner_by_item_id: dict[str, str | None] = {}
         self._transcript_by_item_id: dict[str, str] = {}
+        self.input_event_observed: dict[str, asyncio.Event] = {}
         self.admissions: list[tuple[str, tuple[str, ...]]] = []
 
     def turn_events(
@@ -161,10 +172,26 @@ class _OwnedInputRealtimeProvider(DeterministicRealtimePlanProvider):
                     audio_start_ms=100 + turn_index,
                 )
             )
-        return super().turn_events(harness=harness, turn_id=turn_id)
+
+        async def _events_after_origin_is_observed() -> AsyncIterator[
+            RealtimeProviderTurnEvent
+        ]:
+            await self.wait_until_input_observed(item_id=item_id)
+            async for event in super(_OwnedInputRealtimeProvider, self).turn_events(
+                harness=harness,
+                turn_id=turn_id,
+            ):
+                yield event
+
+        return _events_after_origin_is_observed()
 
     async def next_input_event(self) -> RealtimeProviderInputEvent:
-        return await self._input_lifecycle.get()
+        event = await self._input_lifecycle.get()
+        self.input_event_observed.setdefault(event.item_id, asyncio.Event()).set()
+        return event
+
+    async def wait_until_input_observed(self, *, item_id: str) -> None:
+        await self.input_event_observed.setdefault(item_id, asyncio.Event()).wait()
 
     def input_item_owner(self, *, item_id: str) -> str | None:
         if item_id not in self._owner_by_item_id:
@@ -220,6 +247,90 @@ class _FailingSpeech(DeterministicStreamingSpeechSynthesizer):
         raise RuntimeError("controlled ElevenLabs outage")
         if False:  # pragma: no cover - keeps the async-generator contract explicit
             yield cast(SynthesizedSpeechItem, None)
+
+
+class _GatedOwnedInputRealtimeProvider(_OwnedInputRealtimeProvider):
+    def __init__(
+        self,
+        plan: AvaTurnPlan,
+        *,
+        originating_item_ids: tuple[str, ...],
+    ) -> None:
+        super().__init__(plan, originating_item_ids=originating_item_ids)
+        self.response_stream_started = asyncio.Event()
+        self.allow_response = asyncio.Event()
+
+    async def _stream(self) -> AsyncIterator[RealtimeProviderTurnEvent]:
+        self.response_stream_started.set()
+        await self.allow_response.wait()
+        async for event in super()._stream():
+            yield event
+
+
+class _GatedSpeech(DeterministicStreamingSpeechSynthesizer):
+    def __init__(self) -> None:
+        super().__init__(chunk_sample_count=8)
+        self.phrase_started = asyncio.Event()
+        self.allow_first_item = asyncio.Event()
+        self.iterator_closed = asyncio.Event()
+
+    async def synthesize(
+        self,
+        segment: SpeechPhrase,
+        *,
+        turn_id: str,
+    ) -> AsyncIterator[SynthesizedSpeechItem]:
+        self.phrase_started.set()
+        try:
+            await self.allow_first_item.wait()
+            async for item in super().synthesize(segment, turn_id=turn_id):
+                yield item
+        finally:
+            self.iterator_closed.set()
+
+
+class _BoundaryGatedSpeech(DeterministicStreamingSpeechSynthesizer):
+    def __init__(self) -> None:
+        super().__init__(chunk_sample_count=8)
+        self.segment_started: dict[str, asyncio.Event] = {}
+        self.allow_segment: dict[str, asyncio.Event] = {}
+        self.first_chunk_emitted: dict[str, asyncio.Event] = {}
+        self.allow_second_chunk: dict[str, asyncio.Event] = {}
+        self.iterator_closed: dict[str, asyncio.Event] = {}
+
+    def _event(self, source: dict[str, asyncio.Event], key: str) -> asyncio.Event:
+        return source.setdefault(key, asyncio.Event())
+
+    async def synthesize(
+        self,
+        segment: SpeechPhrase,
+        *,
+        turn_id: str,
+    ) -> AsyncIterator[SynthesizedSpeechItem]:
+        del turn_id
+        self.synthesized_segment_ids.append(segment.id)
+        self._event(self.segment_started, segment.id).set()
+        try:
+            await self._event(self.allow_segment, segment.id).wait()
+            spans = (
+                SpeechAlignment.model_validate(
+                    {
+                        "segmentId": segment.id,
+                        "textStart": 0,
+                        "textEnd": len(segment.speech),
+                        "sampleStart": 0,
+                        "sampleEnd": 8,
+                        "phoneme": None,
+                    }
+                ),
+            )
+            yield SynthesizedAlignmentBatch(spans)
+            self._event(self.first_chunk_emitted, segment.id).set()
+            yield SynthesizedAudioChunk(bytes(16))
+            await self._event(self.allow_second_chunk, segment.id).wait()
+            yield SynthesizedAudioChunk(bytes(16))
+        finally:
+            self._event(self.iterator_closed, segment.id).set()
 
 
 class _FailingMemory(DevelopmentAuthoritativeMemoryStore):
@@ -474,6 +585,329 @@ async def test_normal_turn_freezes_v4_wire_order_identity_and_pcm_adjacency() ->
         "microphone" not in str(event.event).casefold() for event in scenario.controls
     )
     await scenario.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_started_while_waiting_for_first_phrase_preempts_before_audio() -> (
+    None
+):
+    plan = _plan()
+    provider = _GatedOwnedInputRealtimeProvider(
+        plan,
+        originating_item_ids=("item-planning-origin", "item-planning-next"),
+    )
+    scenario = _V4ConversationScenario(
+        session_id="session-v4-planning-preemption",
+        turn_ids=("turn-v4-planning-a", "turn-v4-planning-b"),
+        plan=plan,
+        realtime=provider,
+    )
+    try:
+        await scenario.start()
+        for _ in range(3):
+            await scenario.next_frame()
+        next_frame = asyncio.create_task(scenario.next_frame())
+        await provider.response_stream_started.wait()
+        await provider.wait_until_input_observed(item_id="item-planning-origin")
+        provider.emit_speech_started(
+            item_id="item-planning-next",
+            audio_start_ms=210,
+        )
+        provider.allow_response.set()
+
+        frame = await next_frame
+
+        assert isinstance(frame, AvaServerControlFrameV4)
+        assert isinstance(frame.event, TurnPhaseChangedEventV4)
+        assert frame.event.phase == SpeechPhase.CANCELLING
+        cancelled = cast(
+            TurnCancelledEventV4,
+            await scenario.read_until(
+                lambda event: isinstance(event, TurnCancelledEventV4)
+            ),
+        )
+        assert cancelled.delivered_sample_count == 0
+        assert cancelled.delivered_text == ""
+        assert not any(
+            isinstance(event, AudioMetadataEventV4) for event in scenario.controls
+        )
+        created_b = cast(
+            TurnCreatedEventV4,
+            await scenario.read_until(
+                lambda event: isinstance(event, TurnCreatedEventV4)
+                and event.turn_id == "turn-v4-planning-b"
+            ),
+        )
+        assert created_b.turn_id == "turn-v4-planning-b"
+        await scenario.read_until(
+            lambda event: isinstance(event, TurnPhaseChangedEventV4)
+            and event.turn_id == "turn-v4-planning-b"
+            and event.phase == SpeechPhase.LISTENING
+        )
+        await scenario.next_frame()
+        assert provider.input_item_owner(item_id="item-planning-next") == (
+            "turn-v4-planning-b"
+        )
+    finally:
+        await scenario.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_started_after_audio_metadata_preempts_before_tts_opens() -> None:
+    plan = _plan()
+    provider = _OwnedInputRealtimeProvider(
+        plan,
+        originating_item_ids=("item-metadata-origin",),
+    )
+    speech = _GatedSpeech()
+    scenario = _V4ConversationScenario(
+        session_id="session-v4-metadata-preemption",
+        turn_ids=("turn-v4-metadata-preemption",),
+        plan=plan,
+        realtime=provider,
+        speech=speech,
+    )
+    try:
+        await scenario.start()
+        metadata = cast(
+            AudioMetadataEventV4,
+            await scenario.read_until(
+                lambda event: isinstance(event, AudioMetadataEventV4)
+            ),
+        )
+        await scenario._start_playback(metadata)
+        await provider.wait_until_input_observed(item_id="item-metadata-origin")
+        provider.emit_speech_started(
+            item_id="item-metadata-next",
+            audio_start_ms=320,
+        )
+        speech.allow_first_item.set()
+
+        frame = await scenario.next_frame()
+
+        assert isinstance(frame, AvaServerControlFrameV4)
+        assert isinstance(frame.event, InterruptRequestedEventV4)
+        assert frame.event.stream_id == metadata.stream_id
+        assert speech.cancelled_turn_ids == ["turn-v4-metadata-preemption"]
+        assert not any(
+            isinstance(event, AudioChunkEventV4) for event in scenario.controls
+        )
+    finally:
+        await scenario.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_started_during_tts_before_first_pcm_cancels_exact_phrase() -> (
+    None
+):
+    plan = _plan()
+    provider = _OwnedInputRealtimeProvider(
+        plan,
+        originating_item_ids=("item-tts-origin",),
+    )
+    speech = _GatedSpeech()
+    scenario = _V4ConversationScenario(
+        session_id="session-v4-tts-preemption",
+        turn_ids=("turn-v4-tts-preemption",),
+        plan=plan,
+        realtime=provider,
+        speech=speech,
+    )
+    try:
+        await scenario.start()
+        metadata = cast(
+            AudioMetadataEventV4,
+            await scenario.read_until(
+                lambda event: isinstance(event, AudioMetadataEventV4)
+            ),
+        )
+        await scenario._start_playback(metadata)
+        pending = asyncio.create_task(scenario.next_frame())
+        await speech.phrase_started.wait()
+        await provider.wait_until_input_observed(item_id="item-tts-origin")
+        provider.emit_speech_started(
+            item_id="item-tts-next",
+            audio_start_ms=410,
+        )
+        speech.allow_first_item.set()
+
+        frame = await pending
+
+        assert isinstance(frame, AvaServerControlFrameV4)
+        assert isinstance(frame.event, InterruptRequestedEventV4)
+        assert speech.cancelled_turn_ids == ["turn-v4-tts-preemption"]
+        assert speech.iterator_closed.is_set()
+        assert not any(
+            isinstance(event, AudioChunkEventV4) for event in scenario.controls
+        )
+    finally:
+        await scenario.close()
+
+
+@pytest.mark.asyncio
+async def test_preemption_at_pcm_item_boundary_keeps_descriptor_binary_atomic() -> None:
+    plan = _plan()
+    segment_id = "speech_1"
+    provider = _OwnedInputRealtimeProvider(
+        plan,
+        originating_item_ids=("item-pcm-origin",),
+    )
+    speech = _BoundaryGatedSpeech()
+    scenario = _V4ConversationScenario(
+        session_id="session-v4-pcm-boundary",
+        turn_ids=("turn-v4-pcm-boundary",),
+        plan=plan,
+        realtime=provider,
+        speech=speech,
+    )
+    try:
+        await scenario.start()
+        metadata = cast(
+            AudioMetadataEventV4,
+            await scenario.read_until(
+                lambda event: isinstance(event, AudioMetadataEventV4)
+            ),
+        )
+        await scenario._start_playback(metadata)
+        speech._event(speech.allow_segment, segment_id).set()
+        await scenario.read_until(
+            lambda event: isinstance(event, AlignmentBatchEventV4)
+        )
+        descriptor = await scenario.next_frame()
+        binary = await scenario.next_frame()
+        assert isinstance(descriptor, AvaServerControlFrameV4)
+        assert isinstance(descriptor.event, AudioChunkEventV4)
+        assert isinstance(binary, AvaServerPcmFrameV4)
+        assert binary.descriptor == descriptor.event
+        await speech._event(speech.first_chunk_emitted, segment_id).wait()
+        await provider.wait_until_input_observed(item_id="item-pcm-origin")
+
+        pending = asyncio.create_task(scenario.next_frame())
+        provider.emit_speech_started(
+            item_id="item-pcm-next",
+            audio_start_ms=510,
+        )
+        speech._event(speech.allow_second_chunk, segment_id).set()
+        frame = await pending
+
+        assert isinstance(frame, AvaServerControlFrameV4)
+        assert isinstance(frame.event, InterruptRequestedEventV4)
+        assert [
+            event for event in scenario.controls if isinstance(event, AudioChunkEventV4)
+        ] == [descriptor.event]
+        scenario.assert_pcm_adjacency()
+    finally:
+        await scenario.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_started_between_phrases_prevents_next_phrase_synthesis() -> None:
+    plan = _plan("ava_turn_plan_v3.json")
+    first_segment_id = "speech_1"
+    second_segment_id = "speech_2"
+    provider = _OwnedInputRealtimeProvider(
+        plan,
+        originating_item_ids=("item-between-origin",),
+    )
+    speech = _BoundaryGatedSpeech()
+    scenario = _V4ConversationScenario(
+        session_id="session-v4-between-phrases",
+        turn_ids=("turn-v4-between-phrases",),
+        plan=plan,
+        realtime=provider,
+        speech=speech,
+    )
+    try:
+        await scenario.start()
+        metadata = cast(
+            AudioMetadataEventV4,
+            await scenario.read_until(
+                lambda event: isinstance(event, AudioMetadataEventV4)
+            ),
+        )
+        await scenario._start_playback(metadata)
+        speech._event(speech.allow_segment, first_segment_id).set()
+        speech._event(speech.allow_second_chunk, first_segment_id).set()
+        while True:
+            frame = await scenario.next_frame()
+            if isinstance(frame, AvaServerPcmFrameV4) and (
+                len(
+                    [
+                        event
+                        for event in scenario.controls
+                        if isinstance(event, AudioChunkEventV4)
+                    ]
+                )
+                == 2
+            ):
+                break
+        await provider.wait_until_input_observed(item_id="item-between-origin")
+        provider.emit_speech_started(
+            item_id="item-between-next",
+            audio_start_ms=610,
+        )
+
+        frame = await scenario.next_frame()
+
+        assert isinstance(frame, AvaServerControlFrameV4)
+        assert isinstance(frame.event, InterruptRequestedEventV4)
+        assert second_segment_id not in speech.synthesized_segment_ids
+    finally:
+        await scenario.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_started_during_second_phrase_cancels_without_later_pcm() -> None:
+    plan = _plan("ava_turn_plan_v3.json")
+    first_segment_id = "speech_1"
+    second_segment_id = "speech_2"
+    provider = _OwnedInputRealtimeProvider(
+        plan,
+        originating_item_ids=("item-second-origin",),
+    )
+    speech = _BoundaryGatedSpeech()
+    scenario = _V4ConversationScenario(
+        session_id="session-v4-second-phrase",
+        turn_ids=("turn-v4-second-phrase",),
+        plan=plan,
+        realtime=provider,
+        speech=speech,
+    )
+    try:
+        await scenario.start()
+        metadata = cast(
+            AudioMetadataEventV4,
+            await scenario.read_until(
+                lambda event: isinstance(event, AudioMetadataEventV4)
+            ),
+        )
+        await scenario._start_playback(metadata)
+        speech._event(speech.allow_segment, first_segment_id).set()
+        speech._event(speech.allow_second_chunk, first_segment_id).set()
+        await scenario.read_until(
+            lambda event: isinstance(event, SegmentReadyEventV4)
+            and event.segment_index == 1
+        )
+        pending = asyncio.create_task(scenario.next_frame())
+        await speech._event(speech.segment_started, second_segment_id).wait()
+        await provider.wait_until_input_observed(item_id="item-second-origin")
+        provider.emit_speech_started(
+            item_id="item-second-next",
+            audio_start_ms=710,
+        )
+        speech._event(speech.allow_segment, second_segment_id).set()
+
+        frame = await pending
+
+        assert isinstance(frame, AvaServerControlFrameV4)
+        assert isinstance(frame.event, InterruptRequestedEventV4)
+        assert speech.cancelled_turn_ids == ["turn-v4-second-phrase"]
+        assert not speech._event(
+            speech.first_chunk_emitted,
+            second_segment_id,
+        ).is_set()
+    finally:
+        await scenario.close()
 
 
 @pytest.mark.asyncio

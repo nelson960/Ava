@@ -28,6 +28,7 @@ from ava_backend.realtime.events_v4 import (
     AudioMetadataEventV4,
     AvaClientEventUnionV4,
     CanvasInteractionEventV4,
+    InterruptRequestedEventV4,
     MemoryPersistenceFailedEventV4,
     SegmentReadyEventV4,
     TurnCancelledEventV4,
@@ -46,6 +47,7 @@ from ava_backend.realtime.memory import DevelopmentAuthoritativeMemoryStore
 from ava_backend.realtime.plan import AvaTurnPlan
 from ava_backend.realtime.provider_session import (
     NegotiatedRealtimeCall,
+    RealtimeProviderInputEvent,
     RealtimeProviderProtocolError,
     RealtimeProviderTurnEvent,
     RealtimeProviderUnavailableError,
@@ -123,6 +125,26 @@ class _BlockingCanvasInteractionJobs:
         return getattr(self._delegate, name)
 
 
+class _BlockingInteractionContextProvider(DeterministicRealtimePlanProvider):
+    def __init__(self, plan: AvaTurnPlan) -> None:
+        super().__init__(plan, wait_for_canvas_interaction_response=True)
+        self.context_refresh_started = asyncio.Event()
+        self.allow_context_refresh = asyncio.Event()
+        self.interaction_response_requested = asyncio.Event()
+
+    async def prepare(self, *, harness):  # type: ignore[no-untyped-def]
+        if self.prepared_session_updates:
+            self.context_refresh_started.set()
+            await self.allow_context_refresh.wait()
+        await super().prepare(harness=harness)
+
+    async def request_canvas_interaction_response(self, *, turn_id: str) -> bool:
+        triggered = await super().request_canvas_interaction_response(turn_id=turn_id)
+        if triggered:
+            self.interaction_response_requested.set()
+        return triggered
+
+
 def _canvas_runtime(
     *,
     state: SvgCanvasSessionState | None = None,
@@ -183,6 +205,57 @@ def _active_labeled_canvas_state(
         svg_sha256=document.svg_sha256,
         manifest_sha256=document.manifest_sha256,
         first_rendered_sample=4_800,
+    )
+    return state
+
+
+def _active_multi_binding_canvas_state() -> SvgCanvasSessionState:
+    document = SvgDocumentValidator().validate(
+        """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600"
+ data-ava-interaction-mode="explore">
+<title>Plant cell</title><desc>Three labeled plant-cell parts.</desc>
+<g id="nucleus" data-ava-binding="explore_nucleus"
+ data-ava-target="nucleus" aria-label="Explore nucleus">
+  <text x="120" y="180">Nucleus</text>
+</g>
+<g id="wall" data-ava-binding="explore_wall"
+ data-ava-target="wall" aria-label="Explore cell wall">
+  <text x="420" y="180">Cell wall</text>
+</g>
+<g id="chloroplast" data-ava-binding="explore_chloroplast"
+ data-ava-target="chloroplast" aria-label="Explore chloroplast">
+  <text x="720" y="180">Chloroplast</text>
+</g>
+</svg>"""
+    )
+    generation = SvgCanvasSpecialistGeneration(
+        generation_id="generation-active-multi-context",
+        document=document,
+    )
+    state = SvgCanvasSessionState()
+    state.stage_generation(
+        generation,
+        source_turn_id="turn-canvas-source",
+        base_scene_id=None,
+        base_revision=0,
+        workspace_epoch=state.workspace.reset_epoch,
+    )
+    state.mark_document_prepared(
+        generation_id=generation.generation_id,
+        svg_sha256=document.svg_sha256,
+        manifest_sha256=document.manifest_sha256,
+        renderer_capability_version=str(document.manifest["rendererCapabilityVersion"]),
+        validator_version=str(document.manifest["validatorVersion"]),
+    )
+    state.schedule_presentation(
+        generation_id=generation.generation_id,
+        presentation_sample_offset=0,
+    )
+    state.mark_presented(
+        generation_id=generation.generation_id,
+        svg_sha256=document.svg_sha256,
+        manifest_sha256=document.manifest_sha256,
+        first_rendered_sample=0,
     )
     return state
 
@@ -377,6 +450,10 @@ class _MalformedRealtimeProvider:
     ) -> AsyncIterator[RealtimeProviderTurnEvent]:
         del harness, turn_id
         yield RealtimeSpeechTextDelta(delta="Invalid\u0000speech")
+
+    async def next_input_event(self) -> RealtimeProviderInputEvent:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable suspended provider input observer")
 
     async def complete_canvas_tool(
         self,
@@ -777,12 +854,19 @@ async def test_valid_canvas_interaction_refreshes_context_before_one_response() 
     state = _active_labeled_canvas_state()
     active = state.active
     assert active is not None
-    provider = DeterministicRealtimePlanProvider(_plan())
+    provider = DeterministicRealtimePlanProvider(
+        _plan(),
+        wait_for_canvas_interaction_response=True,
+    )
     coordinator, _, _, _ = _coordinator(
         realtime=provider,
         canvas_state=state,
     )
     await _ready(coordinator)
+    delivery = asyncio.create_task(
+        _complete_delivered_turn(coordinator, first_client_sequence=2)
+    )
+    await provider.turn_stream_started.wait()
 
     await coordinator.receive(
         _client(
@@ -798,6 +882,7 @@ async def test_valid_canvas_interaction_refreshes_context_before_one_response() 
             }
         )
     )
+    await delivery
 
     assert provider.canvas_interaction_response_turn_ids == [TURN_ID]
     assert len(provider.canvas_interaction_response_session_updates) == 1
@@ -810,6 +895,292 @@ async def test_valid_canvas_interaction_refreshes_context_before_one_response() 
     assert '<last_interaction mode="explore">' in instructions
     assert '<target>Explore condensation</target>' in instructions
     await coordinator.close()
+
+
+async def test_rapid_canvas_interactions_coalesce_optional_speech_to_latest() -> None:
+    state = _active_multi_binding_canvas_state()
+    active = state.active
+    assert active is not None
+    provider = _BlockingInteractionContextProvider(_plan())
+    coordinator, _, _, _ = _coordinator(
+        realtime=provider,
+        canvas_state=state,
+    )
+    await _ready(coordinator)
+    delivery = asyncio.create_task(
+        _complete_delivered_turn(coordinator, first_client_sequence=4)
+    )
+    await provider.turn_stream_started.wait()
+    first = asyncio.create_task(
+        coordinator.receive(
+            _client(
+                {
+                    "event": "canvasInteraction",
+                    "sequence": 1,
+                    "sceneId": active.scene_id,
+                    "sceneRevision": active.revision,
+                    "interactionRevision": 1,
+                    "svgSha256": active.document.svg_sha256,
+                    "manifestSha256": active.document.manifest_sha256,
+                    "bindingId": "explore_nucleus",
+                }
+            )
+        )
+    )
+    try:
+        await provider.context_refresh_started.wait()
+        assert first.done(), "canonical admission waited for optional response work"
+        await first
+        await coordinator.receive(
+            _client(
+                {
+                    "event": "canvasInteraction",
+                    "sequence": 2,
+                    "sceneId": active.scene_id,
+                    "sceneRevision": active.revision,
+                    "interactionRevision": 2,
+                    "svgSha256": active.document.svg_sha256,
+                    "manifestSha256": active.document.manifest_sha256,
+                    "bindingId": "explore_wall",
+                }
+            )
+        )
+        await coordinator.receive(
+            _client(
+                {
+                    "event": "canvasInteraction",
+                    "sequence": 3,
+                    "sceneId": active.scene_id,
+                    "sceneRevision": active.revision,
+                    "interactionRevision": 3,
+                    "svgSha256": active.document.svg_sha256,
+                    "manifestSha256": active.document.manifest_sha256,
+                    "bindingId": "explore_chloroplast",
+                }
+            )
+        )
+        provider.allow_context_refresh.set()
+        await provider.interaction_response_requested.wait()
+        await delivery
+
+        assert state.last_interaction is not None
+        assert state.last_interaction.interaction_revision == 3
+        assert state.last_interaction.binding_id == "explore_chloroplast"
+        assert provider.canvas_interaction_response_turn_ids == [TURN_ID]
+        installed = provider.canvas_interaction_response_session_updates[0]["session"]
+        assert isinstance(installed, dict)
+        instructions = installed["instructions"]
+        assert isinstance(instructions, str)
+        assert "<target>Explore chloroplast</target>" in instructions
+        assert "<target>Explore nucleus</target>" not in instructions
+        assert "<target>Explore cell wall</target>" not in instructions
+    finally:
+        provider.allow_context_refresh.set()
+        await asyncio.gather(first, return_exceptions=True)
+        if not delivery.done():
+            delivery.cancel()
+            await asyncio.gather(delivery, return_exceptions=True)
+        await coordinator.close()
+
+
+async def test_child_speech_supersedes_interaction_while_context_refresh_is_pending() -> (
+    None
+):
+    state = _active_labeled_canvas_state()
+    active = state.active
+    assert active is not None
+    provider = _BlockingInteractionContextProvider(_plan())
+    coordinator, _, _, _ = _coordinator(
+        realtime=provider,
+        canvas_state=state,
+    )
+    await _ready(coordinator)
+    frames = coordinator.frames()
+    try:
+        for _ in range(3):
+            await anext(frames)
+        await coordinator.receive(
+            _client(
+                {
+                    "event": "canvasInteraction",
+                    "sequence": 1,
+                    "sceneId": active.scene_id,
+                    "sceneRevision": active.revision,
+                    "interactionRevision": 1,
+                    "svgSha256": active.document.svg_sha256,
+                    "manifestSha256": active.document.manifest_sha256,
+                    "bindingId": "explore_condensation",
+                }
+            )
+        )
+        pending_frame = asyncio.create_task(anext(frames))
+        await provider.turn_stream_started.wait()
+        await provider.context_refresh_started.wait()
+        provider.emit_input_event(
+            RealtimeProviderInputEvent(
+                event_type="input_audio_buffer.speech_started",
+                item_id="item-child-wins",
+                audio_start_ms=800,
+            )
+        )
+        provider.allow_context_refresh.set()
+
+        first_frame = await pending_frame
+        controls: list[object] = []
+        if isinstance(first_frame, AvaServerControlFrameV4):
+            controls.append(first_frame.event)
+        async for frame in frames:
+            if not isinstance(frame, AvaServerControlFrameV4):
+                continue
+            controls.append(frame.event)
+            if isinstance(frame.event, TurnCancelledEventV4):
+                break
+
+        assert state.last_interaction is not None
+        assert state.last_interaction.binding_id == "explore_condensation"
+        assert provider.canvas_interaction_response_turn_ids == []
+        assert not any(
+            isinstance(event, InterruptRequestedEventV4) for event in controls
+        )
+        terminal = controls[-1]
+        assert isinstance(terminal, TurnCancelledEventV4)
+        assert terminal.reason == "providerSpeechStarted"
+        assert terminal.delivered_sample_count == 0
+    finally:
+        provider.allow_context_refresh.set()
+        await frames.aclose()
+        await coordinator.close()
+
+
+async def test_tap_during_interaction_speech_rearms_only_latest_reaction() -> None:
+    state = _active_multi_binding_canvas_state()
+    active = state.active
+    assert active is not None
+    provider = DeterministicRealtimePlanProvider(
+        _plan(),
+        child_text=None,
+        wait_for_canvas_interaction_response=True,
+    )
+    coordinator, _, _, _ = _coordinator(
+        realtime=provider,
+        persistent=True,
+        canvas_state=state,
+    )
+    await _ready(coordinator)
+    frames = coordinator.frames()
+    try:
+        await coordinator.receive(
+            _client(
+                {
+                    "event": "canvasInteraction",
+                    "sequence": 1,
+                    "sceneId": active.scene_id,
+                    "sceneRevision": active.revision,
+                    "interactionRevision": 1,
+                    "svgSha256": active.document.svg_sha256,
+                    "manifestSha256": active.document.manifest_sha256,
+                    "bindingId": "explore_nucleus",
+                }
+            )
+        )
+
+        first_metadata: AudioMetadataEventV4 | None = None
+        async for frame in frames:
+            if not isinstance(frame, AvaServerControlFrameV4):
+                continue
+            if isinstance(frame.event, AudioMetadataEventV4):
+                first_metadata = frame.event
+                break
+        assert first_metadata is not None
+        await coordinator.receive(
+            _client(
+                {
+                    "event": "playbackStarted",
+                    "sequence": 2,
+                    "turnId": TURN_ID,
+                    "streamId": STREAM_ID,
+                    "renderedSampleCount": 0,
+                }
+            )
+        )
+        await coordinator.receive(
+            _client(
+                {
+                    "event": "canvasInteraction",
+                    "sequence": 3,
+                    "sceneId": active.scene_id,
+                    "sceneRevision": active.revision,
+                    "interactionRevision": 2,
+                    "svgSha256": active.document.svg_sha256,
+                    "manifestSha256": active.document.manifest_sha256,
+                    "bindingId": "explore_wall",
+                }
+            )
+        )
+
+        interrupted: InterruptRequestedEventV4 | None = None
+        async for frame in frames:
+            if isinstance(frame, AvaServerControlFrameV4) and isinstance(
+                frame.event, InterruptRequestedEventV4
+            ):
+                interrupted = frame.event
+                break
+        assert interrupted is not None
+        assert interrupted.stream_id == STREAM_ID
+        await coordinator.receive(
+            _client(
+                {
+                    "event": "playbackStopped",
+                    "sequence": 4,
+                    "turnId": TURN_ID,
+                    "streamId": STREAM_ID,
+                    "renderedSampleCount": 0,
+                    "reason": "canvasInteractionSuperseded",
+                }
+            )
+        )
+        await coordinator.receive(
+            _client(
+                {
+                    "event": "cancelTurn",
+                    "sequence": 5,
+                    "turnId": TURN_ID,
+                    "requestId": "cancel-canvas-interaction-a",
+                    "reason": "canvasInteractionSuperseded",
+                }
+            )
+        )
+
+        replacement_metadata: AudioMetadataEventV4 | None = None
+        async for frame in frames:
+            if not isinstance(frame, AvaServerControlFrameV4):
+                continue
+            if (
+                isinstance(frame.event, AudioMetadataEventV4)
+                and frame.event.turn_id == "turn-coordinator-2"
+            ):
+                replacement_metadata = frame.event
+                break
+
+        assert replacement_metadata is not None
+        assert state.last_interaction is not None
+        assert state.last_interaction.interaction_revision == 2
+        assert state.last_interaction.binding_id == "explore_wall"
+        assert provider.canvas_interaction_response_turn_ids == [
+            TURN_ID,
+            "turn-coordinator-2",
+        ]
+        latest_session = provider.canvas_interaction_response_session_updates[-1][
+            "session"
+        ]
+        assert isinstance(latest_session, dict)
+        instructions = latest_session["instructions"]
+        assert isinstance(instructions, str)
+        assert "<target>Explore cell wall</target>" in instructions
+        assert "<target>Explore nucleus</target>" not in instructions
+    finally:
+        await frames.aclose()
+        await coordinator.close()
 
 
 async def test_interaction_context_refresh_spanning_rearm_never_attaches_to_new_turn() -> (

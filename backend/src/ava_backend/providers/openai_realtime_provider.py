@@ -270,6 +270,8 @@ class _OpenAIRealtimeEventChannel:
         self._active_response_id: str | None = None
         self._awaiting_response_trigger_turn_id: str | None = None
         self._interaction_response_turn_id: str | None = None
+        self._interaction_response_readiness_changed = asyncio.Event()
+        self._settled_turn_ids: set[str] = set()
         self._response_owner_by_id: dict[str, str | None] = {}
         self._late_cancel_error_expected = False
         self._prepared_session_update: str | None = None
@@ -284,6 +286,7 @@ class _OpenAIRealtimeEventChannel:
         self._child_transcription_events_by_turn: dict[str, asyncio.Event] = {}
         self._input_item_turn_ids: dict[str, str | None] = {}
         self._input_transcription_outcomes: dict[str, _InputTranscriptionOutcome] = {}
+        self._input_terminal_observed_at: dict[str, float] = {}
 
     async def start_receiver(self) -> None:
         """Start the sole raw sideband reader for this provider session."""
@@ -433,6 +436,7 @@ class _OpenAIRealtimeEventChannel:
         if response_id is not None and event_type.startswith("response."):
             if event_type == "response.created":
                 self._awaiting_response_trigger_turn_id = None
+                self._interaction_response_readiness_changed.set()
             if response_id not in self._response_owner_by_id:
                 # The session receiver observes provider identity before a
                 # turn consumer necessarily reaches the event. Keep the
@@ -452,6 +456,7 @@ class _OpenAIRealtimeEventChannel:
             "input_audio_buffer.committed",
         }:
             self._awaiting_response_trigger_turn_id = None
+            self._interaction_response_readiness_changed.set()
         if (
             event_type in _INPUT_TRANSCRIPTION_PROGRESS_EVENT_TYPES
             or event_type
@@ -466,6 +471,12 @@ class _OpenAIRealtimeEventChannel:
         if item_id not in self._input_item_turn_ids:
             self._input_item_turn_ids[item_id] = None
             _retain_latest(self._input_item_turn_ids, maximum=64)
+        if event_type in {
+            "input_audio_buffer.speech_stopped",
+            "input_audio_buffer.committed",
+        }:
+            self._input_terminal_observed_at[item_id] = monotonic()
+            _retain_latest(self._input_terminal_observed_at, maximum=64)
         if event_type in _INPUT_TRANSCRIPTION_PROGRESS_EVENT_TYPES:
             self._validate_input_transcription_progress(event)
         elif event_type == "conversation.item.input_audio_transcription.completed":
@@ -549,6 +560,8 @@ class _OpenAIRealtimeEventChannel:
         self._active_response_id = None
         self._awaiting_response_trigger_turn_id = turn_id
         self._interaction_response_turn_id = None
+        self._settled_turn_ids.discard(turn_id)
+        self._interaction_response_readiness_changed.set()
         self.last_usage = None
         self.last_response_id = None
         self.last_first_delta_ms = None
@@ -604,9 +617,11 @@ class _OpenAIRealtimeEventChannel:
             # particular, response.created may already be queued on the wire
             # even when we have not observed its response ID yet.
             if response_completed:
+                self._settled_turn_ids.add(turn_id)
                 self._active_turn_id = None
                 self._active_response_id = None
                 self._awaiting_response_trigger_turn_id = None
+                self._interaction_response_readiness_changed.set()
 
     async def complete_canvas_tool(
         self,
@@ -677,6 +692,7 @@ class _OpenAIRealtimeEventChannel:
             return False
         self._awaiting_response_trigger_turn_id = None
         self._interaction_response_turn_id = turn_id
+        self._interaction_response_readiness_changed.set()
         await self._send_json(
             {
                 "type": "response.create",
@@ -702,6 +718,34 @@ class _OpenAIRealtimeEventChannel:
             active_response_id=self._active_response_id,
         )
         return True
+
+    async def wait_until_canvas_interaction_response_ready(
+        self,
+        *,
+        turn_id: str,
+    ) -> bool:
+        if not turn_id.strip():
+            raise ValueError("turn_id cannot be empty")
+        while not self._closed:
+            if turn_id in self._cancelled_turn_ids or turn_id in self._settled_turn_ids:
+                return False
+            if (
+                self._active_turn_id == turn_id
+                and self._awaiting_response_trigger_turn_id == turn_id
+                and self._active_response_id is None
+                and self._pending_canvas_call_id is None
+            ):
+                return True
+            self._interaction_response_readiness_changed.clear()
+            if (
+                self._active_turn_id == turn_id
+                and self._awaiting_response_trigger_turn_id == turn_id
+                and self._active_response_id is None
+                and self._pending_canvas_call_id is None
+            ):
+                return True
+            await self._interaction_response_readiness_changed.wait()
+        return False
 
     async def prepare(self, *, harness: RealtimeHarness) -> None:
         """Prepare the sideband before Flutter is told to unmute the mic."""
@@ -758,6 +802,7 @@ class _OpenAIRealtimeEventChannel:
             return
         if self._awaiting_response_trigger_turn_id == turn_id:
             self._awaiting_response_trigger_turn_id = None
+            self._interaction_response_readiness_changed.set()
         cancelled_pending_canvas = (
             not self._closed
             and self._active_turn_id == turn_id
@@ -788,12 +833,15 @@ class _OpenAIRealtimeEventChannel:
             self._active_response_id = None
             self._active_turn_id = None
             self._cancelled_turn_ids.add(turn_id)
+            self._interaction_response_readiness_changed.set()
             return
         if self._closed or self._active_turn_id != turn_id:
             self._cancelled_turn_ids.add(turn_id)
+            self._interaction_response_readiness_changed.set()
             return
         await self._cancel_and_drain_active_response()
         self._cancelled_turn_ids.add(turn_id)
+        self._interaction_response_readiness_changed.set()
 
     async def _cancel_and_drain_active_response(self) -> None:
         """Restore the persistent socket to an exact response boundary."""
@@ -1296,6 +1344,7 @@ class _OpenAIRealtimeEventChannel:
         self._closed = True
         self._awaiting_response_trigger_turn_id = None
         self._interaction_response_turn_id = None
+        self._interaction_response_readiness_changed.set()
         try:
             await self._socket.close(code=1000, reason="Ava session closed")
         finally:
@@ -1338,6 +1387,8 @@ class _OpenAIRealtimeEventChannel:
             argument_parts: list[str] = []
             final_arguments: str | None = None
             function_item_count = 0
+            response_created_at: float | None = None
+            first_text_delta_observed = False
 
             while True:
                 event = await self._receive_event(
@@ -1389,6 +1440,7 @@ class _OpenAIRealtimeEventChannel:
                     continue
 
                 if event_type == "response.created":
+                    response_created_at = monotonic()
                     self._awaiting_response_trigger_turn_id = None
                     if not response_expected:
                         trigger_started = monotonic()
@@ -1401,6 +1453,43 @@ class _OpenAIRealtimeEventChannel:
                         )
                     response_id = candidate
                     self._active_response_id = candidate
+                    if (
+                        not continuation
+                        and self._interaction_response_turn_id != turn_id
+                    ):
+                        input_terminal_at = max(
+                            (
+                                observed_at
+                                for item_id, observed_at in (
+                                    self._input_terminal_observed_at.items()
+                                )
+                                if self._input_item_turn_ids.get(item_id) == turn_id
+                            ),
+                            default=None,
+                        )
+                        if input_terminal_at is not None:
+                            elapsed_ms = max(
+                                0.0,
+                                (response_created_at - input_terminal_at) * 1000,
+                            )
+                            LOGGER.info(
+                                "openai_realtime_latency turn_id=%s response_id=%s "
+                                "stage=input_terminal_to_response_created "
+                                "elapsed_ms=%.2f",
+                                turn_id,
+                                candidate,
+                                elapsed_ms,
+                                extra={
+                                    "ava_context": {
+                                        "turnId": turn_id,
+                                        "providerResponseId": candidate,
+                                        "stage": (
+                                            "inputTerminalToResponseCreated"
+                                        ),
+                                        "elapsedMs": elapsed_ms,
+                                    }
+                                },
+                            )
                     continue
 
                 if event_type in (
@@ -1420,6 +1509,34 @@ class _OpenAIRealtimeEventChannel:
                             self.last_first_delta_ms = (
                                 monotonic() - trigger_started
                             ) * 1000
+                        if (
+                            not first_text_delta_observed
+                            and response_created_at is not None
+                        ):
+                            first_text_delta_observed = True
+                            created_to_delta_ms = max(
+                                0.0,
+                                (monotonic() - response_created_at) * 1000,
+                            )
+                            LOGGER.info(
+                                "openai_realtime_latency turn_id=%s "
+                                "response_id=%s "
+                                "stage=response_created_to_first_text_delta "
+                                "elapsed_ms=%.2f",
+                                turn_id,
+                                candidate_response_id,
+                                created_to_delta_ms,
+                                extra={
+                                    "ava_context": {
+                                        "turnId": turn_id,
+                                        "providerResponseId": candidate_response_id,
+                                        "stage": (
+                                            "responseCreatedToFirstTextDelta"
+                                        ),
+                                        "elapsedMs": created_to_delta_ms,
+                                    }
+                                },
+                            )
                         yield RealtimeSpeechTextDelta(delta=delta)
                     continue
 
@@ -1948,6 +2065,15 @@ class OpenAIRealtimeProviderSession:
 
     async def request_canvas_interaction_response(self, *, turn_id: str) -> bool:
         return await self._require_channel().request_canvas_interaction_response(
+            turn_id=turn_id
+        )
+
+    async def wait_until_canvas_interaction_response_ready(
+        self,
+        *,
+        turn_id: str,
+    ) -> bool:
+        return await self._require_channel().wait_until_canvas_interaction_response_ready(
             turn_id=turn_id
         )
 

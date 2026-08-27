@@ -240,6 +240,56 @@ def test_v4_interrupt_request_is_turn_and_stream_bound() -> None:
     assert json.loads(serialize_server_event_v4(event)) == payload
 
 
+def test_v4_turn_state_machine_accepts_synthesizing_interrupt_after_metadata() -> (
+    None
+):
+    payloads = _speech_turn_payloads()
+    machine = RealtimeTurnStateMachine()
+    for payload in payloads[:7]:
+        machine.accept(AVA_SERVER_EVENT_ADAPTER_V4.validate_python(payload))
+    interrupt = AVA_SERVER_EVENT_ADAPTER_V4.validate_python(
+        {
+            "protocolVersion": 4,
+            "event": "interruptRequested",
+            "sessionId": "session-1234",
+            "turnId": "turn-1234",
+            "sequence": 7,
+            "revision": 4,
+            "streamId": "stream-1234",
+            "reason": "providerSpeechStarted",
+        }
+    )
+
+    snapshot = machine.accept(interrupt)
+
+    assert snapshot.phase == SpeechPhase.SYNTHESIZING
+    assert snapshot.received_sample_count == 0
+
+
+def test_v4_turn_state_machine_rejects_synthesizing_interrupt_without_metadata() -> (
+    None
+):
+    payloads = _speech_turn_payloads()
+    machine = RealtimeTurnStateMachine()
+    for payload in payloads[:6]:
+        machine.accept(AVA_SERVER_EVENT_ADAPTER_V4.validate_python(payload))
+    interrupt = AVA_SERVER_EVENT_ADAPTER_V4.validate_python(
+        {
+            "protocolVersion": 4,
+            "event": "interruptRequested",
+            "sessionId": "session-1234",
+            "turnId": "turn-1234",
+            "sequence": 6,
+            "revision": 4,
+            "streamId": "stream-1234",
+            "reason": "providerSpeechStarted",
+        }
+    )
+
+    with pytest.raises(RealtimeStateError, match="audioMetadata"):
+        machine.accept(interrupt)
+
+
 def test_v4_turn_state_machine_accepts_speech_and_isolates_memory_warning() -> None:
     machine = RealtimeTurnStateMachine()
     events = [
