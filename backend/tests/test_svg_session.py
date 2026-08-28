@@ -321,6 +321,11 @@ def test_reportable_interaction_enters_realtime_canvas_context() -> None:
 
     assert '<last_interaction mode="explore">' in context
     assert "<target>Rain cloud</target>" in context
+    assert (
+        '<last_interaction mode="explore"><target>Rain cloud</target>'
+        "</last_interaction>"
+    ) in context
+    assert '>"<target>' not in context
 
 
 def test_interaction_context_survives_session_state_replacement() -> None:

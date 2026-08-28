@@ -1297,7 +1297,8 @@ class DeterministicRealtimeSessionCoordinator:
                         continue
                     self._canvas_interaction_response_turn_id = turn_id
                     triggered = await self._realtime.request_canvas_interaction_response(
-                        turn_id=turn_id
+                        turn_id=turn_id,
+                        interaction=interaction,
                     )
                     superseded = not self._is_latest_canvas_interaction(interaction)
                     if not triggered:

@@ -11,7 +11,10 @@ import pytest
 from ava_backend.canvas.svg_delivery import SvgCanvasDocumentStore
 from ava_backend.canvas.svg_document import SvgDocumentValidator
 from ava_backend.canvas.svg_session import SvgCanvasSessionState
-from ava_backend.canvas.svg_workspace import SvgCanvasWorkspace
+from ava_backend.canvas.svg_workspace import (
+    RecordedSvgCanvasInteraction,
+    SvgCanvasWorkspace,
+)
 from ava_backend.canvas.svg_specialist import (
     SvgCanvasSpecialistGeneration,
     SvgCanvasSpecialistRequest,
@@ -138,8 +141,16 @@ class _BlockingInteractionContextProvider(DeterministicRealtimePlanProvider):
             await self.allow_context_refresh.wait()
         await super().prepare(harness=harness)
 
-    async def request_canvas_interaction_response(self, *, turn_id: str) -> bool:
-        triggered = await super().request_canvas_interaction_response(turn_id=turn_id)
+    async def request_canvas_interaction_response(
+        self,
+        *,
+        turn_id: str,
+        interaction: RecordedSvgCanvasInteraction,
+    ) -> bool:
+        triggered = await super().request_canvas_interaction_response(
+            turn_id=turn_id,
+            interaction=interaction,
+        )
         if triggered:
             self.interaction_response_requested.set()
         return triggered
@@ -915,6 +926,9 @@ async def test_valid_canvas_interaction_refreshes_context_before_one_response() 
     await delivery
 
     assert provider.canvas_interaction_response_turn_ids == [TURN_ID]
+    assert provider.canvas_interaction_response_interactions == [
+        state.last_interaction
+    ]
     assert len(provider.canvas_interaction_response_session_updates) == 1
     session = provider.canvas_interaction_response_session_updates[0]["session"]
     assert isinstance(session, dict)
@@ -997,6 +1011,9 @@ async def test_rapid_canvas_interactions_coalesce_optional_speech_to_latest() ->
         assert state.last_interaction.interaction_revision == 3
         assert state.last_interaction.binding_id == "explore_chloroplast"
         assert provider.canvas_interaction_response_turn_ids == [TURN_ID]
+        assert provider.canvas_interaction_response_interactions == [
+            state.last_interaction
+        ]
         installed = provider.canvas_interaction_response_session_updates[0]["session"]
         assert isinstance(installed, dict)
         instructions = installed["instructions"]
@@ -1069,6 +1086,7 @@ async def test_child_speech_supersedes_interaction_while_context_refresh_is_pend
         assert state.last_interaction is not None
         assert state.last_interaction.binding_id == "explore_condensation"
         assert provider.canvas_interaction_response_turn_ids == []
+        assert provider.canvas_interaction_response_interactions == []
         assert not any(
             isinstance(event, InterruptRequestedEventV4) for event in controls
         )
@@ -1215,6 +1233,14 @@ async def test_tap_during_interaction_speech_rearms_only_latest_reaction() -> No
             TURN_ID,
             "turn-coordinator-2",
         ]
+        assert [
+            interaction.binding_id
+            for interaction in provider.canvas_interaction_response_interactions
+        ] == ["explore_nucleus", "explore_wall"]
+        assert [
+            interaction.interaction_revision
+            for interaction in provider.canvas_interaction_response_interactions
+        ] == [1, 2]
         latest_session = provider.canvas_interaction_response_session_updates[-1][
             "session"
         ]
@@ -1425,6 +1451,7 @@ async def test_interaction_context_refresh_spanning_rearm_never_attaches_to_new_
     assert state.last_interaction is not None
     assert state.last_interaction.binding_id == "explore_condensation"
     assert provider.canvas_interaction_response_turn_ids == []
+    assert provider.canvas_interaction_response_interactions == []
     instructions = provider.prepared_session_updates[-1]["session"]
     assert isinstance(instructions, dict)
     installed = instructions["instructions"]

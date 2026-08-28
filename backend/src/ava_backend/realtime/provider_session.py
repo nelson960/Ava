@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Protocol
 
+from ..canvas.svg_workspace import RecordedSvgCanvasInteraction
 from .harness import RealtimeHarness
 from .tool_contract import (
     InteractiveCanvasToolOutput,
@@ -124,7 +125,12 @@ class RealtimeProviderSession(Protocol):
         output: InteractiveCanvasToolOutput | InteractiveCanvasToolOutputV4,
     ) -> None: ...
 
-    async def request_canvas_interaction_response(self, *, turn_id: str) -> bool:
+    async def request_canvas_interaction_response(
+        self,
+        *,
+        turn_id: str,
+        interaction: RecordedSvgCanvasInteraction,
+    ) -> bool:
         """Trigger one idle semantic response without inventing child input."""
         ...
 

@@ -9,6 +9,7 @@ import pytest
 from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
 
+from ava_backend.canvas.svg_workspace import RecordedSvgCanvasInteraction
 from ava_backend.protocol import AgeBand
 from ava_backend.providers.openai_realtime_provider import (
     OpenAIRealtimeProbeRequest,
@@ -33,6 +34,28 @@ RESPONSE_ID = "resp_test_live_0001"
 CONTINUATION_RESPONSE_ID = "resp_test_live_0002"
 FUNCTION_CALL_ID = "call_test_live_0001"
 _TEST_CHANNELS: set[_OpenAIRealtimeEventChannel] = set()
+
+
+def _recorded_interaction(
+    *,
+    binding_id: str = "explore_great_red_spot",
+    accessibility_label: str = "Great Red Spot",
+    interaction_mode: str = "explore",
+    interaction_revision: int = 1,
+    step_index: int | None = None,
+) -> RecordedSvgCanvasInteraction:
+    return RecordedSvgCanvasInteraction(
+        scene_id="scene_jupiter",
+        scene_revision=3,
+        interaction_revision=interaction_revision,
+        svg_sha256="a" * 64,
+        manifest_sha256="b" * 64,
+        binding_id=binding_id,
+        interaction_mode=interaction_mode,
+        target_id=f"target_{binding_id}",
+        accessibility_label=accessibility_label,
+        step_index=step_index,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -1264,7 +1287,8 @@ async def test_idle_canvas_interaction_can_trigger_existing_semantic_turn() -> N
     await socket.wait_received(1)
 
     accepted = await channel.request_canvas_interaction_response(
-        turn_id="turn-canvas-interaction"
+        turn_id="turn-canvas-interaction",
+        interaction=_recorded_interaction(),
     )
 
     assert accepted is True
@@ -1275,8 +1299,16 @@ async def test_idle_canvas_interaction_can_trigger_existing_semantic_turn() -> N
     response = interaction_requests[0]["response"]
     assert response["output_modalities"] == ["text"]
     assert response["tool_choice"] == "none"
-    assert response["max_output_tokens"] == 800
+    assert response["max_output_tokens"] == 128
     assert "no Markdown" in response["instructions"]
+    assert 'scene_id="scene_jupiter"' in response["instructions"]
+    assert 'scene_revision="3"' in response["instructions"]
+    assert 'interaction_revision="1"' in response["instructions"]
+    assert 'mode="explore"' in response["instructions"]
+    assert 'binding_id="explore_great_red_spot"' in response["instructions"]
+    assert 'target_id="target_explore_great_red_spot"' in response["instructions"]
+    assert "<target>Great Red Spot</target>" in response["instructions"]
+    assert "latest validated canvas interaction" not in response["instructions"]
     assert not any(
         sent.get("type") == "conversation.item.create"
         and isinstance(sent.get("item"), dict)
@@ -1297,6 +1329,92 @@ async def test_idle_canvas_interaction_can_trigger_existing_semantic_turn() -> N
 
 
 @pytest.mark.asyncio
+async def test_canvas_interaction_response_owns_each_exact_target_instruction() -> None:
+    interactions = (
+        _recorded_interaction(),
+        _recorded_interaction(
+            binding_id="select_europa",
+            accessibility_label="Europa",
+            interaction_mode="select",
+            interaction_revision=2,
+        ),
+    )
+    instructions: list[str] = []
+
+    for index, interaction in enumerate(interactions, start=1):
+        channel, socket = _channel([])
+        turn_id = f"turn-exact-target-{index}"
+        iterator = channel.stream_turn(
+            harness=_harness(),
+            turn_id=turn_id,
+        ).__aiter__()
+        pending_event = asyncio.create_task(iterator.__anext__())
+        await socket.wait_received(1)
+
+        assert await channel.request_canvas_interaction_response(
+            turn_id=turn_id,
+            interaction=interaction,
+        )
+        response_create = next(
+            sent for sent in socket.sent if sent.get("type") == "response.create"
+        )
+        response = response_create["response"]
+        assert isinstance(response, dict)
+        instruction = response["instructions"]
+        assert isinstance(instruction, str)
+        instructions.append(instruction)
+
+        pending_event.cancel()
+        await asyncio.gather(pending_event, return_exceptions=True)
+        await iterator.aclose()
+
+    assert "<target>Great Red Spot</target>" in instructions[0]
+    assert "Europa" not in instructions[0]
+    assert "<target>Europa</target>" in instructions[1]
+    assert "Great Red Spot" not in instructions[1]
+    assert 'interaction_revision="1"' in instructions[0]
+    assert 'interaction_revision="2"' in instructions[1]
+    assert instructions[0] != instructions[1]
+
+
+@pytest.mark.asyncio
+async def test_steps_interaction_response_owns_exact_step() -> None:
+    channel, socket = _channel([])
+    iterator = channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-exact-step",
+    ).__aiter__()
+    pending_event = asyncio.create_task(iterator.__anext__())
+    await socket.wait_received(1)
+
+    assert await channel.request_canvas_interaction_response(
+        turn_id="turn-exact-step",
+        interaction=_recorded_interaction(
+            binding_id="step_moon_orbit",
+            accessibility_label="Moon orbit",
+            interaction_mode="steps",
+            step_index=2,
+        ),
+    )
+    response_create = next(
+        sent for sent in socket.sent if sent.get("type") == "response.create"
+    )
+    response = response_create["response"]
+    assert isinstance(response, dict)
+    instruction = response["instructions"]
+    assert isinstance(instruction, str)
+    assert 'mode="steps"' in instruction
+    assert 'step_index="2"' in instruction
+    assert "<target>Moon orbit</target>" in instruction
+    assert "Back" not in instruction
+    assert "Next" not in instruction
+
+    pending_event.cancel()
+    await asyncio.gather(pending_event, return_exceptions=True)
+    await iterator.aclose()
+
+
+@pytest.mark.asyncio
 async def test_canvas_interaction_trigger_is_single_shot() -> None:
     channel, socket = _channel([])
     iterator = channel.stream_turn(
@@ -1307,10 +1425,12 @@ async def test_canvas_interaction_trigger_is_single_shot() -> None:
     await socket.wait_received(1)
 
     assert await channel.request_canvas_interaction_response(
-        turn_id="turn-canvas-single-shot"
+        turn_id="turn-canvas-single-shot",
+        interaction=_recorded_interaction(),
     )
     assert not await channel.request_canvas_interaction_response(
-        turn_id="turn-canvas-single-shot"
+        turn_id="turn-canvas-single-shot",
+        interaction=_recorded_interaction(),
     )
     assert len(
         [sent for sent in socket.sent if sent.get("type") == "response.create"]
@@ -1336,7 +1456,8 @@ async def test_canvas_interaction_response_cannot_call_canvas_tool() -> None:
     pending_event = asyncio.create_task(iterator.__anext__())
     await socket.wait_received(1)
     assert await channel.request_canvas_interaction_response(
-        turn_id="turn-canvas-no-tools"
+        turn_id="turn-canvas-no-tools",
+        interaction=_recorded_interaction(),
     )
 
     for event in _canvas_response_events(
@@ -1375,7 +1496,8 @@ async def test_child_input_observed_first_suppresses_canvas_interaction_response
     await socket.wait_received(2)
 
     assert not await channel.request_canvas_interaction_response(
-        turn_id="turn-child-wins"
+        turn_id="turn-child-wins",
+        interaction=_recorded_interaction(),
     )
     assert not any(sent.get("type") == "response.create" for sent in socket.sent)
 
@@ -1408,7 +1530,8 @@ async def test_already_owned_child_input_suppresses_interaction_response() -> No
     await socket.wait_sent(1)
 
     assert not await channel.request_canvas_interaction_response(
-        turn_id="turn-owned-child"
+        turn_id="turn-owned-child",
+        interaction=_recorded_interaction(),
     )
     assert not any(sent.get("type") == "response.create" for sent in socket.sent)
 
@@ -1435,7 +1558,8 @@ async def test_active_normal_response_suppresses_canvas_interaction_response() -
     assert isinstance(await pending_event, RealtimeSpeechTextDelta)
 
     assert not await channel.request_canvas_interaction_response(
-        turn_id="turn-normal-response-active"
+        turn_id="turn-normal-response-active",
+        interaction=_recorded_interaction(),
     )
     assert not any(sent.get("type") == "response.create" for sent in socket.sent)
 
@@ -1800,7 +1924,8 @@ async def test_cancellation_during_pending_interaction_response_create_does_not_
     pending_event = asyncio.create_task(iterator.__anext__())
     await socket.wait_sent(1)
     assert await channel.request_canvas_interaction_response(
-        turn_id="turn-interaction-a"
+        turn_id="turn-interaction-a",
+        interaction=_recorded_interaction(),
     )
     pending_event.cancel()
     await asyncio.gather(pending_event, return_exceptions=True)
@@ -1858,7 +1983,8 @@ async def test_child_vad_cancels_pending_interaction_before_next_child_response(
     pending_event = asyncio.create_task(iterator.__anext__())
     await socket.wait_sent(1)
     assert await channel.request_canvas_interaction_response(
-        turn_id="turn-interaction-vad-a"
+        turn_id="turn-interaction-vad-a",
+        interaction=_recorded_interaction(),
     )
 
     socket.push(

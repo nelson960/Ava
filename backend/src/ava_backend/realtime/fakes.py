@@ -5,6 +5,7 @@ import re
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 
+from ..canvas.svg_workspace import RecordedSvgCanvasInteraction
 from .delivery import (
     SynthesizedAlignmentBatch,
     SynthesizedAudioChunk,
@@ -143,6 +144,9 @@ class DeterministicRealtimePlanProvider:
             InteractiveCanvasToolOutput | InteractiveCanvasToolOutputV4
         ] = []
         self.canvas_interaction_response_turn_ids: list[str] = []
+        self.canvas_interaction_response_interactions: list[
+            RecordedSvgCanvasInteraction
+        ] = []
         self.canvas_interaction_response_session_updates: list[
             dict[str, object]
         ] = []
@@ -286,7 +290,12 @@ class DeterministicRealtimePlanProvider:
         self.completed_canvas_outputs.append(output)
         await asyncio.sleep(0)
 
-    async def request_canvas_interaction_response(self, *, turn_id: str) -> bool:
+    async def request_canvas_interaction_response(
+        self,
+        *,
+        turn_id: str,
+        interaction: RecordedSvgCanvasInteraction,
+    ) -> bool:
         if not turn_id:
             raise ValueError("turn_id cannot be empty")
         if (
@@ -295,6 +304,7 @@ class DeterministicRealtimePlanProvider:
         ):
             return False
         self.canvas_interaction_response_turn_ids.append(turn_id)
+        self.canvas_interaction_response_interactions.append(interaction)
         if not self.prepared_session_updates:
             raise AssertionError(
                 "canvas interaction response requires a prepared session update"
