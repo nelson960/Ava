@@ -10,6 +10,7 @@ import 'package:ava/models/ava_svg_canvas_protocol.dart';
 import 'package:ava/services/ava_svg_document_service.dart';
 import 'package:ava/ui/dashboard/ava_svg_canvas_panel.dart';
 import 'package:ava/ui/dashboard/ava_svg_canvas_view.dart';
+import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -398,6 +399,77 @@ void main() {
     expect(payload, isNot(contains('label')));
     expect(payload, isNot(contains('value')));
     controller.dispose();
+  });
+
+  test('explore A then A emits one semantic interaction', () async {
+    final commands = await _interactionCommands(
+      mode: AvaSvgInteractionMode.explore,
+      declaredBindings: const ['A'],
+      selections: const ['A', 'A'],
+    );
+
+    expect(commands, hasLength(1));
+    expect(commands.single.fields['bindingId'], 'binding-A');
+    expect(commands.single.fields['interactionRevision'], 1);
+  });
+
+  test('explore A then B then A emits three semantic interactions', () async {
+    final commands = await _interactionCommands(
+      mode: AvaSvgInteractionMode.explore,
+      declaredBindings: const ['A', 'B'],
+      selections: const ['A', 'B', 'A'],
+    );
+
+    expect(
+      commands.map((command) => command.fields['bindingId']),
+      orderedEquals(['binding-A', 'binding-B', 'binding-A']),
+    );
+    expect(
+      commands.map((command) => command.fields['interactionRevision']),
+      orderedEquals([1, 2, 3]),
+    );
+  });
+
+  test('select A then A emits one semantic interaction', () async {
+    final commands = await _interactionCommands(
+      mode: AvaSvgInteractionMode.select,
+      declaredBindings: const ['A'],
+      selections: const ['A', 'A'],
+    );
+
+    expect(commands, hasLength(1));
+    expect(commands.single.fields['interactionRevision'], 1);
+  });
+
+  test('steps callbacks remain progressive semantic interactions', () async {
+    final commands = await _interactionCommands(
+      mode: AvaSvgInteractionMode.steps,
+      declaredBindings: const ['A', 'B'],
+      selections: const ['A', 'A'],
+    );
+
+    expect(commands, hasLength(2));
+    expect(
+      commands.map((command) => command.fields['interactionRevision']),
+      orderedEquals([1, 2]),
+    );
+  });
+
+  test('rapid genuine A then B then C emits every selection', () async {
+    final commands = await _interactionCommands(
+      mode: AvaSvgInteractionMode.select,
+      declaredBindings: const ['A', 'B', 'C'],
+      selections: const ['A', 'B', 'C'],
+    );
+
+    expect(
+      commands.map((command) => command.fields['bindingId']),
+      orderedEquals(['binding-A', 'binding-B', 'binding-C']),
+    );
+    expect(
+      commands.map((command) => command.fields['interactionRevision']),
+      orderedEquals([1, 2, 3]),
+    );
   });
 
   test('dismissed active drawing can be reopened from the session host',
@@ -1462,6 +1534,85 @@ void main() {
     );
     controller.dispose();
   });
+}
+
+Future<List<AvaSvgCanvasClientCommand>> _interactionCommands({
+  required AvaSvgInteractionMode mode,
+  required List<String> declaredBindings,
+  required List<String> selections,
+}) async {
+  final interactionDocument = _interactionDocument(
+    mode: mode,
+    bindingNames: declaredBindings,
+  );
+  final commands = <AvaSvgCanvasClientCommand>[];
+  final controller = await _activate(
+    interactionDocument,
+    _eventsForDocument(interactionDocument),
+    commands,
+  );
+  commands.clear();
+  for (final selection in selections) {
+    controller.reportBinding(
+      interactionDocument.manifest.bindings['binding-$selection']!,
+    );
+  }
+  controller.dispose();
+  return commands;
+}
+
+AvaValidatedSvgCanvasDocument _interactionDocument({
+  required AvaSvgInteractionMode mode,
+  required List<String> bindingNames,
+}) {
+  final svgText =
+      '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600">
+${bindingNames.map((name) => '<g id="element-$name" data-ava-binding="binding-$name"><text id="reveal-$name">$name</text></g>').join()}
+</svg>''';
+  final bindings = bindingNames.indexed.map((entry) {
+    final (index, name) = entry;
+    return <String, Object?>{
+      'accessibilityLabel': 'Binding $name',
+      'bindingId': 'binding-$name',
+      'elementId': 'element-$name',
+      'revealIds': mode == AvaSvgInteractionMode.explore
+          ? <String>['reveal-$name']
+          : <String>[],
+      'targetId': 'element-$name',
+      if (mode == AvaSvgInteractionMode.steps) 'stepIndex': index + 1,
+    };
+  }).toList(growable: false);
+  final manifestText = jsonEncode({
+    'background': '#dff5ff',
+    'bindings': bindings,
+    'description': 'Deterministic interaction admission fixture.',
+    'interactionMode': mode.name,
+    'manifestVersion': avaSvgManifestVersion,
+    'rendererCapabilityVersion': avaSvgRendererCapabilityVersion,
+    'sourceTrust': 'modelGeneratedData',
+    'title': 'Interaction admission',
+    'validatorVersion': avaSvgValidatorVersion,
+    'viewBox': [0.0, 0.0, 1000.0, 600.0],
+  });
+  final svgBytes = Uint8List.fromList(utf8.encode(svgText));
+  final manifestBytes = Uint8List.fromList(utf8.encode(manifestText));
+  final descriptor = AvaSvgCanvasDocumentDescriptorV4(
+    generationId: 'generation-${mode.name}-interaction',
+    sourceTurnId: 'turn-${mode.name}-interaction',
+    sceneId: 'scene-${mode.name}-interaction',
+    sceneRevision: 1,
+    svgPath: '/canvas-documents/${mode.name}/svg',
+    manifestPath: '/canvas-documents/${mode.name}/manifest',
+    svgSha256: sha256.convert(svgBytes).toString(),
+    manifestSha256: sha256.convert(manifestBytes).toString(),
+    svgByteLength: svgBytes.length,
+    manifestByteLength: manifestBytes.length,
+  );
+  return AvaValidatedSvgCanvasDocument.verify(
+    descriptor: descriptor,
+    svgBytes: svgBytes,
+    manifestBytes: manifestBytes,
+  );
 }
 
 Future<AvaSvgCanvasController> _activate(

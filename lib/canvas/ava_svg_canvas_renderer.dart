@@ -132,6 +132,7 @@ body{opacity:0;background:$background}
     const report = (binding) => bridge('$bindingHandler', {bindingId: binding.bindingId});
     const activate = (record) => {
       const binding = record.binding;
+      if (interactionMode !== 'steps' && selectedBindingId === binding.bindingId) return;
       if (interactionMode === 'explore') {
         if (selectedBindingId && selectedBindingId !== binding.bindingId) {
           const previous = bindings.get(selectedBindingId);

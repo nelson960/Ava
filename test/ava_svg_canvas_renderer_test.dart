@@ -83,6 +83,28 @@ void main() {
     expect(html, contains('new ResizeObserver(queueRebuild)'));
   });
 
+  test('explore and select report only a change of selection', () {
+    final html = const AvaSvgCanvasHtmlRenderer().build(
+      document: document,
+      preparedHandler: 'prepared_handler',
+      presentedHandler: 'presented_handler',
+      bindingHandler: 'binding_handler',
+      errorHandler: 'error_handler',
+    );
+
+    expect(
+      html,
+      contains(
+        "if (interactionMode !== 'steps' && "
+        'selectedBindingId === binding.bindingId) return;',
+      ),
+    );
+    expect(
+      html.indexOf('selectedBindingId === binding.bindingId'),
+      lessThan(html.indexOf('report(binding);')),
+    );
+  });
+
   test('steps use renderer-owned controls and do not report initial state', () {
     final html = const AvaSvgCanvasHtmlRenderer().build(
       document: document,
@@ -99,6 +121,14 @@ void main() {
     expect(html, contains('applyStep(currentStep - 1, true)'));
     expect(html, contains("applyStep(1, false)"));
     expect(html, contains("if (interactionMode !== 'steps')"));
+    expect(
+      html,
+      isNot(
+        contains(
+          'if (selectedBindingId === binding.bindingId) return;',
+        ),
+      ),
+    );
   });
 
   test('legacy generic action runtime is absent', () {

@@ -151,6 +151,7 @@ final class AvaSvgCanvasController extends ChangeNotifier {
   int _lastRenderedSample = 0;
   final Map<String, int> _renderedSamplesByTurn = {};
   int _interactionRevision = 0;
+  String? _selectedBindingId;
   String? _failedActiveRendererGenerationId;
   bool _closed = false;
   ({String generationId, Duration startedAt})? _rendererPreparation;
@@ -536,6 +537,7 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     _candidate = null;
     _generation = null;
     _interactionRevision = 0;
+    _selectedBindingId = null;
     _failedActiveRendererGenerationId = null;
     _recordDescriptor(
       'canvas.activation.completed',
@@ -556,6 +558,14 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     if (!identical(canonical, binding)) {
       throw StateError('SVG binding does not belong to the active manifest.');
     }
+    final interactionMode = active.document.manifest.interactionMode;
+    final selectionChanged = _selectedBindingId != binding.bindingId;
+    if ((interactionMode == AvaSvgInteractionMode.explore ||
+            interactionMode == AvaSvgInteractionMode.select) &&
+        !selectionChanged) {
+      return;
+    }
+    _selectedBindingId = binding.bindingId;
     _interactionRevision += 1;
     final descriptor = active.document.descriptor;
     _emit(
