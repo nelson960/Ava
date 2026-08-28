@@ -337,6 +337,79 @@ def test_delivered_turn_requires_audio_and_text_to_agree() -> None:
         DeliveredConversationTurn.model_validate(payload)
 
 
+def test_canvas_interaction_is_a_typed_input_without_fabricated_child_text() -> None:
+    turn = DeliveredConversationTurn.model_validate(
+        {
+            "turnId": "turn-interaction",
+            "inputKind": "canvasInteraction",
+            "childText": None,
+            "childTextSource": None,
+            "canvasInteraction": {
+                "sceneId": "scene-A",
+                "sceneRevision": 2,
+                "interactionRevision": 7,
+                "interactionMode": "explore",
+                "bindingId": "binding-A",
+                "targetId": "target-A",
+                "accessibilityLabel": "target-A label",
+                "stepIndex": None,
+            },
+            "avaDeliveredText": "A heard response.",
+            "deliveredSampleCount": 24_000,
+            "childTurnSummary": "Canvas interaction with target-A label.",
+            "terminal": "completed",
+        }
+    )
+
+    assert turn.input_kind == "canvasInteraction"
+    assert turn.child_text is None
+    assert turn.child_text_source is None
+    assert turn.canvas_interaction is not None
+    assert turn.canvas_interaction.binding_id == "binding-A"
+
+
+async def test_canvas_interaction_never_creates_stable_memory_without_speech() -> None:
+    store = DevelopmentAuthoritativeMemoryStore()
+    interaction_turn = DeliveredConversationTurn.model_validate(
+        {
+            "turnId": "turn-interaction-stable",
+            "inputKind": "canvasInteraction",
+            "childText": None,
+            "childTextSource": None,
+            "canvasInteraction": {
+                "sceneId": "scene-A",
+                "sceneRevision": 1,
+                "interactionRevision": 1,
+                "interactionMode": "select",
+                "bindingId": "binding-A",
+                "targetId": "target-A",
+                "accessibilityLabel": "target-A label",
+                "stepIndex": None,
+            },
+            "avaDeliveredText": "",
+            "deliveredSampleCount": 0,
+            "childTurnSummary": "Canvas interaction.",
+            "terminal": "cancelled",
+        }
+    )
+
+    decision = await store.commit_delivered_turn(
+        subject="child:interaction-stable",
+        turn=interaction_turn,
+        proposal=_proposal(),
+        memory_id="memory-from-tap",
+    )
+    snapshot = await store.load_snapshot(
+        subject="child:interaction-stable",
+        age_band="middleChildhood",
+    )
+
+    assert decision.accepted is False
+    assert "speech transcript" in decision.reason
+    assert snapshot.delivered_turns == [interaction_turn]
+    assert snapshot.stable_memories == []
+
+
 def test_snapshot_rejects_duplicate_records() -> None:
     turn = _turn().model_dump(mode="json", by_alias=True)
     with pytest.raises(ValueError, match="turn IDs"):

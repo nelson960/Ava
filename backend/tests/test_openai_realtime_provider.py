@@ -23,8 +23,10 @@ from ava_backend.providers.openai_realtime_provider import (
 from ava_backend.realtime.harness import build_realtime_harness
 from ava_backend.realtime.memory import AuthoritativeMemorySnapshot
 from ava_backend.realtime.tool_contract import (
+    CANVAS_MODEL_SAFE_REJECTION_REASON,
     INTERACTIVE_CANVAS_TOOL_NAME,
     InteractiveCanvasToolOutput,
+    InteractiveCanvasToolOutputV4,
     RealtimeCanvasToolCall,
     RealtimeRejectedCanvasToolCall,
     RealtimeSpeechTextDelta,
@@ -380,6 +382,31 @@ async def test_session_receiver_continues_across_idle_keepalive_windows() -> Non
     assert channel._receiver_task is not None
     assert not channel._receiver_task.done()
     await channel.close()
+
+
+def test_available_child_transcript_peek_never_starts_or_drains_receiver() -> None:
+    channel, socket = _channel([])
+
+    assert channel.available_child_transcript_for_turn("turn-unavailable") is None
+    assert channel._receiver_task is None
+    assert socket.received_count == 0
+
+    channel._input_item_turn_ids["item-indexed"] = "turn-available"
+    channel._record_input_transcription(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "item-indexed",
+            "transcript": "Already indexed.",
+        },
+        failed=False,
+    )
+
+    assert (
+        channel.available_child_transcript_for_turn("turn-available")
+        == "Already indexed."
+    )
+    assert channel._receiver_task is None
+    assert socket.received_count == 0
 
 
 @pytest.mark.asyncio
@@ -1216,7 +1243,6 @@ async def test_canvas_call_gets_one_output_then_tool_disabled_continuation(
             "operation": operation,
             "brief": "Show a labeled water cycle with a clear loop.",
             "interactionMode": "explore",
-            "interactionGoal": "Tap the cloud to reveal precipitation.",
         },
         separators=(",", ":"),
     )
@@ -1272,8 +1298,70 @@ async def test_canvas_call_gets_one_output_then_tool_disabled_continuation(
         sent for sent in socket.sent if sent.get("type") == "response.create"
     ]
     assert continuation_requests[-1]["response"]["tool_choice"] == "none"
+    assert continuation_requests[-1]["response"]["max_output_tokens"] == 64
+    accepted_instructions = continuation_requests[-1]["response"]["instructions"]
+    assert 'status="accepted"' in accepted_instructions
+    assert "Do not claim the visual failed" in accepted_instructions
+    assert "Do not claim presentation is complete yet" in accepted_instructions
     assert channel.last_usage is not None
     assert channel.last_usage.total_tokens == 23
+
+
+@pytest.mark.asyncio
+async def test_rejected_canvas_continuation_is_outcome_owned_and_bounded() -> None:
+    arguments = json.dumps(
+        {
+            "operation": "new",
+            "brief": "visual-brief-A",
+            "interactionMode": "none",
+        },
+        separators=(",", ":"),
+    )
+    channel, socket = _channel(
+        [
+            *_canvas_response_events(arguments=arguments, preamble=""),
+            *_text_response_events(
+                response_id=CONTINUATION_RESPONSE_ID,
+                text="The optional visual is unavailable.",
+            ),
+        ]
+    )
+
+    async for event in channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-canvas-rejected",
+    ):
+        if isinstance(event, RealtimeCanvasToolCall):
+            await channel.complete_canvas_tool(
+                turn_id="turn-canvas-rejected",
+                call_id=event.call_id,
+                output=InteractiveCanvasToolOutputV4.model_validate(
+                    {
+                        "status": "rejected",
+                        "reason": CANVAS_MODEL_SAFE_REJECTION_REASON,
+                    }
+                ),
+            )
+
+    function_output = next(
+        sent
+        for sent in socket.sent
+        if isinstance(sent.get("item"), dict)
+        and sent["item"].get("type") == "function_call_output"
+    )
+    serialized_output = function_output["item"]["output"]
+    assert isinstance(serialized_output, str)
+    assert json.loads(serialized_output) == {
+        "status": "rejected",
+        "reason": CANVAS_MODEL_SAFE_REJECTION_REASON,
+    }
+    continuation = [
+        sent for sent in socket.sent if sent.get("type") == "response.create"
+    ][-1]["response"]
+    assert continuation["tool_choice"] == "none"
+    assert continuation["max_output_tokens"] == 64
+    assert 'status="rejected"' in continuation["instructions"]
+    assert "Do not expose internal reasons" in continuation["instructions"]
 
 
 @pytest.mark.asyncio
@@ -1463,7 +1551,7 @@ async def test_canvas_interaction_response_cannot_call_canvas_tool() -> None:
     for event in _canvas_response_events(
         arguments=(
             '{"operation":"new","brief":"Show a cell.",'
-            '"interactionMode":"none","interactionGoal":null}'
+            '"interactionMode":"none"}'
         ),
         preamble="",
     ):
@@ -1619,6 +1707,58 @@ async def test_invalid_canvas_arguments_are_rejected_without_killing_speech(
     ]
     assert len(function_outputs) == 1
     assert json.loads(function_outputs[0]["item"]["output"])["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_canvas_validation_logs_issue_paths_without_raw_arguments(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw_brief = "raw-private-visual-brief"
+    channel, _socket = _channel(
+        [
+            *_canvas_response_events(
+                arguments=json.dumps(
+                    {
+                        "brief": raw_brief,
+                        "interactionMode": "none",
+                    }
+                ),
+                preamble="",
+            ),
+            *_text_response_events(
+                response_id=CONTINUATION_RESPONSE_ID,
+                text="The optional visual is unavailable.",
+            ),
+        ]
+    )
+    caplog.set_level(logging.WARNING, logger="ava_backend.openai_realtime")
+
+    async for event in channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-invalid-content-free-log",
+    ):
+        if isinstance(event, RealtimeRejectedCanvasToolCall):
+            await channel.complete_canvas_tool(
+                turn_id="turn-invalid-content-free-log",
+                call_id=event.call_id,
+                output=InteractiveCanvasToolOutputV4.model_validate(
+                    {
+                        "status": "rejected",
+                        "reason": CANVAS_MODEL_SAFE_REJECTION_REASON,
+                    }
+                ),
+            )
+
+    record = next(
+        item
+        for item in caplog.records
+        if item.getMessage().startswith("openai_canvas_arguments_rejected")
+    )
+    context = record.ava_context  # type: ignore[attr-defined]
+    assert context["issueCount"] == 1
+    assert context["issues"] == [{"path": "operation", "code": "missing"}]
+    assert raw_brief not in caplog.text
+    assert raw_brief not in str(context)
 
 
 @pytest.mark.asyncio

@@ -30,7 +30,6 @@ from ava_backend.providers.openai_svg_canvas_provider import OpenAISvgCanvasSpec
 
 _RUN_COUNT = 5
 _BRIEF = "Show a labeled water cycle with a clear loop."
-_INTERACTION_GOAL = "Let the child tap each stage to reveal its label."
 _SAFETY_IDENTIFIER = hashlib.sha256(
     b"ava-sol-canvas-stream-diagnostic-v1"
 ).hexdigest()
@@ -190,7 +189,7 @@ async def _consume_one(
             "generationId": f"generation-sol-stream-probe-{run_number}",
             "sourceTurnId": f"turn-sol-stream-probe-{run_number}",
             "brief": _BRIEF,
-            "interactionGoal": _INTERACTION_GOAL,
+            "interactionMode": "explore",
             "ageBand": "middleChildhood",
         }
     )
@@ -290,7 +289,7 @@ async def _run(*, allow_spend: bool) -> int:
             "instructionsCharacters": len(instructions),
             "representativeBriefId": "waterCycleV1",
             "representativeBriefCharacters": len(_BRIEF),
-            "interactionGoalPresent": True,
+            "interactionMode": "explore",
             "runCount": _RUN_COUNT,
         },
         "runs": results,
@@ -386,7 +385,7 @@ async def _verify_terminal_contract() -> int:
                 "generationId": f"generation-terminal-{terminal_type}",
                 "sourceTurnId": f"turn-terminal-{terminal_type}",
                 "brief": _BRIEF,
-                "interactionGoal": _INTERACTION_GOAL,
+                "interactionMode": "explore",
                 "ageBand": "middleChildhood",
             }
         )

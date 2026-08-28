@@ -29,7 +29,6 @@ dev = [
 ava-evaluate-personality-v3 = "ava_backend.realtime.eval_cli:main"
 ava-live-realtime-probe = "ava_backend.realtime.live_probe:main"
 ava-live-realtime-semantic-matrix = "ava_backend.realtime.live_semantic_matrix:main"
-ava-live-canvas-probe = "ava_backend.canvas.live_probe:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ava_backend"]

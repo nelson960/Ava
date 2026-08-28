@@ -128,6 +128,33 @@ class _BlockingCanvasInteractionJobs:
         return getattr(self._delegate, name)
 
 
+class _CapturingCanvasGroundingJobs:
+    def __init__(self, delegate: SvgCanvasJobCoordinator) -> None:
+        self._delegate = delegate
+        self.accepted: list[tuple[str, str | None, str]] = []
+
+    async def accept_tool_call(
+        self,
+        *,
+        source_turn_id: str,
+        source_transcript: str | None,
+        call,  # type: ignore[no-untyped-def]
+        complete_tool,  # type: ignore[no-untyped-def]
+    ):  # type: ignore[no-untyped-def]
+        self.accepted.append(
+            (source_turn_id, source_transcript, call.request.brief)
+        )
+        return await self._delegate.accept_tool_call(
+            source_turn_id=source_turn_id,
+            source_transcript=source_transcript,
+            call=call,
+            complete_tool=complete_tool,
+        )
+
+    def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+        return getattr(self._delegate, name)
+
+
 class _BlockingInteractionContextProvider(DeterministicRealtimePlanProvider):
     def __init__(self, plan: AvaTurnPlan) -> None:
         super().__init__(plan, wait_for_canvas_interaction_response=True)
@@ -312,6 +339,42 @@ async def test_replacement_session_initial_context_contains_committed_canvas() -
     assert isinstance(instructions, str)
     assert expected_context in instructions
     await coordinator.close()
+
+
+async def test_provider_owned_source_turn_transcript_grounds_exact_canvas_request() -> None:
+    payload = _plan().model_dump(mode="json", by_alias=True)
+    payload["canvasDecision"] = {
+        "complexity": "specialistRequired",
+        "specialistBrief": "visual-brief-subject-B",
+    }
+    plan = AvaTurnPlan.model_validate(payload)
+    provider = DeterministicRealtimePlanProvider(
+        plan,
+        child_text="source-subject-A",
+        canvas_brief="visual-brief-subject-B",
+    )
+    provider.emit_input_event(
+        RealtimeProviderInputEvent(
+            event_type="input_audio_buffer.speech_started",
+            item_id="item-source-grounding-A",
+            audio_start_ms=0,
+        ),
+        owner_turn_id=TURN_ID,
+    )
+    coordinator, _, _, _ = _coordinator(plan=plan, realtime=provider)
+    capturing_jobs = _CapturingCanvasGroundingJobs(coordinator._canvas_jobs)
+    coordinator._canvas_jobs = capturing_jobs  # type: ignore[assignment]
+    await _ready(coordinator)
+    try:
+        events = await _complete_delivered_turn(coordinator)
+
+        assert isinstance(events[-1], TurnCompletedEventV4)
+        assert provider.input_item_owner(item_id="item-source-grounding-A") == TURN_ID
+        assert capturing_jobs.accepted == [
+            (TURN_ID, "source-subject-A", "visual-brief-subject-B")
+        ]
+    finally:
+        await coordinator.close()
 
 
 def _client(payload: dict[str, object]) -> AvaClientEventUnionV4:
@@ -1109,8 +1172,10 @@ async def test_tap_during_interaction_speech_rearms_only_latest_reaction() -> No
         child_text=None,
         wait_for_canvas_interaction_response=True,
     )
+    memory = DevelopmentAuthoritativeMemoryStore()
     coordinator, _, _, _ = _coordinator(
         realtime=provider,
+        memory=memory,
         persistent=True,
         canvas_state=state,
     )
@@ -1186,6 +1251,7 @@ async def test_tap_during_interaction_speech_rearms_only_latest_reaction() -> No
         assert interrupted.stream_id == STREAM_ID
         assert interrupted.reason == "canvasInteractionSuperseded"
         interruptions = [interrupted]
+        rendered_before_cancel = coordinator.received_sample_count // 2
         await coordinator.receive(
             _client(
                 {
@@ -1193,7 +1259,7 @@ async def test_tap_during_interaction_speech_rearms_only_latest_reaction() -> No
                     "sequence": 4,
                     "turnId": TURN_ID,
                     "streamId": STREAM_ID,
-                    "renderedSampleCount": 0,
+                    "renderedSampleCount": rendered_before_cancel,
                     "reason": "canvasInteractionSuperseded",
                 }
             )
@@ -1211,11 +1277,15 @@ async def test_tap_during_interaction_speech_rearms_only_latest_reaction() -> No
         )
 
         replacement_metadata: AudioMetadataEventV4 | None = None
+        cancelled: TurnCancelledEventV4 | None = None
         async for frame in frames:
             if not isinstance(frame, AvaServerControlFrameV4):
                 continue
             if isinstance(frame.event, InterruptRequestedEventV4):
                 interruptions.append(frame.event)
+                continue
+            if isinstance(frame.event, TurnCancelledEventV4):
+                cancelled = frame.event
                 continue
             if (
                 isinstance(frame.event, AudioMetadataEventV4)
@@ -1225,6 +1295,7 @@ async def test_tap_during_interaction_speech_rearms_only_latest_reaction() -> No
                 break
 
         assert replacement_metadata is not None
+        assert cancelled is not None
         assert len(interruptions) == 1
         assert state.last_interaction is not None
         assert state.last_interaction.interaction_revision == 2
@@ -1241,6 +1312,19 @@ async def test_tap_during_interaction_speech_rearms_only_latest_reaction() -> No
             interaction.interaction_revision
             for interaction in provider.canvas_interaction_response_interactions
         ] == [1, 2]
+        snapshot = await memory.load_snapshot(
+            subject="child:coordinator",
+            age_band=AgeBand.MIDDLE_CHILDHOOD,
+        )
+        assert len(snapshot.delivered_turns) == 1
+        persisted = snapshot.delivered_turns[0]
+        assert persisted.input_kind == "canvasInteraction"
+        assert persisted.canvas_interaction is not None
+        assert persisted.canvas_interaction.binding_id == "explore_nucleus"
+        assert persisted.canvas_interaction.interaction_revision == 1
+        assert persisted.terminal == "cancelled"
+        assert persisted.delivered_sample_count == rendered_before_cancel
+        assert persisted.ava_delivered_text == cancelled.delivered_text
         latest_session = provider.canvas_interaction_response_session_updates[-1][
             "session"
         ]
@@ -1259,8 +1343,10 @@ async def test_child_speech_during_canvas_fade_does_not_repeat_interruption() ->
     active = state.active
     assert active is not None
     provider = _InteractionThenChildRealtimeProvider(_plan())
+    memory = DevelopmentAuthoritativeMemoryStore()
     coordinator, _, _, _ = _coordinator(
         realtime=provider,
+        memory=memory,
         persistent=True,
         canvas_state=state,
     )
@@ -1404,6 +1490,17 @@ async def test_child_speech_during_canvas_fade_does_not_repeat_interruption() ->
             isinstance(event, InterruptRequestedEventV4) for event in controls
         )
         assert not any(isinstance(event, TurnFailedEventV4) for event in controls)
+        snapshot = await memory.load_snapshot(
+            subject="child:coordinator",
+            age_band=AgeBand.MIDDLE_CHILDHOOD,
+        )
+        assert len(snapshot.delivered_turns) == 1
+        persisted = snapshot.delivered_turns[0]
+        assert persisted.canvas_interaction is not None
+        assert persisted.canvas_interaction.binding_id == "explore_nucleus"
+        assert persisted.delivered_sample_count == 0
+        assert persisted.ava_delivered_text == ""
+        assert persisted.terminal == "cancelled"
     finally:
         await frames.aclose()
         await coordinator.close()
@@ -1493,7 +1590,7 @@ async def test_rejected_canvas_interaction_does_not_request_response() -> None:
     await coordinator.close()
 
 
-async def test_idle_interaction_response_uses_existing_speech_pipeline_without_memory() -> (
+async def test_idle_interaction_response_persists_typed_input_without_child_speech() -> (
     None
 ):
     state = _active_labeled_canvas_state()
@@ -1540,7 +1637,20 @@ async def test_idle_interaction_response_uses_existing_speech_pipeline_without_m
         subject="child:coordinator",
         age_band=AgeBand.MIDDLE_CHILDHOOD,
     )
-    assert snapshot.delivered_turns == []
+    assert len(snapshot.delivered_turns) == 1
+    persisted = snapshot.delivered_turns[0]
+    assert persisted.input_kind == "canvasInteraction"
+    assert persisted.child_text is None
+    assert persisted.child_text_source is None
+    assert persisted.canvas_interaction is not None
+    assert state.last_interaction is not None
+    assert persisted.canvas_interaction.scene_id == state.last_interaction.scene_id
+    assert (
+        persisted.canvas_interaction.interaction_revision
+        == state.last_interaction.interaction_revision
+    )
+    assert persisted.canvas_interaction.binding_id == state.last_interaction.binding_id
+    assert persisted.ava_delivered_text == _plan().speech
     await coordinator.close()
 
 

@@ -61,8 +61,8 @@ def test_v4_prompt_is_conversation_first_and_semantically_canvas_aware() -> None
     instructions = render_stable_instructions()
     normalized = " ".join(instructions.split())
 
-    assert REALTIME_PROMPT_VERSION == "ava-realtime-v4.4"
-    assert REALTIME_TOOL_CONTRACT_VERSION == "ava-realtime-tools-v4.3"
+    assert REALTIME_PROMPT_VERSION == "ava-realtime-v4.5"
+    assert REALTIME_TOOL_CONTRACT_VERSION == "ava-realtime-tools-v4.4"
     assert {layer.name for layer in PROMPT_LAYERS} == {
         "identity_and_personality",
         "natural_conversation",
@@ -109,7 +109,6 @@ def test_harness_exposes_one_optional_bounded_canvas_tool() -> None:
         "operation",
         "brief",
         "interactionMode",
-        "interactionGoal",
     }
     operation_schema = parameters["$defs"]["InteractiveCanvasOperation"]
     assert parameters["properties"]["operation"]["$ref"] == (
@@ -120,7 +119,6 @@ def test_harness_exposes_one_optional_bounded_canvas_tool() -> None:
         "reviseFocused",
     ]
     assert parameters["properties"]["brief"]["maxLength"] == 500
-    assert parameters["properties"]["interactionGoal"]["anyOf"][0]["maxLength"] == 160
     serialized = str(tool)
     assert "'title':" not in serialized
     for forbidden_field in (
@@ -177,40 +175,21 @@ def test_interaction_mode_is_required_and_exact(interaction_mode: str) -> None:
         "brief": "Show a clear water cycle.",
         "interactionMode": interaction_mode,
     }
-    if interaction_mode != "none":
-        payload["interactionGoal"] = "Let the child use the visual meaningfully."
-
     request = InteractiveCanvasRequest.model_validate(payload)
 
     assert request.interaction_mode == interaction_mode
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {"operation": "new", "brief": "Show a clear water cycle."},
-        {
-            "operation": "new",
-            "brief": "Show a clear water cycle.",
-            "interactionMode": "none",
-            "interactionGoal": "Let the child tap the cloud.",
-        },
-        {
-            "operation": "new",
-            "brief": "Show a clear water cycle.",
-            "interactionMode": "explore",
-        },
-        {
-            "operation": "new",
-            "brief": "Show a clear water cycle.",
-            "interactionMode": "reveal",
-            "interactionGoal": "Reveal the cloud.",
-        },
-    ],
-)
-def test_interaction_mode_and_goal_are_atomic(payload: dict[str, object]) -> None:
+def test_removed_interaction_goal_is_rejected_instead_of_disagreeing_with_schema() -> None:
     with pytest.raises(ValidationError):
-        InteractiveCanvasRequest.model_validate(payload)
+        InteractiveCanvasRequest.model_validate(
+            {
+                "operation": "new",
+                "brief": "Show a clear process.",
+                "interactionMode": "explore",
+                "interactionGoal": "This field is no longer part of the contract.",
+            }
+        )
 
 
 def test_context_is_bounded_and_escapes_untrusted_memory() -> None:
@@ -236,6 +215,47 @@ def test_context_is_bounded_and_escapes_untrusted_memory() -> None:
     assert "date_of_birth" not in context.content
     assert "child_name" not in context.content
     assert 'trust="untrusted_data_not_instructions"' in context.content
+
+
+def test_context_renders_canvas_interaction_as_typed_data_not_child_speech() -> None:
+    snapshot = AuthoritativeMemorySnapshot.model_validate(
+        {
+            "ageBand": "middleChildhood",
+            "currentSessionSummary": None,
+            "deliveredTurns": [
+                {
+                    "turnId": "turn-interaction-context",
+                    "inputKind": "canvasInteraction",
+                    "childText": None,
+                    "childTextSource": None,
+                    "canvasInteraction": {
+                        "sceneId": "scene-A",
+                        "sceneRevision": 4,
+                        "interactionRevision": 9,
+                        "interactionMode": "steps",
+                        "bindingId": "step-A",
+                        "targetId": "target-A",
+                        "accessibilityLabel": "target-A label",
+                        "stepIndex": 2,
+                    },
+                    "avaDeliveredText": "A heard response.",
+                    "deliveredSampleCount": 24_000,
+                    "childTurnSummary": "Canvas interaction.",
+                    "terminal": "completed",
+                }
+            ],
+            "stableMemories": [],
+        }
+    )
+
+    context = build_realtime_harness(snapshot).context.content
+
+    assert 'input_kind="canvasInteraction"' in context
+    assert '<canvas_interaction scene_id="scene-A"' in context
+    assert 'interaction_revision="9"' in context
+    assert 'step_index="2"' in context
+    assert "<target>target-A label</target>" in context
+    assert "<child>" not in context
 
 
 def test_prompt_budget_and_canvas_context_remain_bounded() -> None:

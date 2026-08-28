@@ -241,7 +241,6 @@ def _request(**changes: object) -> SvgCanvasSpecialistRequest:
         "sourceTurnId": "turn_1",
         "brief": "Show how a cloud forms.",
         "interactionMode": "select",
-        "interactionGoal": "Let the child select the cloud.",
         "ageBand": "middleChildhood",
     }
     payload.update(changes)
@@ -306,7 +305,7 @@ async def test_provider_uses_sol_raw_responses_and_preserves_exact_svg() -> None
     assert "Never truncate generated SVG" in instructions
 
 
-async def test_absent_interaction_goal_prefers_a_static_svg() -> None:
+async def test_none_interaction_mode_prefers_a_static_svg() -> None:
     svg = _svg(label="Static cloud", interaction_mode="none")
     client = _Client([_response(svg)])
     provider = OpenAISvgCanvasSpecialist(
@@ -316,9 +315,7 @@ async def test_absent_interaction_goal_prefers_a_static_svg() -> None:
         client=client,  # type: ignore[arg-type]
     )
 
-    generation = await provider.generate(
-        _request(interactionMode="none", interactionGoal=None)
-    )
+    generation = await provider.generate(_request(interactionMode="none"))
 
     assert generation.document.bindings == {}
     instructions = client.responses.arguments[0]["instructions"]
@@ -326,7 +323,7 @@ async def test_absent_interaction_goal_prefers_a_static_svg() -> None:
     assert "`none` is static" in instructions
 
 
-async def test_explicit_interaction_goal_allows_only_goal_serving_bindings() -> None:
+async def test_explicit_interaction_mode_allows_matching_bindings() -> None:
     svg = (
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" '
         'data-ava-interaction-mode="select">'
@@ -343,9 +340,7 @@ async def test_explicit_interaction_goal_allows_only_goal_serving_bindings() -> 
         client=client,  # type: ignore[arg-type]
     )
 
-    generation = await provider.generate(
-        _request(interactionGoal="Let the child select the cloud.")
-    )
+    generation = await provider.generate(_request())
 
     assert tuple(generation.document.bindings) == ("select_cloud",)
     instructions = client.responses.arguments[0]["instructions"]
@@ -354,18 +349,17 @@ async def test_explicit_interaction_goal_allows_only_goal_serving_bindings() -> 
 
 
 @pytest.mark.parametrize(
-    ("requested_mode", "returned_mode", "goal"),
+    ("requested_mode", "returned_mode"),
     [
-        ("none", "select", None),
-        ("explore", "none", "Let the child explore the cloud."),
-        ("select", "explore", "Let the child select the cloud."),
-        ("steps", "select", "Let the child move through cloud stages."),
+        ("none", "select"),
+        ("explore", "none"),
+        ("select", "explore"),
+        ("steps", "select"),
     ],
 )
 async def test_requested_interaction_mode_must_match_validated_svg(
     requested_mode: str,
     returned_mode: str,
-    goal: str | None,
 ) -> None:
     client = _Client([_response(_svg(interaction_mode=returned_mode))])
     provider = OpenAISvgCanvasSpecialist(
@@ -376,9 +370,7 @@ async def test_requested_interaction_mode_must_match_validated_svg(
     )
 
     with pytest.raises(SvgCanvasSpecialistInvalidError, match="interactionModeMismatch"):
-        await provider.generate(
-            _request(interactionMode=requested_mode, interactionGoal=goal)
-        )
+        await provider.generate(_request(interactionMode=requested_mode))
 
 
 async def test_interaction_mode_mismatch_uses_existing_quality_repair() -> None:
@@ -399,10 +391,7 @@ async def test_interaction_mode_mismatch_uses_existing_quality_repair() -> None:
     )
 
     generation = await provider.generate(
-        _request(
-            interactionMode="explore",
-            interactionGoal="Let the child explore the cloud.",
-        )
+        _request(interactionMode="explore")
     )
 
     assert generation.document.interaction_mode == "explore"

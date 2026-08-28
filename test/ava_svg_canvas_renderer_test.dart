@@ -28,6 +28,28 @@ void main() {
     );
   });
 
+  test('selected accessibility hitbox remains visually transparent', () {
+    final html = const AvaSvgCanvasHtmlRenderer().build(
+      document: document,
+      preparedHandler: 'prepared_handler',
+      presentedHandler: 'presented_handler',
+      bindingHandler: 'binding_handler',
+      errorHandler: 'error_handler',
+    );
+
+    expect(html, contains('min-width:44px'));
+    expect(html, contains('min-height:44px'));
+    expect(html, contains('.ava-hit.ava-selected'));
+    expect(
+      html,
+      contains(
+        '.ava-hit.ava-selected{border:0;background:transparent;outline:0;box-shadow:none}',
+      ),
+    );
+    expect(html, isNot(contains('border:3px solid')));
+    expect(html, isNot(contains('background:rgba(69,179,166')));
+  });
+
   test('trusted wrapper embeds exact SVG as base64 and blocks all network', () {
     final html = const AvaSvgCanvasHtmlRenderer().build(
       document: document,

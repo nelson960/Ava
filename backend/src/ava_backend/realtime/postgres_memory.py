@@ -15,9 +15,9 @@ from .memory import (
     MAX_WEEKLY_RECORDS,
     AvaMemoryProposal,
     AuthoritativeMemorySnapshot,
-    ChildTurnTextSource,
     ConversationResetReceipt,
     DeliveredConversationTurn,
+    DeliveredInputKind,
     MemoryProposalDecision,
     WeeklyConversationRecap,
     WeeklyConversationRecord,
@@ -25,7 +25,7 @@ from .memory import (
     _validate_subject,
     _validate_weekly_summary,
     compact_session_summary,
-    evaluate_memory_proposal,
+    evaluate_delivered_turn_memory_proposal,
     _validate_optional_summary,
 )
 
@@ -90,19 +90,19 @@ class PostgresAuthoritativeMemoryStore:
                     """
                     select version
                     from ava_private.schema_migrations
-                    where name = 'realtime_memory_v3'
+                    where name = 'realtime_memory_v4'
                     """
                 )
                 row = await cursor.fetchone()
         except (PsycopgError, PoolTimeout) as error:
             await self._pool.close()
             raise PostgresMemoryStoreError(
-                "PostgreSQL memory is unavailable or its v3 migration is missing"
+                "PostgreSQL memory is unavailable or its v4 migration is missing"
             ) from error
         if row is None or cast(int, row["version"]) != 1:
             await self._pool.close()
             raise PostgresMemoryStoreError(
-                "PostgreSQL memory schema realtime_memory_v3 version 1 is required"
+                "PostgreSQL memory schema realtime_memory_v4 version 1 is required"
             )
         self._opened = True
 
@@ -144,9 +144,13 @@ class PostgresAuthoritativeMemoryStore:
                 state = await state_cursor.fetchone()
                 turns_cursor = await connection.execute(
                     """
-                    select turn_id, child_text, child_text_source,
+                    select turn_id, input_kind, child_text, child_text_source,
                            ava_delivered_text, delivered_sample_count,
-                           child_turn_summary, terminal
+                           child_turn_summary, terminal,
+                           canvas_scene_id, canvas_scene_revision,
+                           canvas_interaction_revision, canvas_interaction_mode,
+                           canvas_binding_id, canvas_target_id,
+                           canvas_accessibility_label, canvas_step_index
                     from ava_private.delivered_turns
                     where subject = %s
                     order by occurred_at asc, turn_id asc
@@ -176,8 +180,27 @@ class PostgresAuthoritativeMemoryStore:
                 "deliveredTurns": [
                     {
                         "turnId": row["turn_id"],
+                        "inputKind": row["input_kind"],
                         "childText": row["child_text"],
                         "childTextSource": row["child_text_source"],
+                        "canvasInteraction": (
+                            {
+                                "sceneId": row["canvas_scene_id"],
+                                "sceneRevision": row["canvas_scene_revision"],
+                                "interactionRevision": row[
+                                    "canvas_interaction_revision"
+                                ],
+                                "interactionMode": row["canvas_interaction_mode"],
+                                "bindingId": row["canvas_binding_id"],
+                                "targetId": row["canvas_target_id"],
+                                "accessibilityLabel": row[
+                                    "canvas_accessibility_label"
+                                ],
+                                "stepIndex": row["canvas_step_index"],
+                            }
+                            if row["input_kind"] == DeliveredInputKind.CANVAS_INTERACTION
+                            else None
+                        ),
                         "avaDeliveredText": row["ava_delivered_text"],
                         "deliveredSampleCount": row["delivered_sample_count"],
                         "childTurnSummary": row["child_turn_summary"],
@@ -216,13 +239,12 @@ class PostgresAuthoritativeMemoryStore:
             turn.model_dump(mode="json", by_alias=True)
         )
         weekly_summary = _validate_weekly_summary(validated_turn.child_turn_summary)
-        decision = evaluate_memory_proposal(
+        decision = evaluate_delivered_turn_memory_proposal(
+            turn=validated_turn,
             proposal=proposal,
-            child_text=validated_turn.child_text,
-            source_turn_id=validated_turn.turn_id,
             memory_id=memory_id,
-            child_text_source=ChildTurnTextSource(validated_turn.child_text_source),
         )
+        interaction = validated_turn.canvas_interaction
 
         async with self._connection() as connection:
             try:
@@ -239,21 +261,41 @@ class PostgresAuthoritativeMemoryStore:
                     await connection.execute(
                         """
                         insert into ava_private.delivered_turns (
-                          subject, turn_id, child_text, child_text_source,
+                          subject, turn_id, input_kind, child_text, child_text_source,
                           ava_delivered_text, delivered_sample_count,
-                          child_turn_summary, terminal, occurred_at
-                        ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                          child_turn_summary, terminal, occurred_at,
+                          canvas_scene_id, canvas_scene_revision,
+                          canvas_interaction_revision, canvas_interaction_mode,
+                          canvas_binding_id, canvas_target_id,
+                          canvas_accessibility_label, canvas_step_index
+                        ) values (
+                          %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                          %s, %s, %s, %s, %s, %s, %s, %s
+                        )
                         """,
                         (
                             normalized_subject,
                             validated_turn.turn_id,
+                            str(validated_turn.input_kind),
                             validated_turn.child_text,
-                            str(validated_turn.child_text_source),
+                            (
+                                str(validated_turn.child_text_source)
+                                if validated_turn.child_text_source is not None
+                                else None
+                            ),
                             validated_turn.ava_delivered_text,
                             validated_turn.delivered_sample_count,
                             validated_turn.child_turn_summary,
                             str(validated_turn.terminal),
                             normalized_occurred_at,
+                            interaction.scene_id if interaction else None,
+                            interaction.scene_revision if interaction else None,
+                            interaction.interaction_revision if interaction else None,
+                            str(interaction.interaction_mode) if interaction else None,
+                            interaction.binding_id if interaction else None,
+                            interaction.target_id if interaction else None,
+                            interaction.accessibility_label if interaction else None,
+                            interaction.step_index if interaction else None,
                         ),
                     )
                     await connection.execute(

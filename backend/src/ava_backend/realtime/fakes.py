@@ -119,9 +119,6 @@ class DeterministicRealtimePlanProvider:
                     "operation": "new",
                     "brief": canvas_brief,
                     "interactionMode": "explore",
-                    "interactionGoal": (
-                        "Let the child reveal or select one useful label."
-                    ),
                 }
             )
             if canvas_brief is not None
@@ -215,6 +212,11 @@ class DeterministicRealtimePlanProvider:
         if not turn_id:
             raise ValueError("turn_id cannot be empty")
         await asyncio.sleep(0)
+        return self._child_text
+
+    def available_child_transcript(self, *, turn_id: str) -> str | None:
+        if not turn_id:
+            raise ValueError("turn_id cannot be empty")
         return self._child_text
 
     async def next_input_event(self) -> RealtimeProviderInputEvent:

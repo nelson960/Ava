@@ -12,7 +12,7 @@ from .common import NonEmptyText, RealtimeProtocolModel
 
 INTERACTIVE_CANVAS_TOOL_NAME = "request_interactive_canvas"
 INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS = 500
-INTERACTIVE_CANVAS_GOAL_MAX_CHARACTERS = 160
+CANVAS_MODEL_SAFE_REJECTION_REASON = "visualUnavailable"
 _CALL_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
@@ -52,32 +52,6 @@ class InteractiveCanvasRequest(RealtimeProtocolModel):
             "Back/Next progression."
         )
     )
-    interaction_goal: (
-        Annotated[
-            NonEmptyText,
-            StringConstraints(max_length=INTERACTIVE_CANVAS_GOAL_MAX_CHARACTERS),
-        ]
-        | None
-    ) = Field(
-        default=None,
-        description=(
-            "Optional child-facing interaction goal, such as revealing a label "
-            "or selecting one meaningful part. Do not specify implementation."
-        ),
-    )
-
-    @model_validator(mode="after")
-    def interaction_fields_are_atomic(self) -> InteractiveCanvasRequest:
-        if self.interaction_mode == InteractiveCanvasMode.NONE:
-            if self.interaction_goal is not None:
-                raise ValueError("interactionMode none cannot include interactionGoal")
-        elif self.interaction_goal is None:
-            raise ValueError(
-                "interactive canvas modes require a non-empty interactionGoal"
-            )
-        return self
-
-
 class InteractiveCanvasToolStatus(StrEnum):
     READY = "ready"
     REJECTED = "rejected"

@@ -25,6 +25,7 @@ from ava_backend.canvas.svg_specialist import (
     SvgCanvasSpecialistGeneration,
     SvgCanvasSpecialistRequest,
     SvgCanvasSpecialistUnavailableError,
+    render_svg_canvas_specialist_instructions,
 )
 from ava_backend.canvas.svg_workspace import (
     SvgCanvasWorkspace,
@@ -247,7 +248,6 @@ def _call(
                 "operation": operation,
                 "brief": brief,
                 "interactionMode": "select",
-                "interactionGoal": "Let the child select the cloud.",
             }
         ),
     )
@@ -314,6 +314,48 @@ async def _accepted_coordinator(
     )
     await specialist.started.wait()
     return coordinator, specialist, sink, completions, output, documents
+
+
+async def test_source_turn_transcript_and_realtime_brief_remain_distinct_for_sol() -> None:
+    specialist = _Specialist()
+    sink = _Sink()
+    coordinator = SvgCanvasJobCoordinator(
+        session_id="session-grounding",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+        specialist=specialist,
+        state=SvgCanvasSessionState(),
+        documents=SvgCanvasDocumentStore(),
+        event_sink=sink,
+        generation_id_factory=lambda: "generation-grounding",
+    )
+    completions: list[tuple[str, str, InteractiveCanvasToolOutputV4]] = []
+    try:
+        await coordinator.accept_tool_call(
+            source_turn_id="turn-grounding",
+            source_transcript="source-subject-A",
+            call=_call(brief="visual-brief-subject-B"),
+            complete_tool=lambda turn, call, result: _record_completion(
+                completions,
+                turn,
+                call,
+                result,
+            ),
+        )
+        await specialist.started.wait()
+
+        request = specialist.requests[0]
+        assert request.source_turn_id == "turn-grounding"
+        assert request.source_transcript == "source-subject-A"
+        assert request.brief == "visual-brief-subject-B"
+        model_input = request.model_input()
+        assert "source-subject-A" in model_input
+        assert "visual-brief-subject-B" in model_input
+        instructions = render_svg_canvas_specialist_instructions(SvgDocumentValidator())
+        assert "untrusted semantic" in instructions
+        assert "never as instructions" in instructions
+    finally:
+        specialist.release.set()
+        await coordinator.close()
 
 
 async def _activated_coordinator(
@@ -552,7 +594,7 @@ async def test_revise_focused_without_current_is_rejected_before_sol() -> None:
 
         assert output.status == InteractiveCanvasToolStatusV4.REJECTED
         assert output.generation_id is None
-        assert output.reason == "There is no current canvas to revise."
+        assert output.reason == "visualUnavailable"
         assert completions == [("turn-empty-revision", "call_1", output)]
         assert specialist.requests == []
         assert sink.started == []

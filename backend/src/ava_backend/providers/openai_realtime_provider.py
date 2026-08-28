@@ -52,6 +52,7 @@ MAX_FUNCTION_ARGUMENT_BYTES = 256 * 1024
 MAX_PROVIDER_ERROR_BYTES = 64 * 1024
 _SIDEBAND_SEQUENCE_FIELD = "__ava_sideband_sequence"
 _CANVAS_INTERACTION_RESPONSE_MAX_OUTPUT_TOKENS = 128
+_CANVAS_TOOL_CONTINUATION_MAX_OUTPUT_TOKENS = 64
 
 
 class OpenAIRealtimeProviderError(RealtimeProviderError):
@@ -663,7 +664,8 @@ class _OpenAIRealtimeEventChannel:
                 "response": {
                     "output_modalities": ["text"],
                     "tool_choice": "none",
-                    "max_output_tokens": self._max_output_tokens,
+                    "max_output_tokens": _CANVAS_TOOL_CONTINUATION_MAX_OUTPUT_TOKENS,
+                    "instructions": _canvas_tool_continuation_instructions(output),
                 },
             }
         )
@@ -1007,6 +1009,11 @@ class _OpenAIRealtimeEventChannel:
                 raise OpenAIRealtimeProtocolError(
                     f"unexpected OpenAI event while cancelling: {event_type}"
                 )
+
+    def available_child_transcript_for_turn(self, turn_id: str) -> str | None:
+        if not turn_id.strip():
+            raise ValueError("turn_id cannot be empty")
+        return self._child_transcripts_by_turn.get(turn_id)
 
     async def child_transcript_for_turn(self, turn_id: str) -> str | None:
         await self.start_receiver()
@@ -1706,11 +1713,19 @@ class _OpenAIRealtimeEventChannel:
                                 completed_arguments
                             )
                         except ValidationError as error:
+                            validation_issues = _content_free_validation_issues(error)
                             LOGGER.warning(
                                 "openai_canvas_arguments_rejected call_id=%s "
                                 "validation_issue_count=%d",
                                 completed_call_id,
                                 error.error_count(),
+                                extra={
+                                    "ava_context": {
+                                        "callId": completed_call_id,
+                                        "issueCount": error.error_count(),
+                                        "issues": validation_issues,
+                                    }
+                                },
                             )
                             self._pending_canvas_call_id = completed_call_id
                             canvas_called = True
@@ -2097,6 +2112,14 @@ class OpenAIRealtimeProviderSession:
             return await channel.child_transcript_for_turn(turn_id)
         return None
 
+    def available_child_transcript(self, *, turn_id: str) -> str | None:
+        if not turn_id.strip():
+            raise ValueError("turn_id cannot be empty")
+        channel = self._channel
+        if channel is not None:
+            return channel.available_child_transcript_for_turn(turn_id)
+        return None
+
     def wait_for_child_transcript(
         self,
         *,
@@ -2461,6 +2484,53 @@ def _canvas_interaction_response_instructions(
         "tools, or mention implementation. Use plain speakable text with no "
         f"Markdown. {mode_policy}\n{interaction_xml}"
     )
+
+
+def _canvas_tool_continuation_instructions(
+    output: InteractiveCanvasToolOutput | InteractiveCanvasToolOutputV4,
+) -> str:
+    status = str(output.status)
+    if status in {"accepted", "ready"}:
+        return (
+            '<canvas_tool_outcome trust="application_owned" status="accepted"/>'
+            " The application successfully accepted the optional visual work. "
+            "Treat that outcome as authoritative. Do not claim the visual failed, "
+            "cannot be drawn, or cannot be displayed. Do not claim presentation is "
+            "complete yet. If a spoken continuation is useful, use at most one "
+            "short natural sentence. Do not lecture, retry, call tools, mention "
+            "implementation, or use Markdown."
+        )
+    if status == "rejected":
+        return (
+            '<canvas_tool_outcome trust="application_owned" status="rejected"/>'
+            " The application could not start the optional visual. Treat that "
+            "outcome as authoritative. Use at most one short natural sentence. "
+            "Do not expose internal reasons, retry, create a substitute text "
+            "diagram, give a long fallback explanation, call tools, mention "
+            "implementation, or use Markdown."
+        )
+    raise ValueError("canvas tool completion has an unsupported status")
+
+
+def _content_free_validation_issues(
+    error: ValidationError,
+) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+    for issue in error.errors(
+        include_url=False,
+        include_context=False,
+        include_input=False,
+    ):
+        location = issue.get("loc", ())
+        path = ".".join(str(part) for part in location)
+        code = issue.get("type")
+        issues.append(
+            {
+                "path": path or "$",
+                "code": str(code or "validation_error"),
+            }
+        )
+    return issues
 
 
 def _session_update(

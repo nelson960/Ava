@@ -214,21 +214,8 @@ PYTHONPATH=src AVA_OPENAI_LIVE_TESTS_ENABLED=true \
 The matrix is bounded to eight cases and 800 output tokens per turn. It is not
 an ordinary test and must never run without the explicit spend gate.
 
-The independent canvas probe performs one strict Responses request, compiles
-the result, runs the full scene validator, and prints the accepted transaction
-for visual inspection:
-
-```sh
-cd backend
-PYTHONPATH=src AVA_OPENAI_LIVE_TESTS_ENABLED=true \
-  /opt/miniconda3/envs/ml/bin/python -m ava_backend.canvas.live_probe \
-  --allow-spend \
-  --max-output-tokens 1800 \
-  --brief 'Show a labeled water cycle with one tap-to-reveal rain label.'
-```
-
-Neither live probe runs from tests or starts without both the environment gate
-and explicit `--allow-spend` acknowledgement.
+The Realtime live probe does not run from tests or start without both the
+environment gate and explicit `--allow-spend` acknowledgement.
 
 Rejected probes report the provider response ID, billed usage, total validation
 issue count, and a bounded list of schema paths/error codes. They intentionally

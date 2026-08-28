@@ -1,14 +1,5 @@
 # Ava conversation evaluations
 
-## Dynamic canvas quality gate
-
-`canvas_quality_cases_v1.json` is the provider-independent review matrix for
-the generic canvas specialist. It contains briefs rather than fixed scenes, so
-it does not become a diagram catalog. Generated candidates must first pass the
-strict scene schema and deterministic clipping, hierarchy, label-overlap,
-connector, touch-target, and interaction checks. iPhone and iPad rendering,
-clarity, visual hierarchy, and usefulness still require visual review.
-
 ## Protocol-v3 personality gate
 
 `personality_cases_v3.json` is the active, provider-independent personality

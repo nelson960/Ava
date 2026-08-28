@@ -68,6 +68,7 @@ from .speech_contract import (
 )
 from .svg_canvas_jobs import SvgCanvasJobCoordinator
 from .tool_contract import (
+    CANVAS_MODEL_SAFE_REJECTION_REASON,
     InteractiveCanvasToolOutputV4,
     InteractiveCanvasToolStatusV4,
     RealtimeCanvasToolCall,
@@ -226,6 +227,7 @@ class DeterministicRealtimeSessionCoordinator:
         self._canvas_interaction_response_task: asyncio.Task[None] | None = None
         self._canvas_interaction_response_wakeup = asyncio.Event()
         self._canvas_interaction_response_turn_id: str | None = None
+        self._turn_canvas_interaction_input: RecordedSvgCanvasInteraction | None = None
         self._server_preemption_reason: str | None = None
 
     @property
@@ -615,6 +617,11 @@ class DeterministicRealtimeSessionCoordinator:
             await self._cancel_active_turn_work()
             self._last_error = error
             delivered_samples = self._bounded_rendered_sample_count()
+            delivered_text = ledger.delivered_text(delivered_samples)
+            await self._commit_failed_interaction_memory(
+                delivered_sample_count=delivered_samples,
+                delivered_text=delivered_text,
+            )
             yield self._failed_frame(
                 SpeechFailureCode.MODEL_INVALID,
                 _format_failure_message(
@@ -624,7 +631,7 @@ class DeterministicRealtimeSessionCoordinator:
                 component=SpeechFailureComponent.REALTIME_PROVIDER,
                 retryable=False,
                 delivered_sample_count=delivered_samples,
-                delivered_text=ledger.delivered_text(delivered_samples),
+                delivered_text=delivered_text,
             )
         except RealtimeProviderUnavailableError as error:
             if self._terminal:
@@ -636,6 +643,11 @@ class DeterministicRealtimeSessionCoordinator:
             await self._cancel_active_turn_work()
             self._last_error = error
             delivered_samples = self._bounded_rendered_sample_count()
+            delivered_text = ledger.delivered_text(delivered_samples)
+            await self._commit_failed_interaction_memory(
+                delivered_sample_count=delivered_samples,
+                delivered_text=delivered_text,
+            )
             yield self._failed_frame(
                 SpeechFailureCode.MODEL_UNAVAILABLE,
                 _format_failure_message(
@@ -645,7 +657,7 @@ class DeterministicRealtimeSessionCoordinator:
                 component=SpeechFailureComponent.REALTIME_PROVIDER,
                 retryable=True,
                 delivered_sample_count=delivered_samples,
-                delivered_text=ledger.delivered_text(delivered_samples),
+                delivered_text=delivered_text,
             )
         except Exception as error:
             if self._terminal:
@@ -657,13 +669,18 @@ class DeterministicRealtimeSessionCoordinator:
             await self._cancel_active_turn_work()
             self._last_error = error
             delivered_samples = self._bounded_rendered_sample_count()
+            delivered_text = ledger.delivered_text(delivered_samples)
+            await self._commit_failed_interaction_memory(
+                delivered_sample_count=delivered_samples,
+                delivered_text=delivered_text,
+            )
             yield self._failed_frame(
                 SpeechFailureCode.INTERNAL,
                 "Ava's turn could not be completed safely.",
                 component=SpeechFailureComponent.COORDINATOR,
                 retryable=True,
                 delivered_sample_count=delivered_samples,
-                delivered_text=ledger.delivered_text(delivered_samples),
+                delivered_text=delivered_text,
             )
         finally:
             await cast(
@@ -1210,6 +1227,7 @@ class DeterministicRealtimeSessionCoordinator:
         self._cancellation_requested = asyncio.Event()
         self._server_preemption_reason = None
         self._canvas_interaction_response_turn_id = None
+        self._turn_canvas_interaction_input = None
         self._interruption_provider_item_id = None
         self._interruption_provider_audio_start_ms = None
         self._provider_speech_started_observed_at = None
@@ -1296,12 +1314,22 @@ class DeterministicRealtimeSessionCoordinator:
                     if not self._is_latest_canvas_interaction(interaction):
                         continue
                     self._canvas_interaction_response_turn_id = turn_id
+                    if self._turn_id != turn_id or self._terminal:
+                        self._canvas_interaction_response_turn_id = None
+                        continue
+                    if self._turn_canvas_interaction_input is not None:
+                        raise CoordinatorStateError(
+                            "Realtime turn already owns a canvas interaction input"
+                        )
+                    self._turn_canvas_interaction_input = interaction
                     triggered = await self._realtime.request_canvas_interaction_response(
                         turn_id=turn_id,
                         interaction=interaction,
                     )
                     superseded = not self._is_latest_canvas_interaction(interaction)
                     if not triggered:
+                        if self._turn_canvas_interaction_input == interaction:
+                            self._turn_canvas_interaction_input = None
                         self._canvas_interaction_response_turn_id = None
                         break
                     if superseded:
@@ -1443,7 +1471,7 @@ class DeterministicRealtimeSessionCoordinator:
                         output=InteractiveCanvasToolOutputV4.model_validate(
                             {
                                 "status": InteractiveCanvasToolStatusV4.REJECTED,
-                                "reason": event.reason,
+                                "reason": CANVAS_MODEL_SAFE_REJECTION_REASON,
                             }
                         ),
                     )
@@ -1499,8 +1527,24 @@ class DeterministicRealtimeSessionCoordinator:
     ) -> None:
         state.canvas_started = monotonic()
         self._canvas_status = "requested"
+        source_transcript = self._realtime.available_child_transcript(
+            turn_id=self._turn_id,
+        )
+        bounded_source_transcript = (
+            _bounded_child_transcript(source_transcript)
+            if source_transcript is not None
+            else None
+        )
+        LOGGER.info(
+            "canvas_source_grounding_resolved session_id=%s turn_id=%s "
+            "transcript_available=%s",
+            self._session_id,
+            self._turn_id,
+            bounded_source_transcript is not None,
+        )
         output = await self._canvas_jobs.accept_tool_call(
             source_turn_id=self._turn_id,
+            source_transcript=bounded_source_transcript,
             call=call,
             complete_tool=self._complete_canvas_tool,
         )
@@ -2061,7 +2105,7 @@ class DeterministicRealtimeSessionCoordinator:
 
         delivered_samples = self._bounded_rendered_sample_count()
         delivered_text = ledger.delivered_text(delivered_samples)
-        if plan is not None:
+        if plan is not None or self._turn_canvas_interaction_input is not None:
             try:
                 await self._commit_memory(
                     turn_id=self._turn_id,
@@ -2106,12 +2150,25 @@ class DeterministicRealtimeSessionCoordinator:
         self,
         *,
         turn_id: str,
-        plan: _TurnResult,
+        plan: _TurnResult | None,
         delivered_sample_count: int,
         delivered_text: str,
         terminal: DeliveredTurnTerminal,
     ) -> None:
         occurred_at = self._require_turn_occurred_at()
+        interaction = self._turn_canvas_interaction_input
+        if interaction is not None:
+            await self._persist_delivered_canvas_interaction(
+                turn_id=turn_id,
+                interaction=interaction,
+                delivered_sample_count=delivered_sample_count,
+                delivered_text=delivered_text,
+                terminal=terminal,
+                occurred_at=occurred_at,
+            )
+            return
+        if plan is None:
+            return
         if self._child_text is None or self._child_text_source is None:
             child_transcript = await self._realtime.child_transcript(
                 turn_id=turn_id
@@ -2164,6 +2221,29 @@ class DeterministicRealtimeSessionCoordinator:
             terminal=terminal,
             occurred_at=occurred_at,
         )
+
+    async def _commit_failed_interaction_memory(
+        self,
+        *,
+        delivered_sample_count: int,
+        delivered_text: str,
+    ) -> None:
+        if self._turn_canvas_interaction_input is None:
+            return
+        try:
+            await self._commit_memory(
+                turn_id=self._turn_id,
+                plan=None,
+                delivered_sample_count=delivered_sample_count,
+                delivered_text=delivered_text,
+                terminal=DeliveredTurnTerminal.FAILED,
+            )
+        except Exception:
+            LOGGER.exception(
+                "failed_interaction_memory_commit_failed session_id=%s turn_id=%s",
+                self._session_id,
+                self._turn_id,
+            )
 
     async def _commit_memory_after_transcription(
         self,
@@ -2246,6 +2326,46 @@ class DeterministicRealtimeSessionCoordinator:
                 "avaDeliveredText": delivered_text,
                 "deliveredSampleCount": delivered_sample_count,
                 "childTurnSummary": plan.child_turn_summary,
+                "terminal": terminal,
+            }
+        )
+        self._last_memory_decision = await self._memory.commit_delivered_turn(
+            subject=self._subject,
+            turn=turn,
+            proposal=None,
+            memory_id=None,
+            occurred_at=occurred_at,
+        )
+
+    async def _persist_delivered_canvas_interaction(
+        self,
+        *,
+        turn_id: str,
+        interaction: RecordedSvgCanvasInteraction,
+        delivered_sample_count: int,
+        delivered_text: str,
+        terminal: DeliveredTurnTerminal,
+        occurred_at: datetime,
+    ) -> None:
+        turn = DeliveredConversationTurn.model_validate(
+            {
+                "turnId": turn_id,
+                "inputKind": "canvasInteraction",
+                "childText": None,
+                "childTextSource": None,
+                "canvasInteraction": {
+                    "sceneId": interaction.scene_id,
+                    "sceneRevision": interaction.scene_revision,
+                    "interactionRevision": interaction.interaction_revision,
+                    "interactionMode": interaction.interaction_mode,
+                    "bindingId": interaction.binding_id,
+                    "targetId": interaction.target_id,
+                    "accessibilityLabel": interaction.accessibility_label,
+                    "stepIndex": interaction.step_index,
+                },
+                "avaDeliveredText": delivered_text,
+                "deliveredSampleCount": delivered_sample_count,
+                "childTurnSummary": "Canvas interaction.",
                 "terminal": terminal,
             }
         )

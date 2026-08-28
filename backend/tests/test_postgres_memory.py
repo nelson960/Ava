@@ -7,6 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from psycopg import AsyncConnection, errors
 
 from ava_backend.canvas.svg_delivery import SvgCanvasDocumentStore
 from ava_backend.canvas.svg_session import SvgCanvasSessionState
@@ -73,6 +74,31 @@ def _turn(index: int) -> DeliveredConversationTurn:
     )
 
 
+def _interaction_turn(index: int) -> DeliveredConversationTurn:
+    return DeliveredConversationTurn.model_validate(
+        {
+            "turnId": f"turn-interaction-{index}",
+            "inputKind": "canvasInteraction",
+            "childText": None,
+            "childTextSource": None,
+            "canvasInteraction": {
+                "sceneId": "scene-A",
+                "sceneRevision": 2,
+                "interactionRevision": index,
+                "interactionMode": "explore",
+                "bindingId": f"binding-{index}",
+                "targetId": f"target-{index}",
+                "accessibilityLabel": f"target-{index} label",
+                "stepIndex": None,
+            },
+            "avaDeliveredText": "A bounded heard response.",
+            "deliveredSampleCount": 24_000,
+            "childTurnSummary": "Canvas interaction.",
+            "terminal": "completed",
+        }
+    )
+
+
 async def test_postgres_v3_memory_round_trip_compaction_recap_and_reset() -> None:
     assert TEST_DATABASE_URL is not None
     store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
@@ -129,6 +155,153 @@ async def test_postgres_v3_memory_round_trip_compaction_recap_and_reset() -> Non
         assert empty.current_session_summary is None
     finally:
         await store.close()
+
+
+async def test_postgres_typed_canvas_interaction_round_trip_and_reset() -> None:
+    assert TEST_DATABASE_URL is not None
+    store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
+    subject = f"test:{uuid4()}"
+    interaction_turn = _interaction_turn(1)
+    await store.open()
+    try:
+        decision = await store.commit_delivered_turn(
+            subject=subject,
+            turn=interaction_turn,
+            proposal=AvaMemoryProposal.model_validate(
+                {
+                    "kind": "interest",
+                    "summary": "A proposal without speech evidence.",
+                    "evidence": "target-1 label",
+                    "confidence": 0.99,
+                }
+            ),
+            memory_id="memory-from-interaction",
+        )
+        snapshot = await store.load_snapshot(
+            subject=subject,
+            age_band="middleChildhood",
+        )
+
+        assert decision.accepted is False
+        assert "speech transcript" in decision.reason
+        assert snapshot.delivered_turns == [interaction_turn]
+        assert snapshot.stable_memories == []
+
+        await store.reset_conversation(subject=subject)
+        reset_snapshot = await store.load_snapshot(
+            subject=subject,
+            age_band="middleChildhood",
+        )
+        assert reset_snapshot.delivered_turns == []
+    finally:
+        await store.close()
+
+
+async def test_postgres_rejects_ambiguous_hybrid_delivered_input() -> None:
+    assert TEST_DATABASE_URL is not None
+    subject = f"test:{uuid4()}"
+    turn_id = f"turn-{uuid4().hex[:12]}"
+    connection = await AsyncConnection.connect(TEST_DATABASE_URL, autocommit=True)
+    try:
+        await connection.execute(
+            """
+            insert into ava_private.memory_state (subject)
+            values (%s)
+            """,
+            (subject,),
+        )
+        await connection.execute(
+            """
+            insert into ava_private.turn_receipts (subject, turn_id)
+            values (%s, %s)
+            """,
+            (subject, turn_id),
+        )
+        with pytest.raises(errors.CheckViolation):
+            await connection.execute(
+                """
+                insert into ava_private.delivered_turns (
+                  subject, turn_id, input_kind, child_text, child_text_source,
+                  ava_delivered_text, delivered_sample_count,
+                  child_turn_summary, terminal,
+                  canvas_scene_id, canvas_scene_revision,
+                  canvas_interaction_revision, canvas_interaction_mode,
+                  canvas_binding_id, canvas_target_id,
+                  canvas_accessibility_label, canvas_step_index
+                ) values (
+                  %s, %s, 'canvasInteraction', %s, 'transcript',
+                  '', 0, 'Canvas interaction.', 'completed',
+                  'scene-A', 1, 1, 'explore', 'binding-A', 'target-A',
+                  'target-A label', null
+                )
+                """,
+                (subject, turn_id, "fabricated child speech"),
+            )
+    finally:
+        await connection.execute(
+            "delete from ava_private.memory_state where subject = %s",
+            (subject,),
+        )
+        await connection.close()
+
+
+async def test_postgres_rejects_null_or_blank_canvas_interaction_fields() -> None:
+    assert TEST_DATABASE_URL is not None
+    subject = f"test:{uuid4()}"
+    connection = await AsyncConnection.connect(TEST_DATABASE_URL, autocommit=True)
+    invalid_inputs = (
+        ("scene-A", None, 1, "explore", "binding-A", "target-A", "Target A", None),
+        ("scene-A", 1, None, "explore", "binding-A", "target-A", "Target A", None),
+        ("scene-A", 1, 1, None, "binding-A", "target-A", "Target A", None),
+        ("scene-A", 1, 1, "explore", "binding-A", "target-A", None, None),
+        ("   ", 1, 1, "explore", "binding-A", "target-A", "Target A", None),
+        ("scene-A", 1, 1, "explore", "   ", "target-A", "Target A", None),
+        ("scene-A", 1, 1, "explore", "binding-A", "   ", "Target A", None),
+        ("scene-A", 1, 1, "explore", "binding-A", "target-A", "   ", None),
+        ("scene-A", 1, 1, "steps", "binding-A", "target-A", "Target A", None),
+        ("scene-A", 1, 1, "steps", "binding-A", "target-A", "Target A", 13),
+        ("scene-A", 1, 1, "explore", "binding-A", "target-A", "Target A", 1),
+        ("scene-A", 1, 1, "select", "binding-A", "target-A", "Target A", 1),
+    )
+    try:
+        await connection.execute(
+            "insert into ava_private.memory_state (subject) values (%s)",
+            (subject,),
+        )
+        for index, values in enumerate(invalid_inputs):
+            turn_id = f"turn-invalid-canvas-{index}"
+            await connection.execute(
+                """
+                insert into ava_private.turn_receipts (subject, turn_id)
+                values (%s, %s)
+                """,
+                (subject, turn_id),
+            )
+            with pytest.raises(errors.CheckViolation):
+                await connection.execute(
+                    """
+                    insert into ava_private.delivered_turns (
+                      subject, turn_id, input_kind, child_text, child_text_source,
+                      ava_delivered_text, delivered_sample_count,
+                      child_turn_summary, terminal,
+                      canvas_scene_id, canvas_scene_revision,
+                      canvas_interaction_revision, canvas_interaction_mode,
+                      canvas_binding_id, canvas_target_id,
+                      canvas_accessibility_label, canvas_step_index
+                    ) values (
+                      %s, %s, 'canvasInteraction', null, null,
+                      '', 0, 'Canvas interaction.', 'completed',
+                      %s, %s, %s, %s, %s, %s, %s, %s
+                    )
+                    """,
+                    (subject, turn_id, *values),
+                )
+    finally:
+        await connection.execute(
+            "delete from ava_private.memory_state where subject = %s",
+            (subject,),
+        )
+        await connection.close()
 
 
 async def test_fake_realtime_tts_delivery_pipeline_commits_to_postgres() -> None:

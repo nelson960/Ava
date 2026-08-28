@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Sequence
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import ConfigDict, Field, StringConstraints, model_validator
+from pydantic import Field, StringConstraints, model_validator
 
 from ..canvas.protocol import (
     CANVAS_MAX_POINTS,
@@ -16,7 +15,6 @@ from ..canvas.protocol import (
     CanvasBounds,
     CanvasColorToken,
     CanvasCreateOperation,
-    CanvasDeleteOperation,
     CanvasEllipseNode,
     CanvasExploreAction,
     CanvasDragWithinAction,
@@ -35,12 +33,10 @@ from ..canvas.protocol import (
     CanvasSelectAction,
     CanvasTextNode,
     CanvasToggleVisibilityAction,
-    CanvasUpdateOperation,
     CanvasEasing,
 )
-from ..canvas.validation import ValidatedCanvasScene
 from .common import NodeIdentifier, NonEmptyText, RealtimeProtocolModel
-from .plan import AvaCanvasCue, AvaPhraseAnchor, AvaTurnPlan, SegmentIdentifier
+from .plan import AvaCanvasCue, AvaPhraseAnchor, SegmentIdentifier
 
 
 class ModelCanvasNodeKind(StrEnum):
@@ -283,20 +279,6 @@ class ModelCanvasPathNode(_ModelCanvasNodeBase):
 
 
 type ModelCanvasNode = (
-    ModelCanvasGroupNode
-    | ModelCanvasTextNode
-    | ModelCanvasLineNode
-    | ModelCanvasArrowNode
-    | ModelCanvasCircleNode
-    | ModelCanvasEllipseNode
-    | ModelCanvasRectNode
-    | ModelCanvasPolygonNode
-    | ModelCanvasPolylineNode
-    | ModelCanvasPathNode
-)
-
-
-type ModelCanvasSpecialistNode = (
     ModelCanvasGroupNode
     | ModelCanvasTextNode
     | ModelCanvasLineNode
@@ -612,279 +594,6 @@ class ModelCanvasPlanEntity(RealtimeProtocolModel):
     color_hint: str | None = None
 
 
-class ModelCanvasPlanRelation(RealtimeProtocolModel):
-    id: NodeIdentifier
-    from_entity_id: NodeIdentifier
-    to_entity_id: NodeIdentifier
-    kind: str = "flow"
-    label: str | None = None
-    direction_hint: str | None = None
-    animated: bool = False
-
-
-class ModelCanvasPlanInteraction(RealtimeProtocolModel):
-    model_config = ConfigDict(extra="ignore", populate_by_name=True)
-
-    id: NodeIdentifier
-    trigger_entity_id: NodeIdentifier | None = None
-    trigger_node_id: NodeIdentifier | None = None
-    target_entity_id: NodeIdentifier | None = None
-    target_node_id: NodeIdentifier | None = None
-    action: Literal[
-        "explore",
-        "select",
-        "toggleVisibility",
-        "reveal",
-        "dragWithin",
-        "reset",
-    ] = "explore"
-    reveal_entity_ids: list[NodeIdentifier] = Field(default_factory=list)
-    reveal_node_ids: list[NodeIdentifier] = Field(default_factory=list)
-    animate_node_ids: list[NodeIdentifier] = Field(default_factory=list)
-    exclusive: bool = True
-    bounds: CanvasBounds | None = None
-
-
-class ModelCanvasSpecialistDraft(RealtimeProtocolModel):
-    """Provider-facing canvas content with Ava-owned scene identity."""
-
-    title: Annotated[NonEmptyText, StringConstraints(max_length=100)]
-    summary: Annotated[NonEmptyText, StringConstraints(max_length=320)]
-    svg: str | None = Field(
-        default=None,
-        description="Standard SVG vector markup (<svg viewBox='0 0 1000 600'>...</svg>)",
-    )
-    nodes: list[ModelCanvasSpecialistNode] | None = Field(
-        default=None,
-        max_length=96,
-    )
-    entities: list[ModelCanvasEntity | ModelCanvasPlanEntity] = Field(
-        default_factory=list,
-        max_length=16,
-    )
-    interactions: list[ModelCanvasInteraction] = Field(
-        default_factory=list,
-        max_length=16,
-    )
-    motions: list[ModelCanvasMotion] = Field(default_factory=list, max_length=16)
-    # Optional legacy metadata (ignored during compilation)
-    visual_type: ModelCanvasVisualType = ModelCanvasVisualType.FREEFORM
-    topology: ModelCanvasTopology = ModelCanvasTopology.SPATIAL
-    theme: str = "friendlyScience"
-    relations: list[ModelCanvasPlanRelation] = Field(
-        default_factory=list,
-        max_length=16,
-    )
-
-    @model_validator(mode="after")
-    def content_is_interactive_and_renderer_safe(self) -> ModelCanvasSpecialistDraft:
-        if self.svg is None and not self.nodes:
-            raise ValueError("Draft must provide either svg markup or nodes")
-        if self.nodes is not None:
-            if not self.interactions:
-                raise ValueError("interactions must contain at least 1 item")
-            _validate_specialist_canvas_behavior(self.nodes, self.interactions)
-        return self
-
-    def bind_scene_id(self, scene_id: NodeIdentifier) -> ModelCanvasDraft:
-        if self.svg:
-            from ..canvas.svg_import import parse_svg_to_canvas_draft
-
-            return parse_svg_to_canvas_draft(
-                self.svg,
-                scene_id=scene_id,
-                title=self.title,
-                summary=self.summary,
-                entities=self.entities,
-                motions=self.motions,
-            )
-
-        from ..canvas.compiler import CanvasSceneCompiler
-
-        return CanvasSceneCompiler().compile_plan(self, scene_id=scene_id)
-
-
-_CANVAS_SAFE_LEFT = 40.0
-_CANVAS_SAFE_TOP = 40.0
-_CANVAS_SAFE_RIGHT = 960.0
-_CANVAS_SAFE_BOTTOM = 560.0
-
-
-def _validate_specialist_canvas_behavior(
-    nodes: Sequence[ModelCanvasNode],
-    interactions: Sequence[ModelCanvasInteraction | ModelCanvasPlanInteraction],
-) -> None:
-    """Validate stateful behavior that the renderer cannot safely infer.
-
-    Typography, label collision, connector routing, and minimum pointer hit
-    areas are presentation concerns. The Flutter renderer owns those using its
-    actual font metrics and viewport. Rejecting them while parsing provider
-    output made optional scenes fail before the renderer could lay them out.
-    """
-
-    bounds_by_id: dict[NodeIdentifier, tuple[float, float, float, float]] = {}
-
-    for node in nodes:
-        bounds = _model_node_bounds(node)
-        if bounds is not None:
-            bounds_by_id[node.id] = bounds
-
-    node_by_id = {node.id: node for node in nodes}
-    visibility_targets: set[NodeIdentifier] = set()
-    for interaction in interactions:
-        if isinstance(interaction, ModelCanvasExploreInteraction):
-            visibility_targets.update(interaction.reveal_node_ids)
-            if interaction.target_node_id:
-                for node in nodes:
-                    if node.id.startswith(interaction.target_node_id):
-                        visibility_targets.add(node.id)
-            for reveal_id in interaction.reveal_node_ids:
-                prefix = reveal_id.replace("_detail", "").replace("_card", "")
-                for node in nodes:
-                    if node.id.startswith(prefix):
-                        visibility_targets.add(node.id)
-        elif (
-            not isinstance(interaction, ModelCanvasPlanInteraction)
-            and getattr(interaction, "trigger_entity_id", None) is None
-        ):
-            if interaction.action in (
-                ModelCanvasInteractionAction.REVEAL,
-                ModelCanvasInteractionAction.TOGGLE_VISIBILITY,
-            ):
-                if interaction.target_node_id is not None:
-                    visibility_targets.add(interaction.target_node_id)
-        elif (
-            isinstance(interaction, ModelCanvasPlanInteraction)
-            or getattr(interaction, "trigger_entity_id", None) is not None
-        ):
-            for entity_id in getattr(interaction, "reveal_entity_ids", []):
-                visibility_targets.add(entity_id)
-                for node in nodes:
-                    if node.id.startswith(entity_id):
-                        visibility_targets.add(node.id)
-
-    # If a parent group is in visibility_targets, all its child nodes are also targetable
-    for _ in range(3):
-        for node in nodes:
-            if node.parent_id is not None and node.parent_id in visibility_targets:
-                visibility_targets.add(node.id)
-
-    for node in nodes:
-        if node.hidden and node.id not in visibility_targets:
-            raise ValueError(
-                f"hidden canvas node {node.id!r} has no reveal or toggle interaction"
-            )
-
-    for interaction in interactions:
-        if (
-            isinstance(interaction, ModelCanvasPlanInteraction)
-            or getattr(interaction, "trigger_entity_id", None) is not None
-        ):
-            continue
-        trigger = node_by_id.get(interaction.trigger_node_id)
-        if trigger is None:
-            continue
-        if interaction.action == ModelCanvasInteractionAction.RESET and (
-            trigger.design_role != ModelCanvasDesignRole.INTERACTIVE_CONTROL
-        ):
-            object.__setattr__(
-                trigger, "design_role", ModelCanvasDesignRole.INTERACTIVE_CONTROL
-            )
-        if interaction.bounds is not None:
-            clamped_left = max(_CANVAS_SAFE_LEFT, float(interaction.bounds.left))
-            clamped_top = max(_CANVAS_SAFE_TOP, float(interaction.bounds.top))
-            clamped_right = min(_CANVAS_SAFE_RIGHT, float(interaction.bounds.right))
-            clamped_bottom = min(_CANVAS_SAFE_BOTTOM, float(interaction.bounds.bottom))
-            object.__setattr__(interaction.bounds, "left", clamped_left)
-            object.__setattr__(interaction.bounds, "top", clamped_top)
-            object.__setattr__(interaction.bounds, "right", clamped_right)
-            object.__setattr__(interaction.bounds, "bottom", clamped_bottom)
-        if interaction.target_node_id is not None and interaction.action in {
-            ModelCanvasInteractionAction.SELECT,
-            ModelCanvasInteractionAction.DRAG_WITHIN,
-            ModelCanvasInteractionAction.EXPLORE,
-        }:
-            target = node_by_id.get(interaction.target_node_id)
-            if target is not None:
-                object.__setattr__(target, "hidden", False)
-        if isinstance(interaction, ModelCanvasExploreInteraction):
-            for node_id in interaction.reveal_node_ids:
-                if (
-                    node_id != interaction.target_node_id
-                    and node_id in node_by_id
-                    and node_id not in interaction.animate_node_ids
-                ):
-                    object.__setattr__(node_by_id[node_id], "hidden", True)
-            for node_id in interaction.animate_node_ids:
-                if node_id in node_by_id:
-                    object.__setattr__(node_by_id[node_id], "hidden", False)
-        if (
-            interaction.action == ModelCanvasInteractionAction.DRAG_WITHIN
-            and interaction.target_node_id is not None
-            and interaction.bounds is not None
-        ):
-            target_bounds = bounds_by_id.get(interaction.target_node_id)
-            if target_bounds is not None:
-                center_x = (target_bounds[0] + target_bounds[2]) / 2
-                center_y = (target_bounds[1] + target_bounds[3]) / 2
-                if not (
-                    interaction.bounds.left <= center_x <= interaction.bounds.right
-                    and interaction.bounds.top <= center_y <= interaction.bounds.bottom
-                ):
-                    raise ValueError(
-                        "dragWithin bounds must contain the target's initial center"
-                    )
-
-
-def _model_node_bounds(
-    node: ModelCanvasNode,
-) -> tuple[float, float, float, float] | None:
-    if isinstance(node, ModelCanvasTextNode):
-        font_size, _ = _model_text_typography(node.design_role)
-        lines = node.text.splitlines()
-        width = min(
-            520.0,
-            max(44.0, max(len(line) for line in lines) * font_size * 0.54),
-        )
-        height = max(44.0, len(lines) * font_size * 1.2)
-        return (
-            node.x - width / 2,
-            node.y - height / 2,
-            node.x + width / 2,
-            node.y + height / 2,
-        )
-    if isinstance(node, (ModelCanvasLineNode, ModelCanvasArrowNode)):
-        return (
-            min(node.x, node.x2),
-            min(node.y, node.y2),
-            max(node.x, node.x2),
-            max(node.y, node.y2),
-        )
-    if isinstance(node, ModelCanvasCircleNode):
-        return (
-            node.x - node.radius,
-            node.y - node.radius,
-            node.x + node.radius,
-            node.y + node.radius,
-        )
-    if isinstance(node, ModelCanvasEllipseNode):
-        return (
-            node.x - node.radius_x,
-            node.y - node.radius_y,
-            node.x + node.radius_x,
-            node.y + node.radius_y,
-        )
-    if isinstance(node, ModelCanvasRectNode):
-        return (node.x, node.y, node.x + node.width, node.y + node.height)
-    if isinstance(node, (ModelCanvasPolygonNode, ModelCanvasPolylineNode)):
-        xs = [point.x for point in node.points]
-        ys = [point.y for point in node.points]
-        return (min(xs), min(ys), max(xs), max(ys))
-    # Paths are validated by the bounded path grammar. Computing exact bezier
-    # bounds belongs to the compiler and is deliberately not approximated here.
-    return None
-
-
 def _model_text_typography(
     role: ModelCanvasDesignRole,
 ) -> tuple[float, str]:
@@ -1014,137 +723,6 @@ def compile_model_canvas_draft(
     return ModelCanvasCompiler().compile_canvas_draft(
         draft,
         transaction_id=transaction_id,
-    )
-
-
-def compile_model_canvas_revision(
-    draft: ModelCanvasDraft,
-    *,
-    transaction_id: NodeIdentifier,
-    current: ValidatedCanvasScene,
-) -> AvaCanvasTransaction:
-    """Derive one Ava-owned atomic revision from a complete desired draft."""
-
-    if draft.scene_id != current.id:
-        raise ValueError(
-            "canvas specialist must preserve sceneId while revising a scene"
-        )
-
-    validated = ModelCanvasCue.model_validate(
-        {
-            "id": transaction_id,
-            "anchor": {"phrase": "canvas", "occurrence": 0},
-            "sceneId": draft.scene_id,
-            "nodes": [
-                node.model_dump(mode="json", by_alias=True) for node in draft.nodes
-            ],
-            "interactions": [
-                interaction.model_dump(mode="json", by_alias=True)
-                for interaction in draft.interactions
-            ],
-            "motions": [
-                motion.model_dump(mode="json", by_alias=True)
-                for motion in draft.motions
-            ],
-        }
-    )
-    current_nodes = dict(current.nodes)
-    desired_nodes = {
-        operation.node.id: operation.node
-        for operation in (_compile_create_operation(node) for node in validated.nodes)
-    }
-    desired_bindings = tuple(
-        _compile_interaction(interaction) for interaction in validated.interactions
-    )
-
-    operations: list[
-        CanvasDeleteOperation
-        | CanvasUpdateOperation
-        | CanvasCreateOperation
-        | CanvasAnimateOperation
-    ] = []
-    for node_id in current_nodes:
-        if node_id in desired_nodes:
-            continue
-        operations.append(
-            CanvasDeleteOperation.model_validate(
-                {"operation": "delete", "nodeId": node_id}
-            )
-        )
-    for node_id in desired_nodes:
-        if node_id not in current_nodes:
-            continue
-        desired = desired_nodes[node_id]
-        if desired != current_nodes[node_id]:
-            operations.append(
-                CanvasUpdateOperation.model_validate(
-                    {
-                        "operation": "update",
-                        "node": desired.model_dump(mode="json", by_alias=True),
-                    }
-                )
-            )
-    for node_id in desired_nodes:
-        if node_id in current_nodes:
-            continue
-        operations.append(
-            CanvasCreateOperation.model_validate(
-                {
-                    "operation": "create",
-                    "node": desired_nodes[node_id].model_dump(
-                        mode="json",
-                        by_alias=True,
-                    ),
-                }
-            )
-        )
-
-    operations.extend(_compile_motion(motion) for motion in draft.motions)
-
-    if not operations:
-        # A repeated visual request must still reopen a locally dismissed panel.
-        # An identical, validated update advances the canonical revision and
-        # gives the coordinator a real transaction to deliver as a canvasCue.
-        first = next(iter(desired_nodes.values()))
-        operations.append(
-            CanvasUpdateOperation.model_validate(
-                {
-                    "operation": "update",
-                    "node": first.model_dump(mode="json", by_alias=True),
-                }
-            )
-        )
-
-    return AvaCanvasTransaction.model_validate(
-        {
-            "id": transaction_id,
-            "sceneId": draft.scene_id,
-            "baseRevision": current.revision,
-            "revision": current.revision + 1,
-            "operations": [
-                operation.model_dump(mode="json", by_alias=True)
-                for operation in operations
-            ],
-            "stateVariables": [],
-            "bindings": [
-                binding.model_dump(mode="json", by_alias=True)
-                for binding in desired_bindings
-            ],
-        }
-    )
-
-
-def model_canvas_draft_from_runtime_plan(plan: AvaTurnPlan) -> ModelCanvasDraft:
-    cues = [cue for segment in plan.segments for cue in segment.canvas_cues]
-    if len(cues) != 1:
-        raise ValueError("fake canvas specialist requires exactly one runtime cue")
-    cue = _model_cue_from_runtime(cues[0])
-    return ModelCanvasDraft.model_validate(
-        {
-            "sceneId": cue["sceneId"],
-            "nodes": cue["nodes"],
-            "interactions": cue["interactions"],
-        }
     )
 
 

@@ -40,6 +40,7 @@ from .events_v4 import (
     CanvasPresentedEventV4,
 )
 from .tool_contract import (
+    CANVAS_MODEL_SAFE_REJECTION_REASON,
     InteractiveCanvasOperation,
     InteractiveCanvasToolOutputV4,
     InteractiveCanvasToolStatusV4,
@@ -164,32 +165,37 @@ class SvgCanvasJobCoordinator:
         self,
         *,
         source_turn_id: str,
+        source_transcript: str | None = None,
         call: RealtimeCanvasToolCall,
         complete_tool: CompleteCanvasTool,
     ) -> InteractiveCanvasToolOutputV4:
+        rejection_message: str | None = None
         async with self._lock:
             if self._closed:
+                rejection_message = "canvas generation is closed"
                 output = InteractiveCanvasToolOutputV4.model_validate(
                     {
                         "status": InteractiveCanvasToolStatusV4.REJECTED,
-                        "reason": "canvas generation is closed",
+                        "reason": CANVAS_MODEL_SAFE_REJECTION_REASON,
                     }
                 )
             elif self._jobs or self._state.candidate is not None:
+                rejection_message = "another canvas generation is already pending"
                 output = InteractiveCanvasToolOutputV4.model_validate(
                     {
                         "status": InteractiveCanvasToolStatusV4.REJECTED,
-                        "reason": "another canvas generation is already pending",
+                        "reason": CANVAS_MODEL_SAFE_REJECTION_REASON,
                     }
                 )
             elif (
                 call.request.operation == InteractiveCanvasOperation.REVISE_FOCUSED
                 and self._state.active is None
             ):
+                rejection_message = "There is no current canvas to revise."
                 output = InteractiveCanvasToolOutputV4.model_validate(
                     {
                         "status": InteractiveCanvasToolStatusV4.REJECTED,
-                        "reason": "There is no current canvas to revise.",
+                        "reason": CANVAS_MODEL_SAFE_REJECTION_REASON,
                     }
                 )
             else:
@@ -205,9 +211,9 @@ class SvgCanvasJobCoordinator:
                     {
                         "generationId": generation_id,
                         "sourceTurnId": source_turn_id,
+                        "sourceTranscript": source_transcript,
                         "brief": call.request.brief,
                         "interactionMode": call.request.interaction_mode,
-                        "interactionGoal": call.request.interaction_goal,
                         "ageBand": self._age_band,
                         "currentSceneId": active.scene_id if active else None,
                         "currentRevision": active.revision if active else None,
@@ -264,7 +270,9 @@ class SvgCanvasJobCoordinator:
             await self._event_sink.tool_call_rejected(
                 call_id=call.call_id,
                 source_turn_id=source_turn_id,
-                message=output.reason or "The optional visual request was rejected.",
+                message=(
+                    rejection_message or "The optional visual request was rejected."
+                ),
             )
             return output
 

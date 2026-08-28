@@ -10,18 +10,18 @@ from typing import Any, Literal
 from .memory import (
     AuthoritativeMemorySnapshot,
     DeliveredConversationTurn,
+    DeliveredInputKind,
     StableMemoryRecord,
 )
 from .tool_contract import (
     INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS,
-    INTERACTIVE_CANVAS_GOAL_MAX_CHARACTERS,
     INTERACTIVE_CANVAS_TOOL_NAME,
     InteractiveCanvasRequest,
 )
 
 
-REALTIME_PROMPT_VERSION = "ava-realtime-v4.4"
-REALTIME_TOOL_CONTRACT_VERSION = "ava-realtime-tools-v4.3"
+REALTIME_PROMPT_VERSION = "ava-realtime-v4.5"
+REALTIME_TOOL_CONTRACT_VERSION = "ava-realtime-tools-v4.4"
 DEFAULT_REALTIME_REASONING_EFFORT: Literal["low"] = "low"
 
 
@@ -66,27 +66,26 @@ unclear audio, a casual mention of drawing, or information already clearer in a
 short spoken answer. Respect a request not to use a visual. Decide from the full
 conversation, never from isolated words or a keyword list.
 
-When calling it, say at most one short natural bridge sentence, then call it
-immediately. Before calling, decide whether the child wants a separate visual
+When calling it, call it immediately rather than speculating about what the
+visual will contain. Before calling, decide whether the child wants a separate visual
 or a modification of the current/focused visual. Use operation=new for a
 separate visual or different concept. Use operation=reviseFocused only when the
 child intends to modify the current/focused visual. Merely discussing or asking
 about the current visual is not a revision. Provide only the visual's purpose, essential objects,
-relationships, flow, labels, and at most one useful child-facing interaction
-goal. Choose interactionMode=none for an ordinary static visual,
+relationships, flow, and labels. Choose interactionMode=none for an ordinary static visual,
 interactionMode=explore when the child should tap parts to learn,
 interactionMode=select when the child should choose one visible item, and
 interactionMode=steps for ordered Back/Next progression. Do not make a visual
 interactive merely because interaction is available. When revising, preserve
 the current interaction mode unless the intended interaction meaning changes.
-Keep the brief under {INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS} characters
-and the interaction goal under {INTERACTIVE_CANVAS_GOAL_MAX_CHARACTERS}
-characters. Never provide geometry, coordinates, SVG, paths, code, styles,
+Keep the brief under {INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS} characters.
+Never provide geometry, coordinates, SVG, paths, code, styles,
 scene IDs, revisions, or implementation instructions. When the tool is
 available, never claim Ava cannot draw and never mention the tool or handoff.
-After a successful result, briefly explain the visual. After a rejected result,
-continue the spoken answer and say only that the picture could not be shown
-right now.
+The application owns the exact tool outcome. An accepted result means generation
+started asynchronously; it does not mean the visual has already appeared. A
+rejected result means the visual is unavailable. Never contradict either result,
+retry automatically, or replace the visual with a long spoken substitute.
 
 An active canvas context contains only bounded semantics derived from the
 validated current SVG. Use its title, description, visible labels, named objects,
@@ -277,10 +276,43 @@ def render_realtime_context(
         )
     lines.append("  <recent_delivered_turns>")
     for turn in selected_turns:
+        lines.append(
+            f'    <turn id="{escape(turn.turn_id, quote=True)}" '
+            f'input_kind="{escape(str(turn.input_kind), quote=True)}">'
+        )
+        if turn.input_kind == DeliveredInputKind.SPEECH:
+            if turn.child_text is None:
+                raise ValueError("speech memory context lost child text")
+            lines.append(
+                f"      <child>{escape(turn.child_text, quote=False)}</child>"
+            )
+        else:
+            interaction = turn.canvas_interaction
+            if interaction is None:
+                raise ValueError("canvas memory context lost interaction identity")
+            step_attribute = (
+                f' step_index="{interaction.step_index}"'
+                if interaction.step_index is not None
+                else ""
+            )
+            lines.extend(
+                (
+                    "      <canvas_interaction "
+                    f'scene_id="{escape(interaction.scene_id, quote=True)}" '
+                    f'scene_revision="{interaction.scene_revision}" '
+                    f'interaction_revision="{interaction.interaction_revision}" '
+                    f'mode="{escape(str(interaction.interaction_mode), quote=True)}" '
+                    f'binding_id="{escape(interaction.binding_id, quote=True)}" '
+                    f'target_id="{escape(interaction.target_id, quote=True)}"'
+                    f"{step_attribute}>",
+                    "        <target>"
+                    f"{escape(interaction.accessibility_label, quote=False)}"
+                    "</target>",
+                    "      </canvas_interaction>",
+                )
+            )
         lines.extend(
             (
-                f'    <turn id="{escape(turn.turn_id, quote=True)}">',
-                f"      <child>{escape(turn.child_text, quote=False)}</child>",
                 "      <ava_delivered>"
                 f"{escape(turn.ava_delivered_text, quote=False)}"
                 "</ava_delivered>",
@@ -300,7 +332,7 @@ def render_realtime_context(
         )
     lines.extend(("  </stable_memories>", "</ava_runtime_context>"))
     included_characters = sum(
-        len(turn.child_text) + len(turn.ava_delivered_text) for turn in selected_turns
+        _delivered_turn_character_count(turn) for turn in selected_turns
     ) + sum(len(memory.summary) for memory in selected_memories)
     if snapshot.current_session_summary is not None:
         included_characters += len(snapshot.current_session_summary)
@@ -321,7 +353,7 @@ def _select_delivered_turns(
     selected: list[DeliveredConversationTurn] = []
     characters = 0
     for turn in reversed(turns):
-        size = len(turn.child_text) + len(turn.ava_delivered_text)
+        size = _delivered_turn_character_count(turn)
         if len(selected) >= limits.max_delivered_turns or (
             characters + size > limits.max_delivered_characters
         ):
@@ -329,6 +361,24 @@ def _select_delivered_turns(
         selected.append(turn)
         characters += size
     return tuple(reversed(selected))
+
+
+def _delivered_turn_character_count(turn: DeliveredConversationTurn) -> int:
+    if turn.input_kind == DeliveredInputKind.SPEECH:
+        return len(turn.child_text or "") + len(turn.ava_delivered_text)
+    interaction = turn.canvas_interaction
+    if interaction is None:
+        raise ValueError("canvas delivered turn lost interaction identity")
+    return sum(
+        len(value)
+        for value in (
+            interaction.scene_id,
+            interaction.binding_id,
+            interaction.target_id,
+            interaction.accessibility_label,
+            turn.ava_delivered_text,
+        )
+    )
 
 
 def _select_stable_memories(

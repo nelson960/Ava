@@ -12,6 +12,7 @@ from pydantic import Field, StringConstraints, model_validator
 
 from ..protocol import AgeBand
 from .common import NonEmptyText, ProtocolIdentifier, RealtimeProtocolModel
+from .tool_contract import InteractiveCanvasMode
 
 MAX_DELIVERED_TURNS = 8
 MAX_STABLE_MEMORIES = 12
@@ -43,6 +44,35 @@ class ChildTurnTextSource(StrEnum):
     MODEL_SUMMARY = "modelSummary"
 
 
+class DeliveredInputKind(StrEnum):
+    SPEECH = "speech"
+    CANVAS_INTERACTION = "canvasInteraction"
+
+
+class DeliveredCanvasInteraction(RealtimeProtocolModel):
+    scene_id: ProtocolIdentifier
+    scene_revision: int = Field(ge=1, le=10_001)
+    interaction_revision: int = Field(ge=1, le=2_147_483_647)
+    interaction_mode: InteractiveCanvasMode
+    binding_id: ProtocolIdentifier
+    target_id: ProtocolIdentifier
+    accessibility_label: Annotated[
+        NonEmptyText,
+        StringConstraints(max_length=160),
+    ]
+    step_index: int | None = Field(default=None, ge=1, le=12)
+
+    @model_validator(mode="after")
+    def mode_matches_step_identity(self) -> DeliveredCanvasInteraction:
+        if self.interaction_mode == InteractiveCanvasMode.NONE:
+            raise ValueError("a static canvas cannot produce an interaction input")
+        if (self.interaction_mode == InteractiveCanvasMode.STEPS) != (
+            self.step_index is not None
+        ):
+            raise ValueError("steps interaction input requires an exact stepIndex")
+        return self
+
+
 class DeliveredConversationTurn(RealtimeProtocolModel):
     """Authoritative turn content derived from rendered playback.
 
@@ -51,8 +81,12 @@ class DeliveredConversationTurn(RealtimeProtocolModel):
     """
 
     turn_id: ProtocolIdentifier
-    child_text: Annotated[NonEmptyText, StringConstraints(max_length=2_000)]
-    child_text_source: ChildTurnTextSource = ChildTurnTextSource.TRANSCRIPT
+    input_kind: DeliveredInputKind = DeliveredInputKind.SPEECH
+    child_text: (
+        Annotated[NonEmptyText, StringConstraints(max_length=2_000)] | None
+    ) = None
+    child_text_source: ChildTurnTextSource | None = ChildTurnTextSource.TRANSCRIPT
+    canvas_interaction: DeliveredCanvasInteraction | None = None
     ava_delivered_text: Annotated[str, StringConstraints(max_length=1_800)]
     delivered_sample_count: int = Field(ge=0, le=2_147_483_647)
     child_turn_summary: Annotated[NonEmptyText, StringConstraints(max_length=240)]
@@ -60,6 +94,20 @@ class DeliveredConversationTurn(RealtimeProtocolModel):
 
     @model_validator(mode="after")
     def delivered_samples_match_text(self) -> DeliveredConversationTurn:
+        if self.input_kind == DeliveredInputKind.SPEECH:
+            if self.child_text is None or self.child_text_source is None:
+                raise ValueError("speech input requires childText and childTextSource")
+            if self.canvas_interaction is not None:
+                raise ValueError("speech input cannot contain a canvas interaction")
+        else:
+            if self.child_text is not None or self.child_text_source is not None:
+                raise ValueError(
+                    "canvas interaction input cannot contain child speech fields"
+                )
+            if self.canvas_interaction is None:
+                raise ValueError(
+                    "canvas interaction input requires typed interaction identity"
+                )
         has_audio = self.delivered_sample_count > 0
         has_text = bool(self.ava_delivered_text)
         if has_text and not has_audio:
@@ -278,12 +326,10 @@ class DevelopmentAuthoritativeMemoryStore:
             turn.model_dump(mode="json", by_alias=True)
         )
         weekly_summary = _validate_weekly_summary(validated_turn.child_turn_summary)
-        decision = evaluate_memory_proposal(
+        decision = evaluate_delivered_turn_memory_proposal(
+            turn=validated_turn,
             proposal=proposal,
-            child_text=validated_turn.child_text,
-            source_turn_id=validated_turn.turn_id,
             memory_id=memory_id,
-            child_text_source=validated_turn.child_text_source,
         )
 
         async with self._lock:
@@ -477,6 +523,35 @@ def evaluate_memory_proposal(
             "reason": "Proposal is explicit, allowlisted, evidenced, and confident.",
             "record": record.model_dump(mode="json", by_alias=True),
         }
+    )
+
+
+def evaluate_delivered_turn_memory_proposal(
+    *,
+    turn: DeliveredConversationTurn,
+    proposal: AvaMemoryProposal | None,
+    memory_id: str | None,
+) -> MemoryProposalDecision:
+    if turn.input_kind == DeliveredInputKind.CANVAS_INTERACTION:
+        if proposal is None:
+            if memory_id is not None:
+                raise ValueError("memory_id must be absent when there is no proposal")
+            return _decision(
+                False,
+                "Canvas interaction input is retained without a stable memory proposal.",
+            )
+        return _decision(
+            False,
+            "Stable memory requires genuine child speech transcript evidence.",
+        )
+    if turn.child_text is None or turn.child_text_source is None:
+        raise ValueError("speech delivered turn lost its transcript evidence")
+    return evaluate_memory_proposal(
+        proposal=proposal,
+        child_text=turn.child_text,
+        source_turn_id=turn.turn_id,
+        memory_id=memory_id,
+        child_text_source=turn.child_text_source,
     )
 
 

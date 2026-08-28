@@ -68,7 +68,7 @@ body{opacity:0;background:$background}
 #ava-host svg{display:block;width:100%;height:100%}
 #ava-overlay{pointer-events:none}
 .ava-hit{position:absolute;box-sizing:border-box;min-width:44px;min-height:44px;border:0;padding:0;background:transparent;pointer-events:auto;touch-action:none;-webkit-tap-highlight-color:transparent}
-.ava-hit.ava-selected{border:3px solid rgba(33,126,132,.9);border-radius:14px;background:rgba(255,255,255,.2)}
+.ava-hit.ava-selected{border:0;background:transparent;outline:0;box-shadow:none}
 .ava-step-controls{position:absolute;left:50%;bottom:12px;transform:translateX(-50%);display:flex;align-items:center;gap:10px;padding:6px 10px;border-radius:18px;background:rgba(255,255,255,.92);pointer-events:auto}
 .ava-step-controls button{min-width:44px;min-height:44px;border:0;border-radius:14px;background:#d7eeee;color:#173d40;font:600 15px system-ui}
 .ava-step-controls button:disabled{opacity:.38}
