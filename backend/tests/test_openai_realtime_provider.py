@@ -22,6 +22,9 @@ from ava_backend.providers.openai_realtime_provider import (
 )
 from ava_backend.realtime.harness import build_realtime_harness
 from ava_backend.realtime.memory import AuthoritativeMemorySnapshot
+from ava_backend.realtime.provider_session import (
+    RealtimeProviderResponseIncompleteError,
+)
 from ava_backend.realtime.tool_contract import (
     CANVAS_MODEL_SAFE_REJECTION_REASON,
     INTERACTIVE_CANVAS_TOOL_NAME,
@@ -59,6 +62,32 @@ def _recorded_interaction(
         accessibility_label=accessibility_label,
         step_index=step_index,
     )
+
+
+def _interaction_conversation_item_text(
+    sent_events: list[dict[str, object]],
+) -> str:
+    user_items = [
+        sent["item"]
+        for sent in sent_events
+        if sent.get("type") == "conversation.item.create"
+        and isinstance(sent.get("item"), dict)
+        and sent["item"].get("role") == "user"
+    ]
+    assert len(user_items) == 1
+    item = user_items[0]
+    assert isinstance(item, dict)
+    assert item["type"] == "message"
+    assert item["role"] == "user"
+    content = item["content"]
+    assert isinstance(content, list)
+    assert len(content) == 1
+    part = content[0]
+    assert isinstance(part, dict)
+    assert part["type"] == "input_text"
+    text = part["text"]
+    assert isinstance(text, str)
+    return text
 
 
 @pytest.fixture(autouse=True)
@@ -1300,10 +1329,9 @@ async def test_canvas_call_gets_one_output_then_tool_disabled_continuation(
     ]
     assert continuation_requests[-1]["response"]["tool_choice"] == "none"
     assert continuation_requests[-1]["response"]["max_output_tokens"] == 64
-    accepted_instructions = continuation_requests[-1]["response"]["instructions"]
-    assert 'status="accepted"' in accepted_instructions
-    assert "Do not claim the visual failed" in accepted_instructions
-    assert "Do not claim presentation is complete yet" in accepted_instructions
+    assert continuation_requests[-1]["response"]["conversation"] == "auto"
+    assert "instructions" not in continuation_requests[-1]["response"]
+    assert "input" not in continuation_requests[-1]["response"]
     assert channel.last_usage is not None
     assert channel.last_usage.total_tokens == 23
 
@@ -1361,8 +1389,9 @@ async def test_rejected_canvas_continuation_is_outcome_owned_and_bounded() -> No
     ][-1]["response"]
     assert continuation["tool_choice"] == "none"
     assert continuation["max_output_tokens"] == 64
-    assert 'status="rejected"' in continuation["instructions"]
-    assert "Do not expose internal reasons" in continuation["instructions"]
+    assert continuation["conversation"] == "auto"
+    assert "instructions" not in continuation
+    assert "input" not in continuation
 
 
 @pytest.mark.asyncio
@@ -1386,27 +1415,42 @@ async def test_idle_canvas_interaction_can_trigger_existing_semantic_turn() -> N
     ]
     assert len(interaction_requests) == 1
     response = interaction_requests[0]["response"]
+    assert isinstance(response, dict)
     assert response["output_modalities"] == ["text"]
     assert response["tool_choice"] == "none"
-    assert response["max_output_tokens"] == 64
-    assert "no Markdown" in response["instructions"]
-    assert 'mode="explore"' in response["instructions"]
-    assert (
-        "<semantic_focus>Great Red Spot</semantic_focus>"
-        in response["instructions"]
+    assert response["max_output_tokens"] == 256
+    assert response["conversation"] == "auto"
+    assert "input" not in response
+    assert "instructions" not in response
+    semantic_input = _interaction_conversation_item_text(socket.sent)
+    assert semantic_input.startswith(
+        '<canvas_interaction trust="user_action_context" mode="explore">'
     )
-    assert "scene_id" not in response["instructions"]
-    assert "scene_revision" not in response["instructions"]
-    assert "interaction_revision" not in response["instructions"]
-    assert "binding_id" not in response["instructions"]
-    assert "target_id" not in response["instructions"]
-    assert "latest validated canvas interaction" not in response["instructions"]
+    assert 'mode="explore"' in semantic_input
+    assert 'trust="user_action_context"' in semantic_input
+    assert "<semantic_focus>Great Red Spot</semantic_focus>" in semantic_input
+    for application_identity in (
+        "scene_id",
+        "scene_revision",
+        "interaction_revision",
+        "binding_id",
+        "target_id",
+        "svg_sha256",
+        "manifest_sha256",
+    ):
+        assert application_identity not in semantic_input
     assert not any(
         sent.get("type") == "conversation.item.create"
         and isinstance(sent.get("item"), dict)
-        and sent["item"].get("role") == "user"
+        and sent["item"].get("role") == "system"
         for sent in socket.sent
     )
+    session_update = next(
+        sent for sent in socket.sent if sent.get("type") == "session.update"
+    )
+    session = session_update["session"]
+    assert isinstance(session, dict)
+    assert session["instructions"] == _harness().instructions
 
     for event in _text_response_events(
         response_id="resp_canvas_interaction",
@@ -1421,7 +1465,7 @@ async def test_idle_canvas_interaction_can_trigger_existing_semantic_turn() -> N
 
 
 @pytest.mark.asyncio
-async def test_canvas_interaction_response_owns_each_exact_target_instruction() -> None:
+async def test_canvas_interaction_response_owns_each_exact_semantic_context() -> None:
     interactions = (
         _recorded_interaction(
             binding_id="binding-A",
@@ -1436,7 +1480,7 @@ async def test_canvas_interaction_response_owns_each_exact_target_instruction() 
             interaction_revision=2,
         ),
     )
-    instructions: list[str] = []
+    semantic_inputs: list[str] = []
 
     for index, interaction in enumerate(interactions, start=1):
         channel, socket = _channel([])
@@ -1457,33 +1501,35 @@ async def test_canvas_interaction_response_owns_each_exact_target_instruction() 
         )
         response = response_create["response"]
         assert isinstance(response, dict)
-        instruction = response["instructions"]
-        assert isinstance(instruction, str)
-        instructions.append(instruction)
+        assert response["conversation"] == "auto"
+        assert "input" not in response
+        assert "instructions" not in response
+        semantic_inputs.append(_interaction_conversation_item_text(socket.sent))
 
         pending_event.cancel()
         await asyncio.gather(pending_event, return_exceptions=True)
         await iterator.aclose()
 
-    assert "<semantic_focus>semantic-focus-A</semantic_focus>" in instructions[0]
-    assert "semantic-focus-B" not in instructions[0]
-    assert "<semantic_focus>semantic-focus-B</semantic_focus>" in instructions[1]
-    assert "semantic-focus-A" not in instructions[1]
-    assert 'mode="explore"' in instructions[0]
-    assert 'mode="select"' in instructions[1]
-    for instruction in instructions:
-        assert "scene_id" not in instruction
-        assert "scene_revision" not in instruction
-        assert "interaction_revision" not in instruction
-        assert "binding_id" not in instruction
-        assert "target_id" not in instruction
-        assert "binding-A" not in instruction
-        assert "binding-B" not in instruction
-        assert "shared-visual-target" not in instruction
-    assert "Do not broaden beyond semantic_focus" in instructions[0]
-    assert "Do not repeat the scene overview" in instructions[0]
-    assert "Do not repeat previous interaction answers" in instructions[0]
-    assert instructions[0] != instructions[1]
+    assert (
+        "<semantic_focus>semantic-focus-A</semantic_focus>" in semantic_inputs[0]
+    )
+    assert "semantic-focus-B" not in semantic_inputs[0]
+    assert (
+        "<semantic_focus>semantic-focus-B</semantic_focus>" in semantic_inputs[1]
+    )
+    assert "semantic-focus-A" not in semantic_inputs[1]
+    assert 'mode="explore"' in semantic_inputs[0]
+    assert 'mode="select"' in semantic_inputs[1]
+    for semantic_input in semantic_inputs:
+        assert "scene_id" not in semantic_input
+        assert "scene_revision" not in semantic_input
+        assert "interaction_revision" not in semantic_input
+        assert "binding_id" not in semantic_input
+        assert "target_id" not in semantic_input
+        assert "binding-A" not in semantic_input
+        assert "binding-B" not in semantic_input
+        assert "shared-visual-target" not in semantic_input
+    assert semantic_inputs[0] != semantic_inputs[1]
 
 
 @pytest.mark.asyncio
@@ -1510,17 +1556,73 @@ async def test_steps_interaction_response_owns_exact_step() -> None:
     )
     response = response_create["response"]
     assert isinstance(response, dict)
-    instruction = response["instructions"]
-    assert isinstance(instruction, str)
-    assert 'mode="steps"' in instruction
-    assert 'step_index="2"' in instruction
-    assert "<semantic_focus>Moon orbit</semantic_focus>" in instruction
-    assert "Back" not in instruction
-    assert "Next" not in instruction
+    assert response["conversation"] == "auto"
+    assert "input" not in response
+    assert "instructions" not in response
+    semantic_input = _interaction_conversation_item_text(socket.sent)
+    assert 'mode="steps"' in semantic_input
+    assert 'step_index="2"' in semantic_input
+    assert "<semantic_focus>Moon orbit</semantic_focus>" in semantic_input
 
     pending_event.cancel()
     await asyncio.gather(pending_event, return_exceptions=True)
     await iterator.aclose()
+
+
+@pytest.mark.asyncio
+async def test_incomplete_canvas_interaction_response_is_not_completed() -> None:
+    channel, socket = _channel([])
+    iterator = channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-incomplete-canvas-interaction",
+    ).__aiter__()
+    pending_event = asyncio.create_task(iterator.__anext__())
+    await socket.wait_received(1)
+
+    assert await channel.request_canvas_interaction_response(
+        turn_id="turn-incomplete-canvas-interaction",
+        interaction=_recorded_interaction(),
+    )
+    response_id = "resp_incomplete_canvas_interaction"
+    socket.push({"type": "response.created", "response": {"id": response_id}})
+    socket.push(
+        {
+            "type": "response.output_text.delta",
+            "response_id": response_id,
+            "delta": "Here is a partial",
+        }
+    )
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": response_id,
+                "status": "incomplete",
+                "status_details": {
+                    "type": "incomplete",
+                    "reason": "max_output_tokens",
+                },
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "output_text", "text": "Here is a partial"}
+                        ],
+                    }
+                ],
+                "usage": _usage(10, 256),
+            },
+        }
+    )
+
+    assert await pending_event == RealtimeSpeechTextDelta(delta="Here is a partial")
+    with pytest.raises(
+        RealtimeProviderResponseIncompleteError,
+        match="incomplete.*max_output_tokens",
+    ):
+        await iterator.__anext__()
+    assert channel.last_response_id is None
 
 
 @pytest.mark.asyncio

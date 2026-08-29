@@ -1,6 +1,6 @@
 {
   "schemaVersion": 3,
-  "promptVersion": "ava-realtime-v4.5",
+  "promptVersion": "ava-realtime-v4.6",
   "cases": [
     {
       "id": "casual_greeting",

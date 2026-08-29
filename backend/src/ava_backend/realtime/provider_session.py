@@ -39,6 +39,14 @@ class RealtimeProviderUnavailableError(RealtimeProviderError):
     """The provider session could not complete the active Ava turn."""
 
 
+class RealtimeProviderResponseIncompleteError(RealtimeProviderError):
+    """The provider ended one response without completing its output."""
+
+    def __init__(self, *, reason: str) -> None:
+        super().__init__(f"Realtime provider response was incomplete: {reason}")
+        self.reason = reason
+
+
 class RealtimeNegotiationError(RuntimeError):
     """Base error for a failed provider WebRTC negotiation."""
 

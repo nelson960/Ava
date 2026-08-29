@@ -52,6 +52,7 @@ from ava_backend.realtime.provider_session import (
     NegotiatedRealtimeCall,
     RealtimeProviderInputEvent,
     RealtimeProviderProtocolError,
+    RealtimeProviderResponseIncompleteError,
     RealtimeProviderTurnEvent,
     RealtimeProviderUnavailableError,
 )
@@ -201,6 +202,21 @@ class _InteractionThenChildRealtimeProvider(DeterministicRealtimePlanProvider):
 
     def serve_future_child_turns(self) -> None:
         self._wait_for_canvas_interaction_response = False
+
+
+class _IncompleteInteractionRealtimeProvider(DeterministicRealtimePlanProvider):
+    def __init__(self, plan: AvaTurnPlan) -> None:
+        super().__init__(
+            plan,
+            child_text=None,
+            wait_for_canvas_interaction_response=True,
+        )
+
+    async def _stream(self) -> AsyncIterator[RealtimeProviderTurnEvent]:
+        self.turn_stream_started.set()
+        await self._canvas_interaction_response_requested.wait()
+        raise RealtimeProviderResponseIncompleteError(reason="max_output_tokens")
+        yield  # pragma: no cover - makes this an async generator
 
 
 def _canvas_runtime(
@@ -1651,6 +1667,56 @@ async def test_idle_interaction_response_persists_typed_input_without_child_spee
     )
     assert persisted.canvas_interaction.binding_id == state.last_interaction.binding_id
     assert persisted.ava_delivered_text == _plan().speech
+    await coordinator.close()
+
+
+async def test_incomplete_interaction_response_is_cancelled_not_completed() -> None:
+    state = _active_labeled_canvas_state()
+    active = state.active
+    assert active is not None
+    provider = _IncompleteInteractionRealtimeProvider(_plan())
+    memory = DevelopmentAuthoritativeMemoryStore()
+    coordinator, _, _, _ = _coordinator(
+        realtime=provider,
+        memory=memory,
+        canvas_state=state,
+    )
+    await _ready(coordinator)
+    delivery = asyncio.create_task(
+        _complete_delivered_turn(coordinator, first_client_sequence=2)
+    )
+    await provider.turn_stream_started.wait()
+
+    await coordinator.receive(
+        _client(
+            {
+                "event": "canvasInteraction",
+                "sequence": 1,
+                "sceneId": active.scene_id,
+                "sceneRevision": active.revision,
+                "interactionRevision": 1,
+                "svgSha256": active.document.svg_sha256,
+                "manifestSha256": active.document.manifest_sha256,
+                "bindingId": "explore_condensation",
+            }
+        )
+    )
+    events = await delivery
+
+    terminal = events[-1]
+    assert isinstance(terminal, TurnCancelledEventV4)
+    assert terminal.reason == "providerResponseIncomplete:max_output_tokens"
+    assert not any(isinstance(event, TurnCompletedEventV4) for event in events)
+    snapshot = await memory.load_snapshot(
+        subject="child:coordinator",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+    )
+    assert len(snapshot.delivered_turns) == 1
+    persisted = snapshot.delivered_turns[0]
+    assert persisted.input_kind == "canvasInteraction"
+    assert persisted.terminal == "cancelled"
+    assert persisted.ava_delivered_text == ""
+    assert provider.cancelled_turn_ids == []
     await coordinator.close()
 
 

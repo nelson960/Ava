@@ -54,6 +54,7 @@ from .provider_session import (
     NegotiatedRealtimeCall,
     RealtimeProviderInputEvent,
     RealtimeProviderProtocolError,
+    RealtimeProviderResponseIncompleteError,
     RealtimeProviderTurnEvent,
     RealtimeProviderSession,
     RealtimeProviderUnavailableError,
@@ -774,6 +775,7 @@ class DeterministicRealtimeSessionCoordinator:
         )
         self._active_planning_task = planning_task
         provider_preempted = False
+        provider_incomplete_reason: str | None = None
 
         try:
             while True:
@@ -910,6 +912,11 @@ class DeterministicRealtimeSessionCoordinator:
                         self._turn_id,
                         len(plan.segments),
                     )
+        except RealtimeProviderResponseIncompleteError as error:
+            await self._cancel_provider_input_observer()
+            await asyncio.gather(planning_task, return_exceptions=True)
+            self._active_planning_task = None
+            provider_incomplete_reason = error.reason
         except (
             RealtimeProviderProtocolError,
             StreamingTurnParseError,
@@ -1000,6 +1007,16 @@ class DeterministicRealtimeSessionCoordinator:
             async for frame in self._cancel_frames(
                 plan=plan,
                 ledger=ledger,
+            ):
+                yield frame
+            return
+
+        if provider_incomplete_reason is not None:
+            async for frame in self._cancel_frames(
+                plan=plan,
+                ledger=ledger,
+                reason=f"providerResponseIncomplete:{provider_incomplete_reason}",
+                provider_response_terminal=True,
             ):
                 yield frame
             return
@@ -2091,6 +2108,7 @@ class DeterministicRealtimeSessionCoordinator:
         plan: _TurnResult | None,
         ledger: DeliveredTextLedger,
         reason: str | None = None,
+        provider_response_terminal: bool = False,
     ) -> AsyncIterator[AvaServerOutboundFrameV4]:
         cancel = self._cancel_event
         cancellation_reason = reason or (cancel.reason if cancel is not None else None)
@@ -2099,7 +2117,8 @@ class DeterministicRealtimeSessionCoordinator:
                 "cancellation frames require a client cancel or provider preemption"
             )
         yield self._phase_frame(SpeechPhase.CANCELLING)
-        await self._realtime.cancel(turn_id=self._turn_id)
+        if not provider_response_terminal:
+            await self._realtime.cancel(turn_id=self._turn_id)
         await self._speech.cancel(turn_id=self._turn_id)
         await self._interrupt_canvas_turn()
 

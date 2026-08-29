@@ -61,7 +61,7 @@ def test_v4_prompt_is_conversation_first_and_semantically_canvas_aware() -> None
     instructions = render_stable_instructions()
     normalized = " ".join(instructions.split())
 
-    assert REALTIME_PROMPT_VERSION == "ava-realtime-v4.5"
+    assert REALTIME_PROMPT_VERSION == "ava-realtime-v4.6"
     assert REALTIME_TOOL_CONTRACT_VERSION == "ava-realtime-tools-v4.4"
     assert {layer.name for layer in PROMPT_LAYERS} == {
         "identity_and_personality",
@@ -71,22 +71,27 @@ def test_v4_prompt_is_conversation_first_and_semantically_canvas_aware() -> None
         "tool_availability",
     }
     assert "Ordinary conversation is the primary experience" in normalized
-    assert "Do not automatically teach" in normalized
     assert "semantic and optional" in normalized
-    assert "never from isolated words or a keyword list" in normalized
-    assert "never claim Ava cannot draw" in normalized
     assert "operation=new" in normalized
     assert "operation=reviseFocused" in normalized
-    assert "Merely discussing" in normalized
+    assert "semantic_focus is the active referent" in normalized
+    assert "Application identifiers have no language meaning" in normalized
     assert "function_call_output" not in normalized
-    for forbidden in (
+
+    # Assert absence of deterministic sentence counts and conversational example blocks
+    for conversational_determinism in (
+        "one to three short",
+        "Great question",
+        "Let me think",
+        "As an AI",
+        "that part",
         "emit_ava_turn",
         "canvasNeeded",
         "rawSvg",
         "boneRotations",
         "pointAtDashboard",
     ):
-        assert forbidden not in instructions
+        assert conversational_determinism not in instructions
 
 
 def test_harness_exposes_one_optional_bounded_canvas_tool() -> None:
