@@ -41,6 +41,7 @@ _TEST_CHANNELS: set[_OpenAIRealtimeEventChannel] = set()
 def _recorded_interaction(
     *,
     binding_id: str = "explore_great_red_spot",
+    target_id: str | None = None,
     accessibility_label: str = "Great Red Spot",
     interaction_mode: str = "explore",
     interaction_revision: int = 1,
@@ -54,7 +55,7 @@ def _recorded_interaction(
         manifest_sha256="b" * 64,
         binding_id=binding_id,
         interaction_mode=interaction_mode,
-        target_id=f"target_{binding_id}",
+        target_id=target_id or f"target_{binding_id}",
         accessibility_label=accessibility_label,
         step_index=step_index,
     )
@@ -1387,15 +1388,18 @@ async def test_idle_canvas_interaction_can_trigger_existing_semantic_turn() -> N
     response = interaction_requests[0]["response"]
     assert response["output_modalities"] == ["text"]
     assert response["tool_choice"] == "none"
-    assert response["max_output_tokens"] == 128
+    assert response["max_output_tokens"] == 64
     assert "no Markdown" in response["instructions"]
-    assert 'scene_id="scene_jupiter"' in response["instructions"]
-    assert 'scene_revision="3"' in response["instructions"]
-    assert 'interaction_revision="1"' in response["instructions"]
     assert 'mode="explore"' in response["instructions"]
-    assert 'binding_id="explore_great_red_spot"' in response["instructions"]
-    assert 'target_id="target_explore_great_red_spot"' in response["instructions"]
-    assert "<target>Great Red Spot</target>" in response["instructions"]
+    assert (
+        "<semantic_focus>Great Red Spot</semantic_focus>"
+        in response["instructions"]
+    )
+    assert "scene_id" not in response["instructions"]
+    assert "scene_revision" not in response["instructions"]
+    assert "interaction_revision" not in response["instructions"]
+    assert "binding_id" not in response["instructions"]
+    assert "target_id" not in response["instructions"]
     assert "latest validated canvas interaction" not in response["instructions"]
     assert not any(
         sent.get("type") == "conversation.item.create"
@@ -1419,10 +1423,15 @@ async def test_idle_canvas_interaction_can_trigger_existing_semantic_turn() -> N
 @pytest.mark.asyncio
 async def test_canvas_interaction_response_owns_each_exact_target_instruction() -> None:
     interactions = (
-        _recorded_interaction(),
         _recorded_interaction(
-            binding_id="select_europa",
-            accessibility_label="Europa",
+            binding_id="binding-A",
+            target_id="shared-visual-target",
+            accessibility_label="semantic-focus-A",
+        ),
+        _recorded_interaction(
+            binding_id="binding-B",
+            target_id="shared-visual-target",
+            accessibility_label="semantic-focus-B",
             interaction_mode="select",
             interaction_revision=2,
         ),
@@ -1456,12 +1465,24 @@ async def test_canvas_interaction_response_owns_each_exact_target_instruction() 
         await asyncio.gather(pending_event, return_exceptions=True)
         await iterator.aclose()
 
-    assert "<target>Great Red Spot</target>" in instructions[0]
-    assert "Europa" not in instructions[0]
-    assert "<target>Europa</target>" in instructions[1]
-    assert "Great Red Spot" not in instructions[1]
-    assert 'interaction_revision="1"' in instructions[0]
-    assert 'interaction_revision="2"' in instructions[1]
+    assert "<semantic_focus>semantic-focus-A</semantic_focus>" in instructions[0]
+    assert "semantic-focus-B" not in instructions[0]
+    assert "<semantic_focus>semantic-focus-B</semantic_focus>" in instructions[1]
+    assert "semantic-focus-A" not in instructions[1]
+    assert 'mode="explore"' in instructions[0]
+    assert 'mode="select"' in instructions[1]
+    for instruction in instructions:
+        assert "scene_id" not in instruction
+        assert "scene_revision" not in instruction
+        assert "interaction_revision" not in instruction
+        assert "binding_id" not in instruction
+        assert "target_id" not in instruction
+        assert "binding-A" not in instruction
+        assert "binding-B" not in instruction
+        assert "shared-visual-target" not in instruction
+    assert "Do not broaden beyond semantic_focus" in instructions[0]
+    assert "Do not repeat the scene overview" in instructions[0]
+    assert "Do not repeat previous interaction answers" in instructions[0]
     assert instructions[0] != instructions[1]
 
 
@@ -1493,7 +1514,7 @@ async def test_steps_interaction_response_owns_exact_step() -> None:
     assert isinstance(instruction, str)
     assert 'mode="steps"' in instruction
     assert 'step_index="2"' in instruction
-    assert "<target>Moon orbit</target>" in instruction
+    assert "<semantic_focus>Moon orbit</semantic_focus>" in instruction
     assert "Back" not in instruction
     assert "Next" not in instruction
 

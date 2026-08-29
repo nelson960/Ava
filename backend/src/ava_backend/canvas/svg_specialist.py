@@ -195,6 +195,10 @@ ART DIRECTION
 INTERACTION METADATA
 - Copy the requested mode exactly to the SVG root as `data-ava-interaction-mode`.
 - `none` is static and has no bindings or step metadata.
+- For every binding, `aria-label` describes the exact semantic meaning of that
+  tappable binding and is self-contained enough to ground a short spoken response.
+- `data-ava-target` is visual/identity metadata, not spoken semantic focus.
+- Omit `data-ava-target` when a distinct visual target is unnecessary.
 - `explore` uses 1-32 visible hotspots with unique `id`, `data-ava-binding`,
   `aria-label`, optional `data-ava-target`, and optional `data-ava-reveal` IDs.
 - `select` uses 1-32 visible choices with unique `id`, `data-ava-binding`,

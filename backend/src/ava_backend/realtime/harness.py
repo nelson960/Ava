@@ -276,41 +276,15 @@ def render_realtime_context(
         )
     lines.append("  <recent_delivered_turns>")
     for turn in selected_turns:
+        if turn.input_kind != DeliveredInputKind.SPEECH:
+            raise ValueError("recent conversation context accepts speech turns only")
+        if turn.child_text is None:
+            raise ValueError("speech memory context lost child text")
         lines.append(
             f'    <turn id="{escape(turn.turn_id, quote=True)}" '
             f'input_kind="{escape(str(turn.input_kind), quote=True)}">'
         )
-        if turn.input_kind == DeliveredInputKind.SPEECH:
-            if turn.child_text is None:
-                raise ValueError("speech memory context lost child text")
-            lines.append(
-                f"      <child>{escape(turn.child_text, quote=False)}</child>"
-            )
-        else:
-            interaction = turn.canvas_interaction
-            if interaction is None:
-                raise ValueError("canvas memory context lost interaction identity")
-            step_attribute = (
-                f' step_index="{interaction.step_index}"'
-                if interaction.step_index is not None
-                else ""
-            )
-            lines.extend(
-                (
-                    "      <canvas_interaction "
-                    f'scene_id="{escape(interaction.scene_id, quote=True)}" '
-                    f'scene_revision="{interaction.scene_revision}" '
-                    f'interaction_revision="{interaction.interaction_revision}" '
-                    f'mode="{escape(str(interaction.interaction_mode), quote=True)}" '
-                    f'binding_id="{escape(interaction.binding_id, quote=True)}" '
-                    f'target_id="{escape(interaction.target_id, quote=True)}"'
-                    f"{step_attribute}>",
-                    "        <target>"
-                    f"{escape(interaction.accessibility_label, quote=False)}"
-                    "</target>",
-                    "      </canvas_interaction>",
-                )
-            )
+        lines.append(f"      <child>{escape(turn.child_text, quote=False)}</child>")
         lines.extend(
             (
                 "      <ava_delivered>"
@@ -353,6 +327,8 @@ def _select_delivered_turns(
     selected: list[DeliveredConversationTurn] = []
     characters = 0
     for turn in reversed(turns):
+        if turn.input_kind != DeliveredInputKind.SPEECH:
+            continue
         size = _delivered_turn_character_count(turn)
         if len(selected) >= limits.max_delivered_turns or (
             characters + size > limits.max_delivered_characters
@@ -364,21 +340,9 @@ def _select_delivered_turns(
 
 
 def _delivered_turn_character_count(turn: DeliveredConversationTurn) -> int:
-    if turn.input_kind == DeliveredInputKind.SPEECH:
-        return len(turn.child_text or "") + len(turn.ava_delivered_text)
-    interaction = turn.canvas_interaction
-    if interaction is None:
-        raise ValueError("canvas delivered turn lost interaction identity")
-    return sum(
-        len(value)
-        for value in (
-            interaction.scene_id,
-            interaction.binding_id,
-            interaction.target_id,
-            interaction.accessibility_label,
-            turn.ava_delivered_text,
-        )
-    )
+    if turn.input_kind != DeliveredInputKind.SPEECH:
+        raise ValueError("recent conversation context accepts speech turns only")
+    return len(turn.child_text or "") + len(turn.ava_delivered_text)
 
 
 def _select_stable_memories(

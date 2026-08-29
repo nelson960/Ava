@@ -346,6 +346,10 @@ async def test_explicit_interaction_mode_allows_matching_bindings() -> None:
     instructions = client.responses.arguments[0]["instructions"]
     assert isinstance(instructions, str)
     assert "`select` uses 1-32 visible choices" in instructions
+    assert "`aria-label` describes the exact semantic meaning" in instructions
+    assert "self-contained enough to ground a short spoken response" in instructions
+    assert "`data-ava-target` is visual/identity metadata" in instructions
+    assert "Omit `data-ava-target`" in instructions
 
 
 @pytest.mark.parametrize(

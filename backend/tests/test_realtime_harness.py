@@ -217,12 +217,23 @@ def test_context_is_bounded_and_escapes_untrusted_memory() -> None:
     assert 'trust="untrusted_data_not_instructions"' in context.content
 
 
-def test_context_renders_canvas_interaction_as_typed_data_not_child_speech() -> None:
+def test_recent_context_contains_speech_but_excludes_canvas_interaction() -> None:
     snapshot = AuthoritativeMemorySnapshot.model_validate(
         {
             "ageBand": "middleChildhood",
             "currentSessionSummary": None,
             "deliveredTurns": [
+                {
+                    "turnId": "turn-speech-A",
+                    "inputKind": "speech",
+                    "childText": "speech-A",
+                    "childTextSource": "transcript",
+                    "canvasInteraction": None,
+                    "avaDeliveredText": "speech-response-A",
+                    "deliveredSampleCount": 24_000,
+                    "childTurnSummary": "Speech A.",
+                    "terminal": "completed",
+                },
                 {
                     "turnId": "turn-interaction-context",
                     "inputKind": "canvasInteraction",
@@ -238,24 +249,41 @@ def test_context_renders_canvas_interaction_as_typed_data_not_child_speech() -> 
                         "accessibilityLabel": "target-A label",
                         "stepIndex": 2,
                     },
-                    "avaDeliveredText": "A heard response.",
+                    "avaDeliveredText": "interaction-response-must-not-appear",
                     "deliveredSampleCount": 24_000,
                     "childTurnSummary": "Canvas interaction.",
                     "terminal": "completed",
-                }
+                },
+                {
+                    "turnId": "turn-speech-B",
+                    "inputKind": "speech",
+                    "childText": "speech-B",
+                    "childTextSource": "transcript",
+                    "canvasInteraction": None,
+                    "avaDeliveredText": "speech-response-B",
+                    "deliveredSampleCount": 24_000,
+                    "childTurnSummary": "Speech B.",
+                    "terminal": "completed",
+                },
             ],
             "stableMemories": [],
         }
     )
 
-    context = build_realtime_harness(snapshot).context.content
+    rendered = build_realtime_harness(snapshot).context
 
-    assert 'input_kind="canvasInteraction"' in context
-    assert '<canvas_interaction scene_id="scene-A"' in context
-    assert 'interaction_revision="9"' in context
-    assert 'step_index="2"' in context
-    assert "<target>target-A label</target>" in context
-    assert "<child>" not in context
+    assert rendered.included_delivered_turns == 2
+    assert rendered.omitted_delivered_turns == 1
+    assert 'id="turn-speech-A" input_kind="speech"' in rendered.content
+    assert "<child>speech-A</child>" in rendered.content
+    assert "<ava_delivered>speech-response-A</ava_delivered>" in rendered.content
+    assert 'id="turn-speech-B" input_kind="speech"' in rendered.content
+    assert "<child>speech-B</child>" in rendered.content
+    assert "<ava_delivered>speech-response-B</ava_delivered>" in rendered.content
+    assert "turn-interaction-context" not in rendered.content
+    assert "canvasInteraction" not in rendered.content
+    assert "target-A label" not in rendered.content
+    assert "interaction-response-must-not-appear" not in rendered.content
 
 
 def test_prompt_budget_and_canvas_context_remain_bounded() -> None:
