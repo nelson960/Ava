@@ -1251,7 +1251,13 @@ async def test_cancel_preserves_transcription_progress_for_its_committed_item() 
     assert await channel.child_transcript_for_turn("turn-cancelled") == (
         "Interrupted question."
     )
-    assert [event["type"] for event in socket.sent].count("response.cancel") == 1
+    cancel_events = [
+        event for event in socket.sent if event["type"] == "response.cancel"
+    ]
+    assert len(cancel_events) == 1
+    assert cancel_events[0]["response_id"] == RESPONSE_ID
+    assert isinstance(cancel_events[0]["event_id"], str)
+    assert cancel_events[0]["event_id"].startswith("ava_response_cancel_")
 
 
 @pytest.mark.asyncio
@@ -2350,7 +2356,13 @@ async def test_cancel_before_response_id_is_known_settles_idempotently() -> None
     await channel.cancel(turn_id="turn-cancel-before-created")
     await channel.cancel(turn_id="turn-cancel-before-created")
 
-    assert [event["type"] for event in socket.sent].count("response.cancel") == 1
+    cancel_events = [
+        event for event in socket.sent if event["type"] == "response.cancel"
+    ]
+    assert len(cancel_events) == 1
+    assert set(cancel_events[0]) == {"type", "event_id"}
+    assert isinstance(cancel_events[0]["event_id"], str)
+    assert cancel_events[0]["event_id"].startswith("ava_response_cancel_")
     assert channel._active_turn_id is None
     assert channel._active_response_id is None
 
@@ -2509,6 +2521,7 @@ async def test_child_vad_cancels_pending_interaction_before_next_child_response(
         "turn-child-vad-b"
     )
     assert channel.last_response_id == "resp_child_vad_b"
+    assert not channel._outstanding_cancel_outcomes
 
 
 @pytest.mark.asyncio
@@ -2559,11 +2572,244 @@ async def test_late_cancel_error_arriving_after_next_response_created_is_consume
 
     assert received == [RealtimeSpeechTextDelta(delta="The next turn remains healthy.")]
     assert channel.last_response_id == CONTINUATION_RESPONSE_ID
-    assert channel._late_cancel_error_expected is None
+    assert not channel._outstanding_cancel_outcomes
     assert [event["type"] for event in socket.sent].count("response.cancel") == 1
     assert any(
         record.getMessage().startswith("openai_realtime_late_cancel_error_consumed")
         for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_late_cancel_error_survives_a_complete_later_turn() -> None:
+    later_turn_events = _text_response_events(
+        response_id="resp_later_turn",
+        text="The later turn completes normally.",
+    )
+    subsequent_turn_events = _text_response_events(
+        response_id="resp_subsequent_turn",
+        text="The persistent session remains usable.",
+    )
+    channel, socket = _channel(
+        [
+            {
+                "type": "response.done",
+                "response": {
+                    "id": "resp_cancelled_turn",
+                    "status": "completed",
+                    "output": [],
+                    "usage": _usage(3, 1),
+                },
+            },
+            *later_turn_events,
+        ]
+    )
+    await channel.prepare(harness=_harness())
+    channel._active_turn_id = "turn-cancelled"
+    channel._active_response_id = "resp_cancelled_turn"
+
+    await channel.cancel(turn_id="turn-cancelled")
+    later_received = await _collect_turn_events(channel, turn_id="turn-later")
+
+    assert later_received == [
+        RealtimeSpeechTextDelta(delta="The later turn completes normally.")
+    ]
+    assert [
+        (
+            outcome.cancel_sequence,
+            outcome.cancel_event_id,
+            outcome.cancelled_turn_id,
+            outcome.response_id,
+        )
+        for outcome in channel._outstanding_cancel_outcomes
+    ] == [
+        (
+            1,
+            next(
+                event["event_id"]
+                for event in socket.sent
+                if event["type"] == "response.cancel"
+            ),
+            "turn-cancelled",
+            "resp_cancelled_turn",
+        )
+    ]
+
+    cancel_event = next(
+        event for event in socket.sent if event["type"] == "response.cancel"
+    )
+    socket.push(
+        {
+            "type": "error",
+            "error": {
+                "event_id": cancel_event["event_id"],
+                "code": "response_cancel_not_active",
+                "message": "The earlier response was already complete.",
+            },
+        }
+    )
+    for event in subsequent_turn_events:
+        socket.push(event)
+
+    subsequent_received = await _collect_turn_events(
+        channel,
+        turn_id="turn-subsequent",
+    )
+
+    assert subsequent_received == [
+        RealtimeSpeechTextDelta(delta="The persistent session remains usable.")
+    ]
+    assert channel.last_response_id == "resp_subsequent_turn"
+    assert not channel._outstanding_cancel_outcomes
+    assert [event["type"] for event in socket.sent].count("response.cancel") == 1
+
+
+@pytest.mark.asyncio
+async def test_multiple_cancel_outcomes_do_not_overwrite_each_other() -> None:
+    channel, socket = _channel(
+        [
+            {
+                "type": "response.done",
+                "response": {
+                    "id": "resp_cancel_a",
+                    "status": "completed",
+                    "output": [],
+                    "usage": _usage(3, 1),
+                },
+            },
+            {
+                "type": "response.created",
+                "response": {"id": "resp_cancel_b"},
+            },
+        ]
+    )
+    await channel.prepare(harness=_harness())
+    channel._active_turn_id = "turn-cancel-a"
+    channel._active_response_id = "resp_cancel_a"
+    await channel.cancel(turn_id="turn-cancel-a")
+
+    channel._active_turn_id = "turn-cancel-b"
+    channel._active_response_id = "resp_cancel_b"
+    cancel_b = asyncio.create_task(channel.cancel(turn_id="turn-cancel-b"))
+    await socket.wait_sent(3)
+    cancel_events = [
+        event for event in socket.sent if event["type"] == "response.cancel"
+    ]
+    assert len(cancel_events) == 2
+    assert cancel_events[0]["event_id"] != cancel_events[1]["event_id"]
+    assert [event["response_id"] for event in cancel_events] == [
+        "resp_cancel_a",
+        "resp_cancel_b",
+    ]
+    socket.push(
+        {
+            "type": "error",
+            "error": {
+                "event_id": cancel_events[1]["event_id"],
+                "code": "response_cancel_not_active",
+                "message": "Turn B completed before cancellation.",
+            },
+        }
+    )
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp_cancel_b",
+                "status": "completed",
+                "output": [],
+                "usage": _usage(3, 1),
+            },
+        }
+    )
+    await cancel_b
+
+    assert [
+        (
+            outcome.cancel_sequence,
+            outcome.cancel_event_id,
+            outcome.cancelled_turn_id,
+            outcome.response_id,
+        )
+        for outcome in channel._outstanding_cancel_outcomes
+    ] == [(1, cancel_events[0]["event_id"], "turn-cancel-a", "resp_cancel_a")]
+
+    socket.push(
+        {
+            "type": "error",
+            "error": {
+                "event_id": cancel_events[0]["event_id"],
+                "code": "response_cancel_not_active",
+                "message": "Turn A completed before cancellation.",
+            },
+        }
+    )
+    for event in _text_response_events(
+        response_id="resp_after_two_cancels",
+        text="Both cancellation outcomes were attributed.",
+    ):
+        socket.push(event)
+
+    received = await _collect_turn_events(channel, turn_id="turn-after-cancels")
+
+    assert received == [
+        RealtimeSpeechTextDelta(delta="Both cancellation outcomes were attributed.")
+    ]
+    assert channel.last_response_id == "resp_after_two_cancels"
+    assert not channel._outstanding_cancel_outcomes
+    assert [event["type"] for event in socket.sent].count("response.cancel") == 2
+
+
+@pytest.mark.asyncio
+async def test_cancel_not_active_with_unknown_event_id_is_provider_failure() -> None:
+    channel, socket = _channel(
+        [
+            {
+                "type": "response.done",
+                "response": {
+                    "id": "resp_cancelled_before_unknown_error",
+                    "status": "completed",
+                    "output": [],
+                    "usage": _usage(3, 1),
+                },
+            }
+        ]
+    )
+    await channel.prepare(harness=_harness())
+    channel._active_turn_id = "turn-cancelled-before-unknown-error"
+    channel._active_response_id = "resp_cancelled_before_unknown_error"
+    await channel.cancel(turn_id="turn-cancelled-before-unknown-error")
+    cancel_event = next(
+        event for event in socket.sent if event["type"] == "response.cancel"
+    )
+    assert cancel_event["event_id"] != "unknown_client_event"
+    socket.push(
+        {
+            "type": "error",
+            "error": {
+                "event_id": "unknown_client_event",
+                "code": "response_cancel_not_active",
+                "message": "This error does not belong to Ava's cancellation.",
+            },
+        }
+    )
+
+    with pytest.raises(
+        OpenAIRealtimeUnavailableError,
+        match="code=response_cancel_not_active",
+    ):
+        await anext(
+            channel.stream_turn(
+                harness=_harness(),
+                turn_id="turn-after-unknown-error",
+                text_input="Can we continue?",
+                response_max_output_tokens=400,
+            )
+        )
+
+    assert len(channel._outstanding_cancel_outcomes) == 1
+    assert channel._outstanding_cancel_outcomes[0].cancel_event_id == (
+        cancel_event["event_id"]
     )
 
 

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from time import monotonic
 from typing import Protocol, TypeVar
 from urllib.parse import quote, urlsplit
+from uuid import uuid4
 from xml.sax.saxutils import escape
 
 import httpx
@@ -130,9 +131,14 @@ class _InputTranscriptionOutcome:
 
 
 @dataclass(frozen=True, slots=True)
-class _LateCancelErrorExpectation:
+class _OutstandingCancelOutcome:
+    cancel_event_id: str
+    cancel_sequence: int
     cancelled_turn_id: str
     response_id: str | None
+
+
+_MAX_OUTSTANDING_CANCEL_OUTCOMES = 64
 
 
 class OpenAIRealtimeOutputValidationError(OpenAIRealtimeProtocolError):
@@ -290,7 +296,8 @@ class _OpenAIRealtimeEventChannel:
         self._settled_turn_ids: set[str] = set()
         self._response_owner_by_id: dict[str, str | None] = {}
         self._consumed_terminal_response_owner_by_id: dict[str, str] = {}
-        self._late_cancel_error_expected: _LateCancelErrorExpectation | None = None
+        self._outstanding_cancel_outcomes: list[_OutstandingCancelOutcome] = []
+        self._next_cancel_sequence = 1
         self._prepared_session_update: str | None = None
         self._cancelled_turn_ids: set[str] = set()
         self._pending_canvas_call_id: str | None = None
@@ -902,7 +909,7 @@ class _OpenAIRealtimeEventChannel:
                 response_id=response_id,
                 turn_id=cancelled_turn_id,
             )
-        await self._send_response_cancel(
+        active_cancel_outcome = await self._send_response_cancel(
             turn_id=cancelled_turn_id,
             response_id=response_id,
         )
@@ -914,9 +921,22 @@ class _OpenAIRealtimeEventChannel:
             event_type = _event_type(event)
             if event_type == "error":
                 if _provider_error_code(event) == "response_cancel_not_active":
-                    expectation = self._consume_late_cancel_error_expectation()
-                    if expectation is None:
+                    outcome = self._consume_correlated_cancel_outcome(event)
+                    if outcome is None:
                         raise _provider_error(event)
+                    if outcome.cancel_event_id != active_cancel_outcome.cancel_event_id:
+                        LOGGER.info(
+                            "openai_realtime_late_cancel_error_consumed "
+                            "cancel_event_id=%s cancel_sequence=%d "
+                            "cancelled_turn_id=%s "
+                            "cancelled_response_id=%s consumer_turn_id=%s",
+                            outcome.cancel_event_id,
+                            outcome.cancel_sequence,
+                            outcome.cancelled_turn_id,
+                            outcome.response_id,
+                            cancelled_turn_id,
+                        )
+                        continue
                     if response_id is not None:
                         _log_response_diagnostic(
                             "openai_realtime_cancel_not_active_waiting_for_terminal",
@@ -970,13 +990,13 @@ class _OpenAIRealtimeEventChannel:
                     turn_id=cancelled_turn_id,
                 )
                 self._active_response_id = candidate
-                self._bind_late_cancel_error_expectation_response(
+                self._bind_outstanding_cancel_outcome_response(
                     turn_id=cancelled_turn_id,
                     response_id=candidate,
                 )
                 pending_interaction_create = False
                 if cancel_not_active_before_response_created:
-                    await self._send_response_cancel(
+                    active_cancel_outcome = await self._send_response_cancel(
                         turn_id=cancelled_turn_id,
                         response_id=candidate,
                     )
@@ -1016,10 +1036,14 @@ class _OpenAIRealtimeEventChannel:
                 )
                 self._pending_events.extend(deferred_events)
                 # A completed response may race the cancellation error. Keep
-                # the expectation until that error is consumed, including if
-                # it arrives while reading the next semantic response.
+                # its outcome provenance until that error is consumed,
+                # including across later semantic responses.
                 if status != "completed":
-                    self._late_cancel_error_expected = None
+                    self._resolve_outstanding_cancel_outcome(
+                        turn_id=cancelled_turn_id,
+                        response_id=completed_response_id,
+                        terminal_status=status,
+                    )
                 if self._interaction_response_turn_id == cancelled_turn_id:
                     self._interaction_response_turn_id = None
                 self._active_response_id = None
@@ -1037,6 +1061,10 @@ class _OpenAIRealtimeEventChannel:
                     )
                 response_id = event_response_id
                 self._active_response_id = event_response_id
+                self._bind_outstanding_cancel_outcome_response(
+                    turn_id=cancelled_turn_id,
+                    response_id=event_response_id,
+                )
             if event_type in _PRE_RESPONSE_EVENT_TYPES:
                 deferred_events.append(event)
                 continue
@@ -1486,15 +1514,18 @@ class _OpenAIRealtimeEventChannel:
                     )
                 if event_type == "error":
                     if _provider_error_code(event) == "response_cancel_not_active":
-                        expectation = self._consume_late_cancel_error_expectation()
-                        if expectation is None:
+                        outcome = self._consume_correlated_cancel_outcome(event)
+                        if outcome is None:
                             raise _provider_error(event)
                         LOGGER.info(
                             "openai_realtime_late_cancel_error_consumed "
-                            "cancelled_turn_id=%s cancelled_response_id=%s "
-                            "consumer_turn_id=%s",
-                            expectation.cancelled_turn_id,
-                            expectation.response_id,
+                            "cancel_event_id=%s cancel_sequence=%d "
+                            "cancelled_turn_id=%s "
+                            "cancelled_response_id=%s consumer_turn_id=%s",
+                            outcome.cancel_event_id,
+                            outcome.cancel_sequence,
+                            outcome.cancelled_turn_id,
+                            outcome.response_id,
                             turn_id,
                         )
                         continue
@@ -1908,7 +1939,6 @@ class _OpenAIRealtimeEventChannel:
                     self.last_completed_ms = (monotonic() - trigger_started) * 1000
                     if self._interaction_response_turn_id == turn_id:
                         self._interaction_response_turn_id = None
-                    self._expire_late_cancel_error_expectation(turn_id=turn_id)
                     return
 
                 if event_type in _RESPONSE_TRIGGER_EVENT_TYPES:
@@ -1926,50 +1956,96 @@ class _OpenAIRealtimeEventChannel:
         *,
         turn_id: str,
         response_id: str | None,
-    ) -> None:
-        await self._send_json({"type": "response.cancel"})
-        self._late_cancel_error_expected = _LateCancelErrorExpectation(
+    ) -> _OutstandingCancelOutcome:
+        if len(self._outstanding_cancel_outcomes) >= _MAX_OUTSTANDING_CANCEL_OUTCOMES:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI cancellation outcome provenance exhausted its bounded capacity"
+            )
+        cancel_event_id = f"ava_response_cancel_{uuid4().hex}"
+        cancel_event: dict[str, object] = {
+            "type": "response.cancel",
+            "event_id": cancel_event_id,
+        }
+        if response_id is not None:
+            cancel_event["response_id"] = response_id
+        await self._send_json(cancel_event)
+        outcome = _OutstandingCancelOutcome(
+            cancel_event_id=cancel_event_id,
+            cancel_sequence=self._next_cancel_sequence,
             cancelled_turn_id=turn_id,
             response_id=response_id,
         )
+        self._next_cancel_sequence += 1
+        self._outstanding_cancel_outcomes.append(outcome)
+        return outcome
 
-    def _bind_late_cancel_error_expectation_response(
+    def _bind_outstanding_cancel_outcome_response(
         self,
         *,
         turn_id: str,
         response_id: str,
     ) -> None:
-        expectation = self._late_cancel_error_expected
-        if expectation is None or expectation.cancelled_turn_id != turn_id:
-            return
-        if expectation.response_id is not None and expectation.response_id != response_id:
-            raise OpenAIRealtimeProtocolError(
-                "OpenAI cancellation response ID changed before terminal status"
+        for index in range(len(self._outstanding_cancel_outcomes) - 1, -1, -1):
+            outcome = self._outstanding_cancel_outcomes[index]
+            if outcome.cancelled_turn_id != turn_id:
+                continue
+            if outcome.response_id == response_id:
+                return
+            if outcome.response_id is not None:
+                raise OpenAIRealtimeProtocolError(
+                    "OpenAI cancellation response ID changed before terminal status"
+                )
+            self._outstanding_cancel_outcomes[index] = _OutstandingCancelOutcome(
+                cancel_event_id=outcome.cancel_event_id,
+                cancel_sequence=outcome.cancel_sequence,
+                cancelled_turn_id=turn_id,
+                response_id=response_id,
             )
-        self._late_cancel_error_expected = _LateCancelErrorExpectation(
-            cancelled_turn_id=turn_id,
-            response_id=response_id,
-        )
-
-    def _consume_late_cancel_error_expectation(
-        self,
-    ) -> _LateCancelErrorExpectation | None:
-        expectation = self._late_cancel_error_expected
-        self._late_cancel_error_expected = None
-        return expectation
-
-    def _expire_late_cancel_error_expectation(self, *, turn_id: str) -> None:
-        expectation = self._late_cancel_error_expected
-        if expectation is None or expectation.cancelled_turn_id == turn_id:
             return
-        self._late_cancel_error_expected = None
-        LOGGER.info(
-            "openai_realtime_late_cancel_error_expired cancelled_turn_id=%s "
-            "cancelled_response_id=%s completed_turn_id=%s",
-            expectation.cancelled_turn_id,
-            expectation.response_id,
-            turn_id,
-        )
+
+    def _consume_correlated_cancel_outcome(
+        self,
+        event: Mapping[str, object],
+    ) -> _OutstandingCancelOutcome | None:
+        error = _mapping(event.get("error"), "provider error")
+        if "event_id" not in error:
+            if len(self._outstanding_cancel_outcomes) != 1:
+                return None
+            return self._outstanding_cancel_outcomes.pop()
+        cancel_event_id = error.get("event_id")
+        if not isinstance(cancel_event_id, str) or not cancel_event_id:
+            return None
+        for index, outcome in enumerate(self._outstanding_cancel_outcomes):
+            if outcome.cancel_event_id != cancel_event_id:
+                continue
+            return self._outstanding_cancel_outcomes.pop(index)
+        return None
+
+    def _resolve_outstanding_cancel_outcome(
+        self,
+        *,
+        turn_id: str,
+        response_id: str,
+        terminal_status: str,
+    ) -> None:
+        for index, outcome in enumerate(self._outstanding_cancel_outcomes):
+            if outcome.cancelled_turn_id != turn_id:
+                continue
+            if outcome.response_id not in {None, response_id}:
+                continue
+            self._outstanding_cancel_outcomes.pop(index)
+            LOGGER.info(
+                "openai_realtime_cancel_outcome_resolved cancel_event_id=%s "
+                "cancel_sequence=%d "
+                "cancelled_turn_id=%s cancelled_response_id=%s "
+                "terminal_status=%s",
+                outcome.cancel_event_id,
+                outcome.cancel_sequence,
+                outcome.cancelled_turn_id,
+                response_id,
+                terminal_status,
+            )
+            return
 
     async def _send_json(self, payload: Mapping[str, object]) -> None:
         if self._closed:
