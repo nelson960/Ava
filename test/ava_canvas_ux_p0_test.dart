@@ -183,8 +183,8 @@ void main() {
 
     await tester.pumpWidget(buildPanel());
 
-    // 1. Placeholder is shown above renderer, AvaSvgCanvasView is also mounted underneath
-    expect(find.text('Ava is drawing…'), findsOneWidget);
+    // 1. Working label is shown at top-left, AvaSvgCanvasView is mounted underneath
+    expect(find.text('Drawing…'), findsOneWidget);
     expect(find.byType(CircularProgressIndicator), findsOneWidget);
     expect(find.byType(AvaSvgCanvasView), findsOneWidget);
     expect(find.byIcon(CupertinoIcons.xmark_circle_fill), findsOneWidget);
@@ -203,8 +203,8 @@ void main() {
         .receiveDraftAvailable(_draftEvent(documentA, 1, firstBytes));
     await tester.pumpWidget(buildPanel());
 
-    // 2. Placeholder is gone, draft is visible, renderer instance is the SAME
-    expect(find.text('Ava is drawing…'), findsNothing);
+    // 2. Draft is visible, working label updates to finishing, renderer instance is the SAME
+    expect(find.text('Finishing drawing…'), findsOneWidget);
     expect(find.byType(AvaSvgCanvasView), findsOneWidget);
 
     final viewAfter = tester.widget<AvaSvgCanvasView>(

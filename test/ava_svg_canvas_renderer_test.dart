@@ -118,7 +118,22 @@ void main() {
     expect(html, contains("attribute.localName === 'href'"));
     expect(html, contains("attribute.name === 'xlink:href'"));
     expect(html, contains("'marker-start','marker-mid','marker-end'"));
-    expect(html, contains('target.host.replaceChildren(frame)'));
+    expect(
+      html,
+      contains(
+        'if (previousFrame && previousFrame !== frame) previousFrame.remove()',
+      ),
+    );
+    expect(
+      html,
+      contains('if (previousBlobUrl) URL.revokeObjectURL(previousBlobUrl)'),
+    );
+    expect(html, isNot(contains('target.host.replaceChildren(frame)')));
+    expect(html, contains('isVisibleGeometryValid'));
+    expect(html, contains('isDocumentScopeValid'));
+    expect(html, contains("new Error('documentScopeLoadTimeout')"));
+    expect(html, contains("diagnose(operation + '.iframeTimeout', identity)"));
+    expect(html, contains('clearTimeout(timeout)'));
     expect(
         html, contains('const previousActive = active; active = candidate;'));
     expect(html, isNot(contains("document.querySelector('#")));

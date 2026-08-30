@@ -92,7 +92,8 @@ body{background:transparent}
 (() => {
   'use strict';
   const bridge = (name, value) => window.flutter_inappwebview.callHandler(name, value);
-  const fail = (code, identity) => bridge('$errorHandler', {code, generationId:identity.generationId});
+  const diagnose = (stage, identity) => console.debug('avaCanvas|' + stage + '|' + ((identity && identity.generationId) || 'none'));
+  const fail = (code, identity) => { diagnose('rendererError.' + code, identity); return bridge('$errorHandler', {code, generationId:identity.generationId}); };
   const layer = (id) => {
     const root = document.getElementById(id);
     return {root, host:root.querySelector('.ava-host'), overlay:root.querySelector('.ava-overlay'), identity:null, runtime:null, frame:null, document:null, svg:null, blobUrl:null};
@@ -133,16 +134,46 @@ body{background:transparent}
       if (!resolved || !svg.contains(resolved)) throw new Error('localReferenceScopeMismatch');
     }
   };
-  const mountScopedDocument = async (target, encoded) => {
+  const isDocumentScopeValid = (target) => {
+    return Boolean(
+      target &&
+      target.frame &&
+      target.frame.isConnected &&
+      target.document &&
+      target.document.body &&
+      target.svg &&
+      target.document.body.contains(target.svg)
+    );
+  };
+  const isVisibleGeometryValid = (target) => {
+    if (!isDocumentScopeValid(target)) return false;
+    const frameRect = target.frame.getBoundingClientRect();
+    if (!frameRect || frameRect.width <= 0 || frameRect.height <= 0) return false;
+    const svgRect = target.svg.getBoundingClientRect();
+    return Boolean(svgRect && svgRect.width > 0 && svgRect.height > 0);
+  };
+  const mountScopedDocument = async (target, encoded, identity, operation) => {
     const parsedSvg = parseSvg(encoded);
     const blobUrl = URL.createObjectURL(new Blob([frameShell], {type:'text/html'}));
     const frame = document.createElement('iframe');
     frame.className = 'ava-document'; frame.setAttribute('sandbox', 'allow-same-origin');
     frame.style.visibility = 'hidden'; frame.src = blobUrl;
     const loaded = new Promise((resolve, reject) => {
-      frame.addEventListener('load', resolve, {once:true});
-      frame.addEventListener('error', () => reject(new Error('documentScopeLoad')), {once:true});
+      let settled = false;
+      const finish = (callback) => {
+        if (settled) return;
+        settled = true; clearTimeout(timeout); callback();
+      };
+      const timeout = setTimeout(() => {
+        diagnose(operation + '.iframeTimeout', identity);
+        finish(() => reject(new Error('documentScopeLoadTimeout')));
+      }, 5000);
+      frame.addEventListener('load', () => finish(() => { diagnose(operation + '.iframeLoad', identity); resolve(); }), {once:true});
+      frame.addEventListener('error', () => finish(() => { diagnose(operation + '.iframeError', identity); reject(new Error('documentScopeLoad')); }), {once:true});
     });
+    diagnose(operation + '.iframeCreated', identity);
+    const previousFrame = target.frame;
+    const previousBlobUrl = target.blobUrl;
     target.host.appendChild(frame);
     try {
       await loaded;
@@ -151,8 +182,8 @@ body{background:transparent}
       const svg = scopedDocument.importNode(parsedSvg, true);
       scopedDocument.body.replaceChildren(svg);
       verifyScopedReferences(scopedDocument, svg);
-      const previousBlobUrl = target.blobUrl;
-      target.host.replaceChildren(frame); frame.style.visibility = '';
+      if (previousFrame && previousFrame !== frame) previousFrame.remove();
+      frame.style.visibility = '';
       if (previousBlobUrl) URL.revokeObjectURL(previousBlobUrl);
       target.frame = frame; target.document = scopedDocument; target.svg = svg; target.blobUrl = blobUrl;
       return svg;
@@ -179,7 +210,7 @@ body{background:transparent}
   };
   const installDocument = async (target, payload) => {
     const manifest = JSON.parse(decodeUtf8(payload.manifestBase64));
-    const svg = await mountScopedDocument(target, payload.svgBase64);
+    const svg = await mountScopedDocument(target, payload.svgBase64, payload.identity, 'candidate');
     target.overlay.replaceChildren();
     target.identity = payload.identity;
     target.root.style.background = manifest.background || 'transparent';
@@ -276,22 +307,42 @@ body{background:transparent}
   };
   window.avaCanvas = {
     replaceDraft(payload) {
+      diagnose('replaceDraft.entered', payload.identity);
       return enqueueOperation(async () => {
         try {
+          diagnose('replaceDraft.operationStarted', payload.identity);
           if (payload.authoritative !== false || payload.interactive !== false) throw new Error('draftAuthority');
-          await mountScopedDocument(draft, payload.svgBase64);
+          await mountScopedDocument(draft, payload.svgBase64, payload.identity, 'draft');
           draft.identity = payload.identity; draft.runtime = null;
           showOnly(draft);
-          requestAnimationFrame(() => requestAnimationFrame(() => bridge('$draftPresentedHandler', payload.identity)));
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            if (!isVisibleGeometryValid(draft)) {
+              fail('draftViabilityFailed', payload.identity);
+              return;
+            }
+            diagnose('draftPresented.bridgeSent', payload.identity);
+            bridge('$draftPresentedHandler', payload.identity);
+          }));
           return true;
         } catch (_) { fail('draftReplacementFailed', payload.identity); return false; }
       });
     },
     mountCandidate(payload) {
+      diagnose('mountCandidate.entered', payload.identity);
       return enqueueOperation(async () => {
         try {
-          await installDocument(candidate, payload); candidate.root.classList.remove('ava-visible');
-          requestAnimationFrame(() => requestAnimationFrame(() => bridge('$preparedHandler', payload.identity)));
+          diagnose('mountCandidate.operationStarted', payload.identity);
+          await installDocument(candidate, payload);
+          candidate.root.classList.remove('ava-visible');
+          if (!isDocumentScopeValid(candidate)) throw new Error('candidateScopeInvalid');
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            if (!isDocumentScopeValid(candidate)) {
+              fail('rendererPreparationFailed', payload.identity);
+              return;
+            }
+            diagnose('prepared.bridgeSent', payload.identity);
+            bridge('$preparedHandler', payload.identity);
+          }));
           return true;
         } catch (_) { fail('rendererPreparationFailed', payload.identity); return false; }
       });
@@ -299,7 +350,11 @@ body{background:transparent}
     mountActive(payload, interactive) {
       return enqueueOperation(async () => {
         try {
-          await installDocument(active, payload); active.overlay.classList.toggle('ava-interactive', interactive === true); showOnly(active); return true;
+          await installDocument(active, payload);
+          active.overlay.classList.toggle('ava-interactive', interactive === true);
+          showOnly(active);
+          if (!isDocumentScopeValid(active)) throw new Error('activeScopeInvalid');
+          return true;
         } catch (_) { fail('activeMountFailed', payload.identity); return false; }
       });
     },
@@ -308,7 +363,14 @@ body{background:transparent}
         if (!same(candidate.identity, identity)) { fail('candidatePresentationIdentityMismatch', identity); return false; }
         showOnly(candidate);
         if (candidate.runtime) candidate.runtime.queueRebuild();
-        requestAnimationFrame(() => requestAnimationFrame(() => bridge('$presentedHandler', identity)));
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          if (!isVisibleGeometryValid(candidate)) {
+            fail('candidatePresentationViabilityFailed', identity);
+            return;
+          }
+          diagnose('presented.bridgeSent', identity);
+          bridge('$presentedHandler', identity);
+        }));
         return true;
       });
     },
@@ -319,7 +381,9 @@ body{background:transparent}
         clearLayer(candidate);
         active.overlay.classList.toggle('ava-interactive', interactive === true);
         clearLayer(draft);
-        showOnly(active); return true;
+        showOnly(active);
+        if (!isDocumentScopeValid(active)) { fail('activeActivationViabilityFailed', identity); return false; }
+        return true;
       });
     },
     setActiveInteractive(generationId, interactive) {

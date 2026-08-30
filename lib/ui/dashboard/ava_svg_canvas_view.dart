@@ -39,6 +39,7 @@ final class AvaSvgCanvasView extends StatefulWidget {
     required this.onCandidateFirstFramePresented,
     required this.onBinding,
     required this.onError,
+    this.rendererOperationTimeout = const Duration(seconds: 7),
   });
 
   final AvaValidatedSvgCanvasDocument? activeDocument;
@@ -52,6 +53,7 @@ final class AvaSvgCanvasView extends StatefulWidget {
       onCandidateFirstFramePresented;
   final ValueChanged<AvaSvgInteractionBinding> onBinding;
   final AvaSvgCanvasRendererErrorHandler onError;
+  final Duration rendererOperationTimeout;
 
   @override
   State<AvaSvgCanvasView> createState() => _AvaSvgCanvasViewState();
@@ -74,9 +76,15 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
   final List<_DraftRendererIdentity> _issuedDraftIdentities = [];
   final List<_CandidateRendererIdentity> _issuedPreparedIdentities = [];
   final List<_CandidateRendererIdentity> _issuedPresentedIdentities = [];
+  final Map<_DraftRendererIdentity, Completer<String?>> _draftSettlements = {};
+  final Map<_CandidateRendererIdentity, Completer<String?>>
+      _candidatePreparationSettlements = {};
+  final Map<_CandidateRendererIdentity, Completer<String?>>
+      _candidatePresentationSettlements = {};
   String? _mountedCandidateGenerationId;
   String? _presentedCandidateGenerationId;
   bool? _activeInteractive;
+  int _syncRevision = 0;
 
   @override
   void initState() {
@@ -153,23 +161,38 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
         ),
         onWebViewCreated: _onWebViewCreated,
         onLoadStop: (_, __) {
+          _diagnose('shell.loadStop');
           _runtimeReady = true;
+          _diagnose('runtime.ready');
           unawaited(_queueSync());
         },
         shouldOverrideUrlLoading: (_, action) async {
-          final value = action.request.url?.toString();
-          return value == null || value == 'about:blank'
-              ? NavigationActionPolicy.ALLOW
-              : NavigationActionPolicy.CANCEL;
+          final url = action.request.url;
+          final value = url?.toString();
+          final appOwnedDocumentScope =
+              !action.isForMainFrame && url?.scheme == 'blob';
+          final policy =
+              value == null || value == 'about:blank' || appOwnedDocumentScope
+                  ? NavigationActionPolicy.ALLOW
+                  : NavigationActionPolicy.CANCEL;
+          _diagnose(
+            'navigation.${policy == NavigationActionPolicy.ALLOW ? 'allowed' : 'cancelled'}',
+            navigationScheme: url?.scheme,
+            isMainFrame: action.isForMainFrame,
+          );
+          return policy;
         },
-        shouldInterceptRequest: (_, __) async => WebResourceResponse(
-          contentType: 'text/plain',
-          contentEncoding: 'utf-8',
-          data: Uint8List(0),
-          statusCode: 403,
-          reasonPhrase: 'Forbidden',
-          headers: const {'Cache-Control': 'no-store'},
-        ),
+        shouldInterceptRequest: (_, request) async {
+          if (request.url.scheme == 'blob') return null;
+          return WebResourceResponse(
+            contentType: 'text/plain',
+            contentEncoding: 'utf-8',
+            data: Uint8List(0),
+            statusCode: 403,
+            reasonPhrase: 'Forbidden',
+            headers: const {'Cache-Control': 'no-store'},
+          );
+        },
         onReceivedError: (_, request, error) {
           if (request.isForMainFrame == true) {
             widget.onError(
@@ -178,13 +201,20 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
           }
         },
         onWebContentProcessDidTerminate: (_) {
+          _diagnose('webContentProcess.terminated');
           widget.onError('SVG renderer process terminated.');
+        },
+        onConsoleMessage: (_, message) {
+          if (message.message.startsWith('avaCanvas|')) {
+            _diagnose('javascript.${message.message}');
+          }
         },
       ),
     );
   }
 
   void _onWebViewCreated(InAppWebViewController controller) {
+    _diagnose('webView.created');
     _controller = controller;
     controller.addJavaScriptHandler(
       handlerName: _preparedHandler,
@@ -192,6 +222,7 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
         arguments,
         label: 'prepared',
         issuedIdentities: _issuedPreparedIdentities,
+        settlements: _candidatePreparationSettlements,
         callback: widget.onCandidatePrepared,
       ),
     );
@@ -201,12 +232,14 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
         arguments,
         label: 'presented',
         issuedIdentities: _issuedPresentedIdentities,
+        settlements: _candidatePresentationSettlements,
         callback: widget.onCandidateFirstFramePresented,
       ),
     );
     controller.addJavaScriptHandler(
       handlerName: _draftPresentedHandler,
       callback: (arguments) {
+        _diagnose('draftPresented.bridgeReceived');
         try {
           final message = AvaSvgRendererBridgeMessage.fromArguments(arguments);
           _requireExactFields(
@@ -225,6 +258,7 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
               'SVG renderer reported a draft that was never issued.',
             );
           }
+          if (!_settle(_draftSettlements, identity)) return true;
           final draft = widget.draft;
           if (draft == null || _draftIdentity(draft) != identity) return true;
           widget.onDraftPresented(draft);
@@ -272,6 +306,7 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
     controller.addJavaScriptHandler(
       handlerName: _errorHandler,
       callback: (arguments) {
+        _diagnose('rendererError.bridgeReceived');
         try {
           final message = AvaSvgRendererBridgeMessage.fromArguments(arguments);
           _requireExactFields(
@@ -282,10 +317,13 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
           final code = message.requiredString('code', maximum: 80);
           final generationId =
               message.requiredString('generationId', maximum: 64);
-          widget.onError(
-            'SVG renderer rejected the operation ($code).',
-            generationId: generationId,
-          );
+          final settled = _settleGenerationFailure(generationId, code);
+          if (!settled) {
+            widget.onError(
+              'SVG renderer rejected the operation ($code).',
+              generationId: generationId,
+            );
+          }
           return true;
         } on FormatException catch (error) {
           widget.onError(error.message);
@@ -299,8 +337,10 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
     List<dynamic> arguments, {
     required String label,
     required List<_CandidateRendererIdentity> issuedIdentities,
+    required Map<_CandidateRendererIdentity, Completer<String?>> settlements,
     required ValueChanged<AvaValidatedSvgCanvasDocument> callback,
   }) {
+    _diagnose('$label.bridgeReceived');
     try {
       final message = AvaSvgRendererBridgeMessage.fromArguments(arguments);
       _requireExactFields(
@@ -318,6 +358,7 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
           'SVG renderer $label identity was never issued.',
         );
       }
+      if (!_settle(settlements, identity)) return true;
       final candidate = widget.candidate;
       if (candidate == null || _candidateIdentity(candidate) != identity) {
         return true;
@@ -331,12 +372,30 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
   }
 
   Future<void> _queueSync() {
-    _operationTail = _operationTail.then((_) => _syncRenderer()).catchError(
+    final revision = ++_syncRevision;
+    _diagnose('queueSync.enqueued', syncRevision: revision);
+    _operationTail = _operationTail.then((_) async {
+      _diagnose('queueSync.started', syncRevision: revision);
+      await _syncRenderer();
+      _diagnose('queueSync.completed', syncRevision: revision);
+    }).catchError(
       (Object error) {
+        _diagnose(
+          'queueSync.failed',
+          syncRevision: revision,
+          failureType: error.runtimeType.toString(),
+        );
         if (mounted) {
-          widget.onError(
-            'SVG renderer operation failed (${error.runtimeType}).',
-          );
+          if (error case final _AvaSvgRendererOperationFailure failure) {
+            widget.onError(
+              failure.message,
+              generationId: failure.generationId,
+            );
+          } else {
+            widget.onError(
+              'SVG renderer operation failed (${error.runtimeType}).',
+            );
+          }
         }
       },
     );
@@ -389,7 +448,25 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
     final draftIdentity = draft == null ? null : _draftIdentity(draft);
     if (draft != null && _visibleDraftIdentity != draftIdentity) {
       _rememberIssued(_issuedDraftIdentities, draftIdentity!);
-      await _evaluate(controller, _renderer.replaceDraftScript(draft));
+      _diagnose(
+        'draftSync.started',
+        generationId: draftIdentity.generationId,
+        draftIndex: draftIdentity.draftIndex,
+      );
+      await _evaluateUntilBridge(
+        controller: controller,
+        source: _renderer.replaceDraftScript(draft),
+        settlements: _draftSettlements,
+        identity: draftIdentity,
+        operation: 'draft replacement',
+        diagnosticStage: 'draftSync',
+        generationId: draftIdentity.generationId,
+      );
+      _diagnose(
+        'draftSync.settled',
+        generationId: draftIdentity.generationId,
+        draftIndex: draftIdentity.draftIndex,
+      );
       _visibleDraftIdentity = draftIdentity;
     }
 
@@ -400,7 +477,24 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
         _issuedPreparedIdentities,
         _candidateIdentity(candidate),
       );
-      await _evaluate(controller, _renderer.mountCandidateScript(candidate));
+      _diagnose(
+        'candidateSync.started',
+        generationId: candidate.descriptor.generationId,
+      );
+      final identity = _candidateIdentity(candidate);
+      await _evaluateUntilBridge(
+        controller: controller,
+        source: _renderer.mountCandidateScript(candidate),
+        settlements: _candidatePreparationSettlements,
+        identity: identity,
+        operation: 'candidate preparation',
+        diagnosticStage: 'candidateSync',
+        generationId: identity.generationId,
+      );
+      _diagnose(
+        'candidateSync.settled',
+        generationId: candidate.descriptor.generationId,
+      );
       _mountedCandidateGenerationId = candidate.descriptor.generationId;
       _presentedCandidateGenerationId = null;
     }
@@ -411,9 +505,15 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
         _issuedPresentedIdentities,
         _candidateIdentity(candidate),
       );
-      await _evaluate(
-        controller,
-        _renderer.presentCandidateScript(candidate),
+      final identity = _candidateIdentity(candidate);
+      await _evaluateUntilBridge(
+        controller: controller,
+        source: _renderer.presentCandidateScript(candidate),
+        settlements: _candidatePresentationSettlements,
+        identity: identity,
+        operation: 'candidate presentation',
+        diagnosticStage: 'candidatePresentationSync',
+        generationId: identity.generationId,
       );
       _presentedCandidateGenerationId = candidate.descriptor.generationId;
       _visibleDraftIdentity = null;
@@ -448,6 +548,110 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
   ) async {
     await controller.evaluateJavascript(source: source);
   }
+
+  Future<void> _evaluateUntilBridge<T>({
+    required InAppWebViewController controller,
+    required String source,
+    required Map<T, Completer<String?>> settlements,
+    required T identity,
+    required String operation,
+    required String diagnosticStage,
+    required String generationId,
+  }) async {
+    if (settlements.containsKey(identity)) {
+      throw StateError('SVG renderer $operation was already issued.');
+    }
+    final completer = Completer<String?>();
+    settlements[identity] = completer;
+    try {
+      await (() async {
+        await _evaluate(controller, source);
+        _diagnose(
+          '$diagnosticStage.evaluateReturned',
+          generationId: generationId,
+        );
+        final failureCode = await completer.future;
+        if (failureCode != null) {
+          throw _AvaSvgRendererOperationFailure(
+            generationId: generationId,
+            message: 'SVG renderer rejected $operation ($failureCode).',
+          );
+        }
+      })()
+          .timeout(
+        widget.rendererOperationTimeout,
+        onTimeout: () => throw _AvaSvgRendererOperationFailure(
+          generationId: generationId,
+          message: 'SVG renderer $operation did not settle in time.',
+        ),
+      );
+    } finally {
+      if (identical(settlements[identity], completer)) {
+        settlements.remove(identity);
+      }
+    }
+  }
+
+  bool _settle<T>(
+    Map<T, Completer<String?>> settlements,
+    T identity, [
+    String? failureCode,
+  ]) {
+    final completer = settlements[identity];
+    if (completer == null || completer.isCompleted) return false;
+    completer.complete(failureCode);
+    return true;
+  }
+
+  bool _settleGenerationFailure(String generationId, String failureCode) {
+    var settled = false;
+    for (final entry in _draftSettlements.entries.toList(growable: false)) {
+      if (entry.key.generationId == generationId) {
+        settled = _settle(_draftSettlements, entry.key, failureCode) || settled;
+      }
+    }
+    for (final settlements in [
+      _candidatePreparationSettlements,
+      _candidatePresentationSettlements,
+    ]) {
+      for (final entry in settlements.entries.toList(growable: false)) {
+        if (entry.key.generationId == generationId) {
+          settled = _settle(settlements, entry.key, failureCode) || settled;
+        }
+      }
+    }
+    return settled;
+  }
+
+  void _diagnose(
+    String stage, {
+    String? generationId,
+    int? draftIndex,
+    int? syncRevision,
+    String? failureType,
+    String? navigationScheme,
+    bool? isMainFrame,
+  }) {
+    debugPrint(
+      'ava_svg_renderer stage=$stage'
+      '${generationId == null ? '' : ' generation_id=$generationId'}'
+      '${draftIndex == null ? '' : ' draft_index=$draftIndex'}'
+      '${syncRevision == null ? '' : ' sync_revision=$syncRevision'}'
+      '${failureType == null ? '' : ' failure_type=$failureType'}'
+      '${navigationScheme == null ? '' : ' navigation_scheme=$navigationScheme'}'
+      '${isMainFrame == null ? '' : ' is_main_frame=$isMainFrame'}',
+    );
+  }
+}
+
+final class _AvaSvgRendererOperationFailure implements Exception {
+  const _AvaSvgRendererOperationFailure({
+    required this.generationId,
+    required this.message,
+  });
+
+  final String generationId;
+  final String message;
 }
 
 _DraftRendererIdentity _draftIdentity(AvaValidatedSvgCanvasDraft draft) => (
