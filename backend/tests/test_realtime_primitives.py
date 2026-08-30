@@ -32,6 +32,18 @@ async def test_streaming_speech_parser_is_fragmentation_independent() -> None:
         assert [phrase.speech for phrase in emitted] == expected
 
 
+def test_streaming_speech_parser_allows_more_than_legacy_phrase_limit() -> None:
+    speech = " ".join(f"Thought {index}." for index in range(1, 14))
+    parser = StreamingSpeechParser()
+
+    emitted = list(parser.feed(speech))
+    emitted.extend(parser.finish())
+
+    assert [phrase.speech for phrase in emitted] == [
+        f"Thought {index}." for index in range(1, 14)
+    ]
+
+
 def test_streaming_speech_parser_safely_splits_one_long_phrase() -> None:
     speech = ("gentle words " * 58).strip()
     parser = StreamingSpeechParser(max_total_characters=1_000)
@@ -59,6 +71,12 @@ def test_streaming_speech_parser_preserves_response_boundaries() -> None:
 def test_streaming_speech_parser_rejects_invalid_streams() -> None:
     with pytest.raises(StreamingTurnParseError, match="control"):
         StreamingSpeechParser().feed("hello\u0000")
+
+    with pytest.raises(StreamingTurnParseError, match="1800"):
+        StreamingSpeechParser().feed("word " * 360 + "x")
+
+    with pytest.raises(StreamingTurnParseError, match="600 characters"):
+        StreamingSpeechParser().feed("x" * 601)
 
     parser = StreamingSpeechParser(max_total_characters=10, max_segment_characters=10)
     with pytest.raises(StreamingTurnParseError, match="1800"):

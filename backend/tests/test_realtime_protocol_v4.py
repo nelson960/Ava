@@ -13,11 +13,13 @@ from ava_backend.realtime.events_v4 import (
     AvaSessionBootstrapV4,
     CanvasActivatedEventV4,
     CanvasDocumentAvailableEventV4,
+    CanvasDraftAvailableEventV4,
     CanvasGenerationRejectionCode,
     CanvasGenerationStartedEventV4,
     CanvasDocumentPreparedEventV4,
     CanvasInteractionEventV4,
     CanvasPresentedEventV4,
+    CanvasRenderProfileUpdatedEventV4,
     CanvasRejectedEventV4,
     InterruptRequestedEventV4,
     serialize_server_event_v4,
@@ -126,6 +128,19 @@ def test_shared_generation_started_fixture_round_trips() -> None:
     assert json.loads(serialize_server_event_v4(event)) == payload
 
 
+def test_shared_visible_draft_fixture_has_no_scene_or_manifest_authority() -> None:
+    payload = _load("ava_realtime_canvas_draft_v4.json")
+
+    event = AVA_SERVER_EVENT_ADAPTER_V4.validate_python(payload)
+
+    assert isinstance(event, CanvasDraftAvailableEventV4)
+    assert event.authoritative is False
+    assert event.interactive is False
+    assert not hasattr(event, "scene_id")
+    assert not hasattr(event, "manifest_sha256")
+    assert json.loads(serialize_server_event_v4(event)) == payload
+
+
 def test_client_canvas_lifecycle_fixtures_are_session_scoped() -> None:
     payloads = _load("ava_realtime_canvas_client_events_v4.json")
     assert isinstance(payloads, list)
@@ -136,6 +151,49 @@ def test_client_canvas_lifecycle_fixtures_are_session_scoped() -> None:
     assert isinstance(events[2], CanvasPresentedEventV4)
     assert isinstance(events[3], CanvasInteractionEventV4)
     assert all("turnId" not in payload for payload in payloads[1:])
+
+
+def test_canvas_render_profile_update_is_strict_and_session_scoped() -> None:
+    profile: dict[str, object] = {
+        "usableAspectRatio": 1.6,
+        "orientation": "landscape",
+        "widthClass": "regular",
+        "heightClass": "compact",
+        "safeInsets": {
+            "top": 0.02,
+            "right": 0.03,
+            "bottom": 0.04,
+            "left": 0.03,
+        },
+        "touchEnvironment": "direct",
+        "minimumInteractionTargetPoints": 44.0,
+        "textScaleFactor": 1.15,
+    }
+    payload: dict[str, object] = {
+        "protocolVersion": 4,
+        "event": "canvasRenderProfileUpdated",
+        "sessionId": "session-1234",
+        "sequence": 4,
+        "profileRevision": 7,
+        "renderProfile": profile,
+    }
+
+    event = AVA_CLIENT_EVENT_ADAPTER_V4.validate_python(payload)
+
+    assert isinstance(event, CanvasRenderProfileUpdatedEventV4)
+    assert event.profile_revision == 7
+    assert event.render_profile.usable_aspect_ratio == 1.6
+    with pytest.raises(ValidationError):
+        AVA_CLIENT_EVENT_ADAPTER_V4.validate_python(
+            {
+                **payload,
+                "profileRevision": 6,
+                "renderProfile": {
+                    **profile,
+                    "orientation": "portrait",
+                },
+            }
+        )
 
 
 def test_canvas_prepared_cannot_be_confused_with_presented() -> None:
@@ -204,8 +262,7 @@ def test_canvas_generation_limit_is_a_structured_v4_rejection() -> None:
 
     assert isinstance(event, CanvasRejectedEventV4)
     assert (
-        event.rejection_code
-        == CanvasGenerationRejectionCode.GENERATION_LIMIT_EXCEEDED
+        event.rejection_code == CanvasGenerationRejectionCode.GENERATION_LIMIT_EXCEEDED
     )
 
 
@@ -240,9 +297,7 @@ def test_v4_interrupt_request_is_turn_and_stream_bound() -> None:
     assert json.loads(serialize_server_event_v4(event)) == payload
 
 
-def test_v4_turn_state_machine_accepts_synthesizing_interrupt_after_metadata() -> (
-    None
-):
+def test_v4_turn_state_machine_accepts_synthesizing_interrupt_after_metadata() -> None:
     payloads = _speech_turn_payloads()
     machine = RealtimeTurnStateMachine()
     for payload in payloads[:7]:

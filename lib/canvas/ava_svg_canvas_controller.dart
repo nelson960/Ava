@@ -15,6 +15,21 @@ enum AvaSvgCanvasCandidatePhase {
   awaitingActivation,
 }
 
+/// Public trust/presentation lifecycle. Detailed candidate phases remain
+/// internal guards for fetch, renderer callback, and sample-cue ordering.
+enum AvaSvgCanvasLifecyclePhase {
+  generating,
+  draftVisible,
+  validatedCandidate,
+  preparing,
+  presentationScheduled,
+  presented,
+  active,
+  failed,
+  cancelled,
+  superseded,
+}
+
 enum AvaSvgCanvasCommandType {
   canvasDocumentPrepared,
   canvasPreparationFailed,
@@ -90,6 +105,22 @@ final class AvaSvgCanvasCandidateState {
 }
 
 @immutable
+final class AvaSvgCanvasDraftState {
+  const AvaSvgCanvasDraftState({
+    required this.document,
+    this.visible = false,
+  });
+
+  final AvaValidatedSvgCanvasDraft document;
+  final bool visible;
+
+  AvaSvgCanvasDraftState copyWith({bool? visible}) => AvaSvgCanvasDraftState(
+        document: document,
+        visible: visible ?? this.visible,
+      );
+}
+
+@immutable
 final class AvaSvgCanvasActiveState {
   const AvaSvgCanvasActiveState({
     required this.document,
@@ -142,10 +173,16 @@ final class AvaSvgCanvasController extends ChangeNotifier {
   final AvaRetainedSceneRevisionLookup _retainedSceneRevision;
   final Stopwatch _clock = Stopwatch();
   AvaSvgCanvasGenerationState? _generation;
+  AvaSvgCanvasDraftState? _draft;
   AvaSvgCanvasCandidateState? _candidate;
   AvaSvgCanvasActiveState? _active;
   AvaSvgCanvasIssue? _lastIssue;
   int _loadGeneration = 0;
+  int _highestDraftIndexSeen = 0;
+  int _highestDraftIndexAccepted = 0;
+  final Map<int, AvaSvgCanvasDraftDescriptorV4> _pendingDrafts = {};
+  final Map<String, AvaSvgCanvasLifecyclePhase> _terminatedGenerations = {};
+  AvaSvgCanvasLifecyclePhase? _lastPendingOutcome;
   String? _previousRenderedSampleTurnId;
   String? _renderedSampleTurnId;
   int _lastRenderedSample = 0;
@@ -158,6 +195,7 @@ final class AvaSvgCanvasController extends ChangeNotifier {
   ({String generationId, Duration startedAt})? _presentationRequest;
 
   AvaSvgCanvasGenerationState? get generation => _generation;
+  AvaSvgCanvasDraftState? get draft => _draft;
   AvaSvgCanvasCandidateState? get candidate => _candidate;
   AvaSvgCanvasActiveState? get active => _active;
   AvaSvgCanvasIssue? get lastIssue => _lastIssue;
@@ -169,6 +207,36 @@ final class AvaSvgCanvasController extends ChangeNotifier {
 
   String? get previousRenderedSampleTurnId => _previousRenderedSampleTurnId;
   String? get renderedSampleTurnId => _renderedSampleTurnId;
+
+  AvaSvgCanvasLifecyclePhase? get lastPendingOutcome => _lastPendingOutcome;
+
+  AvaSvgCanvasLifecyclePhase? get lifecyclePhase {
+    final candidate = _candidate;
+    if (candidate != null) {
+      return switch (candidate.phase) {
+        AvaSvgCanvasCandidatePhase.fetching =>
+          AvaSvgCanvasLifecyclePhase.validatedCandidate,
+        AvaSvgCanvasCandidatePhase.rendererPreparing ||
+        AvaSvgCanvasCandidatePhase.prepared =>
+          AvaSvgCanvasLifecyclePhase.preparing,
+        AvaSvgCanvasCandidatePhase.presentationScheduled ||
+        AvaSvgCanvasCandidatePhase.presentationRequested =>
+          AvaSvgCanvasLifecyclePhase.presentationScheduled,
+        AvaSvgCanvasCandidatePhase.awaitingActivation =>
+          AvaSvgCanvasLifecyclePhase.presented,
+      };
+    }
+    if (_draft?.visible ?? false) {
+      return AvaSvgCanvasLifecyclePhase.draftVisible;
+    }
+    if (_generation != null) return AvaSvgCanvasLifecyclePhase.generating;
+    if (_lastPendingOutcome != null) return _lastPendingOutcome;
+    if (_active != null) return AvaSvgCanvasLifecyclePhase.active;
+    return null;
+  }
+
+  bool get hasPendingVisual =>
+      _generation != null || _draft != null || _candidate != null;
 
   AvaValidatedSvgCanvasDocument? get documentForRenderer =>
       _candidate?.document ?? _active?.document;
@@ -206,10 +274,8 @@ final class AvaSvgCanvasController extends ChangeNotifier {
         'Canvas generation start identity is invalid.',
       );
     }
-    if (_generation != null || _candidate != null) {
-      throw StateError(
-        'canvasGenerationStarted requires no pending canvas work.',
-      );
+    if (hasPendingVisual) {
+      _terminatePending(AvaSvgCanvasLifecyclePhase.superseded);
     }
     _generation = AvaSvgCanvasGenerationState(
       generationId: generationId,
@@ -220,8 +286,94 @@ final class AvaSvgCanvasController extends ChangeNotifier {
       _generation!,
     );
     _lastIssue = null;
+    _lastPendingOutcome = null;
+    _highestDraftIndexSeen = 0;
+    _highestDraftIndexAccepted = 0;
+    _pendingDrafts.clear();
     _pruneRenderedSamples();
     notifyListeners();
+  }
+
+  Future<void> receiveDraftAvailable(Map<String, Object?> event) async {
+    _ensureOpen();
+    final descriptor = AvaSvgCanvasDraftDescriptorV4.fromJson(event);
+    if (_terminatedGenerations.containsKey(descriptor.generationId)) {
+      _recordDraft('canvas.draft.stale_terminated', descriptor);
+      return;
+    }
+    final generation = _generation;
+    final candidateGenerationId = _candidate?.descriptor.generationId;
+    final ownsPendingGeneration =
+        generation?.generationId == descriptor.generationId ||
+            candidateGenerationId == descriptor.generationId;
+    if (!ownsPendingGeneration ||
+        (generation != null &&
+            generation.sourceTurnId != descriptor.sourceTurnId)) {
+      _recordDraft('canvas.draft.stale_generation', descriptor);
+      return;
+    }
+    final existing = _pendingDrafts[descriptor.draftIndex];
+    if (existing != null) {
+      if (existing.svgSha256 != descriptor.svgSha256 ||
+          existing.svgByteLength != descriptor.svgByteLength ||
+          existing.svgPath != descriptor.svgPath) {
+        throw const FormatException(
+          'Canvas draft index was reused for different content.',
+        );
+      }
+      _recordDraft('canvas.draft.duplicate_ignored', descriptor);
+      return;
+    }
+    if (descriptor.draftIndex <= _highestDraftIndexSeen ||
+        descriptor.draftIndex <= _highestDraftIndexAccepted) {
+      _recordDraft('canvas.draft.stale_index', descriptor);
+      return;
+    }
+    _highestDraftIndexSeen = descriptor.draftIndex;
+    _pendingDrafts[descriptor.draftIndex] = descriptor;
+    _recordDraft('canvas.draft.available_received', descriptor);
+    try {
+      final document = await _documents.fetchDraft(descriptor);
+      if (_closed ||
+          _terminatedGenerations.containsKey(descriptor.generationId) ||
+          descriptor.draftIndex <= _highestDraftIndexAccepted ||
+          _candidate?.phase ==
+              AvaSvgCanvasCandidatePhase.presentationRequested ||
+          _candidate?.phase == AvaSvgCanvasCandidatePhase.awaitingActivation ||
+          (_generation?.generationId != descriptor.generationId &&
+              _candidate?.descriptor.generationId != descriptor.generationId)) {
+        return;
+      }
+      _highestDraftIndexAccepted = descriptor.draftIndex;
+      _draft = AvaSvgCanvasDraftState(document: document);
+      _lastIssue = null;
+      _recordDraft('canvas.draft.accepted', descriptor);
+      notifyListeners();
+    } on Object catch (error) {
+      if (_closed ||
+          _terminatedGenerations.containsKey(descriptor.generationId)) {
+        return;
+      }
+      _lastIssue = AvaSvgCanvasIssue(
+        code: error is FormatException
+            ? 'draftContentIdentityMismatch'
+            : 'draftFetchFailed',
+        message: _boundedMessage(
+          'Ava could not show this drawing preview (${error.runtimeType}).',
+        ),
+        generationId: descriptor.generationId,
+      );
+      _recordDraft(
+        'canvas.draft.rejected',
+        descriptor,
+        fields: {'failureType': error.runtimeType.toString()},
+      );
+      notifyListeners();
+    } finally {
+      if (identical(_pendingDrafts[descriptor.draftIndex], descriptor)) {
+        _pendingDrafts.remove(descriptor.draftIndex);
+      }
+    }
   }
 
   Future<void> receiveDocumentAvailable(
@@ -234,6 +386,9 @@ final class AvaSvgCanvasController extends ChangeNotifier {
       );
     }
     final descriptor = AvaSvgCanvasDocumentDescriptorV4.fromJson(event);
+    if (_terminatedGenerations.containsKey(descriptor.generationId)) {
+      return;
+    }
     final generation = _generation;
     if (generation == null) {
       throw StateError(
@@ -278,6 +433,7 @@ final class AvaSvgCanvasController extends ChangeNotifier {
       phase: AvaSvgCanvasCandidatePhase.fetching,
     );
     _lastIssue = null;
+    _lastPendingOutcome = null;
     notifyListeners();
     try {
       final document = await _documents.fetch(descriptor);
@@ -316,6 +472,23 @@ final class AvaSvgCanvasController extends ChangeNotifier {
         message: 'Ava could not prepare this drawing (${error.runtimeType}).',
       );
     }
+  }
+
+  void draftPresented(AvaValidatedSvgCanvasDraft document) {
+    _ensureOpen();
+    final draft = _draft;
+    if (draft == null ||
+        !identical(draft.document, document) ||
+        draft.document.descriptor.generationId !=
+            document.descriptor.generationId ||
+        draft.document.descriptor.draftIndex !=
+            document.descriptor.draftIndex) {
+      throw StateError('Presented SVG draft is not the accepted draft.');
+    }
+    if (draft.visible) return;
+    _draft = draft.copyWith(visible: true);
+    _recordDraft('canvas.draft.visible', document.descriptor);
+    notifyListeners();
   }
 
   void rendererPrepared() {
@@ -378,12 +551,27 @@ final class AvaSvgCanvasController extends ChangeNotifier {
         event['event'] != 'canvasPresentationCue') {
       throw const FormatException('Canvas presentation cue requires v4.');
     }
-    final candidate = _requireCandidate(AvaSvgCanvasCandidatePhase.prepared);
+    final candidate = _candidate;
+    if (candidate == null) {
+      throw StateError('No SVG canvas candidate is pending.');
+    }
     _requireDescriptorIdentity(event, candidate.descriptor);
     final sample = event['presentationSampleOffset'];
     if (sample is! int || sample < 0 || sample > 2147483647) {
       throw const FormatException(
         'canvasPresentationCue.presentationSampleOffset is invalid.',
+      );
+    }
+    final previousSample = candidate.presentationSampleOffset;
+    final isInitialCue = candidate.phase == AvaSvgCanvasCandidatePhase.prepared;
+    final isEarlierReplacement =
+        candidate.phase == AvaSvgCanvasCandidatePhase.presentationScheduled &&
+            previousSample != null &&
+            sample < previousSample;
+    if (!isInitialCue && !isEarlierReplacement) {
+      throw StateError(
+        'Canvas presentation cue must be initial or replace an unreachable '
+        'source-turn cue with an earlier sample.',
       );
     }
     _recordDescriptor(
@@ -462,6 +650,9 @@ final class AvaSvgCanvasController extends ChangeNotifier {
       phase: AvaSvgCanvasCandidatePhase.awaitingActivation,
       firstRenderedSample: sourceRenderedSample,
     );
+    // The trusted final candidate now owns the visible pending layer. The
+    // draft remains non-authoritative and must not survive presentation.
+    _draft = null;
     _recordDescriptor(
       'canvas.presentation.first_frame',
       candidate.descriptor,
@@ -536,6 +727,9 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     );
     _candidate = null;
     _generation = null;
+    _draft = null;
+    _pendingDrafts.clear();
+    _lastPendingOutcome = null;
     _interactionRevision = 0;
     _selectedBindingId = null;
     _failedActiveRendererGenerationId = null;
@@ -551,7 +745,7 @@ final class AvaSvgCanvasController extends ChangeNotifier {
   void reportBinding(AvaSvgInteractionBinding binding) {
     _ensureOpen();
     final active = _active;
-    if (active == null || !activeRendererHealthy) {
+    if (active == null || !activeRendererHealthy || hasPendingVisual) {
       return;
     }
     final canonical = active.document.manifest.bindings[binding.bindingId];
@@ -602,6 +796,22 @@ final class AvaSvgCanvasController extends ChangeNotifier {
       );
       return;
     }
+    final pendingGenerationId =
+        _draft?.document.descriptor.generationId ?? _generation?.generationId;
+    if (pendingGenerationId != null &&
+        (generationId == null || generationId == pendingGenerationId)) {
+      _terminatePending(AvaSvgCanvasLifecyclePhase.failed);
+      _lastIssue = AvaSvgCanvasIssue(
+        code: message.contains('terminated')
+            ? 'rendererTerminated'
+            : 'rendererRejected',
+        message: _boundedMessage(message),
+        generationId: pendingGenerationId,
+      );
+      _pruneRenderedSamples();
+      notifyListeners();
+      return;
+    }
     final active = _active;
     if (active == null ||
         (generationId != null &&
@@ -642,6 +852,12 @@ final class AvaSvgCanvasController extends ChangeNotifier {
         'canvasDocumentDiscarded.generationId is required.',
       );
     }
+    if (_terminatedGenerations.containsKey(generationId) &&
+        _candidate?.descriptor.generationId != generationId &&
+        _generation?.generationId != generationId &&
+        _draft?.document.descriptor.generationId != generationId) {
+      return;
+    }
     if (_candidate?.descriptor.generationId == generationId) {
       _candidate = null;
       _loadGeneration += 1;
@@ -651,12 +867,21 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     if (_generation?.generationId == generationId) {
       _generation = null;
     }
-    if (_active?.document.descriptor.generationId == generationId) {
-      _active = null;
-      if (_failedActiveRendererGenerationId == generationId) {
-        _failedActiveRendererGenerationId = null;
-      }
+    if (_draft?.document.descriptor.generationId == generationId) {
+      _draft = null;
     }
+    _pendingDrafts.removeWhere(
+      (_, descriptor) => descriptor.generationId == generationId,
+    );
+    final reason = event['reason'];
+    _recordTerminated(
+      generationId,
+      reason == 'superseded'
+          ? AvaSvgCanvasLifecyclePhase.superseded
+          : reason == 'sessionClosed'
+              ? AvaSvgCanvasLifecyclePhase.cancelled
+              : AvaSvgCanvasLifecyclePhase.failed,
+    );
     final sourceTurnId = event['sourceTurnId'];
     if (sourceTurnId is String) {
       _recordIdentity(
@@ -681,6 +906,13 @@ final class AvaSvgCanvasController extends ChangeNotifier {
         message is! String) {
       throw const FormatException('canvasRejected fields are invalid.');
     }
+    if (generationId is String &&
+        _terminatedGenerations.containsKey(generationId) &&
+        _candidate?.descriptor.generationId != generationId &&
+        _generation?.generationId != generationId &&
+        _draft?.document.descriptor.generationId != generationId) {
+      return;
+    }
     if (_candidate?.descriptor.generationId == generationId) {
       _candidate = null;
       _loadGeneration += 1;
@@ -690,10 +922,23 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     if (_generation?.generationId == generationId) {
       _generation = null;
     }
-    // `cancelled` is the structured V4 result for optional canvas work that
-    // was retired by the owning turn's normal interruption path. It clears
-    // pending work but is not a canvas failure and must not replace the
-    // current active scene or create a user-visible error.
+    if (_draft?.document.descriptor.generationId == generationId) {
+      _draft = null;
+    }
+    if (generationId is String) {
+      _pendingDrafts.removeWhere(
+        (_, descriptor) => descriptor.generationId == generationId,
+      );
+      _recordTerminated(
+        generationId,
+        code == 'cancelled'
+            ? AvaSvgCanvasLifecyclePhase.cancelled
+            : AvaSvgCanvasLifecyclePhase.failed,
+      );
+    }
+    // `cancelled` is the structured V4 result for an explicit semantic canvas
+    // cancellation. It clears pending work but is not a renderer failure and
+    // must not replace the current active scene or create a user-visible error.
     _lastIssue = code == 'cancelled'
         ? null
         : AvaSvgCanvasIssue(
@@ -749,6 +994,7 @@ final class AvaSvgCanvasController extends ChangeNotifier {
       _loadGeneration += 1;
       _rendererPreparation = null;
       _presentationRequest = null;
+      _pendingDrafts.clear();
       _documents.close();
     }
     super.dispose();
@@ -789,6 +1035,7 @@ final class AvaSvgCanvasController extends ChangeNotifier {
       if (_previousRenderedSampleTurnId case final value?) value,
       if (_generation?.sourceTurnId case final value?) value,
       if (_candidate?.descriptor.sourceTurnId case final value?) value,
+      if (_draft?.document.descriptor.sourceTurnId case final value?) value,
     };
     _renderedSamplesByTurn.removeWhere(
       (turnId, _) => !retained.contains(turnId),
@@ -816,6 +1063,16 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     _loadGeneration += 1;
     _rendererPreparation = null;
     _presentationRequest = null;
+    if (_draft?.document.descriptor.generationId == descriptor.generationId) {
+      _draft = null;
+    }
+    _pendingDrafts.removeWhere(
+      (_, pending) => pending.generationId == descriptor.generationId,
+    );
+    _recordTerminated(
+      descriptor.generationId,
+      AvaSvgCanvasLifecyclePhase.failed,
+    );
     _lastIssue = AvaSvgCanvasIssue(
       code: failureCode,
       message: _boundedMessage(message),
@@ -901,6 +1158,50 @@ final class AvaSvgCanvasController extends ChangeNotifier {
         ...fields,
       },
     );
+  }
+
+  void _recordDraft(
+    String stage,
+    AvaSvgCanvasDraftDescriptorV4 descriptor, {
+    Duration stageDuration = Duration.zero,
+    Map<String, Object?> fields = const {},
+  }) {
+    _recordIdentity(
+      stage,
+      generationId: descriptor.generationId,
+      sourceTurnId: descriptor.sourceTurnId,
+      stageDuration: stageDuration,
+      fields: {
+        'draftIndex': descriptor.draftIndex,
+        'svgSha256': descriptor.svgSha256,
+        ...fields,
+      },
+    );
+  }
+
+  void _terminatePending(AvaSvgCanvasLifecyclePhase outcome) {
+    final generationId = _candidate?.descriptor.generationId ??
+        _draft?.document.descriptor.generationId ??
+        _generation?.generationId;
+    if (generationId != null) _recordTerminated(generationId, outcome);
+    _generation = null;
+    _draft = null;
+    _candidate = null;
+    _pendingDrafts.clear();
+    _loadGeneration += 1;
+    _rendererPreparation = null;
+    _presentationRequest = null;
+  }
+
+  void _recordTerminated(
+    String generationId,
+    AvaSvgCanvasLifecyclePhase outcome,
+  ) {
+    _terminatedGenerations[generationId] = outcome;
+    while (_terminatedGenerations.length > 32) {
+      _terminatedGenerations.remove(_terminatedGenerations.keys.first);
+    }
+    _lastPendingOutcome = outcome;
   }
 
   void _recordIdentity(

@@ -128,7 +128,12 @@ final class AvaRealtimeTurnRuntime {
   int? _finalRenderedSampleCount;
   int _nextServerSequence = 0;
   int _nextClientSequence = 0;
+  ({
+    int revision,
+    AvaCanvasRenderProfileV4 profile
+  })? _pendingCanvasRenderProfileUpdate;
   bool _started = false;
+  bool _clientReadyEnqueued = false;
   bool _closed = false;
   bool _terminal = false;
   bool _playbackStarted = false;
@@ -159,6 +164,27 @@ final class AvaRealtimeTurnRuntime {
   bool get microphoneTrackEnabled => _mediaSession.microphoneEnabled;
   Future<void> get firstListening => _firstListening.future;
 
+  void updateCanvasRenderProfile(
+    int profileRevision,
+    AvaCanvasRenderProfileV4 renderProfile,
+  ) {
+    if (_closed) return;
+    if (!_clientReadyEnqueued) {
+      final pending = _pendingCanvasRenderProfileUpdate;
+      if (pending == null || profileRevision > pending.revision) {
+        _pendingCanvasRenderProfileUpdate = (
+          revision: profileRevision,
+          profile: renderProfile,
+        );
+      }
+      return;
+    }
+    _enqueueCanvasRenderProfileUpdate(
+      profileRevision: profileRevision,
+      renderProfile: renderProfile,
+    );
+  }
+
   Future<void> run() async {
     if (_started) {
       throw StateError('Ava realtime runtime may be started only once.');
@@ -174,12 +200,22 @@ final class AvaRealtimeTurnRuntime {
         name: 'ava.realtime',
       );
       _trace?.mark('runtime.started');
-      await _sendClient(
+      final clientReady = _sendClient(
         (sequence) => AvaRealtimeClientEventV4.clientReady(
           sessionId: _sessionId,
           sequence: sequence,
         ),
       );
+      _clientReadyEnqueued = true;
+      final pendingProfile = _pendingCanvasRenderProfileUpdate;
+      _pendingCanvasRenderProfileUpdate = null;
+      if (pendingProfile != null) {
+        _enqueueCanvasRenderProfileUpdate(
+          profileRevision: pendingProfile.revision,
+          renderProfile: pendingProfile.profile,
+        );
+      }
+      await clientReady;
       _trace?.mark('client.ready');
       await for (final frame in _transport.frames()) {
         if (_closed) return;
@@ -657,6 +693,7 @@ final class AvaRealtimeTurnRuntime {
         await _handleTerminal(event);
         break;
       case AvaRealtimeServerEventTypeV4.canvasGenerationStarted:
+      case AvaRealtimeServerEventTypeV4.canvasDraftAvailable:
       case AvaRealtimeServerEventTypeV4.canvasDocumentAvailable:
       case AvaRealtimeServerEventTypeV4.canvasPresentationCue:
       case AvaRealtimeServerEventTypeV4.canvasActivated:
@@ -1028,6 +1065,7 @@ final class AvaRealtimeTurnRuntime {
       case AvaRealtimeServerEventTypeV4.turnCreated:
         throw const AvaRealtimeStateException('turnCreated cannot repeat.');
       case AvaRealtimeServerEventTypeV4.canvasGenerationStarted:
+      case AvaRealtimeServerEventTypeV4.canvasDraftAvailable:
       case AvaRealtimeServerEventTypeV4.canvasDocumentAvailable:
       case AvaRealtimeServerEventTypeV4.canvasPresentationCue:
       case AvaRealtimeServerEventTypeV4.canvasActivated:
@@ -1145,6 +1183,7 @@ final class AvaRealtimeTurnRuntime {
       case AvaRealtimeServerEventTypeV4.turnCancelled:
       case AvaRealtimeServerEventTypeV4.turnFailed:
       case AvaRealtimeServerEventTypeV4.canvasGenerationStarted:
+      case AvaRealtimeServerEventTypeV4.canvasDraftAvailable:
       case AvaRealtimeServerEventTypeV4.canvasDocumentAvailable:
       case AvaRealtimeServerEventTypeV4.canvasPresentationCue:
       case AvaRealtimeServerEventTypeV4.canvasActivated:
@@ -1261,6 +1300,13 @@ final class AvaRealtimeTurnRuntime {
     switch (event.type) {
       case AvaRealtimeServerEventTypeV4.canvasGenerationStarted:
         canvasController.receiveGenerationStarted(json);
+        break;
+      case AvaRealtimeServerEventTypeV4.canvasDraftAvailable:
+        unawaited(
+          canvasController
+              .receiveDraftAvailable(json)
+              .catchError(_recordAsynchronousFailure),
+        );
         break;
       case AvaRealtimeServerEventTypeV4.canvasDocumentAvailable:
         AvaSvgCanvasDocumentDescriptorV4.fromJson(json);
@@ -1395,6 +1441,21 @@ final class AvaRealtimeTurnRuntime {
     final operation = _sendTail.then((_) => _transport.send(event));
     _sendTail = operation;
     return operation;
+  }
+
+  void _enqueueCanvasRenderProfileUpdate({
+    required int profileRevision,
+    required AvaCanvasRenderProfileV4 renderProfile,
+  }) {
+    final operation = _enqueue(
+      AvaRealtimeClientEventV4.canvasRenderProfileUpdated(
+        sessionId: _sessionId,
+        sequence: _takeClientSequence(),
+        profileRevision: profileRevision,
+        renderProfile: renderProfile,
+      ),
+    );
+    unawaited(operation.catchError(_recordAsynchronousFailure));
   }
 
   int _takeClientSequence() {

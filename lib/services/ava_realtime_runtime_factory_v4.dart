@@ -65,9 +65,13 @@ final class AvaRealtimeRuntimeFactoryV4 implements AvaRealtimeRuntimeBuilder {
       throw RangeError.range(volume, 0, 1, 'volume');
     }
     final trace = _traceFactory()..mark('connection.requested');
+    final canvasRenderProfile = _canvasHost.requireRenderProfile();
     final bootstrap = await trace.measure(
       'bootstrap.create',
-      () => _bootstrapService.createSessionV4(ageBand: ageBand),
+      () => _bootstrapService.createSessionV4(
+        ageBand: ageBand,
+        canvasRenderProfile: canvasRenderProfile,
+      ),
     );
     trace.attachSession(bootstrap.sessionId);
     void canvasTelemetry(AvaSvgCanvasTelemetryEvent event) {
@@ -108,7 +112,11 @@ final class AvaRealtimeRuntimeFactoryV4 implements AvaRealtimeRuntimeBuilder {
         onMicrophoneTrackChanged: onMicrophoneTrackChanged,
         microphoneInitiallyEnabled: false,
       );
-      _canvasHost.attach(runtime.canvasController);
+      _canvasHost.attach(
+        runtime.canvasController,
+        initialRenderProfile: canvasRenderProfile,
+        renderProfileUpdateSink: runtime.updateCanvasRenderProfile,
+      );
       trace.mark('runtime.ready');
       return runtime;
     } catch (_) {

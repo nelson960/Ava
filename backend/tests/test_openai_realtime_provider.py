@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from builtins import anext
 import json
 import logging
 from collections import deque
 
+import httpx
 import pytest
 from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
@@ -15,21 +17,27 @@ from ava_backend.providers.openai_realtime_provider import (
     OpenAIRealtimeProbeRequest,
     OpenAIRealtimeProtocolError,
     OpenAIRealtimeConnectionClosedError,
+    OpenAIRealtimeProviderSession,
     OpenAIRealtimeRouterBackpressureError,
     OpenAIRealtimeUnavailableError,
     _OpenAIRealtimeEventChannel,
     _session_update,
 )
 from ava_backend.realtime.harness import build_realtime_harness
+from ava_backend.realtime.fakes import DETERMINISTIC_AUDIO_OFFER_SDP
 from ava_backend.realtime.memory import AuthoritativeMemorySnapshot
 from ava_backend.realtime.provider_session import (
+    RealtimeNegotiationResponseError,
     RealtimeProviderResponseIncompleteError,
 )
 from ava_backend.realtime.tool_contract import (
+    CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
     CANVAS_MODEL_SAFE_REJECTION_REASON,
     INTERACTIVE_CANVAS_TOOL_NAME,
     InteractiveCanvasToolOutput,
     InteractiveCanvasToolOutputV4,
+    InteractiveCanvasCancellationToolOutputV4,
+    RealtimeCancelCanvasToolCall,
     RealtimeCanvasToolCall,
     RealtimeRejectedCanvasToolCall,
     RealtimeSpeechTextDelta,
@@ -39,6 +47,58 @@ RESPONSE_ID = "resp_test_live_0001"
 CONTINUATION_RESPONSE_ID = "resp_test_live_0002"
 FUNCTION_CALL_ID = "call_test_live_0001"
 _TEST_CHANNELS: set[_OpenAIRealtimeEventChannel] = set()
+
+
+@pytest.mark.asyncio
+async def test_sdp_negotiation_failure_logs_content_free_provider_metadata(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            headers={"x-request-id": "req_realtime_negotiation_0001"},
+            json={
+                "error": {
+                    "code": "rate_limit_exceeded",
+                    "param": "model",
+                    "message": "provider-response-body-must-not-be-logged",
+                }
+            },
+            request=request,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = OpenAIRealtimeProviderSession(
+            api_key="sk-test-secret-must-not-be-logged",
+            model="gpt-realtime-test",
+            safety_identifier="test_child_0001",
+            connect_timeout_seconds=5,
+            turn_timeout_seconds=30,
+            max_output_tokens=512,
+            http_client=client,
+        )
+        with caplog.at_level(
+            logging.WARNING,
+            logger="ava_backend.openai_realtime",
+        ):
+            with pytest.raises(RealtimeNegotiationResponseError):
+                await provider.negotiate(offer_sdp=DETERMINISTIC_AUDIO_OFFER_SDP)
+
+    records = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("openai_realtime_negotiation_failed")
+    ]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert "stage=sdp" in message
+    assert "provider_status_code=429" in message
+    assert "provider_error_code=rate_limit_exceeded" in message
+    assert "provider_error_parameter=model" in message
+    assert "provider_request_id=req_realtime_negotiation_0001" in message
+    assert "provider-response-body-must-not-be-logged" not in caplog.text
+    assert "sk-test-secret-must-not-be-logged" not in caplog.text
+    assert DETERMINISTIC_AUDIO_OFFER_SDP not in caplog.text
 
 
 def _recorded_interaction(
@@ -267,6 +327,7 @@ def _text_response_events(
 def _canvas_response_events(
     *,
     arguments: str,
+    function_name: str = INTERACTIVE_CANVAS_TOOL_NAME,
     preamble: str = "I’ll show that clearly. ",
 ) -> list[dict[str, object]]:
     midpoint = len(arguments) // 2
@@ -285,7 +346,7 @@ def _canvas_response_events(
             "response_id": RESPONSE_ID,
             "item": {
                 "type": "function_call",
-                "name": INTERACTIVE_CANVAS_TOOL_NAME,
+                "name": function_name,
                 "call_id": FUNCTION_CALL_ID,
                 "arguments": "",
             },
@@ -305,7 +366,7 @@ def _canvas_response_events(
         {
             "type": "response.function_call_arguments.done",
             "response_id": RESPONSE_ID,
-            "name": INTERACTIVE_CANVAS_TOOL_NAME,
+            "name": function_name,
             "call_id": FUNCTION_CALL_ID,
             "arguments": arguments,
         },
@@ -322,7 +383,7 @@ def _canvas_response_events(
                     },
                     {
                         "type": "function_call",
-                        "name": INTERACTIVE_CANVAS_TOOL_NAME,
+                        "name": function_name,
                         "call_id": FUNCTION_CALL_ID,
                         "arguments": arguments,
                     },
@@ -578,7 +639,7 @@ async def test_duplicate_transcription_events_are_resolved_by_item_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_late_response_event_cannot_mutate_new_turn(
+async def test_non_terminal_stale_response_delta_fails_ownership_validation(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.INFO, logger="ava_backend.openai_realtime")
@@ -618,6 +679,78 @@ async def test_late_response_event_cannot_mutate_new_turn(
         "consumerPhase": "turnResponse",
         "activeTurnId": "turn-b",
         "activeResponseId": None,
+    }
+    await channel.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_consumed_continuation_terminal_is_ignored_before_next_turn(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.openai_realtime")
+    arguments = (
+        '{"operation":"new","brief":"Show a simple solar-system orbit.",'
+        '"interactionMode":"none"}'
+    )
+    continuation_events = _text_response_events(
+        response_id=CONTINUATION_RESPONSE_ID,
+        text="The orbit loops around the sun.",
+    )
+    channel, _ = _channel(
+        [
+            *_canvas_response_events(arguments=arguments),
+            *continuation_events,
+            continuation_events[-1],
+            *_text_response_events(
+                response_id="resp_turn_b",
+                text="The new turn is healthy.",
+            ),
+        ]
+    )
+    iterator = channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-canvas-a",
+    ).__aiter__()
+
+    assert isinstance(await anext(iterator), RealtimeSpeechTextDelta)
+    canvas_call = await anext(iterator)
+    assert isinstance(canvas_call, RealtimeCanvasToolCall)
+    await channel.complete_canvas_tool(
+        turn_id="turn-canvas-a",
+        call_id=canvas_call.call_id,
+        output=InteractiveCanvasToolOutput(
+            status="rejected",
+            reason="The optional visual was not available.",
+        ),
+    )
+    assert await anext(iterator) == RealtimeSpeechTextDelta(
+        delta="The orbit loops around the sun."
+    )
+    with pytest.raises(StopAsyncIteration):
+        await anext(iterator)
+
+    received = await _collect_turn_events(channel, turn_id="turn-b")
+
+    assert received == [RealtimeSpeechTextDelta(delta="The new turn is healthy.")]
+    assert channel.last_response_id == "resp_turn_b"
+    assert channel._response_owner_by_id[CONTINUATION_RESPONSE_ID] == "turn-canvas-a"
+    assert channel._response_owner_by_id["resp_turn_b"] == "turn-b"
+    assert channel._consumed_terminal_response_owner_by_id[
+        CONTINUATION_RESPONSE_ID
+    ] == "turn-canvas-a"
+    duplicate = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage().startswith(
+            "openai_realtime_duplicate_terminal_ignored"
+        )
+    )
+    assert duplicate == {
+        "component": "realtimeProvider",
+        "responseId": CONTINUATION_RESPONSE_ID,
+        "responseOwnerTurnId": "turn-canvas-a",
+        "activeTurnId": "turn-b",
+        "sidebandSequence": 12,
     }
     await channel.close()
 
@@ -673,7 +806,10 @@ def test_session_update_uses_text_output_and_one_optional_semantic_tool() -> Non
 
     assert session["output_modalities"] == ["text"]
     assert session["tool_choice"] == "auto"
-    assert [tool["name"] for tool in session["tools"]] == [INTERACTIVE_CANVAS_TOOL_NAME]
+    assert [tool["name"] for tool in session["tools"]] == [
+        INTERACTIVE_CANVAS_TOOL_NAME,
+        CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
+    ]
     turn_detection = session["audio"]["input"]["turn_detection"]
     assert session["audio"]["input"]["transcription"] == {"model": "gpt-transcribe"}
     assert turn_detection["create_response"] is True
@@ -1328,12 +1464,56 @@ async def test_canvas_call_gets_one_output_then_tool_disabled_continuation(
         sent for sent in socket.sent if sent.get("type") == "response.create"
     ]
     assert continuation_requests[-1]["response"]["tool_choice"] == "none"
-    assert continuation_requests[-1]["response"]["max_output_tokens"] == 64
+    assert continuation_requests[-1]["response"]["max_output_tokens"] == 128
     assert continuation_requests[-1]["response"]["conversation"] == "auto"
     assert "instructions" not in continuation_requests[-1]["response"]
     assert "input" not in continuation_requests[-1]["response"]
     assert channel.last_usage is not None
     assert channel.last_usage.total_tokens == 23
+
+
+@pytest.mark.asyncio
+async def test_explicit_canvas_cancellation_call_gets_idempotent_tool_output() -> None:
+    channel, socket = _channel(
+        [
+            *_canvas_response_events(
+                arguments="{}",
+                function_name=CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
+                preamble="",
+            ),
+            *_text_response_events(
+                response_id=CONTINUATION_RESPONSE_ID,
+                text="Okay.",
+            ),
+        ]
+    )
+
+    received = []
+    async for event in channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-cancel-canvas",
+    ):
+        received.append(event)
+        if isinstance(event, RealtimeCancelCanvasToolCall):
+            await channel.complete_canvas_tool(
+                turn_id="turn-cancel-canvas",
+                call_id=event.call_id,
+                output=InteractiveCanvasCancellationToolOutputV4.model_validate(
+                    {"status": "accepted"}
+                ),
+            )
+
+    assert [type(event) for event in received] == [
+        RealtimeCancelCanvasToolCall,
+        RealtimeSpeechTextDelta,
+    ]
+    function_output = next(
+        sent
+        for sent in socket.sent
+        if isinstance(sent.get("item"), dict)
+        and sent["item"].get("type") == "function_call_output"
+    )
+    assert json.loads(function_output["item"]["output"]) == {"status": "accepted"}
 
 
 @pytest.mark.asyncio
@@ -1388,7 +1568,7 @@ async def test_rejected_canvas_continuation_is_outcome_owned_and_bounded() -> No
         sent for sent in socket.sent if sent.get("type") == "response.create"
     ][-1]["response"]
     assert continuation["tool_choice"] == "none"
-    assert continuation["max_output_tokens"] == 64
+    assert continuation["max_output_tokens"] == 128
     assert continuation["conversation"] == "auto"
     assert "instructions" not in continuation
     assert "input" not in continuation
@@ -2332,7 +2512,14 @@ async def test_child_vad_cancels_pending_interaction_before_next_child_response(
 
 
 @pytest.mark.asyncio
-async def test_late_cancel_error_cannot_poison_the_next_turn() -> None:
+async def test_late_cancel_error_arriving_after_next_response_created_is_consumed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.openai_realtime")
+    next_turn_events = _text_response_events(
+        response_id=CONTINUATION_RESPONSE_ID,
+        text="The next turn remains healthy.",
+    )
     channel, socket = _channel(
         [
             {
@@ -2344,6 +2531,7 @@ async def test_late_cancel_error_cannot_poison_the_next_turn() -> None:
                     "usage": _usage(3, 1),
                 },
             },
+            next_turn_events[0],
             {
                 "type": "error",
                 "error": {
@@ -2351,10 +2539,7 @@ async def test_late_cancel_error_cannot_poison_the_next_turn() -> None:
                     "message": "The completed response is no longer active.",
                 },
             },
-            *_text_response_events(
-                response_id=CONTINUATION_RESPONSE_ID,
-                text="The next turn remains healthy.",
-            ),
+            *next_turn_events[1:],
         ]
     )
     await channel.prepare(harness=_harness())
@@ -2374,7 +2559,40 @@ async def test_late_cancel_error_cannot_poison_the_next_turn() -> None:
 
     assert received == [RealtimeSpeechTextDelta(delta="The next turn remains healthy.")]
     assert channel.last_response_id == CONTINUATION_RESPONSE_ID
+    assert channel._late_cancel_error_expected is None
     assert [event["type"] for event in socket.sent].count("response.cancel") == 1
+    assert any(
+        record.getMessage().startswith("openai_realtime_late_cancel_error_consumed")
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_not_active_without_ava_cancel_is_provider_failure() -> None:
+    channel, _ = _channel(
+        [
+            {
+                "type": "error",
+                "error": {
+                    "code": "response_cancel_not_active",
+                    "message": "No response was cancelled by Ava.",
+                },
+            }
+        ]
+    )
+
+    with pytest.raises(
+        OpenAIRealtimeUnavailableError,
+        match="code=response_cancel_not_active",
+    ):
+        await anext(
+            channel.stream_turn(
+                harness=_harness(),
+                turn_id="turn-without-cancel",
+                text_input="Can we continue?",
+                response_max_output_tokens=400,
+            )
+        )
 
 
 @pytest.mark.asyncio

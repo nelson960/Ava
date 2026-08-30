@@ -103,8 +103,10 @@ class _NoCanvasSpecialist:
     async def generate(
         self,
         request: SvgCanvasSpecialistRequest,
+        *,
+        draft_sink: object | None = None,
     ) -> SvgCanvasSpecialistGeneration:
-        del request
+        del request, draft_sink
         raise AssertionError("speech-only coordinator test requested canvas")
 
     async def cancel(self, *, generation_id: str) -> None:
@@ -142,9 +144,7 @@ class _CapturingCanvasGroundingJobs:
         call,  # type: ignore[no-untyped-def]
         complete_tool,  # type: ignore[no-untyped-def]
     ):  # type: ignore[no-untyped-def]
-        self.accepted.append(
-            (source_turn_id, source_transcript, call.request.brief)
-        )
+        self.accepted.append((source_turn_id, source_transcript, call.request.brief))
         return await self._delegate.accept_tool_call(
             source_turn_id=source_turn_id,
             source_transcript=source_transcript,
@@ -215,6 +215,19 @@ class _IncompleteInteractionRealtimeProvider(DeterministicRealtimePlanProvider):
     async def _stream(self) -> AsyncIterator[RealtimeProviderTurnEvent]:
         self.turn_stream_started.set()
         await self._canvas_interaction_response_requested.wait()
+        raise RealtimeProviderResponseIncompleteError(reason="max_output_tokens")
+        yield  # pragma: no cover - makes this an async generator
+
+
+class _IncompleteAfterSpeechRealtimeProvider(DeterministicRealtimePlanProvider):
+    def __init__(self, plan: AvaTurnPlan) -> None:
+        super().__init__(plan)
+        self.allow_incomplete = asyncio.Event()
+
+    async def _stream(self) -> AsyncIterator[RealtimeProviderTurnEvent]:
+        self.turn_stream_started.set()
+        yield RealtimeSpeechTextDelta(delta=f"{self._speech_segments[0]} ")
+        await self.allow_incomplete.wait()
         raise RealtimeProviderResponseIncompleteError(reason="max_output_tokens")
         yield  # pragma: no cover - makes this an async generator
 
@@ -357,7 +370,9 @@ async def test_replacement_session_initial_context_contains_committed_canvas() -
     await coordinator.close()
 
 
-async def test_provider_owned_source_turn_transcript_grounds_exact_canvas_request() -> None:
+async def test_provider_owned_source_turn_transcript_grounds_exact_canvas_request() -> (
+    None
+):
     payload = _plan().model_dump(mode="json", by_alias=True)
     payload["canvasDecision"] = {
         "complexity": "specialistRequired",
@@ -1005,9 +1020,7 @@ async def test_valid_canvas_interaction_refreshes_context_before_one_response() 
     await delivery
 
     assert provider.canvas_interaction_response_turn_ids == [TURN_ID]
-    assert provider.canvas_interaction_response_interactions == [
-        state.last_interaction
-    ]
+    assert provider.canvas_interaction_response_interactions == [state.last_interaction]
     assert len(provider.canvas_interaction_response_session_updates) == 1
     session = provider.canvas_interaction_response_session_updates[0]["session"]
     assert isinstance(session, dict)
@@ -1016,7 +1029,7 @@ async def test_valid_canvas_interaction_refreshes_context_before_one_response() 
     assert '<canvas_context trust="untrusted_model_generated_data"' in instructions
     assert 'interaction_mode="explore"' in instructions
     assert '<last_interaction mode="explore">' in instructions
-    assert '<target>Explore condensation</target>' in instructions
+    assert "<target>Explore condensation</target>" in instructions
     await coordinator.close()
 
 
@@ -1716,8 +1729,237 @@ async def test_incomplete_interaction_response_is_cancelled_not_completed() -> N
     assert persisted.input_kind == "canvasInteraction"
     assert persisted.terminal == "cancelled"
     assert persisted.ava_delivered_text == ""
+    assert terminal.delivered_sample_count == 0
+    assert not any(isinstance(event, AudioMetadataEventV4) for event in events)
+    assert not any(isinstance(event, InterruptRequestedEventV4) for event in events)
     assert provider.cancelled_turn_ids == []
     await coordinator.close()
+
+
+async def test_provider_incomplete_after_playback_waits_for_exact_stopped_position() -> (
+    None
+):
+    provider = _IncompleteAfterSpeechRealtimeProvider(_plan())
+    coordinator, _, speech, _ = _coordinator(
+        realtime=provider,
+        persistent=True,
+    )
+    await _ready(coordinator)
+    frames = coordinator.frames()
+    client_sequence = 1
+    periodic_rendered_sample_count: int | None = None
+    interruption: InterruptRequestedEventV4 | None = None
+    try:
+        while interruption is None:
+            frame = await anext(frames)
+            if isinstance(frame, AvaServerPcmFrameV4):
+                if periodic_rendered_sample_count is None:
+                    periodic_rendered_sample_count = coordinator.received_sample_count
+                    await coordinator.receive(
+                        _client(
+                            {
+                                "event": "playbackProgress",
+                                "sequence": client_sequence,
+                                "turnId": TURN_ID,
+                                "streamId": STREAM_ID,
+                                "renderedSampleCount": periodic_rendered_sample_count,
+                                "bufferedSampleCount": 0,
+                            }
+                        )
+                    )
+                    client_sequence += 1
+                    provider.allow_incomplete.set()
+                continue
+            if not isinstance(frame, AvaServerControlFrameV4):
+                continue
+            event = frame.event
+            if isinstance(event, AudioMetadataEventV4):
+                await coordinator.receive(
+                    _client(
+                        {
+                            "event": "playbackStarted",
+                            "sequence": client_sequence,
+                            "turnId": TURN_ID,
+                            "streamId": STREAM_ID,
+                            "renderedSampleCount": 0,
+                        }
+                    )
+                )
+                client_sequence += 1
+            elif isinstance(event, InterruptRequestedEventV4):
+                interruption = event
+            elif isinstance(event, TurnCancelledEventV4):
+                pytest.fail(
+                    "provider-incomplete playback terminated before the exact "
+                    "playbackStopped position"
+                )
+
+        assert periodic_rendered_sample_count is not None
+        assert interruption.reason == "providerResponseIncomplete:max_output_tokens"
+        assert interruption.stream_id == STREAM_ID
+        assert provider.cancelled_turn_ids == []
+
+        waiting_for_stop = asyncio.create_task(anext(frames))
+        await _advance_ready_callbacks()
+        assert not waiting_for_stop.done(), (
+            "turnCancelled was emitted before Flutter supplied playbackStopped"
+        )
+
+        stopped_rendered_sample_count = coordinator.received_sample_count
+        assert stopped_rendered_sample_count > periodic_rendered_sample_count
+        await coordinator.receive(
+            _client(
+                {
+                    "event": "playbackStopped",
+                    "sequence": client_sequence,
+                    "turnId": TURN_ID,
+                    "streamId": STREAM_ID,
+                    "renderedSampleCount": stopped_rendered_sample_count,
+                    "reason": "providerResponseIncomplete:max_output_tokens",
+                }
+            )
+        )
+        client_sequence += 1
+        await _advance_ready_callbacks()
+        assert not waiting_for_stop.done(), (
+            "turnCancelled was emitted before Flutter supplied cancelTurn"
+        )
+        await coordinator.receive(
+            _client(
+                {
+                    "event": "cancelTurn",
+                    "sequence": client_sequence,
+                    "turnId": TURN_ID,
+                    "requestId": "cancel-provider-incomplete-playback",
+                    "reason": "providerResponseIncomplete:max_output_tokens",
+                }
+            )
+        )
+
+        events: list[object] = []
+        first_after_stop = await waiting_for_stop
+        if isinstance(first_after_stop, AvaServerControlFrameV4):
+            events.append(first_after_stop.event)
+        rearmed: TurnCreatedEventV4 | None = None
+        async for frame in frames:
+            if not isinstance(frame, AvaServerControlFrameV4):
+                continue
+            events.append(frame.event)
+            if (
+                isinstance(frame.event, TurnCreatedEventV4)
+                and frame.event.turn_id != TURN_ID
+            ):
+                rearmed = frame.event
+                break
+
+        terminal = next(
+            event for event in events if isinstance(event, TurnCancelledEventV4)
+        )
+        assert terminal.reason == "providerResponseIncomplete:max_output_tokens"
+        assert terminal.delivered_sample_count == stopped_rendered_sample_count
+        assert rearmed is not None
+        assert rearmed.turn_id == "turn-coordinator-2"
+        assert provider.cancelled_turn_ids == []
+        assert speech.cancelled_turn_ids == [TURN_ID]
+    finally:
+        provider.allow_incomplete.set()
+        await frames.aclose()
+        await coordinator.close()
+
+
+async def test_provider_incomplete_after_metadata_without_playback_cancels_at_zero() -> (
+    None
+):
+    provider = _IncompleteAfterSpeechRealtimeProvider(_plan())
+    coordinator, _, speech, _ = _coordinator(realtime=provider)
+    await _ready(coordinator)
+    frames = coordinator.frames()
+    events: list[object] = []
+    try:
+        async for frame in frames:
+            if not isinstance(frame, AvaServerControlFrameV4):
+                continue
+            event = frame.event
+            events.append(event)
+            if isinstance(event, AudioMetadataEventV4):
+                provider.allow_incomplete.set()
+            if isinstance(event, TurnCancelledEventV4):
+                break
+
+        terminal = events[-1]
+        assert isinstance(terminal, TurnCancelledEventV4)
+        assert terminal.reason == "providerResponseIncomplete:max_output_tokens"
+        assert terminal.delivered_sample_count == 0
+        assert any(isinstance(event, AudioMetadataEventV4) for event in events)
+        assert not any(isinstance(event, InterruptRequestedEventV4) for event in events)
+        assert provider.cancelled_turn_ids == []
+        assert speech.cancelled_turn_ids == [TURN_ID]
+    finally:
+        provider.allow_incomplete.set()
+        await frames.aclose()
+        await coordinator.close()
+
+
+async def test_provider_incomplete_after_playback_stopped_uses_final_position() -> None:
+    provider = _IncompleteAfterSpeechRealtimeProvider(_plan())
+    coordinator, _, speech, _ = _coordinator(realtime=provider)
+    await _ready(coordinator)
+    frames = coordinator.frames()
+    client_sequence = 1
+    stopped_rendered_sample_count: int | None = None
+    events: list[object] = []
+    try:
+        async for frame in frames:
+            if isinstance(frame, AvaServerPcmFrameV4):
+                if stopped_rendered_sample_count is None:
+                    stopped_rendered_sample_count = coordinator.received_sample_count
+                    await coordinator.receive(
+                        _client(
+                            {
+                                "event": "playbackStopped",
+                                "sequence": client_sequence,
+                                "turnId": TURN_ID,
+                                "streamId": STREAM_ID,
+                                "renderedSampleCount": stopped_rendered_sample_count,
+                                "reason": "providerResponseIncomplete:max_output_tokens",
+                            }
+                        )
+                    )
+                    client_sequence += 1
+                    provider.allow_incomplete.set()
+                continue
+            if not isinstance(frame, AvaServerControlFrameV4):
+                continue
+            event = frame.event
+            events.append(event)
+            if isinstance(event, AudioMetadataEventV4):
+                await coordinator.receive(
+                    _client(
+                        {
+                            "event": "playbackStarted",
+                            "sequence": client_sequence,
+                            "turnId": TURN_ID,
+                            "streamId": STREAM_ID,
+                            "renderedSampleCount": 0,
+                        }
+                    )
+                )
+                client_sequence += 1
+            if isinstance(event, TurnCancelledEventV4):
+                break
+
+        terminal = events[-1]
+        assert isinstance(terminal, TurnCancelledEventV4)
+        assert stopped_rendered_sample_count is not None
+        assert terminal.reason == "providerResponseIncomplete:max_output_tokens"
+        assert terminal.delivered_sample_count == stopped_rendered_sample_count
+        assert not any(isinstance(event, InterruptRequestedEventV4) for event in events)
+        assert provider.cancelled_turn_ids == []
+        assert speech.cancelled_turn_ids == [TURN_ID]
+    finally:
+        provider.allow_incomplete.set()
+        await frames.aclose()
+        await coordinator.close()
 
 
 async def test_late_turn_a_commit_preserves_cross_turn_memory_chronology() -> None:

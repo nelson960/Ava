@@ -103,8 +103,12 @@ final class AvaRealtimeBootstrapService {
 
   Future<AvaSessionBootstrapV4> createSessionV4({
     required AvaRealtimeAgeBand ageBand,
+    required AvaCanvasRenderProfileV4 canvasRenderProfile,
   }) async {
-    final request = AvaSessionCreateRequestV4(ageBand: ageBand);
+    final request = AvaSessionCreateRequestV4(
+      ageBand: ageBand,
+      canvasRenderProfile: canvasRenderProfile,
+    );
     final response = await _transport.postJson(
       endpoint: _configuration.realtimeSessionsV4Endpoint,
       headers: const {

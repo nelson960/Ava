@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 
 from .svg_document import ValidatedSvgDocument
 
@@ -33,16 +34,61 @@ class SvgCanvasWorkspaceError(ValueError):
     """A committed canvas update conflicts with canonical workspace state."""
 
 
+class SvgCanvasExecutionStatus(StrEnum):
+    GENERATING = "generating"
+    DRAFT_VISIBLE = "draftVisible"
+    VALIDATED_CANDIDATE = "validatedCandidate"
+    PREPARING = "preparing"
+    PRESENTATION_SCHEDULED = "presentationScheduled"
+    PRESENTED = "presented"
+    ACTIVE = "active"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    SUPERSEDED = "superseded"
+
+    @property
+    def terminal(self) -> bool:
+        return self in {
+            SvgCanvasExecutionStatus.ACTIVE,
+            SvgCanvasExecutionStatus.FAILED,
+            SvgCanvasExecutionStatus.CANCELLED,
+            SvgCanvasExecutionStatus.SUPERSEDED,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SvgCanvasExecution:
+    generation_id: str
+    source_turn_id: str
+    operation: str
+    status: SvgCanvasExecutionStatus
+    scene_id: str | None = None
+    scene_revision: int | None = None
+    terminal_reason: str | None = None
+
+
+_EXECUTION_PROGRESS = {
+    SvgCanvasExecutionStatus.GENERATING: 0,
+    SvgCanvasExecutionStatus.DRAFT_VISIBLE: 1,
+    SvgCanvasExecutionStatus.VALIDATED_CANDIDATE: 2,
+    SvgCanvasExecutionStatus.PREPARING: 3,
+    SvgCanvasExecutionStatus.PRESENTATION_SCHEDULED: 4,
+    SvgCanvasExecutionStatus.PRESENTED: 5,
+}
+
+
 class SvgCanvasWorkspace:
     """Subject-scoped process-lifetime owner of committed SVG scenes."""
 
     maximum_scene_count = 10
+    maximum_execution_history = 64
 
     def __init__(self) -> None:
         self._scenes: list[ActiveSvgCanvasScene] = []
         self._current_scene_id: str | None = None
         self._last_interaction: RecordedSvgCanvasInteraction | None = None
         self._reset_epoch = 0
+        self._executions: dict[str, SvgCanvasExecution] = {}
 
     @property
     def reset_epoch(self) -> int:
@@ -65,11 +111,123 @@ class SvgCanvasWorkspace:
     def last_interaction(self) -> RecordedSvgCanvasInteraction | None:
         return self._last_interaction
 
+    @property
+    def focused_scene_id(self) -> str | None:
+        return self._current_scene_id
+
+    @property
+    def executions(self) -> tuple[SvgCanvasExecution, ...]:
+        return tuple(self._executions.values())
+
+    def execution(self, generation_id: str) -> SvgCanvasExecution | None:
+        return self._executions.get(generation_id)
+
     def scene(self, scene_id: str) -> ActiveSvgCanvasScene | None:
         return next(
             (scene for scene in self._scenes if scene.scene_id == scene_id),
             None,
         )
+
+    def focus(self, scene_id: str) -> ActiveSvgCanvasScene:
+        scene = self.scene(scene_id)
+        if scene is None:
+            raise SvgCanvasWorkspaceError("focused SVG canvas scene does not exist")
+        self._current_scene_id = scene_id
+        self._last_interaction = None
+        return scene
+
+    def start_execution(
+        self,
+        *,
+        generation_id: str,
+        source_turn_id: str,
+        operation: str,
+    ) -> SvgCanvasExecution:
+        if generation_id in self._executions:
+            raise SvgCanvasWorkspaceError("canvas generation identity was reused")
+        self._prune_execution_history()
+        if len(self._executions) >= self.maximum_execution_history:
+            raise SvgCanvasWorkspaceError(
+                "canvas execution history is full of non-terminal work"
+            )
+        execution = SvgCanvasExecution(
+            generation_id=generation_id,
+            source_turn_id=source_turn_id,
+            operation=operation,
+            status=SvgCanvasExecutionStatus.GENERATING,
+        )
+        self._executions[generation_id] = execution
+        return execution
+
+    def advance_execution(
+        self,
+        generation_id: str,
+        status: SvgCanvasExecutionStatus,
+        *,
+        scene_id: str | None = None,
+        scene_revision: int | None = None,
+    ) -> SvgCanvasExecution:
+        execution = self._require_execution(generation_id)
+        if execution.status.terminal:
+            raise SvgCanvasWorkspaceError("terminal canvas execution cannot advance")
+        if status.terminal or status not in _EXECUTION_PROGRESS:
+            raise SvgCanvasWorkspaceError("canvas execution advance requires a phase")
+        current_order = _EXECUTION_PROGRESS[execution.status]
+        requested_order = _EXECUTION_PROGRESS[status]
+        if requested_order < current_order:
+            raise SvgCanvasWorkspaceError("canvas execution phase cannot move backward")
+        skips_optional_draft = (
+            execution.status is SvgCanvasExecutionStatus.GENERATING
+            and status is SvgCanvasExecutionStatus.VALIDATED_CANDIDATE
+        )
+        if requested_order > current_order + 1 and not skips_optional_draft:
+            raise SvgCanvasWorkspaceError(
+                "canvas execution phase cannot skip trust stages"
+            )
+        updated = SvgCanvasExecution(
+            generation_id=execution.generation_id,
+            source_turn_id=execution.source_turn_id,
+            operation=execution.operation,
+            status=status,
+            scene_id=scene_id if scene_id is not None else execution.scene_id,
+            scene_revision=(
+                scene_revision
+                if scene_revision is not None
+                else execution.scene_revision
+            ),
+        )
+        self._executions[generation_id] = updated
+        return updated
+
+    def finish_execution(
+        self,
+        generation_id: str,
+        status: SvgCanvasExecutionStatus,
+        *,
+        reason: str | None = None,
+    ) -> SvgCanvasExecution:
+        if not status.terminal:
+            raise SvgCanvasWorkspaceError(
+                "canvas execution terminal status is required"
+            )
+        execution = self._require_execution(generation_id)
+        if execution.status.terminal:
+            if execution.status is status:
+                return execution
+            raise SvgCanvasWorkspaceError(
+                "canvas execution already has a terminal status"
+            )
+        updated = SvgCanvasExecution(
+            generation_id=execution.generation_id,
+            source_turn_id=execution.source_turn_id,
+            operation=execution.operation,
+            status=status,
+            scene_id=execution.scene_id,
+            scene_revision=execution.scene_revision,
+            terminal_reason=reason,
+        )
+        self._executions[generation_id] = updated
+        return updated
 
     def commit(
         self,
@@ -103,6 +261,7 @@ class SvgCanvasWorkspace:
                     self._current_scene_id = None
             self._current_scene_id = scene.scene_id
             self._last_interaction = None
+            self._finish_active_execution(scene.generation_id)
             return scene
 
         existing = self._scenes[existing_index]
@@ -132,6 +291,7 @@ class SvgCanvasWorkspace:
         self._scenes[existing_index] = scene
         self._current_scene_id = scene.scene_id
         self._last_interaction = None
+        self._finish_active_execution(scene.generation_id)
         return scene
 
     def record_interaction(
@@ -155,7 +315,44 @@ class SvgCanvasWorkspace:
         self._scenes.clear()
         self._current_scene_id = None
         self._last_interaction = None
+        for generation_id, execution in tuple(self._executions.items()):
+            if not execution.status.terminal:
+                self.finish_execution(
+                    generation_id,
+                    SvgCanvasExecutionStatus.CANCELLED,
+                    reason="workspaceReset",
+                )
         self._reset_epoch += 1
+
+    def _finish_active_execution(self, generation_id: str) -> None:
+        execution = self._executions.get(generation_id)
+        if execution is None:
+            return
+        if execution.status is not SvgCanvasExecutionStatus.PRESENTED:
+            raise SvgCanvasWorkspaceError(
+                "canvas execution must be presented before activation"
+            )
+        self.finish_execution(generation_id, SvgCanvasExecutionStatus.ACTIVE)
+
+    def _require_execution(self, generation_id: str) -> SvgCanvasExecution:
+        execution = self._executions.get(generation_id)
+        if execution is None:
+            raise SvgCanvasWorkspaceError("canvas execution does not exist")
+        return execution
+
+    def _prune_execution_history(self) -> None:
+        while len(self._executions) >= self.maximum_execution_history:
+            terminal_id = next(
+                (
+                    generation_id
+                    for generation_id, execution in self._executions.items()
+                    if execution.status.terminal
+                ),
+                None,
+            )
+            if terminal_id is None:
+                return
+            del self._executions[terminal_id]
 
 
 class SvgCanvasWorkspaceStore:

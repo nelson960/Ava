@@ -300,6 +300,12 @@ final class _UnexpectedDocumentLoader implements AvaSvgDocumentLoader {
       throw StateError('Unexpected canvas document fetch.');
 
   @override
+  Future<AvaValidatedSvgCanvasDraft> fetchDraft(
+    AvaSvgCanvasDraftDescriptorV4 descriptor,
+  ) =>
+      throw StateError('Unexpected canvas draft fetch.');
+
+  @override
   void close() {}
 }
 

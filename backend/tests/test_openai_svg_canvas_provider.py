@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from ava_backend.canvas.svg_specialist import (
+    SvgCanvasVisibleDraft,
     SvgCanvasSpecialistGenerationLimitError,
     SvgCanvasSpecialistInvalidError,
     SvgCanvasSpecialistRequest,
@@ -23,8 +24,8 @@ from ava_backend.providers.openai_svg_canvas_provider import (
 def _svg(*, label: str = "Cloud", interaction_mode: str = "select") -> str:
     if interaction_mode in {"select", "explore"}:
         binding = (
-        '<ellipse id="cloud" data-ava-binding="select_cloud" aria-label="Cloud" '
-        'cx="500" cy="250" rx="160" ry="70" fill="#dff5ff"/>\n'
+            '<ellipse id="cloud" data-ava-binding="select_cloud" aria-label="Cloud" '
+            'cx="500" cy="250" rx="160" ry="70" fill="#dff5ff"/>\n'
         )
     elif interaction_mode == "steps":
         binding = (
@@ -35,8 +36,7 @@ def _svg(*, label: str = "Cloud", interaction_mode: str = "select") -> str:
         )
     else:
         binding = (
-            '<ellipse id="cloud" cx="500" cy="250" rx="160" ry="70" '
-            'fill="#dff5ff"/>\n'
+            '<ellipse id="cloud" cx="500" cy="250" rx="160" ry="70" fill="#dff5ff"/>\n'
         )
     return (
         "\n"
@@ -298,11 +298,13 @@ async def test_provider_uses_sol_raw_responses_and_preserves_exact_svg() -> None
     instructions = arguments["instructions"]
     assert isinstance(instructions, str)
     assert (
-        "Produce the smallest complete SVG that clearly teaches the requested concept."
-        in instructions
+        "versioned renderer capability below is the sole SVG capability authority"
+        in (instructions)
     )
-    assert "Target no more than 7,000 SVG characters" in instructions
-    assert "Never truncate generated SVG" in instructions
+    assert "resolution-independent viewBox" in instructions
+    assert "1000 × 600" not in instructions
+    assert "7,000 SVG characters" not in instructions
+    assert arguments["max_output_tokens"] == 20_000
 
 
 async def test_none_interaction_mode_prefers_a_static_svg() -> None:
@@ -345,7 +347,8 @@ async def test_explicit_interaction_mode_allows_matching_bindings() -> None:
     assert tuple(generation.document.bindings) == ("select_cloud",)
     instructions = client.responses.arguments[0]["instructions"]
     assert isinstance(instructions, str)
-    assert "`select` uses 1-32 visible choices" in instructions
+    assert '"interactionContract"' in instructions
+    assert '"select":{"maximum":32,"minimum":1}' in instructions
     assert "`aria-label` describes the exact semantic meaning" in instructions
     assert "self-contained enough to ground a short spoken response" in instructions
     assert "`data-ava-target` is visual/identity metadata" in instructions
@@ -373,7 +376,9 @@ async def test_requested_interaction_mode_must_match_validated_svg(
         client=client,  # type: ignore[arg-type]
     )
 
-    with pytest.raises(SvgCanvasSpecialistInvalidError, match="interactionModeMismatch"):
+    with pytest.raises(
+        SvgCanvasSpecialistInvalidError, match="interactionModeMismatch"
+    ):
         await provider.generate(_request(interactionMode=requested_mode))
 
 
@@ -394,9 +399,7 @@ async def test_interaction_mode_mismatch_uses_existing_quality_repair() -> None:
         client=client,  # type: ignore[arg-type]
     )
 
-    generation = await provider.generate(
-        _request(interactionMode="explore")
-    )
+    generation = await provider.generate(_request(interactionMode="explore"))
 
     assert generation.document.interaction_mode == "explore"
     assert len(client.responses.arguments) == 2
@@ -484,16 +487,19 @@ async def test_provider_permits_one_deterministic_repair() -> None:
     assert generation.input_tokens == 240
     assert len(client.responses.arguments) == 2
     repair_input = client.responses.arguments[1]["input"][0]["content"][0]["text"]
-    assert 'code="attributeForbidden"' in repair_input
-    assert (
-        "<validation_detail>SVG attribute &#x27;foo&#x27; is not "
-        "allowed</validation_detail>"
-    ) in repair_input
+    assert "<validation_feedback>" in repair_input
+    assert "&quot;category&quot;:&quot;capability&quot;" in repair_input
+    assert "&quot;code&quot;:&quot;attributeForbidden&quot;" in repair_input
+    assert "&quot;affectedAttribute&quot;:&quot;foo&quot;" in repair_input
+    assert "&quot;affectedElementId&quot;:&quot;cloud&quot;" in repair_input
     assert "foo=&quot;bar&quot;" in repair_input
 
 
-async def test_generation_deadline_bounds_original_and_repair_together() -> None:
-    invalid = _svg().replace("<ellipse", "<script")
+async def test_repair_receives_its_own_bounded_lifecycle_budget() -> None:
+    invalid = _svg().replace(
+        '<ellipse id="cloud"',
+        '<ellipse id="cloud" foo="bar"',
+    )
     blocked = asyncio.Event()
 
     class _ResponsesWithBlockedRepair(_Responses):
@@ -507,7 +513,7 @@ async def test_generation_deadline_bounds_original_and_repair_together() -> None
     settings = Settings(
         environment=AvaEnvironment.TEST,
         openai_canvas_max_quality_repairs=1,
-    ).model_copy(update={"openai_canvas_timeout_seconds": 0.02})
+    ).model_copy(update={"openai_canvas_repair_timeout_seconds": 0.02})
     responses = _ResponsesWithBlockedRepair([])
     provider = OpenAISvgCanvasSpecialist(
         settings,
@@ -545,6 +551,34 @@ async def test_current_svg_revision_context_preserves_whitespace() -> None:
     )
 
     assert request.current_svg == current_svg
+
+
+def test_render_profile_is_semantic_context_with_explicit_absence() -> None:
+    absent = _request().model_input()
+    profiled = _request(
+        renderProfile={
+            "usableAspectRatio": 0.68,
+            "orientation": "portrait",
+            "widthClass": "compact",
+            "heightClass": "regular",
+            "safeInsets": {
+                "top": 0.04,
+                "right": 0.02,
+                "bottom": 0.08,
+                "left": 0.02,
+            },
+            "touchEnvironment": "direct",
+            "minimumInteractionTargetPoints": 48,
+            "textScaleFactor": 1.2,
+        }
+    ).model_input()
+
+    assert 'availability="unavailable" fallback="responsive_touch_safe"' in absent
+    assert 'availability="client_measured" units="semantic_and_normalized"' in (
+        profiled
+    )
+    assert "&quot;usableAspectRatio&quot;:0.68" in profiled
+    assert "&quot;minimumInteractionTargetPoints&quot;:48.0" in profiled
 
 
 async def test_cancel_is_idempotent_and_surfaces_as_unavailable() -> None:
@@ -629,6 +663,158 @@ async def test_streaming_observability_uses_only_terminal_exact_svg(
     assert completed["reasoningTokens"] == 7
     assert completed["outputDeltaCharacters"] == len(svg)
     assert svg not in caplog.text
+
+
+async def test_streaming_publishes_only_validated_noncanonical_svg_prefixes() -> None:
+    first = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 480" '
+        'data-ava-interaction-mode="none">'
+        "<title>Growing cloud</title><desc>A cloud forming in two visible parts.</desc>"
+        '<ellipse cx="260" cy="220" rx="130" ry="65" fill="#dff5ff"/>'
+    )
+    second = '<circle cx="430" cy="210" r="72" fill="#c9eafa"/></svg>'
+    svg = first + second
+    response = _response(svg)
+    stream = _ResponseStream(response, fragments=[first, second])
+    drafts: list[SvgCanvasVisibleDraft] = []
+
+    async def record_draft(draft: SvgCanvasVisibleDraft) -> None:
+        drafts.append(draft)
+
+    provider = OpenAISvgCanvasSpecialist(
+        Settings(environment=AvaEnvironment.TEST, openai_canvas_max_quality_repairs=0),
+        session_id="session_progressive_draft",
+        safety_identifier="ava_test_user_123",
+        client=_ClientWithStream(stream),  # type: ignore[arg-type]
+    )
+
+    generation = await provider.generate(
+        _request(interactionMode="none"),
+        draft_sink=record_draft,
+    )
+
+    assert generation.document.svg_text == svg
+    assert [draft.draft_index for draft in drafts] == [1, 2]
+    assert drafts[0].document.svg_text == f"{first}</svg>"
+    assert drafts[1].document.svg_text == svg
+    assert all(
+        draft.document.manifest["sourceTrust"] == "modelGeneratedData"
+        for draft in drafts
+    )
+
+
+async def test_security_rejection_does_not_consume_repair_budget() -> None:
+    invalid = _svg().replace("<ellipse", "<script")
+
+    class _SingleRequestResponses(_Responses):
+        async def create(self, **arguments: object) -> object:
+            if self.arguments:
+                raise AssertionError("security rejection must not start a repair")
+            self.arguments.append(arguments)
+            return _ResponseStream(_response(invalid))
+
+    responses = _SingleRequestResponses([])
+    provider = OpenAISvgCanvasSpecialist(
+        Settings(environment=AvaEnvironment.TEST, openai_canvas_max_quality_repairs=1),
+        session_id="session_security_no_repair",
+        safety_identifier="ava_test_user_123",
+        client=SimpleNamespace(responses=responses),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(SvgCanvasSpecialistInvalidError, match="elementForbidden"):
+        await provider.generate(_request())
+
+    assert len(responses.arguments) == 1
+
+
+async def test_stream_stall_terminates_without_starting_repair() -> None:
+    class _CreatedThenStalledStream:
+        def __init__(self) -> None:
+            self._created = False
+            self.closed = False
+
+        def __aiter__(self) -> _CreatedThenStalledStream:
+            return self
+
+        async def __anext__(self) -> object:
+            if not self._created:
+                self._created = True
+                return SimpleNamespace(
+                    type="response.created",
+                    response=SimpleNamespace(id="resp_stalled"),
+                )
+            await asyncio.Future()
+
+        async def close(self) -> None:
+            self.closed = True
+
+    stream = _CreatedThenStalledStream()
+    settings = Settings(environment=AvaEnvironment.TEST).model_copy(
+        update={"openai_canvas_stream_stall_timeout_seconds": 0.02}
+    )
+    provider = OpenAISvgCanvasSpecialist(
+        settings,
+        session_id="session_stream_stall",
+        safety_identifier="ava_test_user_123",
+        client=_ClientWithStream(stream),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(SvgCanvasSpecialistUnavailableError, match="streamStall"):
+        await provider.generate(_request())
+
+    assert stream.closed
+
+
+async def test_first_provider_progress_has_an_independent_deadline() -> None:
+    create_cancelled = asyncio.Event()
+
+    class _NeverStartsResponses:
+        async def create(self, **arguments: object) -> object:
+            assert arguments["stream"] is True
+            try:
+                await asyncio.Future()
+            finally:
+                create_cancelled.set()
+
+    settings = Settings(environment=AvaEnvironment.TEST).model_copy(
+        update={"openai_canvas_first_progress_timeout_seconds": 0.02}
+    )
+    provider = OpenAISvgCanvasSpecialist(
+        settings,
+        session_id="session_first_progress_deadline",
+        safety_identifier="ava_test_user_123",
+        client=SimpleNamespace(responses=_NeverStartsResponses()),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(
+        SvgCanvasSpecialistUnavailableError,
+        match="firstProviderProgress",
+    ):
+        await provider.generate(_request())
+
+    assert create_cancelled.is_set()
+
+
+async def test_accumulated_output_headroom_is_bounded_without_repair() -> None:
+    oversized = "x" * (256 * 1024 + 1)
+    stream = _ResponseStream(_response(oversized), fragments=[oversized])
+    settings = Settings(
+        environment=AvaEnvironment.TEST,
+        canvas_max_svg_bytes=128 * 1024,
+        openai_canvas_max_accumulated_output_bytes=256 * 1024,
+        openai_canvas_max_quality_repairs=1,
+    )
+    provider = OpenAISvgCanvasSpecialist(
+        settings,
+        session_id="session_accumulation_limit",
+        safety_identifier="ava_test_user_123",
+        client=_ClientWithStream(stream),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(SvgCanvasSpecialistGenerationLimitError):
+        await provider.generate(_request())
+
+    assert stream.close_calls == 1
 
 
 async def test_completed_terminal_stops_without_eof_and_preserves_exact_svg() -> None:

@@ -21,9 +21,11 @@ from .provider_session import (
     validate_sdp,
 )
 from .tool_contract import (
+    InteractiveCanvasCancellationToolOutputV4,
     InteractiveCanvasRequest,
     InteractiveCanvasToolOutput,
     InteractiveCanvasToolOutputV4,
+    RealtimeCancelCanvasToolCall,
     RealtimeCanvasToolCall,
     RealtimeRejectedCanvasToolCall,
     RealtimeSpeechTextDelta,
@@ -96,6 +98,7 @@ class DeterministicRealtimePlanProvider:
         *,
         child_text: str | None = "Deterministic child turn.",
         canvas_brief: str | None = None,
+        cancel_pending_canvas: bool = False,
         rejected_canvas_reason: str | None = None,
         wait_for_canvas_interaction_response: bool = False,
         chunk_sizes: Iterable[int] = (17, 5, 43, 2),
@@ -112,6 +115,8 @@ class DeterministicRealtimePlanProvider:
             canvas_brief = plan.canvas_decision.specialist_brief
         if canvas_needed != (canvas_brief is not None):
             raise ValueError("fake canvas brief must match the runtime plan")
+        if cancel_pending_canvas and canvas_brief is not None:
+            raise ValueError("fake canvas cancellation cannot request a canvas")
         self._speech_segments = tuple(segment.speech for segment in plan.segments)
         self._canvas_request = (
             InteractiveCanvasRequest.model_validate(
@@ -126,6 +131,7 @@ class DeterministicRealtimePlanProvider:
         )
         self._child_text = normalized_child_text
         self._rejected_canvas_reason = rejected_canvas_reason
+        self._cancel_pending_canvas = cancel_pending_canvas
         self._wait_for_canvas_interaction_response = (
             wait_for_canvas_interaction_response
         )
@@ -138,7 +144,11 @@ class DeterministicRealtimePlanProvider:
         self.yield_count = 0
         self.cancelled_turn_ids: list[str] = []
         self.completed_canvas_outputs: list[
-            InteractiveCanvasToolOutput | InteractiveCanvasToolOutputV4
+            (
+                InteractiveCanvasToolOutput
+                | InteractiveCanvasToolOutputV4
+                | InteractiveCanvasCancellationToolOutputV4
+            )
         ] = []
         self.canvas_interaction_response_turn_ids: list[str] = []
         self.canvas_interaction_response_interactions: list[
@@ -262,12 +272,19 @@ class DeterministicRealtimePlanProvider:
             async for delta in stream.stream():
                 self.yield_count += 1
                 yield RealtimeSpeechTextDelta(delta=delta)
-            if index == 0 and self._canvas_request is not None:
+            if index == 0 and (
+                self._canvas_request is not None or self._cancel_pending_canvas
+            ):
                 self._pending_call_id = "call_canvas_fake_0001"
-                if self._rejected_canvas_reason is None:
+                if self._cancel_pending_canvas:
+                    yield RealtimeCancelCanvasToolCall(call_id=self._pending_call_id)
+                elif self._rejected_canvas_reason is None:
+                    request = self._canvas_request
+                    if request is None:  # guarded by the enclosing condition
+                        raise RuntimeError("fake canvas request was not configured")
                     yield RealtimeCanvasToolCall(
                         call_id=self._pending_call_id,
-                        request=self._canvas_request,
+                        request=request,
                     )
                 else:
                     yield RealtimeRejectedCanvasToolCall(
@@ -283,7 +300,11 @@ class DeterministicRealtimePlanProvider:
         *,
         turn_id: str,
         call_id: str,
-        output: InteractiveCanvasToolOutput | InteractiveCanvasToolOutputV4,
+        output: (
+            InteractiveCanvasToolOutput
+            | InteractiveCanvasToolOutputV4
+            | InteractiveCanvasCancellationToolOutputV4
+        ),
     ) -> None:
         if not turn_id:
             raise ValueError("turn_id cannot be empty")

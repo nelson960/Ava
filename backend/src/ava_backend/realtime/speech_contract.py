@@ -8,9 +8,13 @@ from pydantic import Field, StringConstraints, field_validator, model_validator
 from .common import NonEmptyText, ProtocolIdentifier, RealtimeProtocolModel
 
 
-MAX_SPEECH_PHRASES = 12
 MAX_SPEECH_PHRASE_CHARACTERS = 600
 MAX_SPEECH_RESPONSE_CHARACTERS = 1_800
+# Every phrase contains at least one non-whitespace character and every pair
+# of phrases requires at least one separator in the source response. The one
+# optional canvas tool boundary may release one otherwise contiguous phrase.
+MAX_SPEECH_SEGMENTS = (MAX_SPEECH_RESPONSE_CHARACTERS + 1) // 2 + 1
+MAX_SPEECH_SEGMENT_INDEX = MAX_SPEECH_SEGMENTS - 1
 MAX_SPEECH_ALIGNMENT_SPANS = 512
 
 SpeechPhraseIdentifier = Annotated[

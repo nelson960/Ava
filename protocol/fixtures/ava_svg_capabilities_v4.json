@@ -137,6 +137,15 @@
     "tspan",
     "use"
   ],
+  "allowedFilterPrimitives": [
+    "feBlend",
+    "feColorMatrix",
+    "feComposite",
+    "feDropShadow",
+    "feFlood",
+    "feGaussianBlur",
+    "feOffset"
+  ],
   "allowedInteractionModes": [
     "none",
     "explore",
@@ -184,19 +193,82 @@
     "visibility",
     "word-spacing"
   ],
+  "documentContract": {
+    "canonicalBytes": "exactUtf8ProviderOutput",
+    "externalResources": false,
+    "resolutionIndependentViewBox": true,
+    "scripts": false
+  },
+  "interactionEnvironment": {
+    "clientExpandsCompactTargets": true,
+    "defaultMinimumTargetPoints": 44,
+    "manifestRequiredForAuthority": true
+  },
+  "interactionContract": {
+    "bindingCountByMode": {
+      "explore": {
+        "maximum": 32,
+        "minimum": 1
+      },
+      "none": {
+        "maximum": 0,
+        "minimum": 0
+      },
+      "select": {
+        "maximum": 32,
+        "minimum": 1
+      },
+      "steps": {
+        "maximum": 12,
+        "minimum": 2
+      }
+    },
+    "stepIndexes": "uniqueContiguousFromOne"
+  },
   "limits": {
+    "attributeCharacters": 131072,
     "attributes": 3072,
+    "attributesPerElement": 64,
+    "backgroundCharacters": 96,
+    "bindingLabelCharacters": 160,
     "bindings": 32,
-    "bytes": 262144,
+    "bytes": 393216,
+    "descriptionCharacters": 800,
     "depth": 32,
     "elements": 384,
     "expandedElements": 2048,
     "filterPrimitives": 48,
+    "manifestBytes": 65536,
+    "pathCharacters": 96000,
     "pathCommands": 6000,
     "referenceDepth": 20,
-    "references": 768
+    "references": 768,
+    "textCharacters": 24000,
+    "titleCharacters": 160,
+    "transformOperations": 768,
+    "viewBoxExtent": 10000.0
   },
   "manifestVersion": "ava-svg-manifest-v2",
+  "referencePolicy": {
+    "allowedNamespaces": [
+      "unqualified",
+      "http://www.w3.org/2000/svg",
+      "http://www.w3.org/1999/xlink",
+      "http://www.w3.org/XML/1998/namespace"
+    ],
+    "documentLocalFragmentsOnly": true,
+    "referenceAttributes": [
+      "clip-path",
+      "fill",
+      "filter",
+      "href",
+      "marker-end",
+      "marker-mid",
+      "marker-start",
+      "mask",
+      "stroke"
+    ]
+  },
   "rendererCapabilityVersion": "ava-svg-renderer-v2",
   "validatorVersion": "ava-svg-validator-v2"
 }

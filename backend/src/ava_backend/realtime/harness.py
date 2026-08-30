@@ -14,14 +14,16 @@ from .memory import (
     StableMemoryRecord,
 )
 from .tool_contract import (
+    CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
     INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS,
     INTERACTIVE_CANVAS_TOOL_NAME,
+    InteractiveCanvasCancellationRequest,
     InteractiveCanvasRequest,
 )
 
 
-REALTIME_PROMPT_VERSION = "ava-realtime-v4.6"
-REALTIME_TOOL_CONTRACT_VERSION = "ava-realtime-tools-v4.4"
+REALTIME_PROMPT_VERSION = "ava-realtime-v4.7"
+REALTIME_TOOL_CONTRACT_VERSION = "ava-realtime-tools-v4.5"
 DEFAULT_REALTIME_REASONING_EFFORT: Literal["low"] = "low"
 
 
@@ -53,19 +55,20 @@ directions, implementation terms, filler boilerplate, or private reasoning.""",
     ),
     PromptLayer(
         "interactive_canvas_tool",
-        f"""Ava has access to {INTERACTIVE_CANVAS_TOOL_NAME}, which creates or
-revises a validated visual in the lower panel. Tool choice is semantic and
-optional. Call it when a visual would materially clarify conversational
-meaning, when the child meaningfully asks to see or draw something, or when
-revising the active canvas. Spatial, cyclic, structural, comparative, and
-ordered relationships are strong candidates. Do not call it when a spoken answer
-is already clear, for casual mentions of drawing, or when the child declines a
-visual. Decide from the full conversation, never from isolated words or a keyword list.
+        f"""Ava can create and revise validated visuals in the lower panel with
+{INTERACTIVE_CANVAS_TOOL_NAME}. When the child's intended outcome is itself a
+visual, fulfill that intent through the canvas tool. When a visual was not
+explicitly intended and would only be helpful, tool choice remains semantic and
+optional. Spatial, cyclic, structural, comparative, and ordered relationships
+are strong candidates. Decide from the full conversation, never from isolated
+words or a keyword list.
 
 Choose operation=new for a separate visual or concept. Choose
 operation=reviseFocused only when modifying the active visual; merely
-discussing the active visual is not a revision. In the brief, describe only the
-visual's purpose, essential objects, relationships, flow, and labels. Choose
+discussing a pending or active visual is not a revision. Use
+{CANCEL_INTERACTIVE_CANVAS_TOOL_NAME} when the child semantically asks to stop
+an unpresented visual. In the brief, describe only the visual's purpose,
+essential objects, relationships, flow, and labels. Choose
 interactionMode=none for static visuals, interactionMode=explore for tapping
 parts to learn, interactionMode=select for choosing one visible option, and
 interactionMode=steps for ordered Back/Next progression. When revising, preserve
@@ -73,18 +76,19 @@ the current interaction mode unless interaction meaning changes. Keep the brief
 under {INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS} characters. Never output
 geometry, coordinates, SVG, paths, code, styling, or scene identifiers.
 
-The application owns visual rendering and tool outcomes. An accepted result
-means generation started asynchronously; a rejected result means the visual is
-unavailable. Treat tool results as authoritative without retrying or describing
-internal mechanics.
+The application owns visual rendering and tool outcomes. An accepted canvas
+result means the application has begun generation asynchronously; it is not a
+promise that the visual is already visible. Treat tool results as authoritative
+without retrying or describing internal mechanics.
 
-Active canvas context supplies bounded semantics from the current visual
-(title, description, visible labels, named objects, interactions). Use it to
-ground conversation and resolve child references without regenerating an
-existing visual. A validated canvas interaction establishes shared semantic
-focus: semantic_focus is the active referent, not a script to recite. Respond
-naturally through Ava's standard conversational character, with child speech
-always guiding conversational intent. Application identifiers have no language
+Canvas context supplies bounded semantics for pending and active visuals
+(purpose, topic, state, title, description, visible labels, named objects, and
+interactions). Use it to ground conversation and resolve child references.
+Normal conversation about a pending or active visual does not itself imply a
+revision. A validated canvas interaction establishes shared semantic focus:
+semantic_focus is the active referent, not a script to recite. Respond naturally
+through Ava's standard conversational character, with child speech always
+guiding conversational intent. Application identifiers have no language
 meaning.""",
     ),
     PromptLayer(
@@ -140,7 +144,7 @@ class RealtimeHarness:
     prompt_version: str
     tool_contract_version: str
     instructions: str
-    tools: tuple[dict[str, Any]]
+    tools: tuple[dict[str, Any], ...]
     tool_choice: Literal["auto"]
     reasoning_effort: Literal["low"]
     context: RenderedRealtimeContext
@@ -202,7 +206,10 @@ def build_realtime_harness(
         prompt_version=REALTIME_PROMPT_VERSION,
         tool_contract_version=REALTIME_TOOL_CONTRACT_VERSION,
         instructions="\n\n".join(sections),
-        tools=(build_interactive_canvas_tool(),),
+        tools=(
+            build_interactive_canvas_tool(),
+            build_cancel_interactive_canvas_tool(),
+        ),
         tool_choice="auto",
         reasoning_effort=DEFAULT_REALTIME_REASONING_EFFORT,
         context=context,
@@ -227,11 +234,28 @@ def build_interactive_canvas_tool() -> dict[str, Any]:
         "type": "function",
         "name": INTERACTIVE_CANVAS_TOOL_NAME,
         "description": (
-            "Request one optional validated visual, explicitly choosing a new "
-            "scene or a revision of the focused scene, when the full "
-            "conversational meaning is materially clearer spatially. "
-            "Do not call for ordinary conversation, casual mentions of drawing, "
-            "unclear speech, or when the child declines a visual."
+            "Create or revise a validated lower-panel visual. Use this when the "
+            "child's intended outcome is a visual, or when a visual is "
+            "semantically useful; choose a new scene or a revision of the "
+            "focused scene."
+        ),
+        "parameters": parameters,
+    }
+
+
+def build_cancel_interactive_canvas_tool() -> dict[str, Any]:
+    parameters = InteractiveCanvasCancellationRequest.model_json_schema(
+        by_alias=True,
+        ref_template="#/$defs/{model}",
+    )
+    _remove_schema_titles(parameters)
+    return {
+        "type": "function",
+        "name": CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
+        "description": (
+            "Stop the currently pending lower-panel visual when the child "
+            "semantically asks to cancel drawing. It does not remove an active "
+            "completed visual."
         ),
         "parameters": parameters,
     }

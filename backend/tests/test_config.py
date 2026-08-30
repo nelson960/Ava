@@ -40,7 +40,14 @@ def test_development_configuration_does_not_hide_missing_model_key() -> None:
     assert settings.openai_realtime_vad_threshold == 0.45
     assert settings.openai_realtime_vad_prefix_padding_ms == 500
     assert settings.openai_realtime_vad_silence_duration_ms == 450
-    assert settings.openai_canvas_timeout_seconds == 60
+    assert settings.openai_canvas_timeout_seconds == 90
+    assert settings.openai_canvas_first_progress_timeout_seconds == 20
+    assert settings.openai_canvas_stream_stall_timeout_seconds == 15
+    assert settings.openai_canvas_overall_timeout_seconds == 150
+    assert settings.openai_canvas_repair_timeout_seconds == 45
+    assert settings.openai_canvas_max_output_tokens == 20_000
+    assert settings.openai_canvas_max_accumulated_output_bytes == 512 * 1024
+    assert settings.canvas_max_svg_bytes == 384 * 1024
     assert settings.openai_live_tests_enabled is False
     assert settings.openai_tts_model == "gpt-4o-mini-tts-2025-12-15"
     assert settings.openai_tts_voice == "marin"

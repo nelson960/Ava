@@ -1,18 +1,44 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 
 import '../models/ava_svg_canvas_protocol.dart';
+import '../models/ava_realtime_protocol_v4.dart';
 import 'ava_svg_canvas_controller.dart';
+
+typedef AvaCanvasRenderProfileUpdateSink = void Function(
+  int profileRevision,
+  AvaCanvasRenderProfileV4 renderProfile,
+);
 
 /// Application-level owner of the presented SVG and the controller attached
 /// to the current realtime session.
 final class AvaSvgCanvasSessionHost extends ChangeNotifier {
   static const int maximumSceneCount = 10;
 
+  AvaSvgCanvasSessionHost({
+    Duration renderProfileDebounce = const Duration(milliseconds: 150),
+  }) : _renderProfileDebounce = renderProfileDebounce {
+    if (renderProfileDebounce.isNegative) {
+      throw ArgumentError.value(
+        renderProfileDebounce,
+        'renderProfileDebounce',
+        'cannot be negative',
+      );
+    }
+  }
+
+  final Duration _renderProfileDebounce;
   AvaSvgCanvasController? _controller;
   final List<AvaValidatedSvgCanvasDocument> _workspaceDocuments = [];
   AvaValidatedSvgCanvasDocument? _presentedDocument;
   bool _panelDismissed = false;
   String? _lastPresentationGeneration;
+  AvaCanvasRenderProfileV4? _renderProfile;
+  AvaCanvasRenderProfileV4? _lastSentRenderProfile;
+  AvaCanvasRenderProfileUpdateSink? _renderProfileUpdateSink;
+  Timer? _renderProfileTimer;
+  int _renderProfileRevision = 0;
 
   AvaSvgCanvasController? get controller => _controller;
   List<AvaValidatedSvgCanvasDocument> get workspaceDocuments =>
@@ -20,6 +46,28 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
   int get sceneCount => _workspaceDocuments.length;
   AvaValidatedSvgCanvasDocument? get presentedDocument => _presentedDocument;
   bool get panelDismissed => _panelDismissed;
+  AvaCanvasRenderProfileV4? get renderProfile => _renderProfile;
+
+  void updateRenderProfile(AvaCanvasRenderProfileV4 profile) {
+    if (_sameRenderProfile(_renderProfile, profile)) return;
+    _renderProfile = profile;
+    if (_renderProfileUpdateSink == null) return;
+    _renderProfileTimer?.cancel();
+    _renderProfileTimer = Timer(
+      _renderProfileDebounce,
+      _flushRenderProfileUpdate,
+    );
+  }
+
+  AvaCanvasRenderProfileV4 requireRenderProfile() {
+    final profile = _renderProfile;
+    if (profile == null) {
+      throw StateError(
+        'The canvas workspace must be measured before session creation.',
+      );
+    }
+    return profile;
+  }
 
   int? retainedSceneRevision(String sceneId) {
     for (final document in _workspaceDocuments) {
@@ -33,18 +81,32 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
   bool get panelVisible {
     if (_panelDismissed) return false;
     return _presentedDocument != null ||
-        _controller?.shouldPresentCandidate == true;
+        (_controller?.hasPendingVisual ?? false);
   }
 
   bool get canReopen => _panelDismissed && _presentedDocument != null;
 
   bool get generating {
-    final candidate = _controller?.candidate;
-    return _controller?.generation != null ||
-        (candidate != null && !controller!.shouldPresentCandidate);
+    final phase = _controller?.lifecyclePhase;
+    return phase == AvaSvgCanvasLifecyclePhase.generating ||
+        phase == AvaSvgCanvasLifecyclePhase.draftVisible ||
+        phase == AvaSvgCanvasLifecyclePhase.validatedCandidate ||
+        phase == AvaSvgCanvasLifecyclePhase.preparing ||
+        phase == AvaSvgCanvasLifecyclePhase.presentationScheduled ||
+        phase == AvaSvgCanvasLifecyclePhase.presented;
   }
 
-  void attach(AvaSvgCanvasController controller) {
+  void attach(
+    AvaSvgCanvasController controller, {
+    AvaCanvasRenderProfileV4? initialRenderProfile,
+    AvaCanvasRenderProfileUpdateSink? renderProfileUpdateSink,
+  }) {
+    if ((initialRenderProfile == null) != (renderProfileUpdateSink == null)) {
+      throw ArgumentError(
+        'An active canvas session requires both its initial render profile '
+        'and update sink.',
+      );
+    }
     if (identical(_controller, controller)) return;
     final previous = _controller;
     if (previous != null) {
@@ -52,9 +114,21 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     }
     _retainPresentedDocument(controller);
     previous?.removeListener(_handleControllerChanged);
+    _renderProfileTimer?.cancel();
+    _renderProfileTimer = null;
     _controller = controller;
+    _renderProfileUpdateSink = renderProfileUpdateSink;
+    _lastSentRenderProfile = initialRenderProfile;
+    _renderProfileRevision = 0;
     _lastPresentationGeneration = null;
     controller.addListener(_handleControllerChanged);
+    if (renderProfileUpdateSink != null &&
+        !_sameRenderProfile(_renderProfile, initialRenderProfile)) {
+      _renderProfileTimer = Timer(
+        _renderProfileDebounce,
+        _flushRenderProfileUpdate,
+      );
+    }
     notifyListeners();
   }
 
@@ -62,6 +136,11 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     if (!identical(_controller, controller)) return;
     _retainPresentedDocument(controller);
     controller.removeListener(_handleControllerChanged);
+    _renderProfileTimer?.cancel();
+    _renderProfileTimer = null;
+    _renderProfileUpdateSink = null;
+    _lastSentRenderProfile = null;
+    _renderProfileRevision = 0;
     _controller = null;
     _lastPresentationGeneration = null;
     notifyListeners();
@@ -104,6 +183,9 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     if (controller == null) return;
     _retainPresentedDocument(controller);
     final candidate = controller.candidate;
+    if (controller.hasPendingVisual) {
+      _panelDismissed = false;
+    }
     if (candidate != null && controller.shouldPresentCandidate) {
       final generation = candidate.descriptor.generationId;
       if (_lastPresentationGeneration != generation) {
@@ -172,8 +254,29 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
         left.manifestByteLength == right.manifestByteLength;
   }
 
+  void _flushRenderProfileUpdate() {
+    _renderProfileTimer = null;
+    final sink = _renderProfileUpdateSink;
+    final profile = _renderProfile;
+    if (sink == null ||
+        profile == null ||
+        _sameRenderProfile(profile, _lastSentRenderProfile)) {
+      return;
+    }
+    if (_renderProfileRevision == 1000000) {
+      throw StateError('Canvas render-profile revision exhausted its bound.');
+    }
+    final revision = _renderProfileRevision + 1;
+    sink(revision, profile);
+    _renderProfileRevision = revision;
+    _lastSentRenderProfile = profile;
+  }
+
   @override
   void dispose() {
+    _renderProfileTimer?.cancel();
+    _renderProfileTimer = null;
+    _renderProfileUpdateSink = null;
     _controller?.removeListener(_handleControllerChanged);
     _controller = null;
     _workspaceDocuments.clear();
@@ -181,3 +284,23 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     super.dispose();
   }
 }
+
+bool _sameRenderProfile(
+  AvaCanvasRenderProfileV4? left,
+  AvaCanvasRenderProfileV4? right,
+) =>
+    identical(left, right) ||
+    (left != null &&
+        right != null &&
+        left.usableAspectRatio == right.usableAspectRatio &&
+        left.orientation == right.orientation &&
+        left.widthClass == right.widthClass &&
+        left.heightClass == right.heightClass &&
+        left.safeInsets.top == right.safeInsets.top &&
+        left.safeInsets.right == right.safeInsets.right &&
+        left.safeInsets.bottom == right.safeInsets.bottom &&
+        left.safeInsets.left == right.safeInsets.left &&
+        left.touchEnvironment == right.touchEnvironment &&
+        left.minimumInteractionTargetPoints ==
+            right.minimumInteractionTargetPoints &&
+        left.textScaleFactor == right.textScaleFactor);

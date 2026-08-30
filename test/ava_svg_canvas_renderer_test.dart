@@ -9,6 +9,24 @@ import 'package:flutter_test/flutter_test.dart';
 const _manifestJson =
     '{"background":"#dff5ff","bindings":[{"accessibilityLabel":"Rain cloud","bindingId":"select-cloud","elementId":"cloud","revealIds":[],"targetId":"cloud"}],"description":"A cloud turns water vapour into rain.","interactionMode":"select","manifestVersion":"ava-svg-manifest-v2","rendererCapabilityVersion":"ava-svg-renderer-v2","sourceTrust":"modelGeneratedData","title":"Café cloud ☁️","validatorVersion":"ava-svg-validator-v2","viewBox":[0.0,0.0,1000.0,600.0]}';
 
+extension on AvaSvgCanvasHtmlRenderer {
+  String build({
+    required AvaValidatedSvgCanvasDocument document,
+    required String preparedHandler,
+    required String presentedHandler,
+    required String bindingHandler,
+    required String errorHandler,
+  }) =>
+      buildShell(
+        preparedHandler: preparedHandler,
+        presentedHandler: presentedHandler,
+        draftPresentedHandler: 'draft_presented_handler',
+        bindingHandler: bindingHandler,
+        errorHandler: errorHandler,
+      ) +
+      mountCandidateScript(document);
+}
+
 void main() {
   late AvaValidatedSvgCanvasDocument document;
 
@@ -65,11 +83,46 @@ void main() {
     expect(html, contains("default-src 'none'"));
     expect(html, contains("connect-src 'none'"));
     expect(html, contains("object-src 'none'"));
-    expect(html, contains("script-src 'nonce-ava-svg-runtime-v1'"));
+    expect(html, contains("script-src 'nonce-ava-svg-runtime-v2'"));
+    expect(html, contains('frame-src blob:'));
     expect(html, contains('Math.max(44, rect.width)'));
-    expect(html, contains("CSS.escape(binding.elementId)"));
-    expect(html, contains('window.avaPresent'));
+    expect(html, contains('window.avaCanvas'));
+    expect(html, contains('replaceDraft(payload)'));
+    expect(html, contains('mountCandidate(payload)'));
+    expect(html, contains('activateCandidate(identity, interactive)'));
+    expect(
+      html,
+      contains('const previousActive = active; active = candidate;'),
+    );
     expect(html, contains('requestAnimationFrame(() => requestAnimationFrame'));
+  });
+
+  test('duplicate local IDs resolve only in each layer iframe document', () {
+    final html = const AvaSvgCanvasHtmlRenderer().build(
+      document: document,
+      preparedHandler: 'prepared_handler',
+      presentedHandler: 'presented_handler',
+      bindingHandler: 'binding_handler',
+      errorHandler: 'error_handler',
+    );
+
+    expect(html, contains("document.createElement('iframe')"));
+    expect(
+        html, contains("frame.setAttribute('sandbox', 'allow-same-origin')"));
+    expect(html, contains('URL.createObjectURL(new Blob([frameShell]'));
+    expect(html, contains("frame-src 'none'"));
+    expect(html, contains("script-src 'none'"));
+    expect(html, contains('target.document.getElementById(id)'));
+    expect(html, contains('scopedDocument.getElementById(id)'));
+    expect(html, contains('svg.contains(resolved)'));
+    expect(html, contains("attribute.localName === 'href'"));
+    expect(html, contains("attribute.name === 'xlink:href'"));
+    expect(html, contains("'marker-start','marker-mid','marker-end'"));
+    expect(html, contains('target.host.replaceChildren(frame)'));
+    expect(
+        html, contains('const previousActive = active; active = candidate;'));
+    expect(html, isNot(contains("document.querySelector('#")));
+    expect(html, isNot(contains("setAttribute('id'")));
   });
 
   test('provider binding values never become bridge-authored semantics', () {
@@ -83,7 +136,10 @@ void main() {
 
     expect(
       html,
-      contains("bridge('binding_handler', {bindingId: binding.bindingId})"),
+      contains(
+        "bridge('binding_handler', {bindingId:binding.bindingId, "
+        'generationId:payload.identity.generationId})',
+      ),
     );
     expect(html, isNot(contains('{bindingId: binding.bindingId, label:')));
   });
@@ -98,11 +154,11 @@ void main() {
     );
 
     expect(html, contains('let selectedBindingId = null'));
-    expect(html, contains("interactionMode === 'explore'"));
+    expect(html, contains("manifest.interactionMode === 'explore'"));
     expect(html, contains('previous.binding.revealIds'));
     expect(html, contains('selectedBindingId = binding.bindingId'));
     expect(html, contains("classList.add('ava-selected')"));
-    expect(html, contains('new ResizeObserver(queueRebuild)'));
+    expect(html, contains('new ResizeObserver(() =>'));
   });
 
   test('explore and select report only a change of selection', () {
@@ -117,7 +173,7 @@ void main() {
     expect(
       html,
       contains(
-        "if (interactionMode !== 'steps' && "
+        "if (manifest.interactionMode !== 'steps' && "
         'selectedBindingId === binding.bindingId) return;',
       ),
     );
@@ -142,7 +198,7 @@ void main() {
     expect(html, contains('applyStep(currentStep + 1, true)'));
     expect(html, contains('applyStep(currentStep - 1, true)'));
     expect(html, contains("applyStep(1, false)"));
-    expect(html, contains("if (interactionMode !== 'steps')"));
+    expect(html, contains("if (manifest.interactionMode !== 'steps')"));
     expect(
       html,
       isNot(

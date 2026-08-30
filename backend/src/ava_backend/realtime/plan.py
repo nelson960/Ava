@@ -15,8 +15,8 @@ from ..canvas.protocol import (
 from .common import NodeIdentifier, NonEmptyText, RealtimeProtocolModel
 from .memory import AvaMemoryProposal
 from .speech_contract import (
-    MAX_SPEECH_PHRASES,
     MAX_SPEECH_RESPONSE_CHARACTERS,
+    MAX_SPEECH_SEGMENTS,
     SpeechDelivery,
     SpeechExpressionIntent,
     SpeechGazeIntent,
@@ -27,7 +27,7 @@ from .speech_contract import (
 )
 
 
-MAX_REALTIME_SPEECH_SEGMENTS = MAX_SPEECH_PHRASES
+MAX_REALTIME_SPEECH_SEGMENTS = MAX_SPEECH_SEGMENTS
 AvaDelivery = SpeechDelivery
 AvaExpressionIntent = SpeechExpressionIntent
 AvaGazeIntent = SpeechGazeIntent

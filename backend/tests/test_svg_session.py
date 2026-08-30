@@ -132,7 +132,7 @@ def test_presented_ack_before_scheduled_sample_fails_visibly() -> None:
     assert state.active is None
 
 
-def test_interruption_discards_unpresented_candidate_not_active_scene() -> None:
+def test_discarding_unpresented_candidate_does_not_touch_active_scene() -> None:
     state = SvgCanvasSessionState()
     first = _generation()
     _prepare_and_schedule(state, first)
@@ -145,7 +145,7 @@ def test_interruption_discards_unpresented_candidate_not_active_scene() -> None:
     second = _generation("generation_2")
     _stage_generation(state, second, source_turn_id="turn_2")
 
-    discarded = state.discard_candidate_for_interrupted_turn(source_turn_id="turn_2")
+    discarded = state.discard_candidate(generation_id="generation_2")
 
     assert discarded is not None
     assert discarded.generation_id == "generation_2"
@@ -233,6 +233,10 @@ def test_realtime_context_is_escaped_and_explicitly_untrusted() -> None:
     context = state.render_realtime_context()
 
     assert 'trust="untrusted_model_generated_data"' in context
+    assert "<active_visual" in context
+    assert active.generation_id not in context
+    assert active.scene_id not in context
+    assert active.document.svg_sha256 not in context
     assert "Cloud &amp; rain" in context
     assert "&lt;gently&gt;" in context
     assert "<target>Rain cloud</target>" in context

@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:ava/models/ava_svg_canvas_protocol.dart';
+import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 const _manifestJson =
@@ -22,6 +23,45 @@ void main() {
     svgBytes =
         File('protocol/fixtures/ava_svg_document_v4.svg').readAsBytesSync();
     manifestBytes = Uint8List.fromList(utf8.encode(_manifestJson));
+  });
+
+  test('Flutter SVG protocol ceiling matches backend 512 KiB ceiling', () {
+    expect(avaSvgMaximumDocumentBytes, 512 * 1024);
+  });
+
+  test('draft verifies exact hash and byte bounds before display', () {
+    final fixture = (jsonDecode(
+      File('protocol/fixtures/ava_realtime_canvas_draft_v4.json')
+          .readAsStringSync(),
+    ) as Map)
+        .cast<String, Object?>();
+    final descriptor = AvaSvgCanvasDraftDescriptorV4.fromJson({
+      ...fixture,
+      'svgSha256': sha256.convert(svgBytes).toString(),
+      'svgByteLength': svgBytes.length,
+    });
+
+    final draft = AvaValidatedSvgCanvasDraft.verify(
+      descriptor: descriptor,
+      svgBytes: svgBytes,
+    );
+    expect(draft.svgBytes, orderedEquals(svgBytes));
+
+    final changed = Uint8List.fromList(svgBytes)..[100] ^= 1;
+    expect(
+      () => AvaValidatedSvgCanvasDraft.verify(
+        descriptor: descriptor,
+        svgBytes: changed,
+      ),
+      throwsFormatException,
+    );
+    expect(
+      () => AvaSvgCanvasDraftDescriptorV4.fromJson({
+        ...fixture,
+        'svgByteLength': avaSvgMaximumDocumentBytes + 1,
+      }),
+      throwsFormatException,
+    );
   });
 
   test('shared v4 fixture preserves and verifies exact UTF-8 SVG bytes', () {

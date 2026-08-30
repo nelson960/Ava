@@ -31,7 +31,9 @@ from ava_backend.realtime.events_v4 import (
     AvaClientEventUnionV4,
     AvaServerEventTypeV4,
     CancelTurnEventV4,
+    CanvasActivatedEventV4,
     CanvasDocumentAvailableEventV4,
+    CanvasPresentationCueEventV4,
     CanvasRejectedEventV4,
     InterruptRequestedEventV4,
     MemoryPersistenceFailedEventV4,
@@ -85,7 +87,10 @@ class _SvgSpecialist:
     async def generate(
         self,
         request: SvgCanvasSpecialistRequest,
+        *,
+        draft_sink: object | None = None,
     ) -> SvgCanvasSpecialistGeneration:
+        del draft_sink
         self.requests.append(request)
         if self._error is not None:
             raise self._error
@@ -114,7 +119,10 @@ class _ControlledSvgSpecialist(_SvgSpecialist):
     async def generate(
         self,
         request: SvgCanvasSpecialistRequest,
+        *,
+        draft_sink: object | None = None,
     ) -> SvgCanvasSpecialistGeneration:
+        del draft_sink
         self.generation_started.set()
         await self.allow_generation.wait()
         return await super().generate(request)
@@ -593,6 +601,57 @@ class _V4ConversationScenario:
                 await close()
             self._frame_stream = None
         await self.coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_active_session_accepts_only_newest_canvas_render_profile_revision() -> (
+    None
+):
+    scenario = _V4ConversationScenario(
+        session_id="session-v4-render-profile",
+        turn_ids=("turn-v4-render-profile",),
+    )
+    try:
+        await scenario.start()
+        newest = {
+            "usableAspectRatio": 1.6,
+            "orientation": "landscape",
+            "widthClass": "regular",
+            "heightClass": "compact",
+            "safeInsets": {
+                "top": 0.02,
+                "right": 0.03,
+                "bottom": 0.04,
+                "left": 0.03,
+            },
+            "touchEnvironment": "direct",
+            "minimumInteractionTargetPoints": 44.0,
+            "textScaleFactor": 1.15,
+        }
+        await scenario.send(
+            {
+                "event": "canvasRenderProfileUpdated",
+                "profileRevision": 2,
+                "renderProfile": newest,
+            }
+        )
+        await scenario.send(
+            {
+                "event": "canvasRenderProfileUpdated",
+                "profileRevision": 1,
+                "renderProfile": {
+                    **newest,
+                    "usableAspectRatio": 0.68,
+                    "orientation": "portrait",
+                    "widthClass": "compact",
+                    "heightClass": "regular",
+                },
+            }
+        )
+
+        assert scenario.canvas_jobs.render_profile_revision == 2
+    finally:
+        await scenario.close()
 
 
 @pytest.mark.asyncio
@@ -1263,8 +1322,7 @@ async def test_originating_input_item_cannot_interrupt_its_own_response() -> Non
 
         assert terminal.turn_id == "turn-v4-origin-a"
         assert not any(
-            isinstance(event, InterruptRequestedEventV4)
-            for event in scenario.controls
+            isinstance(event, InterruptRequestedEventV4) for event in scenario.controls
         )
         assert provider.cancelled_turn_ids == []
     finally:
@@ -1291,8 +1349,7 @@ async def test_duplicate_originating_speech_started_is_non_mutating() -> None:
 
         assert terminal.turn_id == "turn-v4-origin-duplicate"
         assert not any(
-            isinstance(event, InterruptRequestedEventV4)
-            for event in scenario.controls
+            isinstance(event, InterruptRequestedEventV4) for event in scenario.controls
         )
         assert provider.cancelled_turn_ids == []
     finally:
@@ -1337,22 +1394,19 @@ async def test_originating_item_does_not_cancel_pending_canvas_generation() -> N
                 "bufferedSampleCount": 0,
             }
         )
-        await scenario.read_until(
-            lambda event: isinstance(event, TurnCompletedEventV4)
-        )
+        await scenario.read_until(lambda event: isinstance(event, TurnCompletedEventV4))
 
         assert specialist.cancelled_generation_ids == []
         assert scenario.svg_state.candidate is not None
         assert not any(
-            isinstance(event, InterruptRequestedEventV4)
-            for event in scenario.controls
+            isinstance(event, InterruptRequestedEventV4) for event in scenario.controls
         )
     finally:
         await scenario.close()
 
 
 @pytest.mark.asyncio
-async def test_new_input_item_interrupts_exact_stream_and_cancels_pending_canvas(
+async def test_new_input_item_interrupts_stream_but_not_accepted_canvas(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.INFO, logger="ava_backend.realtime_coordinator")
@@ -1364,7 +1418,7 @@ async def test_new_input_item_interrupts_exact_stream_and_cancels_pending_canvas
     specialist = _ControlledSvgSpecialist()
     scenario = _V4ConversationScenario(
         session_id="session-v4-canvas-barge",
-        turn_ids=("turn-v4-canvas-barge",),
+        turn_ids=("turn-v4-canvas-barge", "turn-v4-after-canvas-barge"),
         plan=plan,
         realtime=provider,
         svg_specialist=specialist,
@@ -1413,18 +1467,61 @@ async def test_new_input_item_interrupts_exact_stream_and_cancels_pending_canvas
         assert interrupt.turn_id == speaking.turn_id
         assert interrupt.stream_id == scenario.active_stream_id
         assert terminal.delivered_sample_count == rendered_sample
-        assert specialist.cancelled_generation_ids == [
-            "generation-session-v4-canvas-barge"
-        ]
-        assert scenario.svg_state.candidate is None
+        assert specialist.cancelled_generation_ids == []
+        specialist.allow_generation.set()
+        available = await scenario.read_until(
+            lambda event: isinstance(event, CanvasDocumentAvailableEventV4)
+        )
+        assert isinstance(available, CanvasDocumentAvailableEventV4)
+        assert available.generation_id == "generation-session-v4-canvas-barge"
+        assert scenario.svg_state.candidate is not None
+        await scenario.send(
+            {
+                "event": "canvasDocumentPrepared",
+                "generationId": available.generation_id,
+                "sceneId": available.scene_id,
+                "sceneRevision": available.scene_revision,
+                "svgSha256": available.svg_sha256,
+                "manifestSha256": available.manifest_sha256,
+                "rendererCapabilityVersion": "ava-svg-renderer-v2",
+                "validatorVersion": "ava-svg-validator-v2",
+            }
+        )
+        cue = cast(
+            CanvasPresentationCueEventV4,
+            await scenario.read_until(
+                lambda event: isinstance(event, CanvasPresentationCueEventV4)
+            ),
+        )
+        assert cue.presentation_sample_offset == rendered_sample
+        await scenario.send(
+            {
+                "event": "canvasPresented",
+                "generationId": available.generation_id,
+                "sceneId": available.scene_id,
+                "sceneRevision": available.scene_revision,
+                "svgSha256": available.svg_sha256,
+                "manifestSha256": available.manifest_sha256,
+                "firstRenderedSample": rendered_sample,
+            }
+        )
+        activated = await scenario.read_until(
+            lambda event: isinstance(event, CanvasActivatedEventV4)
+        )
+        assert isinstance(activated, CanvasActivatedEventV4)
+        assert activated.generation_id == available.generation_id
+        assert scenario.svg_state.active is not None
         interruption_record = next(
             record
             for record in caplog.records
             if record.getMessage().startswith("realtime_interruption_requested")
         )
-        assert cast(dict[str, object], interruption_record.ava_context)[
-            "providerInputItemId"
-        ] == "item-next-canvas-barge"
+        assert (
+            cast(dict[str, object], interruption_record.ava_context)[
+                "providerInputItemId"
+            ]
+            == "item-next-canvas-barge"
+        )
     finally:
         await scenario.close()
 
@@ -1522,9 +1619,7 @@ async def test_barge_in_item_is_admitted_next_and_stale_origin_cannot_mutate_it(
         assert interrupt.turn_id == "turn-v4-a"
         assert cancelled_a.delivered_sample_count == rendered_sample
         assert completed_b.turn_id == "turn-v4-b"
-        assert provider.admissions == [
-            ("turn-v4-b", ("item-barge-turn-b",))
-        ]
+        assert provider.admissions == [("turn-v4-b", ("item-barge-turn-b",))]
         assert provider.input_item_owner(item_id="item-origin-turn-a") == "turn-v4-a"
         assert provider.input_item_owner(item_id="item-barge-turn-b") == "turn-v4-b"
         interruption_record = next(
@@ -1532,9 +1627,12 @@ async def test_barge_in_item_is_admitted_next_and_stale_origin_cannot_mutate_it(
             for record in caplog.records
             if record.getMessage().startswith("realtime_interruption_requested")
         )
-        assert cast(dict[str, object], interruption_record.ava_context)[
-            "providerInputItemId"
-        ] == "item-barge-turn-b"
+        assert (
+            cast(dict[str, object], interruption_record.ava_context)[
+                "providerInputItemId"
+            ]
+            == "item-barge-turn-b"
+        )
         snapshot = await memory.load_snapshot(
             subject="child:v4-next-input-ownership",
             age_band=AGE_BAND,

@@ -70,7 +70,50 @@ final class _Loader implements AvaSvgDocumentLoader {
   }
 
   @override
+  Future<AvaValidatedSvgCanvasDraft> fetchDraft(
+    AvaSvgCanvasDraftDescriptorV4 descriptor,
+  ) =>
+      throw StateError('Unexpected SVG draft ${descriptor.draftIndex}.');
+
+  @override
   void close() => closed = true;
+}
+
+final class _DraftLoader implements AvaSvgDocumentLoader {
+  _DraftLoader({
+    required this.document,
+    required this.draftBytesByIndex,
+    this.draftFetcher,
+  });
+
+  final AvaValidatedSvgCanvasDocument document;
+  final Map<int, Uint8List> draftBytesByIndex;
+  final Future<AvaValidatedSvgCanvasDraft> Function(
+    AvaSvgCanvasDraftDescriptorV4 descriptor,
+  )? draftFetcher;
+
+  @override
+  Future<AvaValidatedSvgCanvasDocument> fetch(
+    AvaSvgCanvasDocumentDescriptorV4 descriptor,
+  ) async =>
+      document;
+
+  @override
+  Future<AvaValidatedSvgCanvasDraft> fetchDraft(
+    AvaSvgCanvasDraftDescriptorV4 descriptor,
+  ) async {
+    final fetcher = draftFetcher;
+    if (fetcher != null) return fetcher(descriptor);
+    final bytes = draftBytesByIndex[descriptor.draftIndex];
+    if (bytes == null) throw StateError('Unexpected draft index.');
+    return AvaValidatedSvgCanvasDraft.verify(
+      descriptor: descriptor,
+      svgBytes: bytes,
+    );
+  }
+
+  @override
+  void close() {}
 }
 
 void main() {
@@ -286,11 +329,272 @@ void main() {
     controller.dispose();
   });
 
-  test('turn interruption cancellation preserves active canvas without issue',
+  test('newer complete draft snapshot replaces rather than accumulates',
+      () async {
+    final firstBytes = Uint8List.fromList(document.svgBytes);
+    final secondBytes = Uint8List.fromList(replacementDocument.svgBytes);
+    final controller = AvaSvgCanvasController(
+      documents: _DraftLoader(
+        document: document,
+        draftBytesByIndex: {1: firstBytes, 2: secondBytes},
+      ),
+      commandSink: (_) {},
+    );
+    final host = AvaSvgCanvasSessionHost()..attach(controller);
+    _announceGeneration(controller, document);
+    final firstEvent = _draftEvent(document, 1, firstBytes);
+    final secondEvent = _draftEvent(document, 2, secondBytes);
+
+    await controller.receiveDraftAvailable(firstEvent);
+    controller.draftPresented(controller.draft!.document);
+    expect(controller.lifecyclePhase, AvaSvgCanvasLifecyclePhase.draftVisible);
+    expect(controller.draft!.document.svgBytes, orderedEquals(firstBytes));
+
+    await controller.receiveDraftAvailable(secondEvent);
+    controller.draftPresented(controller.draft!.document);
+    expect(controller.draft!.document.descriptor.draftIndex, 2);
+    expect(controller.draft!.document.svgBytes, orderedEquals(secondBytes));
+    expect(controller.draft!.document.svgBytes.length, secondBytes.length);
+
+    await controller.receiveDraftAvailable(firstEvent);
+    expect(controller.draft!.document.descriptor.draftIndex, 2);
+
+    controller.receiveRejected({
+      'generationId': document.descriptor.generationId,
+      'sourceTurnId': document.descriptor.sourceTurnId,
+      'rejectionCode': 'cancelled',
+      'message': 'The drawing was cancelled.',
+    });
+    expect(controller.draft, isNull);
+    expect(controller.active, isNull);
+    expect(controller.lifecyclePhase, AvaSvgCanvasLifecyclePhase.cancelled);
+    expect(host.panelVisible, isFalse);
+    host.dispose();
+    controller.dispose();
+  });
+
+  test('superseded draft fetch cannot replace its successor or active scene',
+      () async {
+    final oldDraft = Completer<AvaValidatedSvgCanvasDraft>();
+    final successor = _documentWithIdentity(
+      document,
+      generationId: 'generation-draft-successor',
+      sourceTurnId: 'turn-draft-successor',
+      sceneId: 'scene-draft-successor',
+      sceneRevision: 1,
+    );
+    final oldBytes = Uint8List.fromList(replacementDocument.svgBytes);
+    final successorBytes = Uint8List.fromList(document.svgBytes);
+    final controller = AvaSvgCanvasController(
+      documents: _DraftLoader(
+        document: document,
+        draftBytesByIndex: const {},
+        draftFetcher: (descriptor) {
+          if (descriptor.generationId ==
+              replacementDocument.descriptor.generationId) {
+            return oldDraft.future;
+          }
+          return Future.value(
+            AvaValidatedSvgCanvasDraft.verify(
+              descriptor: descriptor,
+              svgBytes: successorBytes,
+            ),
+          );
+        },
+      ),
+      commandSink: (_) {},
+    );
+    await _driveActivation(controller, document, serverEvents);
+    final active = controller.active;
+
+    _announceGeneration(controller, replacementDocument);
+    final oldEvent = _draftEvent(replacementDocument, 1, oldBytes);
+    final oldLoading = controller.receiveDraftAvailable(oldEvent);
+    _announceGeneration(controller, successor);
+    final successorEvent = _draftEvent(successor, 1, successorBytes);
+    await controller.receiveDraftAvailable(successorEvent);
+    controller.draftPresented(controller.draft!.document);
+
+    oldDraft.complete(
+      AvaValidatedSvgCanvasDraft.verify(
+        descriptor: AvaSvgCanvasDraftDescriptorV4.fromJson(oldEvent),
+        svgBytes: oldBytes,
+      ),
+    );
+    await oldLoading;
+    await controller.receiveDraftAvailable(oldEvent);
+    controller.receiveRejected({
+      'generationId': replacementDocument.descriptor.generationId,
+      'sourceTurnId': replacementDocument.descriptor.sourceTurnId,
+      'rejectionCode': 'staticValidationFailed',
+      'message': 'This obsolete generation failed after supersession.',
+    });
+    await controller.rendererFailed(
+      'A stale renderer operation failed.',
+      generationId: replacementDocument.descriptor.generationId,
+    );
+
+    expect(controller.active, same(active));
+    expect(
+      controller.draft!.document.descriptor.generationId,
+      successor.descriptor.generationId,
+    );
+    expect(controller.draft!.document.descriptor.draftIndex, 1);
+    expect(controller.lifecyclePhase, AvaSvgCanvasLifecyclePhase.draftVisible);
+    expect(controller.lastIssue, isNull);
+
+    controller.receiveRejected({
+      'generationId': successor.descriptor.generationId,
+      'sourceTurnId': successor.descriptor.sourceTurnId,
+      'rejectionCode': 'cancelled',
+      'message': 'The successor drawing was cancelled.',
+    });
+    expect(controller.active, same(active));
+    expect(controller.draft, isNull);
+    expect(controller.lifecyclePhase, AvaSvgCanvasLifecyclePhase.cancelled);
+    controller.dispose();
+  });
+
+  test('draft transitions through trusted candidate before activation',
+      () async {
+    final commands = <AvaSvgCanvasClientCommand>[];
+    final draftBytes = Uint8List.fromList(document.svgBytes);
+    final controller = AvaSvgCanvasController(
+      documents: _DraftLoader(
+        document: document,
+        draftBytesByIndex: {1: draftBytes},
+      ),
+      commandSink: commands.add,
+    );
+    controller.beginPlaybackClock(document.descriptor.sourceTurnId);
+    _announceGeneration(controller, document);
+    await controller
+        .receiveDraftAvailable(_draftEvent(document, 1, draftBytes));
+    controller.draftPresented(controller.draft!.document);
+    expect(controller.lifecyclePhase, AvaSvgCanvasLifecyclePhase.draftVisible);
+
+    final candidateLoading =
+        controller.receiveDocumentAvailable(serverEvents[0]);
+    expect(
+      controller.lifecyclePhase,
+      AvaSvgCanvasLifecyclePhase.validatedCandidate,
+    );
+    await candidateLoading;
+    expect(
+      controller.lifecyclePhase,
+      AvaSvgCanvasLifecyclePhase.preparing,
+    );
+    controller.rendererPrepared();
+    expect(commands.last.type, AvaSvgCanvasCommandType.canvasDocumentPrepared);
+    expect(controller.lifecyclePhase, AvaSvgCanvasLifecyclePhase.preparing);
+
+    controller.receivePresentationCue(serverEvents[1]);
+    controller.updateRenderedSample(
+      turnId: document.descriptor.sourceTurnId,
+      renderedSample: serverEvents[2]['firstRenderedSample']! as int,
+    );
+    expect(
+      controller.lifecyclePhase,
+      AvaSvgCanvasLifecyclePhase.presentationScheduled,
+    );
+    controller.firstFramePresented();
+    expect(controller.draft, isNull);
+    expect(controller.lifecyclePhase, AvaSvgCanvasLifecyclePhase.presented);
+    controller.reportBinding(document.manifest.bindings['select-cloud']!);
+    expect(
+      commands.where(
+        (command) => command.type == AvaSvgCanvasCommandType.canvasInteraction,
+      ),
+      isEmpty,
+    );
+
+    controller.receiveActivated(serverEvents[2]);
+    expect(controller.lifecyclePhase, AvaSvgCanvasLifecyclePhase.active);
+    controller.reportBinding(document.manifest.bindings['select-cloud']!);
+    expect(commands.last.type, AvaSvgCanvasCommandType.canvasInteraction);
+    controller.dispose();
+  });
+
+  test('late draft fetch cannot cover a final candidate being presented',
+      () async {
+    final draftBytes = Uint8List.fromList(document.svgBytes);
+    final delayedDraft = Completer<AvaValidatedSvgCanvasDraft>();
+    final controller = AvaSvgCanvasController(
+      documents: _DraftLoader(
+        document: document,
+        draftBytesByIndex: const {},
+        draftFetcher: (_) => delayedDraft.future,
+      ),
+      commandSink: (_) {},
+    );
+    controller.beginPlaybackClock(document.descriptor.sourceTurnId);
+    _announceGeneration(controller, document);
+    final draftEvent = _draftEvent(document, 1, draftBytes);
+    final draftLoading = controller.receiveDraftAvailable(draftEvent);
+    await controller.receiveDocumentAvailable(serverEvents[0]);
+    controller.rendererPrepared();
+    controller.receivePresentationCue(serverEvents[1]);
+    controller.updateRenderedSample(
+      turnId: document.descriptor.sourceTurnId,
+      renderedSample: serverEvents[2]['firstRenderedSample']! as int,
+    );
+
+    delayedDraft.complete(
+      AvaValidatedSvgCanvasDraft.verify(
+        descriptor: AvaSvgCanvasDraftDescriptorV4.fromJson(draftEvent),
+        svgBytes: draftBytes,
+      ),
+    );
+    await draftLoading;
+
+    expect(controller.draft, isNull);
+    expect(
+      controller.lifecyclePhase,
+      AvaSvgCanvasLifecyclePhase.presentationScheduled,
+    );
+    controller.firstFramePresented();
+    controller.receiveActivated(serverEvents[2]);
+    expect(controller.lifecyclePhase, AvaSvgCanvasLifecyclePhase.active);
+    controller.dispose();
+  });
+
+  test('draft renderer failure clears pending work and preserves active scene',
+      () async {
+    final draftBytes = Uint8List.fromList(replacementDocument.svgBytes);
+    final controller = AvaSvgCanvasController(
+      documents: _DraftLoader(
+        document: document,
+        draftBytesByIndex: {1: draftBytes},
+      ),
+      commandSink: (_) {},
+    );
+    await _driveActivation(controller, document, serverEvents);
+    final active = controller.active;
+    _announceGeneration(controller, replacementDocument);
+    await controller.receiveDraftAvailable(
+      _draftEvent(replacementDocument, 1, draftBytes),
+    );
+    controller.draftPresented(controller.draft!.document);
+
+    await controller.rendererFailed(
+      'SVG renderer rejected the draft.',
+      generationId: replacementDocument.descriptor.generationId,
+    );
+
+    expect(controller.active, same(active));
+    expect(controller.generation, isNull);
+    expect(controller.draft, isNull);
+    expect(controller.lifecyclePhase, AvaSvgCanvasLifecyclePhase.failed);
+    expect(controller.lastIssue?.code, 'rendererRejected');
+    controller.dispose();
+  });
+
+  test('semantic canvas cancellation preserves active canvas without issue',
       () async {
     final commands = <AvaSvgCanvasClientCommand>[];
     final controller = await _activate(document, serverEvents, commands);
     final active = controller.active;
+    commands.clear();
 
     controller.receiveGenerationStarted({
       'protocolVersion': 4,
@@ -301,17 +605,21 @@ void main() {
       'generationId': 'generation-interrupted-revision',
       'sourceTurnId': 'turn-interrupted-revision',
     });
+    controller.reportBinding(document.manifest.bindings['select-cloud']!);
+    expect(commands, isEmpty);
     controller.receiveRejected({
       'generationId': 'generation-interrupted-revision',
       'sourceTurnId': 'turn-interrupted-revision',
       'rejectionCode': 'cancelled',
-      'message': 'Canvas generation was cancelled by interruption.',
+      'message': 'The pending canvas was cancelled semantically.',
     });
 
     expect(controller.generation, isNull);
     expect(controller.candidate, isNull);
     expect(controller.active, same(active));
     expect(controller.lastIssue, isNull);
+    controller.reportBinding(document.manifest.bindings['select-cloud']!);
+    expect(commands.single.type, AvaSvgCanvasCommandType.canvasInteraction);
     controller.dispose();
   });
 
@@ -351,7 +659,7 @@ void main() {
       'generationId': document.descriptor.generationId,
       'sourceTurnId': document.descriptor.sourceTurnId,
       'rejectionCode': 'cancelled',
-      'message': 'Canvas generation was cancelled by interruption.',
+      'message': 'The pending canvas was cancelled semantically.',
     });
 
     expect(
@@ -1408,13 +1716,54 @@ void main() {
     final view = tester.widget<AvaSvgCanvasView>(
       find.byType(AvaSvgCanvasView),
     );
-    expect(view.document, same(document));
-    view.onPrepared();
-    view.onFirstFramePresented();
+    expect(view.activeDocument, same(document));
+    expect(view.draft, isNull);
+    expect(view.candidate, isNull);
+    expect(view.interactionsEnabled, isFalse);
     view.onBinding(document.manifest.bindings['select-cloud']!);
     view.onError('Detached renderer diagnostic.');
     await tester.pump();
     expect(commands, isEmpty);
+    host.dispose();
+  });
+
+  testWidgets('draft replacement retains one persistent renderer state',
+      (tester) async {
+    final firstBytes = Uint8List.fromList(document.svgBytes);
+    final secondBytes = Uint8List.fromList(replacementDocument.svgBytes);
+    final controller = AvaSvgCanvasController(
+      documents: _DraftLoader(
+        document: document,
+        draftBytesByIndex: {1: firstBytes, 2: secondBytes},
+      ),
+      commandSink: (_) {},
+    );
+    final host = AvaSvgCanvasSessionHost()..attach(controller);
+    _announceGeneration(controller, document);
+    await controller
+        .receiveDraftAvailable(_draftEvent(document, 1, firstBytes));
+
+    Widget panel() => MaterialApp(
+          home: SizedBox(
+            width: 600,
+            height: 400,
+            child: AvaSvgCanvasPanel(host: host),
+          ),
+        );
+
+    await tester.pumpWidget(panel());
+    final firstState = tester.state(find.byType(AvaSvgCanvasView));
+    expect(find.byType(AvaSvgCanvasView), findsOneWidget);
+
+    await controller
+        .receiveDraftAvailable(_draftEvent(document, 2, secondBytes));
+    await tester.pumpWidget(panel());
+    final secondState = tester.state(find.byType(AvaSvgCanvasView));
+
+    expect(secondState, same(firstState));
+    expect(find.byType(AvaSvgCanvasView), findsOneWidget);
+    host.detach(controller);
+    controller.dispose();
     host.dispose();
   });
 
@@ -1518,6 +1867,38 @@ void main() {
     expect(controller.lastIssue, isNull);
     controller.firstFramePresented();
     expect(controller.candidate?.firstRenderedSample, 5000);
+    controller.dispose();
+  });
+
+  test('interruption replaces an unreachable source-turn cue earlier',
+      () async {
+    final controller = AvaSvgCanvasController(
+      documents: _Loader(Future.value(document)),
+      commandSink: (_) {},
+    );
+    controller.beginPlaybackClock(document.descriptor.sourceTurnId);
+    controller.updateRenderedSample(
+      turnId: document.descriptor.sourceTurnId,
+      renderedSample: 5000,
+    );
+    _announceGeneration(controller, document);
+    await controller.receiveDocumentAvailable(serverEvents[0]);
+    controller.rendererPrepared();
+    controller.receivePresentationCue({
+      ...serverEvents[1],
+      'presentationSampleOffset': 6000,
+    });
+    expect(controller.shouldPresentCandidate, isFalse);
+
+    controller.receivePresentationCue({
+      ...serverEvents[1],
+      'sequence': (serverEvents[1]['sequence']! as int) + 1,
+      'presentationSampleOffset': 5000,
+    });
+
+    expect(controller.shouldPresentCandidate, isTrue);
+    expect(controller.candidate?.presentationSampleOffset, 5000);
+    expect(controller.lastIssue, isNull);
     controller.dispose();
   });
 
@@ -1679,6 +2060,30 @@ void _announceGeneration(
     'sourceTurnId': document.descriptor.sourceTurnId,
   });
 }
+
+Map<String, Object?> _draftEvent(
+  AvaValidatedSvgCanvasDocument source,
+  int draftIndex,
+  Uint8List svgBytes,
+) =>
+    {
+      'protocolVersion': 4,
+      'event': 'canvasDraftAvailable',
+      'sessionId': 'session-1234',
+      'sequence': draftIndex,
+      'revision': 2,
+      'generationId': source.descriptor.generationId,
+      'sourceTurnId': source.descriptor.sourceTurnId,
+      'draftIndex': draftIndex,
+      'svgPath': '/v4/realtime/sessions/session-1234/canvas-drafts/'
+          '${source.descriptor.generationId}/$draftIndex/svg',
+      'svgSha256': sha256.convert(svgBytes).toString(),
+      'svgByteLength': svgBytes.length,
+      'authoritative': false,
+      'interactive': false,
+      'rendererCapabilityVersion': avaSvgRendererCapabilityVersion,
+      'validatorVersion': avaSvgValidatorVersion,
+    };
 
 AvaValidatedSvgCanvasDocument? _documentForDisplay(
   AvaSvgCanvasSessionHost host,

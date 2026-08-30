@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:ava/models/ava_svg_canvas_protocol.dart';
 import 'package:ava/canvas/ava_svg_canvas_telemetry.dart';
 import 'package:ava/services/ava_svg_document_service.dart';
+import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 const _manifestJson =
@@ -134,6 +135,9 @@ void main() {
         protocolVersion: '4',
         contentSha256: List.filled(64, '0').join(),
         cacheControl: 'no-store',
+        canvasAuthority: 'candidate',
+        rendererCapabilityVersion: avaSvgRendererCapabilityVersion,
+        validatorVersion: avaSvgValidatorVersion,
         bytes: Stream.value(svgBytes),
       ),
       descriptor.manifestPath: _response(
@@ -154,6 +158,80 @@ void main() {
 
     expect(
       () => service.fetch(descriptor),
+      throwsA(isA<AvaSvgDocumentFetchException>()),
+    );
+  });
+
+  test('fetches a draft from its authenticated path and verifies authority',
+      () async {
+    final fixture = (jsonDecode(
+      File('protocol/fixtures/ava_realtime_canvas_draft_v4.json')
+          .readAsStringSync(),
+    ) as Map)
+        .cast<String, Object?>();
+    final draftDescriptor = AvaSvgCanvasDraftDescriptorV4.fromJson({
+      ...fixture,
+      'svgSha256': sha256.convert(svgBytes).toString(),
+      'svgByteLength': svgBytes.length,
+    });
+    final transport = _Transport({
+      draftDescriptor.svgPath: _response(
+        bytes: svgBytes,
+        contentType: 'image/svg+xml',
+        hash: draftDescriptor.svgSha256,
+        authority: 'draft',
+      ),
+    });
+    final service = AvaSvgDocumentService(
+      documentBaseUrl: Uri.parse(
+        'https://ava.example.test/v4/realtime/sessions/session-1234/'
+        'canvas-documents',
+      ),
+      canvasToken: 'canvas-token',
+      timeout: const Duration(seconds: 2),
+      transport: transport,
+    );
+
+    final draft = await service.fetchDraft(draftDescriptor);
+
+    expect(draft.svgBytes, orderedEquals(svgBytes));
+    expect(transport.requests.single.endpoint.path, draftDescriptor.svgPath);
+    expect(
+      transport.requests.single.headers['x-ava-canvas-token'],
+      'canvas-token',
+    );
+  });
+
+  test('draft fetch rejects candidate authority before accepting bytes', () {
+    final fixture = (jsonDecode(
+      File('protocol/fixtures/ava_realtime_canvas_draft_v4.json')
+          .readAsStringSync(),
+    ) as Map)
+        .cast<String, Object?>();
+    final draftDescriptor = AvaSvgCanvasDraftDescriptorV4.fromJson({
+      ...fixture,
+      'svgSha256': sha256.convert(svgBytes).toString(),
+      'svgByteLength': svgBytes.length,
+    });
+    final transport = _Transport({
+      draftDescriptor.svgPath: _response(
+        bytes: svgBytes,
+        contentType: 'image/svg+xml',
+        hash: draftDescriptor.svgSha256,
+      ),
+    });
+    final service = AvaSvgDocumentService(
+      documentBaseUrl: Uri.parse(
+        'https://ava.example.test/v4/realtime/sessions/session-1234/'
+        'canvas-documents',
+      ),
+      canvasToken: 'canvas-token',
+      timeout: const Duration(seconds: 2),
+      transport: transport,
+    );
+
+    expect(
+      () => service.fetchDraft(draftDescriptor),
       throwsA(isA<AvaSvgDocumentFetchException>()),
     );
   });
@@ -225,6 +303,7 @@ AvaSvgDocumentFetchResponse _response({
   required Uint8List bytes,
   required String contentType,
   required String hash,
+  String authority = 'candidate',
 }) =>
     AvaSvgDocumentFetchResponse(
       statusCode: HttpStatus.ok,
@@ -232,5 +311,8 @@ AvaSvgDocumentFetchResponse _response({
       protocolVersion: '4',
       contentSha256: hash,
       cacheControl: 'no-store',
+      canvasAuthority: authority,
+      rendererCapabilityVersion: avaSvgRendererCapabilityVersion,
+      validatorVersion: avaSvgValidatorVersion,
       bytes: Stream.value(bytes),
     );

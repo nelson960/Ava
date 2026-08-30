@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:ava/config/ava_backend_configuration.dart';
 import 'package:ava/models/ava_realtime_protocol.dart';
+import 'package:ava/models/ava_realtime_protocol_v4.dart';
 import 'package:ava/services/ava_realtime_bootstrap_service.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -31,6 +32,7 @@ void main() {
 
     final bootstrap = await service.createSessionV4(
       ageBand: AvaRealtimeAgeBand.middleChildhood,
+      canvasRenderProfile: _profile,
     );
 
     expect(bootstrap.sessionId, 'session-1234');
@@ -49,10 +51,19 @@ void main() {
       {
         'protocolVersion': 4,
         'ageBand': 'middleChildhood',
+        'canvasRenderProfile': _profile.toJson(),
       },
     );
     expect(transport.body, isNot(contains('name')));
     expect(transport.body, isNot(contains('dateOfBirth')));
+    final profile = (jsonDecode(transport.body)
+        as Map<String, Object?>)['canvasRenderProfile'] as Map;
+    expect(profile['orientation'], 'landscape');
+    expect(profile['widthClass'], 'regular');
+    expect(profile['heightClass'], 'compact');
+    expect(profile['touchEnvironment'], 'direct');
+    expect(profile['minimumInteractionTargetPoints'], 44.0);
+    expect((profile['safeInsets'] as Map)['bottom'], closeTo(0.04, 0.000001));
   });
 
   test('rejects status, content type, malformed JSON and oversized bodies',
@@ -66,7 +77,10 @@ void main() {
         transport: _BootstrapTransportFake(response),
       );
       await expectLater(
-        service.createSessionV4(ageBand: AvaRealtimeAgeBand.unknown),
+        service.createSessionV4(
+          ageBand: AvaRealtimeAgeBand.unknown,
+          canvasRenderProfile: _profile,
+        ),
         throwsA(matcher),
       );
     }
@@ -144,12 +158,26 @@ void main() {
     );
 
     await expectLater(
-      service.createSessionV4(ageBand: AvaRealtimeAgeBand.unknown),
+      service.createSessionV4(
+        ageBand: AvaRealtimeAgeBand.unknown,
+        canvasRenderProfile: _profile,
+      ),
       throwsA(isA<TimeoutException>()),
     );
     await body.close();
   });
 }
+
+final _profile = AvaCanvasRenderProfileV4.measure(
+  workspaceWidthPoints: 800,
+  workspaceHeightPoints: 500,
+  safeTopPoints: 0,
+  safeRightPoints: 0,
+  safeBottomPoints: 20,
+  safeLeftPoints: 0,
+  directTouch: true,
+  textScaleFactor: 1,
+);
 
 final class _BootstrapTransportFake implements AvaRealtimeBootstrapTransport {
   _BootstrapTransportFake(this.response);

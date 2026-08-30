@@ -50,8 +50,10 @@ class _NoCanvasSpecialist:
     async def generate(
         self,
         request: SvgCanvasSpecialistRequest,
+        *,
+        draft_sink: object | None = None,
     ) -> SvgCanvasSpecialistGeneration:
-        del request
+        del request, draft_sink
         raise AssertionError("PostgreSQL speech pipeline does not request canvas")
 
     async def cancel(self, *, generation_id: str) -> None:

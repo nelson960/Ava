@@ -57,6 +57,16 @@ def test_v4_speech_events_are_byte_and_field_stable() -> None:
         assert json.loads(serialize_server_event_v4(event)) == json.loads(expected_json)
 
 
+def test_v4_accepts_segment_indexes_beyond_the_legacy_phrase_limit() -> None:
+    payload = _segment_payload()
+    payload["segmentIndex"] = 12
+
+    event = AVA_SERVER_EVENT_ADAPTER_V4.validate_python(payload)
+
+    assert isinstance(event, SegmentReadyEventV4)
+    assert event.segment_index == 12
+
+
 def test_streaming_phrase_output_is_frozen_across_fragmentation() -> None:
     text = "Hello there. Water moves in a loop!"
     expected = [
@@ -114,8 +124,9 @@ def test_v4_failure_code_values_are_frozen() -> None:
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        ({"segmentIndex": 12}, "less than 12"),
+        ({"segmentIndex": 901}, "less than or equal to 900"),
         ({"segment": {"speech": ""}}, "at least 1 character"),
+        ({"segment": {"speech": "x" * 601}}, "at most 600 characters"),
         ({"segment": {"delivery": "dramatic"}}, "delivery"),
         ({"segment": {"canvasCues": [{"legacy": "typed"}]}}, "legacy canvas"),
     ],

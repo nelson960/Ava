@@ -11,17 +11,19 @@ from ava_backend.canvas.svg_document import (
     SVG_VALIDATOR_VERSION,
     SvgDocumentValidationError,
     SvgDocumentValidator,
+    SvgValidationLimits,
 )
 
 
 def _document(body: str, *, root_attributes: str = "") -> str:
     interaction_mode = (
-        "" if "data-ava-interaction-mode" in root_attributes
+        ""
+        if "data-ava-interaction-mode" in root_attributes
         else 'data-ava-interaction-mode="none"'
     )
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" '
-        f'{interaction_mode} {root_attributes}>'
+        f"{interaction_mode} {root_attributes}>"
         "<title>Water cycle</title>"
         "<desc>How water moves between the sky and the ground.</desc>"
         f"{body}"
@@ -156,6 +158,42 @@ def test_validator_rejects_missing_local_reference() -> None:
     assert raised.value.code == "referenceMissing"
 
 
+def test_validation_feedback_is_structured_bounded_and_deterministic() -> None:
+    invalid = _document(
+        f'<rect id="bad_rect" unsupported="{"x" * 400}" width="20" height="20"/>'
+    )
+
+    with pytest.raises(SvgDocumentValidationError) as raised:
+        SvgDocumentValidator().validate(invalid)
+
+    feedback = raised.value.feedback.as_json()
+    assert feedback == {
+        "affectedAttribute": "unsupported",
+        "affectedElement": "rect",
+        "affectedElementId": "bad_rect",
+        "category": "capability",
+        "code": "attributeForbidden",
+        "limitName": "allowedAttributes",
+        "message": "SVG attribute 'unsupported' is not allowed",
+        "observedValue": "x" * 240,
+        "observedValueTruncated": True,
+    }
+
+
+def test_validation_limit_feedback_identifies_observed_and_allowed_bytes() -> None:
+    svg = _document('<rect width="20" height="20"/>')
+
+    with pytest.raises(SvgDocumentValidationError) as raised:
+        SvgDocumentValidator(SvgValidationLimits(max_bytes=40)).validate(svg)
+
+    feedback = raised.value.feedback.as_json()
+    assert feedback["category"] == "complexity"
+    assert feedback["code"] == "documentTooLarge"
+    assert feedback["observedValue"] == len(svg.encode("utf-8"))
+    assert feedback["limitName"] == "maxBytes"
+    assert feedback["limit"] == 40
+
+
 def test_validator_rejects_reference_cycles() -> None:
     svg = _document(
         """
@@ -175,8 +213,8 @@ def test_validator_rejects_reference_cycles() -> None:
 
 def test_validator_requires_accessible_interaction_metadata() -> None:
     svg = _document(
-        '<g id="cloud" data-ava-binding="cloud_select"/>'
-        , root_attributes='data-ava-interaction-mode="select"'
+        '<g id="cloud" data-ava-binding="cloud_select"/>',
+        root_attributes='data-ava-interaction-mode="select"',
     )
 
     with pytest.raises(SvgDocumentValidationError) as raised:
@@ -246,6 +284,17 @@ def test_capability_manifest_is_versioned_and_bounded() -> None:
         "data-ava-target",
     ]
     assert manifest["limits"]["bytes"] > 0
+    assert manifest["limits"]["bytes"] == 384 * 1024
+    assert manifest["documentContract"]["resolutionIndependentViewBox"] is True
+    assert manifest["documentContract"]["canonicalBytes"] == ("exactUtf8ProviderOutput")
+    assert manifest["interactionEnvironment"]["manifestRequiredForAuthority"] is True
+    assert manifest["interactionContract"]["bindingCountByMode"]["steps"] == {
+        "maximum": 12,
+        "minimum": 2,
+    }
+    assert manifest["limits"]["manifestBytes"] == 64 * 1024
+    assert manifest["limits"]["titleCharacters"] == 160
+    assert manifest["limits"]["descriptionCharacters"] == 800
 
 
 def test_none_document_rejects_bindings() -> None:
@@ -323,8 +372,7 @@ def test_steps_require_unique_contiguous_indexes() -> None:
     assert [binding.step_index for binding in document.bindings.values()] == [1, 2]
 
     for body in (
-        '<g id="egg" data-ava-binding="egg" data-ava-step="1" '
-        'aria-label="Egg stage"/>',
+        '<g id="egg" data-ava-binding="egg" data-ava-step="1" aria-label="Egg stage"/>',
         '<g id="egg" data-ava-binding="egg" data-ava-step="1" '
         'aria-label="Egg stage"/><g id="larva" data-ava-binding="larva" '
         'data-ava-step="3" aria-label="Larva stage"/>',

@@ -70,20 +70,52 @@ class Settings(BaseSettings):
     openai_canvas_model: Literal["gpt-5.6-sol"] = "gpt-5.6-sol"
     openai_canvas_reasoning_effort: Literal["none", "low"] = "none"
     openai_canvas_timeout_seconds: float = Field(
-        default=60,
+        default=90,
         ge=3,
         le=180,
-        description=(
-            "One generation-wide deadline shared by the original SVG request, "
-            "validation, and the optional repair."
-        ),
+        description="Maximum duration of the primary Sol generation attempt.",
+    )
+    openai_canvas_first_progress_timeout_seconds: float = Field(
+        default=20,
+        ge=1,
+        le=60,
+    )
+    openai_canvas_stream_stall_timeout_seconds: float = Field(
+        default=15,
+        ge=1,
+        le=60,
+    )
+    openai_canvas_overall_timeout_seconds: float = Field(
+        default=150,
+        ge=10,
+        le=300,
+    )
+    openai_canvas_repair_timeout_seconds: float = Field(
+        default=45,
+        ge=3,
+        le=120,
     )
     openai_canvas_max_retries: Literal[0] = 0
     openai_canvas_max_quality_repairs: Literal[0, 1] = 1
     openai_canvas_max_output_tokens: int = Field(
-        default=4096,
-        ge=512,
-        le=16384,
+        default=20_000,
+        ge=4_096,
+        le=32_768,
+    )
+    openai_canvas_max_accumulated_output_bytes: int = Field(
+        default=512 * 1024,
+        ge=256 * 1024,
+        le=1024 * 1024,
+    )
+    canvas_max_svg_bytes: int = Field(
+        default=384 * 1024,
+        ge=128 * 1024,
+        le=512 * 1024,
+    )
+    canvas_presentation_timeout_seconds: float = Field(
+        default=30,
+        ge=1,
+        le=180,
     )
     openai_live_tests_enabled: bool = False
     openai_tts_model: str = "gpt-4o-mini-tts-2025-12-15"
@@ -234,6 +266,22 @@ class Settings(BaseSettings):
         if self.memory_pool_min_size > self.memory_pool_max_size:
             raise ValueError(
                 "AVA_MEMORY_POOL_MIN_SIZE cannot exceed AVA_MEMORY_POOL_MAX_SIZE"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_canvas_lifecycle_budgets(self) -> Settings:
+        if self.openai_canvas_overall_timeout_seconds < (
+            self.openai_canvas_timeout_seconds
+        ):
+            raise ValueError(
+                "AVA_OPENAI_CANVAS_OVERALL_TIMEOUT_SECONDS cannot be shorter than "
+                "AVA_OPENAI_CANVAS_TIMEOUT_SECONDS"
+            )
+        if self.openai_canvas_max_accumulated_output_bytes < self.canvas_max_svg_bytes:
+            raise ValueError(
+                "AVA_OPENAI_CANVAS_MAX_ACCUMULATED_OUTPUT_BYTES cannot be smaller "
+                "than AVA_CANVAS_MAX_SVG_BYTES"
             )
         return self
 

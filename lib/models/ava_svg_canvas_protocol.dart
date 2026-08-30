@@ -6,13 +6,168 @@ import 'package:crypto/crypto.dart';
 const avaSvgRendererCapabilityVersion = 'ava-svg-renderer-v2';
 const avaSvgValidatorVersion = 'ava-svg-validator-v2';
 const avaSvgManifestVersion = 'ava-svg-manifest-v2';
-const avaSvgMaximumDocumentBytes = 262144;
+const avaSvgMaximumDocumentBytes = 512 * 1024;
 const avaSvgMaximumManifestBytes = 65536;
 
 final RegExp _identifier = RegExp(r'^[A-Za-z][A-Za-z0-9._:-]{0,95}$');
 final RegExp _sha256 = RegExp(r'^[a-f0-9]{64}$');
 
 enum AvaSvgInteractionMode { none, explore, select, steps }
+
+final class AvaSvgCanvasDraftDescriptorV4 {
+  const AvaSvgCanvasDraftDescriptorV4({
+    required this.sessionId,
+    required this.generationId,
+    required this.sourceTurnId,
+    required this.draftIndex,
+    required this.svgPath,
+    required this.svgSha256,
+    required this.svgByteLength,
+  });
+
+  final String sessionId;
+  final String generationId;
+  final String sourceTurnId;
+  final int draftIndex;
+  final String svgPath;
+  final String svgSha256;
+  final int svgByteLength;
+
+  factory AvaSvgCanvasDraftDescriptorV4.fromJson(
+    Map<String, Object?> json,
+  ) {
+    _requireExactKeys(
+      json,
+      const {
+        'protocolVersion',
+        'event',
+        'sessionId',
+        'sequence',
+        'revision',
+        'generationId',
+        'sourceTurnId',
+        'draftIndex',
+        'svgPath',
+        'svgSha256',
+        'svgByteLength',
+        'authoritative',
+        'interactive',
+        'rendererCapabilityVersion',
+        'validatorVersion',
+      },
+      'canvasDraftAvailable',
+    );
+    if (json['protocolVersion'] != 4 ||
+        json['event'] != 'canvasDraftAvailable' ||
+        json['authoritative'] != false ||
+        json['interactive'] != false ||
+        json['rendererCapabilityVersion'] != avaSvgRendererCapabilityVersion ||
+        json['validatorVersion'] != avaSvgValidatorVersion) {
+      throw const FormatException(
+        'Canvas draft descriptor has an unsupported trust contract.',
+      );
+    }
+    final sessionId = _requiredProtocolIdentifier(
+      json,
+      'sessionId',
+      'canvasDraftAvailable',
+    );
+    final generationId = _requiredProtocolIdentifier(
+      json,
+      'generationId',
+      'canvasDraftAvailable',
+    );
+    final sourceTurnId = _requiredProtocolIdentifier(
+      json,
+      'sourceTurnId',
+      'canvasDraftAvailable',
+    );
+    final draftIndex = _boundedPositiveInt(
+      json,
+      'draftIndex',
+      'canvasDraftAvailable',
+      32,
+    );
+    final svgPath = _boundedString(
+      json,
+      'svgPath',
+      'canvasDraftAvailable',
+      2048,
+    );
+    if (!RegExp(r'^/[A-Za-z0-9_./:-]+$').hasMatch(svgPath)) {
+      throw const FormatException(
+        'Canvas draft path is not a bounded origin-relative path.',
+      );
+    }
+    final svgHash = _requiredString(
+      json,
+      'svgSha256',
+      'canvasDraftAvailable',
+    );
+    if (!_sha256.hasMatch(svgHash)) {
+      throw const FormatException(
+        'Canvas draft descriptor contains an invalid SHA-256 digest.',
+      );
+    }
+    final svgLength = _boundedPositiveInt(
+      json,
+      'svgByteLength',
+      'canvasDraftAvailable',
+      avaSvgMaximumDocumentBytes,
+    );
+    return AvaSvgCanvasDraftDescriptorV4(
+      sessionId: sessionId,
+      generationId: generationId,
+      sourceTurnId: sourceTurnId,
+      draftIndex: draftIndex,
+      svgPath: svgPath,
+      svgSha256: svgHash,
+      svgByteLength: svgLength,
+    );
+  }
+}
+
+final class AvaValidatedSvgCanvasDraft {
+  AvaValidatedSvgCanvasDraft._({
+    required this.descriptor,
+    required this.svgBytes,
+    required this.svgText,
+  });
+
+  final AvaSvgCanvasDraftDescriptorV4 descriptor;
+  final Uint8List svgBytes;
+  final String svgText;
+
+  factory AvaValidatedSvgCanvasDraft.verify({
+    required AvaSvgCanvasDraftDescriptorV4 descriptor,
+    required Uint8List svgBytes,
+  }) {
+    if (svgBytes.length != descriptor.svgByteLength ||
+        svgBytes.length > avaSvgMaximumDocumentBytes) {
+      throw const FormatException(
+        'Downloaded SVG draft byte length does not match its descriptor.',
+      );
+    }
+    if (sha256.convert(svgBytes).toString() != descriptor.svgSha256) {
+      throw const FormatException(
+        'Downloaded SVG draft content hash does not match its descriptor.',
+      );
+    }
+    final String svgText;
+    try {
+      svgText = utf8.decode(svgBytes, allowMalformed: false);
+    } on FormatException catch (error) {
+      throw FormatException(
+        'Downloaded SVG draft is not strict UTF-8 XML text: ${error.message}',
+      );
+    }
+    return AvaValidatedSvgCanvasDraft._(
+      descriptor: descriptor,
+      svgBytes: Uint8List.fromList(svgBytes),
+      svgText: svgText,
+    );
+  }
+}
 
 final class AvaSvgInteractionBinding {
   const AvaSvgInteractionBinding({
@@ -495,6 +650,18 @@ String _requiredIdentifier(
 ) {
   final value = _requiredString(json, key, label);
   if (!_identifier.hasMatch(value)) {
+    throw FormatException('$label.$key is not a protocol identifier.');
+  }
+  return value;
+}
+
+String _requiredProtocolIdentifier(
+  Map<String, Object?> json,
+  String key,
+  String label,
+) {
+  final value = _requiredString(json, key, label);
+  if (!RegExp(r'^[A-Za-z][A-Za-z0-9._:-]{0,63}$').hasMatch(value)) {
     throw FormatException('$label.$key is not a protocol identifier.');
   }
   return value;

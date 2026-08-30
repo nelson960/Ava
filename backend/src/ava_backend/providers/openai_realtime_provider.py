@@ -32,10 +32,14 @@ from ..realtime.provider_session import (
     validate_sdp,
 )
 from ..realtime.tool_contract import (
+    CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
     INTERACTIVE_CANVAS_TOOL_NAME,
+    InteractiveCanvasCancellationRequest,
+    InteractiveCanvasCancellationToolOutputV4,
     InteractiveCanvasRequest,
     InteractiveCanvasToolOutput,
     InteractiveCanvasToolOutputV4,
+    RealtimeCancelCanvasToolCall,
     RealtimeCanvasToolCall,
     RealtimeRejectedCanvasToolCall,
     RealtimeSpeechTextDelta,
@@ -53,7 +57,8 @@ MAX_FUNCTION_ARGUMENT_BYTES = 256 * 1024
 MAX_PROVIDER_ERROR_BYTES = 64 * 1024
 _SIDEBAND_SEQUENCE_FIELD = "__ava_sideband_sequence"
 _CANVAS_INTERACTION_RESPONSE_MAX_OUTPUT_TOKENS = 256
-_CANVAS_TOOL_CONTINUATION_MAX_OUTPUT_TOKENS = 64
+_CANVAS_TOOL_CONTINUATION_MAX_OUTPUT_TOKENS = 128
+_MAX_CONSUMED_TERMINAL_RESPONSE_IDS = 64
 
 
 class OpenAIRealtimeProviderError(RealtimeProviderError):
@@ -122,6 +127,12 @@ class _InputTranscriptionOutcome:
     turn_id: str | None
     transcript: str | None
     failed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _LateCancelErrorExpectation:
+    cancelled_turn_id: str
+    response_id: str | None
 
 
 class OpenAIRealtimeOutputValidationError(OpenAIRealtimeProtocolError):
@@ -278,7 +289,8 @@ class _OpenAIRealtimeEventChannel:
         self._interaction_response_readiness_changed = asyncio.Event()
         self._settled_turn_ids: set[str] = set()
         self._response_owner_by_id: dict[str, str | None] = {}
-        self._late_cancel_error_expected = False
+        self._consumed_terminal_response_owner_by_id: dict[str, str] = {}
+        self._late_cancel_error_expected: _LateCancelErrorExpectation | None = None
         self._prepared_session_update: str | None = None
         self._cancelled_turn_ids: set[str] = set()
         self._pending_canvas_call_id: str | None = None
@@ -633,7 +645,11 @@ class _OpenAIRealtimeEventChannel:
         *,
         turn_id: str,
         call_id: str,
-        output: InteractiveCanvasToolOutput | InteractiveCanvasToolOutputV4,
+        output: (
+            InteractiveCanvasToolOutput
+            | InteractiveCanvasToolOutputV4
+            | InteractiveCanvasCancellationToolOutputV4
+        ),
     ) -> None:
         if self._closed:
             raise OpenAIRealtimeProtocolError(
@@ -876,7 +892,6 @@ class _OpenAIRealtimeEventChannel:
                 "OpenAI cancellation requires an active Ava turn"
             )
         response_id = self._active_response_id
-        cancel_not_active_received = False
         cancel_not_active_before_response_created = False
         pending_interaction_create = (
             response_id is None
@@ -887,7 +902,10 @@ class _OpenAIRealtimeEventChannel:
                 response_id=response_id,
                 turn_id=cancelled_turn_id,
             )
-        await self._send_json({"type": "response.cancel"})
+        await self._send_response_cancel(
+            turn_id=cancelled_turn_id,
+            response_id=response_id,
+        )
         deferred_events: list[dict[str, object]] = []
         while True:
             event = await self._receive_event(
@@ -896,8 +914,10 @@ class _OpenAIRealtimeEventChannel:
             event_type = _event_type(event)
             if event_type == "error":
                 if _provider_error_code(event) == "response_cancel_not_active":
+                    expectation = self._consume_late_cancel_error_expectation()
+                    if expectation is None:
+                        raise _provider_error(event)
                     if response_id is not None:
-                        cancel_not_active_received = True
                         _log_response_diagnostic(
                             "openai_realtime_cancel_not_active_waiting_for_terminal",
                             event=event,
@@ -916,7 +936,6 @@ class _OpenAIRealtimeEventChannel:
                         # settle that response's ownership boundary.
                         continue
                     if pending_interaction_create:
-                        cancel_not_active_received = True
                         cancel_not_active_before_response_created = True
                         _log_response_diagnostic(
                             "openai_realtime_cancel_not_active_pending_create",
@@ -951,10 +970,16 @@ class _OpenAIRealtimeEventChannel:
                     turn_id=cancelled_turn_id,
                 )
                 self._active_response_id = candidate
+                self._bind_late_cancel_error_expectation_response(
+                    turn_id=cancelled_turn_id,
+                    response_id=candidate,
+                )
                 pending_interaction_create = False
                 if cancel_not_active_before_response_created:
-                    await self._send_json({"type": "response.cancel"})
-                    cancel_not_active_received = False
+                    await self._send_response_cancel(
+                        turn_id=cancelled_turn_id,
+                        response_id=candidate,
+                    )
                 continue
             if event_type == "response.done":
                 completed_response_id = _nested_string(event, "response", "id")
@@ -972,6 +997,12 @@ class _OpenAIRealtimeEventChannel:
                         "OpenAI completed response belongs to a different Ava turn"
                     )
                 status = _nested_string(event, "response", "status")
+                self._mark_response_terminal_consumed(
+                    event,
+                    response_id=completed_response_id,
+                    turn_id=cancelled_turn_id,
+                    consumer_phase="cancellation",
+                )
                 _log_response_diagnostic(
                     "openai_realtime_response_drained",
                     event=event,
@@ -984,13 +1015,11 @@ class _OpenAIRealtimeEventChannel:
                     status=status,
                 )
                 self._pending_events.extend(deferred_events)
-                # If the response completed before the cancel was processed,
-                # OpenAI may next report response_cancel_not_active. That
-                # documented no-op error belongs to this cancel, not the next
-                # child turn.
-                self._late_cancel_error_expected = (
-                    status == "completed" and not cancel_not_active_received
-                )
+                # A completed response may race the cancellation error. Keep
+                # the expectation until that error is consumed, including if
+                # it arrives while reading the next semantic response.
+                if status != "completed":
+                    self._late_cancel_error_expected = None
                 if self._interaction_response_turn_id == cancelled_turn_id:
                     self._interaction_response_turn_id = None
                 self._active_response_id = None
@@ -1237,17 +1266,6 @@ class _OpenAIRealtimeEventChannel:
             raise OpenAIRealtimeProtocolError(
                 "OpenAI response event belongs to a different Ava turn"
             )
-        if _event_type(event) == "response.done":
-            _log_response_diagnostic(
-                "openai_realtime_response_terminal_consumed",
-                event=event,
-                response_owner_turn_id=owner,
-                consumer_turn_id=turn_id,
-                consumer_phase=consumer_phase,
-                active_turn_id=self._active_turn_id,
-                active_response_id=self._active_response_id,
-            )
-
     def _admit_response(self, *, response_id: str, turn_id: str) -> None:
         if not turn_id.strip():
             raise ValueError("turn_id cannot be empty")
@@ -1261,6 +1279,38 @@ class _OpenAIRealtimeEventChannel:
                 "OpenAI response changed Ava turn ownership"
             )
         self._response_owner_by_id[response_id] = turn_id
+
+    def _mark_response_terminal_consumed(
+        self,
+        event: Mapping[str, object],
+        *,
+        response_id: str,
+        turn_id: str,
+        consumer_phase: str,
+    ) -> None:
+        owner = self._response_owner_by_id.get(response_id)
+        if owner is None or owner != turn_id:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI terminal response owner changed before consumption"
+            )
+        if response_id in self._consumed_terminal_response_owner_by_id:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI terminal response was consumed more than once"
+            )
+        self._consumed_terminal_response_owner_by_id[response_id] = owner
+        _retain_latest(
+            self._consumed_terminal_response_owner_by_id,
+            maximum=_MAX_CONSUMED_TERMINAL_RESPONSE_IDS,
+        )
+        _log_response_diagnostic(
+            "openai_realtime_response_terminal_consumed",
+            event=event,
+            response_owner_turn_id=owner,
+            consumer_turn_id=turn_id,
+            consumer_phase=consumer_phase,
+            active_turn_id=self._active_turn_id,
+            active_response_id=self._active_response_id,
+        )
 
     def _validate_input_transcription_progress(
         self,
@@ -1435,14 +1485,17 @@ class _OpenAIRealtimeEventChannel:
                         ),
                     )
                 if event_type == "error":
-                    if (
-                        self._late_cancel_error_expected
-                        and _provider_error_code(event) == "response_cancel_not_active"
-                    ):
-                        self._late_cancel_error_expected = False
+                    if _provider_error_code(event) == "response_cancel_not_active":
+                        expectation = self._consume_late_cancel_error_expectation()
+                        if expectation is None:
+                            raise _provider_error(event)
                         LOGGER.info(
-                            "openai_realtime_late_cancel_error_consumed turn_id=%s",
-                            self._active_turn_id,
+                            "openai_realtime_late_cancel_error_consumed "
+                            "cancelled_turn_id=%s cancelled_response_id=%s "
+                            "consumer_turn_id=%s",
+                            expectation.cancelled_turn_id,
+                            expectation.response_id,
+                            turn_id,
                         )
                         continue
                     raise _provider_error(event)
@@ -1474,7 +1527,6 @@ class _OpenAIRealtimeEventChannel:
                     if not response_expected:
                         trigger_started = monotonic()
                     response_expected = True
-                    self._late_cancel_error_expected = False
                     candidate = _nested_string(event, "response", "id")
                     if response_id is not None and candidate != response_id:
                         raise OpenAIRealtimeProtocolError(
@@ -1583,7 +1635,10 @@ class _OpenAIRealtimeEventChannel:
                             "OpenAI emitted an unexpected additional function call"
                         )
                     function_name = _required_string(item, "name")
-                    if function_name != INTERACTIVE_CANVAS_TOOL_NAME:
+                    if function_name not in {
+                        INTERACTIVE_CANVAS_TOOL_NAME,
+                        CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
+                    }:
                         raise OpenAIRealtimeProtocolError(
                             "OpenAI selected an unavailable function"
                         )
@@ -1632,7 +1687,10 @@ class _OpenAIRealtimeEventChannel:
                     candidate_call_id = _required_string(event, "call_id")
                     candidate_response_id = _required_string(event, "response_id")
                     candidate_arguments = _required_string(event, "arguments")
-                    if candidate_name != INTERACTIVE_CANVAS_TOOL_NAME:
+                    if candidate_name not in {
+                        INTERACTIVE_CANVAS_TOOL_NAME,
+                        CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
+                    }:
                         raise OpenAIRealtimeProtocolError(
                             "OpenAI completed an unavailable function"
                         )
@@ -1664,6 +1722,20 @@ class _OpenAIRealtimeEventChannel:
                             )
                         )
                     except RealtimeProviderResponseIncompleteError:
+                        completed_response_id = _required_string(
+                            _mapping(event.get("response"), "response.done response"),
+                            "id",
+                        )
+                        self._mark_response_terminal_consumed(
+                            event,
+                            response_id=completed_response_id,
+                            turn_id=turn_id,
+                            consumer_phase=(
+                                "canvasContinuation"
+                                if continuation
+                                else "turnResponse"
+                            ),
+                        )
                         self._active_response_id = None
                         if self._interaction_response_turn_id == turn_id:
                             self._interaction_response_turn_id = None
@@ -1699,7 +1771,10 @@ class _OpenAIRealtimeEventChannel:
                         completed_name = _required_string(item, "name")
                         completed_call_id = _required_string(item, "call_id")
                         completed_arguments = _required_string(item, "arguments")
-                        if completed_name != INTERACTIVE_CANVAS_TOOL_NAME:
+                        if completed_name not in {
+                            INTERACTIVE_CANVAS_TOOL_NAME,
+                            CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
+                        }:
                             raise OpenAIRealtimeProtocolError(
                                 "OpenAI response completed an unavailable function"
                             )
@@ -1737,9 +1812,14 @@ class _OpenAIRealtimeEventChannel:
                             call_id=completed_call_id,
                         )
                         try:
-                            request = InteractiveCanvasRequest.model_validate_json(
-                                completed_arguments
-                            )
+                            if completed_name == INTERACTIVE_CANVAS_TOOL_NAME:
+                                request = InteractiveCanvasRequest.model_validate_json(
+                                    completed_arguments
+                                )
+                            else:
+                                InteractiveCanvasCancellationRequest.model_validate_json(
+                                    completed_arguments
+                                )
                         except ValidationError as error:
                             validation_issues = _content_free_validation_issues(error)
                             LOGGER.warning(
@@ -1757,6 +1837,12 @@ class _OpenAIRealtimeEventChannel:
                             )
                             self._pending_canvas_call_id = completed_call_id
                             canvas_called = True
+                            self._mark_response_terminal_consumed(
+                                event,
+                                response_id=completed_response_id,
+                                turn_id=turn_id,
+                                consumer_phase="turnResponse",
+                            )
                             yield RealtimeRejectedCanvasToolCall(
                                 call_id=completed_call_id,
                                 reason=(
@@ -1774,10 +1860,21 @@ class _OpenAIRealtimeEventChannel:
                             break
                         self._pending_canvas_call_id = completed_call_id
                         canvas_called = True
-                        yield RealtimeCanvasToolCall(
-                            call_id=completed_call_id,
-                            request=request,
+                        self._mark_response_terminal_consumed(
+                            event,
+                            response_id=completed_response_id,
+                            turn_id=turn_id,
+                            consumer_phase="turnResponse",
                         )
+                        if completed_name == INTERACTIVE_CANVAS_TOOL_NAME:
+                            yield RealtimeCanvasToolCall(
+                                call_id=completed_call_id,
+                                request=request,
+                            )
+                        else:
+                            yield RealtimeCancelCanvasToolCall(
+                                call_id=completed_call_id
+                            )
                         if completed_call_id not in self._completed_canvas_call_ids:
                             raise OpenAIRealtimeProtocolError(
                                 "Ava did not return the canvas function output"
@@ -1798,11 +1895,20 @@ class _OpenAIRealtimeEventChannel:
                             "the completed response"
                         )
 
+                    self._mark_response_terminal_consumed(
+                        event,
+                        response_id=completed_response_id,
+                        turn_id=turn_id,
+                        consumer_phase=(
+                            "canvasContinuation" if continuation else "turnResponse"
+                        ),
+                    )
                     self.last_response_id = completed_response_id
                     self.last_usage = accumulated_usage
                     self.last_completed_ms = (monotonic() - trigger_started) * 1000
                     if self._interaction_response_turn_id == turn_id:
                         self._interaction_response_turn_id = None
+                    self._expire_late_cancel_error_expectation(turn_id=turn_id)
                     return
 
                 if event_type in _RESPONSE_TRIGGER_EVENT_TYPES:
@@ -1814,6 +1920,56 @@ class _OpenAIRealtimeEventChannel:
                     raise OpenAIRealtimeProtocolError(
                         f"unexpected OpenAI event during Ava turn: {event_type}"
                     )
+
+    async def _send_response_cancel(
+        self,
+        *,
+        turn_id: str,
+        response_id: str | None,
+    ) -> None:
+        await self._send_json({"type": "response.cancel"})
+        self._late_cancel_error_expected = _LateCancelErrorExpectation(
+            cancelled_turn_id=turn_id,
+            response_id=response_id,
+        )
+
+    def _bind_late_cancel_error_expectation_response(
+        self,
+        *,
+        turn_id: str,
+        response_id: str,
+    ) -> None:
+        expectation = self._late_cancel_error_expected
+        if expectation is None or expectation.cancelled_turn_id != turn_id:
+            return
+        if expectation.response_id is not None and expectation.response_id != response_id:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI cancellation response ID changed before terminal status"
+            )
+        self._late_cancel_error_expected = _LateCancelErrorExpectation(
+            cancelled_turn_id=turn_id,
+            response_id=response_id,
+        )
+
+    def _consume_late_cancel_error_expectation(
+        self,
+    ) -> _LateCancelErrorExpectation | None:
+        expectation = self._late_cancel_error_expected
+        self._late_cancel_error_expected = None
+        return expectation
+
+    def _expire_late_cancel_error_expectation(self, *, turn_id: str) -> None:
+        expectation = self._late_cancel_error_expected
+        if expectation is None or expectation.cancelled_turn_id == turn_id:
+            return
+        self._late_cancel_error_expected = None
+        LOGGER.info(
+            "openai_realtime_late_cancel_error_expired cancelled_turn_id=%s "
+            "cancelled_response_id=%s completed_turn_id=%s",
+            expectation.cancelled_turn_id,
+            expectation.response_id,
+            turn_id,
+        )
 
     async def _send_json(self, payload: Mapping[str, object]) -> None:
         if self._closed:
@@ -1844,36 +2000,73 @@ class _OpenAIRealtimeEventChannel:
         timeout_seconds: float | None,
     ) -> dict[str, object]:
         await self.start_receiver()
-        self._received_event_count += 1
-        if self._received_event_count > self._max_events_per_turn:
-            raise OpenAIRealtimeProtocolError(
-                "OpenAI Realtime exceeded Ava's event-count limit"
-            )
-        if self._pending_events:
-            return self._pending_events.popleft()
-        if self._receiver_error is not None and self._router_events.empty():
-            raise self._receiver_error
-        try:
-            if timeout_seconds is None:
-                value = await self._router_events.get()
+        while True:
+            self._received_event_count += 1
+            if self._received_event_count > self._max_events_per_turn:
+                raise OpenAIRealtimeProtocolError(
+                    "OpenAI Realtime exceeded Ava's event-count limit"
+                )
+            if self._pending_events:
+                event = self._pending_events.popleft()
             else:
-                async with asyncio.timeout(timeout_seconds):
-                    value = await self._router_events.get()
-        except TimeoutError as error:
-            raise _OpenAIRealtimeReceiveTimeout(
-                "OpenAI Realtime active-response event receive timed out"
-            ) from error
-        if value is self._receiver_terminal:
-            if self._receiver_error is not None:
-                raise self._receiver_error
-            raise OpenAIRealtimeUnavailableError(
-                "OpenAI Realtime sideband receiver stopped unexpectedly"
-            )
-        if not isinstance(value, dict):
-            raise OpenAIRealtimeProtocolError(
-                "OpenAI Realtime router produced an invalid provider event"
-            )
-        return value
+                if self._receiver_error is not None and self._router_events.empty():
+                    raise self._receiver_error
+                try:
+                    if timeout_seconds is None:
+                        value = await self._router_events.get()
+                    else:
+                        async with asyncio.timeout(timeout_seconds):
+                            value = await self._router_events.get()
+                except TimeoutError as error:
+                    raise _OpenAIRealtimeReceiveTimeout(
+                        "OpenAI Realtime active-response event receive timed out"
+                    ) from error
+                if value is self._receiver_terminal:
+                    if self._receiver_error is not None:
+                        raise self._receiver_error
+                    raise OpenAIRealtimeUnavailableError(
+                        "OpenAI Realtime sideband receiver stopped unexpectedly"
+                    )
+                if not isinstance(value, dict):
+                    raise OpenAIRealtimeProtocolError(
+                        "OpenAI Realtime router produced an invalid provider event"
+                    )
+                event = value
+            if self._is_duplicate_consumed_terminal_response(event):
+                continue
+            return event
+
+    def _is_duplicate_consumed_terminal_response(
+        self,
+        event: Mapping[str, object],
+    ) -> bool:
+        if _event_type(event) != "response.done":
+            return False
+        response_id = _response_id_from_event(event)
+        if response_id is None:
+            return False
+        owner = self._consumed_terminal_response_owner_by_id.get(response_id)
+        if owner is None:
+            return False
+        sequence = _sideband_sequence(event)
+        LOGGER.info(
+            "openai_realtime_duplicate_terminal_ignored response_id=%s "
+            "response_owner_turn_id=%s active_turn_id=%s sideband_sequence=%s",
+            response_id,
+            owner,
+            self._active_turn_id,
+            sequence,
+            extra={
+                "ava_context": {
+                    "component": "realtimeProvider",
+                    "responseId": response_id,
+                    "responseOwnerTurnId": owner,
+                    "activeTurnId": self._active_turn_id,
+                    "sidebandSequence": sequence,
+                }
+            },
+        )
+        return True
 
 
 class OpenAIRealtimeProviderSession:
@@ -1970,6 +2163,10 @@ class OpenAIRealtimeProviderSession:
             ),
         }
         sdp_started = monotonic()
+        provider_status_code: int | None = None
+        provider_error_code: str | None = None
+        provider_error_parameter: str | None = None
+        provider_request_id: str | None = None
         try:
             async with self._http_client.stream(
                 "POST",
@@ -1978,18 +2175,20 @@ class OpenAIRealtimeProviderSession:
                 files=files,
                 timeout=self._connect_timeout_seconds,
             ) as response:
+                provider_status_code = response.status_code
+                provider_request_id = response.headers.get("x-request-id")
                 if response.status_code != 201:
                     error_body = await _read_bounded_error_response(response)
-                    error_code, error_parameter = _provider_http_error_details(
-                        error_body
+                    provider_error_code, provider_error_parameter = (
+                        _provider_http_error_details(error_body)
                     )
                     raise RealtimeNegotiationResponseError(
                         "OpenAI Realtime negotiation failed with HTTP status "
                         f"{response.status_code}",
                         provider_status_code=response.status_code,
-                        provider_error_code=error_code,
-                        provider_error_parameter=error_parameter,
-                        provider_request_id=response.headers.get("x-request-id"),
+                        provider_error_code=provider_error_code,
+                        provider_error_parameter=provider_error_parameter,
+                        provider_request_id=provider_request_id,
                     )
                 location = response.headers.get("location")
                 if location is None:
@@ -2006,7 +2205,17 @@ class OpenAIRealtimeProviderSession:
                     await _read_bounded_response(response, MAX_SDP_BYTES)
                 ).decode("utf-8")
                 call_id = _call_id_from_location(location)
-        except RealtimeNegotiationResponseError:
+        except RealtimeNegotiationResponseError as error:
+            _log_sdp_negotiation_failure(
+                provider_status_code=(
+                    error.provider_status_code or provider_status_code
+                ),
+                provider_error_code=error.provider_error_code or provider_error_code,
+                provider_error_parameter=(
+                    error.provider_error_parameter or provider_error_parameter
+                ),
+                provider_request_id=error.provider_request_id or provider_request_id,
+            )
             raise
         except (UnicodeDecodeError, httpx.HTTPError, OSError) as error:
             raise RealtimeNegotiationUnavailableError(
@@ -2068,10 +2277,19 @@ class OpenAIRealtimeProviderSession:
             (monotonic() - sideband_started) * 1000,
         )
 
-        negotiated = NegotiatedRealtimeCall(
-            answer_sdp=answer_sdp,
-            provider_call_id=call_id,
-        )
+        try:
+            negotiated = NegotiatedRealtimeCall(
+                answer_sdp=answer_sdp,
+                provider_call_id=call_id,
+            )
+        except ValueError:
+            _log_sdp_negotiation_failure(
+                provider_status_code=provider_status_code,
+                provider_error_code=provider_error_code,
+                provider_error_parameter=provider_error_parameter,
+                provider_request_id=provider_request_id,
+            )
+            raise
         self._call_id = call_id
         self._channel = channel
         return negotiated
@@ -2104,7 +2322,11 @@ class OpenAIRealtimeProviderSession:
         *,
         turn_id: str,
         call_id: str,
-        output: InteractiveCanvasToolOutput | InteractiveCanvasToolOutputV4,
+        output: (
+            InteractiveCanvasToolOutput
+            | InteractiveCanvasToolOutputV4
+            | InteractiveCanvasCancellationToolOutputV4
+        ),
     ) -> None:
         await self._require_channel().complete_canvas_tool(
             turn_id=turn_id,
@@ -2395,6 +2617,21 @@ class OpenAIRealtimeLiveProbe:
                                 "Live semantic-selection probe does not render a scene."
                             ),
                         }
+                    ),
+                )
+                continue
+            if isinstance(event, RealtimeCancelCanvasToolCall):
+                parser.finish_response_chunk()
+                if canvas_selected:
+                    raise OpenAIRealtimeProtocolError(
+                        "OpenAI live probe requested multiple canvases"
+                    )
+                canvas_selected = True
+                await channel.complete_canvas_tool(
+                    turn_id=request.turn_id,
+                    call_id=event.call_id,
+                    output=InteractiveCanvasCancellationToolOutputV4.model_validate(
+                        {"status": "accepted"}
                     ),
                 )
                 continue
@@ -2787,6 +3024,24 @@ def _provider_http_error_details(body: bytes) -> tuple[str | None, str | None]:
         else None
     )
     return code, parameter
+
+
+def _log_sdp_negotiation_failure(
+    *,
+    provider_status_code: int | None,
+    provider_error_code: str | None,
+    provider_error_parameter: str | None,
+    provider_request_id: str | None,
+) -> None:
+    LOGGER.warning(
+        "openai_realtime_negotiation_failed stage=sdp "
+        "provider_status_code=%s provider_error_code=%s "
+        "provider_error_parameter=%s provider_request_id=%s",
+        provider_status_code,
+        provider_error_code,
+        provider_error_parameter,
+        provider_request_id,
+    )
 
 
 def _call_id_from_location(location: str) -> str:

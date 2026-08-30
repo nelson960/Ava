@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -6,6 +7,7 @@ import 'package:ava/canvas/ava_svg_canvas_controller.dart';
 import 'package:ava/canvas/ava_svg_canvas_session_host.dart';
 import 'package:ava/config/ava_backend_configuration.dart';
 import 'package:ava/models/ava_realtime_protocol.dart';
+import 'package:ava/models/ava_realtime_protocol_v4.dart';
 import 'package:ava/models/ava_svg_canvas_protocol.dart';
 import 'package:ava/services/ava_realtime_bootstrap_service.dart';
 import 'package:ava/services/ava_realtime_presentation.dart';
@@ -32,6 +34,7 @@ void main() {
     final raw = DeterministicAvaRealtimeRawTransportV4(const []);
     final loader = _Loader();
     final host = AvaSvgCanvasSessionHost();
+    host.updateRenderProfile(_profile);
     final traceEvents = <AvaRealtimeTraceEvent>[];
     final factory = AvaRealtimeRuntimeFactoryV4(
       bootstrapService: AvaRealtimeBootstrapService(
@@ -103,6 +106,7 @@ void main() {
       sceneRevision: 2,
     );
     final host = AvaSvgCanvasSessionHost();
+    host.updateRenderProfile(_profile);
     final owner = AvaSvgCanvasController(
       documents: _Loader(retained),
       commandSink: (_) {},
@@ -144,11 +148,99 @@ void main() {
     expect(host.presentedDocument, same(revised));
     await runtime.close();
   });
+
+  test('active session coalesces render profile updates without bootstrap',
+      () async {
+    final bootstrapTransport = _BootstrapTransport();
+    final media = DeterministicAvaRealtimeMediaSession(offerSdp: _offerSdp);
+    final raw = _OpenRawTransport();
+    final host = AvaSvgCanvasSessionHost(renderProfileDebounce: Duration.zero);
+    host.updateRenderProfile(_profile);
+    final factory = AvaRealtimeRuntimeFactoryV4(
+      bootstrapService: AvaRealtimeBootstrapService(
+        configuration: AvaBackendConfiguration.parse(
+          'https://ava.example.test',
+        ),
+        transport: bootstrapTransport,
+      ),
+      mediaConnector: (_) async => media,
+      transportConnector: (_) async => raw,
+      documentLoaderFactory: (_, __) => _Loader(),
+      canvasHost: host,
+      speechOutput: const _NoopPcmOutput(),
+      presentation: AvaRealtimePresentationController(),
+      cancelRequestIdFactory: () => 'cancel-v4-profile-update',
+    );
+    addTearDown(factory.close);
+    addTearDown(host.dispose);
+    final runtime = await factory.create(
+      ageBand: AvaRealtimeAgeBand.middleChildhood,
+      volume: 0.8,
+    );
+
+    final supersededMeasurement = AvaCanvasRenderProfileV4.measure(
+      workspaceWidthPoints: 500,
+      workspaceHeightPoints: 800,
+      safeTopPoints: 0,
+      safeRightPoints: 0,
+      safeBottomPoints: 20,
+      safeLeftPoints: 0,
+      directTouch: true,
+      textScaleFactor: 1,
+    );
+    final latestMeasurement = AvaCanvasRenderProfileV4.measure(
+      workspaceWidthPoints: 600,
+      workspaceHeightPoints: 800,
+      safeTopPoints: 0,
+      safeRightPoints: 0,
+      safeBottomPoints: 20,
+      safeLeftPoints: 0,
+      directTouch: true,
+      textScaleFactor: 1,
+    );
+    host.updateRenderProfile(supersededMeasurement);
+    host.updateRenderProfile(latestMeasurement);
+    await Future<void>.delayed(Duration.zero);
+
+    final run = runtime.run();
+    for (var attempt = 0;
+        attempt < 10 && raw.sentEvents.length < 2;
+        attempt++) {
+      await Future<void>.delayed(Duration.zero);
+    }
+    expect(bootstrapTransport.postCount, 1);
+    expect(raw.sentEvents.map((event) => event.toJson()['event']), [
+      'clientReady',
+      'canvasRenderProfileUpdated',
+    ]);
+    final update = raw.sentEvents.last.toJson();
+    expect(update['sequence'], 1);
+    expect(update['profileRevision'], 1);
+    expect(
+      (update['renderProfile']! as Map)['usableAspectRatio'],
+      latestMeasurement.usableAspectRatio,
+    );
+
+    await runtime.close();
+    await run;
+  });
 }
+
+final _profile = AvaCanvasRenderProfileV4.measure(
+  workspaceWidthPoints: 800,
+  workspaceHeightPoints: 500,
+  safeTopPoints: 0,
+  safeRightPoints: 0,
+  safeBottomPoints: 20,
+  safeLeftPoints: 0,
+  directTouch: true,
+  textScaleFactor: 1,
+);
 
 final class _BootstrapTransport implements AvaRealtimeBootstrapTransport {
   late Uri endpoint;
   late String protocolHeader;
+  int postCount = 0;
 
   @override
   Future<AvaRealtimeBootstrapResponse> postJson({
@@ -157,6 +249,7 @@ final class _BootstrapTransport implements AvaRealtimeBootstrapTransport {
     required String body,
     required Duration timeout,
   }) async {
+    postCount += 1;
     this.endpoint = endpoint;
     protocolHeader = headers['x-ava-protocol-version']!;
     expect((jsonDecode(body) as Map)['protocolVersion'], 4);
@@ -197,6 +290,29 @@ final class _BootstrapTransport implements AvaRealtimeBootstrapTransport {
   void close() {}
 }
 
+final class _OpenRawTransport implements AvaRealtimeRawTransportV4 {
+  final StreamController<AvaRealtimeInboundFrameV4> _frames =
+      StreamController<AvaRealtimeInboundFrameV4>();
+  final List<AvaRealtimeClientEventV4> sentEvents = [];
+  bool _closed = false;
+
+  @override
+  Stream<AvaRealtimeInboundFrameV4> frames() => _frames.stream;
+
+  @override
+  Future<void> send(AvaRealtimeClientEventV4 event) async {
+    if (_closed) throw StateError('Profile transport is closed.');
+    sentEvents.add(event);
+  }
+
+  @override
+  Future<void> close() async {
+    if (_closed) return;
+    _closed = true;
+    await _frames.close();
+  }
+}
+
 final class _Loader implements AvaSvgDocumentLoader {
   _Loader([this.document]);
 
@@ -214,6 +330,12 @@ final class _Loader implements AvaSvgDocumentLoader {
     }
     return resolved;
   }
+
+  @override
+  Future<AvaValidatedSvgCanvasDraft> fetchDraft(
+    AvaSvgCanvasDraftDescriptorV4 descriptor,
+  ) =>
+      throw StateError('The factory test did not expect a canvas draft.');
 
   @override
   void close() => closed = true;

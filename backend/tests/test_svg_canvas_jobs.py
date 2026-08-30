@@ -8,9 +8,11 @@ import pytest
 
 from ava_backend.canvas.svg_delivery import (
     StoredSvgCanvasDocument,
+    StoredSvgCanvasDraft,
     SvgCanvasDocumentStore,
     SvgDocumentNotFoundError,
 )
+from ava_backend.canvas.render_profile import CanvasRenderProfile
 from ava_backend.canvas.svg_document import SvgDocumentValidator
 from ava_backend.canvas.svg_session import (
     ActiveSvgCanvasScene,
@@ -21,13 +23,16 @@ from ava_backend.canvas.svg_session import (
     SvgCanvasStateErrorCode,
 )
 from ava_backend.canvas.svg_specialist import (
+    SvgCanvasDraftSink,
     SvgCanvasSpecialistGenerationLimitError,
     SvgCanvasSpecialistGeneration,
     SvgCanvasSpecialistRequest,
     SvgCanvasSpecialistUnavailableError,
+    SvgCanvasVisibleDraft,
     render_svg_canvas_specialist_instructions,
 )
 from ava_backend.canvas.svg_workspace import (
+    SvgCanvasExecutionStatus,
     SvgCanvasWorkspace,
     SvgCanvasWorkspaceStore,
 )
@@ -71,7 +76,10 @@ class _Specialist:
     async def generate(
         self,
         request: SvgCanvasSpecialistRequest,
+        *,
+        draft_sink: object | None = None,
     ) -> SvgCanvasSpecialistGeneration:
+        del draft_sink
         self.requests.append(request)
         self.started.set()
         await self.release.wait()
@@ -97,7 +105,10 @@ class _CancellationResistantSpecialist(_Specialist):
     async def generate(
         self,
         request: SvgCanvasSpecialistRequest,
+        *,
+        draft_sink: object | None = None,
     ) -> SvgCanvasSpecialistGeneration:
+        del draft_sink
         self.requests.append(request)
         self.started.set()
         try:
@@ -105,6 +116,37 @@ class _CancellationResistantSpecialist(_Specialist):
         except asyncio.CancelledError:
             self.task_cancelled.set()
             await self.release.wait()
+        return SvgCanvasSpecialistGeneration(
+            generation_id=request.generation_id,
+            document=_document(),
+        )
+
+
+class _ProgressiveSpecialist(_Specialist):
+    def __init__(self) -> None:
+        super().__init__()
+        self.draft_emitted = asyncio.Event()
+
+    async def generate(
+        self,
+        request: SvgCanvasSpecialistRequest,
+        *,
+        draft_sink: SvgCanvasDraftSink | None = None,
+    ) -> SvgCanvasSpecialistGeneration:
+        if draft_sink is None:
+            raise AssertionError("canvas coordinator must connect the draft sink")
+        self.requests.append(request)
+        self.started.set()
+        await draft_sink(
+            SvgCanvasVisibleDraft(
+                generation_id=request.generation_id,
+                draft_index=1,
+                attempt=0,
+                document=_document(),
+            )
+        )
+        self.draft_emitted.set()
+        await self.release.wait()
         return SvgCanvasSpecialistGeneration(
             generation_id=request.generation_id,
             document=_document(),
@@ -121,7 +163,10 @@ class _UnavailableSpecialist(_Specialist):
     async def generate(
         self,
         request: SvgCanvasSpecialistRequest,
+        *,
+        draft_sink: object | None = None,
     ) -> SvgCanvasSpecialistGeneration:
+        del draft_sink
         self.requests.append(request)
         self.started.set()
         raise SvgCanvasSpecialistUnavailableError(
@@ -133,7 +178,10 @@ class _GenerationLimitSpecialist(_Specialist):
     async def generate(
         self,
         request: SvgCanvasSpecialistRequest,
+        *,
+        draft_sink: object | None = None,
     ) -> SvgCanvasSpecialistGeneration:
+        del draft_sink
         self.requests.append(request)
         self.started.set()
         raise SvgCanvasSpecialistGenerationLimitError(
@@ -145,6 +193,7 @@ class _Sink:
     def __init__(self) -> None:
         self.started: list[tuple[str, str]] = []
         self.available: list[StoredSvgCanvasDocument] = []
+        self.drafts: list[StoredSvgCanvasDraft] = []
         self.cues: list[tuple[SvgCanvasCandidate, SvgCanvasPresentationCue]] = []
         self.activations: list[ActiveSvgCanvasScene] = []
         self.discarded: list[
@@ -160,6 +209,7 @@ class _Sink:
         self.rejected_calls: list[tuple[str, str]] = []
         self.interaction_rejections: list[SvgCanvasStateError] = []
         self.activation_failure: Exception | None = None
+        self.rejection_arrived = asyncio.Event()
 
     async def generation_started(
         self,
@@ -171,6 +221,9 @@ class _Sink:
 
     async def document_available(self, stored: StoredSvgCanvasDocument) -> None:
         self.available.append(stored)
+
+    async def draft_available(self, stored: StoredSvgCanvasDraft) -> None:
+        self.drafts.append(stored)
 
     async def presentation_cue(
         self,
@@ -210,6 +263,7 @@ class _Sink:
         del source_turn_id
         self.rejected.append((generation_id, code))
         self.rejection_details.append((generation_id, code, message, retryable))
+        self.rejection_arrived.set()
 
     async def tool_call_rejected(
         self,
@@ -228,6 +282,16 @@ class _Sink:
     ) -> None:
         del event
         self.interaction_rejections.append(error)
+
+
+class _DiscardFailingSink(_Sink):
+    async def document_discarded(
+        self,
+        candidate: SvgCanvasCandidate,
+        reason: CanvasDocumentDiscardReason,
+    ) -> None:
+        del candidate, reason
+        raise RuntimeError("canvas discard delivery failed")
 
 
 def _id_factory(values: list[str]):
@@ -250,6 +314,22 @@ def _call(
                 "interactionMode": "select",
             }
         ),
+    )
+
+
+def _render_profile(*, aspect_ratio: float) -> CanvasRenderProfile:
+    orientation = "portrait" if aspect_ratio < 0.95 else "landscape"
+    return CanvasRenderProfile.model_validate(
+        {
+            "usableAspectRatio": aspect_ratio,
+            "orientation": orientation,
+            "widthClass": "compact" if orientation == "portrait" else "regular",
+            "heightClass": "regular" if orientation == "portrait" else "compact",
+            "safeInsets": {"top": 0.0, "right": 0.0, "bottom": 0.04, "left": 0.0},
+            "touchEnvironment": "direct",
+            "minimumInteractionTargetPoints": 44.0,
+            "textScaleFactor": 1.0,
+        }
     )
 
 
@@ -316,7 +396,72 @@ async def _accepted_coordinator(
     return coordinator, specialist, sink, completions, output, documents
 
 
-async def test_source_turn_transcript_and_realtime_brief_remain_distinct_for_sol() -> None:
+async def test_render_profile_update_is_ordered_and_snapshotted_per_generation() -> (
+    None
+):
+    specialist = _Specialist()
+    sink = _Sink()
+    initial_profile = _render_profile(aspect_ratio=0.68)
+    newest_profile = _render_profile(aspect_ratio=1.6)
+
+    async def complete(
+        turn_id: str,
+        call_id: str,
+        output: InteractiveCanvasToolOutputV4,
+    ) -> None:
+        del turn_id, call_id, output
+
+    coordinator = SvgCanvasJobCoordinator(
+        session_id="session-render-profile",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+        render_profile=initial_profile,
+        specialist=specialist,
+        state=SvgCanvasSessionState(),
+        documents=SvgCanvasDocumentStore(),
+        event_sink=sink,
+        generation_id_factory=_id_factory(["generation-old", "generation-new"]),
+    )
+    try:
+        await coordinator.accept_tool_call(
+            source_turn_id="turn-old",
+            call=_call("call-old"),
+            complete_tool=complete,
+        )
+        await specialist.started.wait()
+        assert specialist.requests[0].render_profile == initial_profile
+
+        assert await coordinator.update_render_profile(
+            profile_revision=2,
+            render_profile=newest_profile,
+        )
+        assert not await coordinator.update_render_profile(
+            profile_revision=1,
+            render_profile=initial_profile,
+        )
+        assert coordinator.render_profile_revision == 2
+        assert specialist.cancelled == []
+        assert specialist.requests[0].render_profile == initial_profile
+
+        await coordinator.accept_tool_call(
+            source_turn_id="turn-new",
+            call=_call("call-new"),
+            complete_tool=complete,
+        )
+        for _ in range(10):
+            if len(specialist.requests) == 2:
+                break
+            await asyncio.sleep(0)
+        assert len(specialist.requests) == 2
+        assert specialist.requests[0].render_profile == initial_profile
+        assert specialist.requests[1].render_profile == newest_profile
+    finally:
+        specialist.release.set()
+        await coordinator.close()
+
+
+async def test_source_turn_transcript_and_realtime_brief_remain_distinct_for_sol() -> (
+    None
+):
     specialist = _Specialist()
     sink = _Sink()
     coordinator = SvgCanvasJobCoordinator(
@@ -414,6 +559,7 @@ async def _prepare_current_candidate(
     documents: SvgCanvasDocumentStore,
     sequence: int,
     session_id: str = "session-1",
+    presentation_sample_offset: int | None = 4_800,
 ) -> tuple[SvgCanvasCandidate, StoredSvgCanvasDocument]:
     stored = sink.available[-1]
     candidate = coordinator.state.candidate
@@ -425,10 +571,11 @@ async def _prepare_current_candidate(
         )
         == stored
     )
-    await coordinator.request_presentation(
-        generation_id=candidate.generation_id,
-        presentation_sample_offset=4_800,
-    )
+    if presentation_sample_offset is not None:
+        await coordinator.request_presentation(
+            generation_id=candidate.generation_id,
+            presentation_sample_offset=presentation_sample_offset,
+        )
     await coordinator.document_prepared(
         CanvasDocumentPreparedEventV4.model_validate(
             {
@@ -520,6 +667,9 @@ async def _commit_shared_workspace_scene(
         session_id="session-canvas-1",
     )
     assert documents.document_count == 0
+    execution = state.workspace.execution(active.generation_id)
+    assert execution is not None
+    assert execution.status == SvgCanvasExecutionStatus.ACTIVE
     await coordinator.close()
     return active
 
@@ -752,6 +902,10 @@ async def test_new_new_revise_new_semantics() -> None:
     assert specialist.requests[2].current_svg == solar_1.document.svg_text
     assert specialist.requests[2].current_svg_sha256 == solar_1.document.svg_sha256
     assert specialist.requests[3].current_svg is None
+    scene_identities = tuple(coordinator.state.workspace.scenes)
+    assert coordinator.state.workspace.focus(plant.scene_id) is plant
+    assert coordinator.state.workspace.focused_scene_id == plant.scene_id
+    assert coordinator.state.workspace.scenes == scene_identities
     assert documents.document_count == 0
     await coordinator.close()
 
@@ -863,6 +1017,120 @@ async def test_generation_deadline_rejects_only_optional_canvas_work() -> None:
     await coordinator.close()
 
 
+async def test_progressive_draft_is_visible_without_candidate_authority() -> None:
+    specialist = _ProgressiveSpecialist()
+    sink = _Sink()
+    state = SvgCanvasSessionState()
+    documents = SvgCanvasDocumentStore()
+    completions: list[tuple[str, str, InteractiveCanvasToolOutputV4]] = []
+    coordinator = SvgCanvasJobCoordinator(
+        session_id="session-progressive",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+        specialist=specialist,
+        state=state,
+        documents=documents,
+        event_sink=sink,
+        generation_id_factory=lambda: "generation-progressive",
+    )
+
+    await coordinator.accept_tool_call(
+        source_turn_id="turn-progressive",
+        call=_call(),
+        complete_tool=lambda turn, call, output: _record_completion(
+            completions,
+            turn,
+            call,
+            output,
+        ),
+    )
+    await specialist.draft_emitted.wait()
+
+    execution = state.workspace.execution("generation-progressive")
+    assert execution is not None
+    assert execution.status == SvgCanvasExecutionStatus.DRAFT_VISIBLE
+    assert state.candidate is None
+    assert len(sink.drafts) == 1
+    stored_draft = sink.drafts[0]
+    assert stored_draft.draft.document.bindings
+    assert "/canvas-drafts/" in stored_draft.svg_path
+    assert (
+        await documents.get_draft(
+            session_id="session-progressive",
+            generation_id="generation-progressive",
+            draft_index=1,
+        )
+        == stored_draft
+    )
+
+    specialist.release.set()
+    await coordinator.wait_for_background_work()
+    execution = state.workspace.execution("generation-progressive")
+    assert execution is not None
+    assert execution.status == SvgCanvasExecutionStatus.PREPARING
+    assert state.candidate is not None
+    assert sink.available
+    await coordinator.close()
+
+
+async def test_unpresented_candidate_times_out_to_failed_and_preserves_active() -> None:
+    workspace = SvgCanvasWorkspace()
+    active = _commit_scene(
+        workspace,
+        scene_id="scene-existing",
+        revision=1,
+        generation_id="generation-existing",
+        source_turn_id="turn-existing",
+    )
+    specialist = _Specialist()
+    sink = _Sink()
+    state = SvgCanvasSessionState(workspace=workspace)
+    documents = SvgCanvasDocumentStore()
+    completions: list[tuple[str, str, InteractiveCanvasToolOutputV4]] = []
+    coordinator = SvgCanvasJobCoordinator(
+        session_id="session-timeout",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+        specialist=specialist,
+        state=state,
+        documents=documents,
+        event_sink=sink,
+        generation_id_factory=lambda: "generation-timeout",
+        presentation_timeout_seconds=0.02,
+    )
+    await coordinator.accept_tool_call(
+        source_turn_id="turn-timeout",
+        call=_call(),
+        complete_tool=lambda turn, call, output: _record_completion(
+            completions,
+            turn,
+            call,
+            output,
+        ),
+    )
+    specialist.release.set()
+    await coordinator.wait_for_background_work()
+    await asyncio.wait_for(sink.rejection_arrived.wait(), timeout=0.25)
+
+    execution = workspace.execution("generation-timeout")
+    assert execution is not None
+    assert execution.status == SvgCanvasExecutionStatus.FAILED
+    assert execution.terminal_reason == "presentationTimeout"
+    assert state.candidate is None
+    assert state.active is active
+    assert sink.discarded[0][1] == CanvasDocumentDiscardReason.PRESENTATION_TIMEOUT
+    assert sink.rejected == [
+        (
+            "generation-timeout",
+            CanvasGenerationRejectionCode.PRESENTATION_FAILED,
+        )
+    ]
+    with pytest.raises(SvgDocumentNotFoundError):
+        await documents.get(
+            session_id="session-timeout",
+            generation_id="generation-timeout",
+        )
+    await coordinator.close()
+
+
 async def test_generation_limit_has_specific_retryable_rejection() -> None:
     specialist = _GenerationLimitSpecialist()
     sink = _Sink()
@@ -954,32 +1222,66 @@ async def test_presentation_anchor_can_arrive_before_sol_document() -> None:
     await coordinator.close()
 
 
-async def test_second_tool_call_is_immediately_rejected_while_generation_pending() -> (
-    None
-):
+async def test_new_canvas_request_supersedes_pending_workspace_generation() -> None:
     (
         coordinator,
-        _specialist,
+        specialist,
         sink,
         completions,
         _output,
         _documents,
     ) = await _accepted_coordinator()
 
-    rejected = await coordinator.accept_tool_call(
-        source_turn_id="turn-1",
-        call=_call("call_2"),
+    replacement = await coordinator.accept_tool_call(
+        source_turn_id="turn-2",
+        call=_call("call_2", brief="Show Japan's major islands."),
         complete_tool=lambda turn, call, output: _record_completion(
             completions, turn, call, output
         ),
     )
 
-    assert rejected.status == InteractiveCanvasToolStatusV4.REJECTED
-    assert rejected.generation_id is None
+    assert replacement.status == InteractiveCanvasToolStatusV4.ACCEPTED
+    assert replacement.generation_id == "generation-2"
     assert len(completions) == 2
-    assert sink.rejected_calls == [
-        ("call_2", "another canvas generation is already pending")
-    ]
+    assert specialist.cancelled == ["generation-1"]
+    assert sink.rejected == [("generation-1", CanvasGenerationRejectionCode.CANCELLED)]
+    superseded = coordinator.state.workspace.execution("generation-1")
+    assert superseded is not None
+    assert superseded.status == SvgCanvasExecutionStatus.SUPERSEDED
+    assert "Japan&#x27;s major islands" in coordinator.render_realtime_context()
+    assert "Show how clouds make rain" not in coordinator.render_realtime_context()
+    await coordinator.close()
+
+
+async def test_revision_request_supersedes_focused_pending_generation() -> None:
+    (
+        coordinator,
+        specialist,
+        sink,
+        completions,
+        _output,
+        _documents,
+    ) = await _accepted_coordinator()
+
+    revision = await coordinator.accept_tool_call(
+        source_turn_id="turn-2",
+        call=_call(
+            "call_2",
+            operation="reviseFocused",
+            brief="Add the major rivers to the India visual.",
+        ),
+        complete_tool=lambda turn, call, output: _record_completion(
+            completions, turn, call, output
+        ),
+    )
+
+    assert revision.status == InteractiveCanvasToolStatusV4.ACCEPTED
+    assert revision.generation_id == "generation-2"
+    assert specialist.cancelled == ["generation-1"]
+    assert sink.rejected == [("generation-1", CanvasGenerationRejectionCode.CANCELLED)]
+    context = coordinator.render_realtime_context()
+    assert 'operation="reviseFocused"' in context
+    assert "Add the major rivers" in context
     await coordinator.close()
 
 
@@ -1033,6 +1335,7 @@ async def test_prepare_ack_and_sample_cue_still_do_not_activate() -> None:
 
     assert len(sink.cues) == 1
     assert coordinator.state.active is None
+    await coordinator.close()
 
 
 async def test_first_frame_ack_activates_and_interactions_use_manifest() -> None:
@@ -2096,42 +2399,106 @@ async def test_canvas_lifecycle_telemetry_preserves_generation_identity(
     await coordinator.close()
 
 
-async def test_interruption_cancels_generation_without_touching_speech() -> None:
+async def test_source_turn_interruption_keeps_accepted_generation_alive() -> None:
     (
         coordinator,
         specialist,
         sink,
         _completions,
         _output,
-        _documents,
+        documents,
     ) = await _accepted_coordinator()
 
-    await coordinator.interrupt_turn(source_turn_id="turn-1")
+    cue = await coordinator.request_interrupted_presentation(
+        source_turn_id="turn-1",
+        presentation_sample_offset=1_337,
+    )
 
-    assert specialist.cancelled == ["generation-1"]
-    assert sink.rejected == [("generation-1", CanvasGenerationRejectionCode.CANCELLED)]
-    assert coordinator.state.candidate is None
+    assert cue is None
+    assert specialist.cancelled == []
+    assert sink.rejected == []
+    specialist.release.set()
+    await coordinator.wait_for_background_work()
+    assert coordinator.state.candidate is not None
+    assert coordinator.state.candidate.generation_id == "generation-1"
+    candidate, stored = await _prepare_current_candidate(
+        coordinator=coordinator,
+        sink=sink,
+        documents=documents,
+        sequence=1,
+        presentation_sample_offset=None,
+    )
+    assert sink.cues[-1][1].presentation_sample_offset == 1_337
+    active = await coordinator.presented(
+        _presented_event(candidate, stored, sequence=2)
+    )
+    assert active.generation_id == "generation-1"
+    await coordinator.close()
 
 
-async def test_interruption_after_download_discards_only_candidate() -> None:
+async def test_source_turn_interruption_keeps_prepared_candidate_alive() -> None:
     (
         coordinator,
         specialist,
         sink,
         _completions,
         _output,
-        _documents,
+        documents,
     ) = await _accepted_coordinator()
     specialist.release.set()
     await coordinator.wait_for_background_work()
-
-    await coordinator.interrupt_turn(source_turn_id="turn-1")
-
-    assert len(sink.discarded) == 1
-    assert sink.discarded[0][1] == (
-        CanvasDocumentDiscardReason.INTERRUPTED_BEFORE_PRESENTATION
+    candidate, _stored = await _prepare_current_candidate(
+        coordinator=coordinator,
+        sink=sink,
+        documents=documents,
+        sequence=1,
+        presentation_sample_offset=None,
     )
-    assert coordinator.state.candidate is None
+    initial_cue = await coordinator.request_presentation(
+        generation_id=candidate.generation_id,
+        presentation_sample_offset=4_800,
+    )
+
+    cue = await coordinator.request_interrupted_presentation(
+        source_turn_id="turn-1",
+        presentation_sample_offset=927,
+    )
+
+    assert sink.discarded == []
+    assert coordinator.state.candidate is not None
+    assert initial_cue is not None
+    assert initial_cue.presentation_sample_offset == 4_800
+    assert cue is not None
+    assert cue.presentation_sample_offset == 927
+    assert [item[1].presentation_sample_offset for item in sink.cues] == [4_800, 927]
+    assert coordinator.state.candidate.presentation_sample_offset == 927
+    await coordinator.close()
+
+
+async def test_no_canvas_action_keeps_pending_workspace_generation() -> None:
+    (
+        coordinator,
+        specialist,
+        sink,
+        _completions,
+        _output,
+        _documents,
+    ) = await _accepted_coordinator()
+
+    cue = await coordinator.request_interrupted_presentation(
+        source_turn_id="turn-2",
+        presentation_sample_offset=0,
+    )
+
+    assert cue is None
+    assert specialist.cancelled == []
+    assert sink.rejected == []
+    context = coordinator.render_realtime_context()
+    assert '<pending_visual state="generating"' in context
+    assert "Show how clouds make rain" in context
+    assert "generation-1" not in context
+    assert "turn-1" not in context
+    await coordinator.close()
 
 
 async def test_cancelled_generation_cannot_commit_after_provider_returns() -> None:
@@ -2161,9 +2528,7 @@ async def test_cancelled_generation_cannot_commit_after_provider_returns() -> No
     )
     await specialist.started.wait()
 
-    cancellation = asyncio.create_task(
-        coordinator.interrupt_turn(source_turn_id="turn-cancelled")
-    )
+    cancellation = asyncio.create_task(coordinator.cancel_pending())
     await specialist.task_cancelled.wait()
     specialist.release.set()
     await cancellation
@@ -2173,10 +2538,13 @@ async def test_cancelled_generation_cannot_commit_after_provider_returns() -> No
     assert sink.rejected == [
         ("generation-cancel-race", CanvasGenerationRejectionCode.CANCELLED)
     ]
+    execution = coordinator.state.workspace.execution("generation-cancel-race")
+    assert execution is not None
+    assert execution.status == SvgCanvasExecutionStatus.CANCELLED
     await coordinator.close()
 
 
-async def test_cancelled_reservation_cannot_start_generation_after_tool_ack() -> None:
+async def test_turn_task_cancellation_cannot_lose_accepted_canvas_handoff() -> None:
     specialist = _Specialist()
     specialist.release.set()
     sink = _Sink()
@@ -2210,25 +2578,26 @@ async def test_cancelled_reservation_cannot_start_generation_after_tool_ack() ->
     )
     await complete_started.wait()
 
-    await coordinator.interrupt_turn(source_turn_id="turn-cancelled")
+    acceptance.cancel()
     complete_release.set()
-    await acceptance
+    with pytest.raises(asyncio.CancelledError):
+        await acceptance
     await coordinator.wait_for_background_work()
 
-    assert specialist.requests == []
-    assert coordinator.state.candidate is None
-    assert sink.started == []
-    assert sink.available == []
-    assert sink.rejected == [
-        (
-            "generation-cancelled-reservation",
-            CanvasGenerationRejectionCode.CANCELLED,
-        )
-    ]
+    assert len(specialist.requests) == 1
+    assert coordinator.state.candidate is not None
+    assert sink.started == [("generation-cancelled-reservation", "turn-cancelled")]
+    assert len(sink.available) == 1
+    assert sink.rejected == []
+    execution = coordinator.state.workspace.execution(
+        "generation-cancelled-reservation"
+    )
+    assert execution is not None
+    assert execution.status == SvgCanvasExecutionStatus.PREPARING
     await coordinator.close()
 
 
-async def test_explicit_expiration_cancels_generation_without_rebasing() -> None:
+async def test_explicit_canvas_cancellation_cancels_pending_generation() -> None:
     (
         coordinator,
         specialist,
@@ -2238,15 +2607,88 @@ async def test_explicit_expiration_cancels_generation_without_rebasing() -> None
         _documents,
     ) = await _accepted_coordinator()
 
-    expired = await coordinator.expire_turn(source_turn_id="turn-1")
+    expired = await coordinator.cancel_pending()
 
     assert expired == ("generation-1",)
     assert specialist.cancelled == ["generation-1"]
     assert coordinator.state.candidate is None
     assert sink.available == []
     assert sink.rejected == [("generation-1", CanvasGenerationRejectionCode.CANCELLED)]
-    assert await coordinator.expire_turn(source_turn_id="turn-1") == ()
+    cancelled = coordinator.state.workspace.execution("generation-1")
+    assert cancelled is not None
+    assert cancelled.status == SvgCanvasExecutionStatus.CANCELLED
+    assert await coordinator.cancel_pending() == ()
     assert len(sink.rejected) == 1
+    await coordinator.close()
+
+
+async def test_cancellation_is_terminal_before_discard_event_delivery() -> None:
+    specialist = _Specialist()
+    sink = _DiscardFailingSink()
+    documents = SvgCanvasDocumentStore()
+
+    async def complete(
+        turn_id: str,
+        call_id: str,
+        output: InteractiveCanvasToolOutputV4,
+    ) -> None:
+        del turn_id, call_id, output
+
+    coordinator = SvgCanvasJobCoordinator(
+        session_id="session-discard-delivery-failure",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+        specialist=specialist,
+        state=SvgCanvasSessionState(),
+        documents=documents,
+        event_sink=sink,
+        generation_id_factory=lambda: "generation-discard-delivery-failure",
+    )
+    await coordinator.accept_tool_call(
+        source_turn_id="turn-discard-delivery-failure",
+        call=_call(),
+        complete_tool=complete,
+    )
+    specialist.release.set()
+    await coordinator.wait_for_background_work()
+
+    with pytest.raises(RuntimeError, match="discard delivery failed"):
+        await coordinator.cancel_pending()
+
+    execution = coordinator.state.workspace.execution(
+        "generation-discard-delivery-failure"
+    )
+    assert execution is not None
+    assert execution.status == SvgCanvasExecutionStatus.CANCELLED
+    assert coordinator.state.candidate is None
+    assert documents.document_count == 0
+    await coordinator.close()
+
+
+async def test_explicit_canvas_cancellation_preserves_active_scene() -> None:
+    (
+        coordinator,
+        _specialist,
+        sink,
+        completions,
+        _documents,
+        _stored,
+        active,
+    ) = await _activated_coordinator()
+
+    await coordinator.accept_tool_call(
+        source_turn_id="turn-2",
+        call=_call("call_2", brief="Show a different rain cloud."),
+        complete_tool=lambda turn, call, output: _record_completion(
+            completions, turn, call, output
+        ),
+    )
+    await coordinator.wait_for_background_work()
+
+    assert coordinator.state.candidate is not None
+    assert await coordinator.cancel_pending() == ("generation-2",)
+    assert coordinator.state.candidate is None
+    assert coordinator.state.active is active
+    assert sink.active_discarded == []
     await coordinator.close()
 
 
@@ -2277,9 +2719,7 @@ async def test_specialist_cancel_failure_cannot_revive_optional_canvas() -> None
     )
     await specialist.started.wait()
 
-    assert await coordinator.expire_turn(source_turn_id="turn-1") == (
-        "generation-cancel-failure",
-    )
+    assert await coordinator.cancel_pending() == ("generation-cancel-failure",)
     assert coordinator.state.candidate is None
     assert sink.available == []
     assert sink.rejected == [
@@ -2319,3 +2759,7 @@ async def test_close_finishes_local_cleanup_when_specialist_cancel_fails() -> No
 
     assert specialist.closed is True
     assert coordinator.state.candidate is None
+    execution = coordinator.state.workspace.execution("generation-close-cancel-failure")
+    assert execution is not None
+    assert execution.status == SvgCanvasExecutionStatus.CANCELLED
+    assert execution.terminal_reason == "sessionClosed"

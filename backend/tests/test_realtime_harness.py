@@ -16,6 +16,7 @@ from ava_backend.realtime.harness import (
 )
 from ava_backend.realtime.memory import AuthoritativeMemorySnapshot
 from ava_backend.realtime.tool_contract import (
+    CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
     INTERACTIVE_CANVAS_TOOL_NAME,
     InteractiveCanvasRequest,
 )
@@ -61,8 +62,8 @@ def test_v4_prompt_is_conversation_first_and_semantically_canvas_aware() -> None
     instructions = render_stable_instructions()
     normalized = " ".join(instructions.split())
 
-    assert REALTIME_PROMPT_VERSION == "ava-realtime-v4.6"
-    assert REALTIME_TOOL_CONTRACT_VERSION == "ava-realtime-tools-v4.4"
+    assert REALTIME_PROMPT_VERSION == "ava-realtime-v4.7"
+    assert REALTIME_TOOL_CONTRACT_VERSION == "ava-realtime-tools-v4.5"
     assert {layer.name for layer in PROMPT_LAYERS} == {
         "identity_and_personality",
         "natural_conversation",
@@ -72,6 +73,9 @@ def test_v4_prompt_is_conversation_first_and_semantically_canvas_aware() -> None
     }
     assert "Ordinary conversation is the primary experience" in normalized
     assert "semantic and optional" in normalized
+    assert "intended outcome is itself a visual" in normalized
+    assert "Normal conversation about a pending or active visual does not itself imply a revision" in normalized
+    assert CANCEL_INTERACTIVE_CANVAS_TOOL_NAME in normalized
     assert "operation=new" in normalized
     assert "operation=reviseFocused" in normalized
     assert "semantic_focus is the active referent" in normalized
@@ -94,7 +98,7 @@ def test_v4_prompt_is_conversation_first_and_semantically_canvas_aware() -> None
         assert conversational_determinism not in instructions
 
 
-def test_harness_exposes_one_optional_bounded_canvas_tool() -> None:
+def test_harness_exposes_bounded_semantic_canvas_actions() -> None:
     harness = build_realtime_harness(_snapshot())
     update = harness.session_update()
 
@@ -102,7 +106,7 @@ def test_harness_exposes_one_optional_bounded_canvas_tool() -> None:
     assert harness.tool_contract_version == REALTIME_TOOL_CONTRACT_VERSION
     assert harness.reasoning_effort == "low"
     assert harness.tool_choice == "auto"
-    assert len(harness.tools) == 1
+    assert len(harness.tools) == 2
     tool = harness.tools[0]
     assert tool["name"] == INTERACTIVE_CANVAS_TOOL_NAME
     assert tool["type"] == "function"
@@ -123,6 +127,12 @@ def test_harness_exposes_one_optional_bounded_canvas_tool() -> None:
         "new",
         "reviseFocused",
     ]
+    cancellation = harness.tools[1]
+    assert cancellation["name"] == CANCEL_INTERACTIVE_CANVAS_TOOL_NAME
+    assert cancellation["type"] == "function"
+    assert cancellation["parameters"]["type"] == "object"
+    assert cancellation["parameters"]["additionalProperties"] is False
+    assert cancellation["parameters"]["properties"] == {}
     assert parameters["properties"]["brief"]["maxLength"] == 500
     serialized = str(tool)
     assert "'title':" not in serialized
@@ -139,7 +149,10 @@ def test_harness_exposes_one_optional_bounded_canvas_tool() -> None:
 
     session = update["session"]
     assert session["tool_choice"] == "auto"
-    assert [item["name"] for item in session["tools"]] == [INTERACTIVE_CANVAS_TOOL_NAME]
+    assert [item["name"] for item in session["tools"]] == [
+        INTERACTIVE_CANVAS_TOOL_NAME,
+        CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
+    ]
     session["tools"][0]["name"] = "mutated"
     assert harness.tools[0]["name"] == INTERACTIVE_CANVAS_TOOL_NAME
 

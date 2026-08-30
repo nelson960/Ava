@@ -8,6 +8,7 @@ from typing import Protocol
 from ..canvas.svg_workspace import RecordedSvgCanvasInteraction
 from .harness import RealtimeHarness
 from .tool_contract import (
+    InteractiveCanvasCancellationToolOutputV4,
     InteractiveCanvasToolOutput,
     InteractiveCanvasToolOutputV4,
     RealtimeTurnEvent,
@@ -130,7 +131,11 @@ class RealtimeProviderSession(Protocol):
         *,
         turn_id: str,
         call_id: str,
-        output: InteractiveCanvasToolOutput | InteractiveCanvasToolOutputV4,
+        output: (
+            InteractiveCanvasToolOutput
+            | InteractiveCanvasToolOutputV4
+            | InteractiveCanvasCancellationToolOutputV4
+        ),
     ) -> None: ...
 
     async def request_canvas_interaction_response(

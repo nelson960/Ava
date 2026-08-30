@@ -22,6 +22,7 @@ from .canvas.svg_delivery import (
     SvgDocumentNotFoundError,
 )
 from .canvas.svg_document import (
+    SVG_MAX_MANIFEST_BYTES,
     SVG_MANIFEST_VERSION,
     SVG_RENDERER_CAPABILITY_VERSION,
     SVG_VALIDATOR_VERSION,
@@ -170,6 +171,7 @@ def create_app(
             10_000,
             max(1, resolved_settings.realtime_max_sessions * 2),
         ),
+        max_document_bytes=resolved_settings.canvas_max_svg_bytes,
     )
     resolved_svg_canvas_workspaces = svg_canvas_workspaces or SvgCanvasWorkspaceStore()
     if (
@@ -307,6 +309,7 @@ def create_app(
                 request_id=request.state.request_id,
                 subject=client.subject,
                 age_band=AgeBand(envelope.age_band),
+                canvas_render_profile=envelope.canvas_render_profile,
             )
         except RealtimeSessionCapacityError:
             return _error_response(
@@ -360,8 +363,8 @@ def create_app(
                     {
                         "maxTurnSeconds": resolved_settings.realtime_max_turn_seconds,
                         "maxResponseCharacters": 1_800,
-                        "maxSvgBytes": 262_144,
-                        "maxManifestBytes": 65_536,
+                        "maxSvgBytes": resolved_settings.canvas_max_svg_bytes,
+                        "maxManifestBytes": SVG_MAX_MANIFEST_BYTES,
                         "maxAudioChunkBytes": 192_000,
                         "playbackProgressIntervalMs": (
                             resolved_settings.realtime_playback_progress_interval_ms
@@ -617,6 +620,7 @@ def create_app(
         session_id: str,
         generation_id: str,
         kind: str,
+        draft_index: int | None = None,
         canvas_token: str | None,
         protocol_header: str | None,
     ) -> Response:
@@ -678,28 +682,48 @@ def create_app(
                 message="The canvas document token is invalid.",
             )
         store: SvgCanvasDocumentStore = app.state.svg_canvas_documents
-        try:
-            stored = await store.get(
-                session_id=session_id,
-                generation_id=generation_id,
-            )
-        except (SvgDocumentNotFoundError, ValueError):
-            return _error_response(
-                request,
-                status_code=404,
-                code=ErrorCode.INVALID_REQUEST,
-                message="The canvas document does not exist.",
-            )
-        if kind == "svg":
-            content = stored.document.svg_bytes
-            content_hash = stored.document.svg_sha256
+        if kind == "draft":
+            if draft_index is None:  # pragma: no cover - route invariant
+                raise RuntimeError("canvas draft route requires draft_index")
+            try:
+                stored_draft = await store.get_draft(
+                    session_id=session_id,
+                    generation_id=generation_id,
+                    draft_index=draft_index,
+                )
+            except (SvgDocumentNotFoundError, ValueError):
+                return _error_response(
+                    request,
+                    status_code=404,
+                    code=ErrorCode.INVALID_REQUEST,
+                    message="The canvas draft does not exist.",
+                )
+            content = stored_draft.draft.document.svg_bytes
+            content_hash = stored_draft.draft.document.svg_sha256
             media_type = "image/svg+xml"
-        elif kind == "manifest":
-            content = stored.document.manifest_bytes
-            content_hash = stored.document.manifest_sha256
-            media_type = "application/json"
-        else:  # pragma: no cover - route invariant
-            raise RuntimeError("unsupported SVG canvas document kind")
+        else:
+            try:
+                stored = await store.get(
+                    session_id=session_id,
+                    generation_id=generation_id,
+                )
+            except (SvgDocumentNotFoundError, ValueError):
+                return _error_response(
+                    request,
+                    status_code=404,
+                    code=ErrorCode.INVALID_REQUEST,
+                    message="The canvas document does not exist.",
+                )
+            if kind == "svg":
+                content = stored.document.svg_bytes
+                content_hash = stored.document.svg_sha256
+                media_type = "image/svg+xml"
+            elif kind == "manifest":
+                content = stored.document.manifest_bytes
+                content_hash = stored.document.manifest_sha256
+                media_type = "application/json"
+            else:  # pragma: no cover - route invariant
+                raise RuntimeError("unsupported SVG canvas document kind")
         return Response(
             content=content,
             status_code=200,
@@ -712,7 +736,33 @@ def create_app(
                 "X-Ava-Renderer-Capability-Version": (SVG_RENDERER_CAPABILITY_VERSION),
                 "X-Ava-Validator-Version": SVG_VALIDATOR_VERSION,
                 "X-Content-SHA256": content_hash,
+                "X-Ava-Canvas-Authority": ("draft" if kind == "draft" else "candidate"),
             },
+        )
+
+    @app.get(
+        "/v4/realtime/sessions/{session_id}/canvas-drafts/"
+        "{generation_id}/{draft_index}/svg"
+    )
+    async def get_svg_canvas_draft(
+        request: Request,
+        session_id: str,
+        generation_id: str,
+        draft_index: int,
+        canvas_token: str | None = Header(default=None, alias="X-Ava-Canvas-Token"),
+        protocol_header: str | None = Header(
+            default=None,
+            alias="X-Ava-Protocol-Version",
+        ),
+    ) -> Response:
+        return await serve_svg_canvas_document(
+            request,
+            session_id=session_id,
+            generation_id=generation_id,
+            kind="draft",
+            draft_index=draft_index,
+            canvas_token=canvas_token,
+            protocol_header=protocol_header,
         )
 
     @app.get("/v4/realtime/sessions/{session_id}/canvas-documents/{generation_id}/svg")

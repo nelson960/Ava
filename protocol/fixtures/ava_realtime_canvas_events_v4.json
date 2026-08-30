@@ -57,6 +57,6 @@
     "sourceTurnId": "turn-5678",
     "sceneId": "scene-1234",
     "sceneRevision": 2,
-    "reason": "interruptedBeforePresentation"
+    "reason": "superseded"
   }
 ]

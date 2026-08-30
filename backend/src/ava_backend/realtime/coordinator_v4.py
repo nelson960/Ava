@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from ..canvas.svg_delivery import StoredSvgCanvasDocument
+from ..canvas.svg_delivery import StoredSvgCanvasDocument, StoredSvgCanvasDraft
 from ..canvas.svg_document import (
     SVG_MANIFEST_VERSION,
     SVG_RENDERER_CAPABILITY_VERSION,
@@ -20,6 +20,10 @@ from .events_v4 import (
     CanvasInteractionEventV4,
 )
 from .svg_canvas_jobs import SvgCanvasJobEventSink
+
+
+class CanvasEventBackpressureError(RuntimeError):
+    """The client-facing canvas control lane stopped making progress."""
 
 
 class ProtocolV4CanvasEventSink(SvgCanvasJobEventSink):
@@ -67,6 +71,24 @@ class ProtocolV4CanvasEventSink(SvgCanvasJobEventSink):
                 "rendererCapabilityVersion": SVG_RENDERER_CAPABILITY_VERSION,
                 "validatorVersion": SVG_VALIDATOR_VERSION,
                 "manifestVersion": SVG_MANIFEST_VERSION,
+            }
+        )
+
+    async def draft_available(self, stored: StoredSvgCanvasDraft) -> None:
+        document = stored.draft.document
+        await self._put(
+            {
+                "event": "canvasDraftAvailable",
+                "generationId": stored.generation_id,
+                "sourceTurnId": stored.source_turn_id,
+                "draftIndex": stored.draft_index,
+                "svgPath": stored.svg_path,
+                "svgSha256": document.svg_sha256,
+                "svgByteLength": len(document.svg_bytes),
+                "authoritative": False,
+                "interactive": False,
+                "rendererCapabilityVersion": SVG_RENDERER_CAPABILITY_VERSION,
+                "validatorVersion": SVG_VALIDATOR_VERSION,
             }
         )
 
@@ -204,4 +226,9 @@ class ProtocolV4CanvasEventSink(SvgCanvasJobEventSink):
         )
 
     async def _put(self, payload: dict[str, object]) -> None:
-        await self._events.put(payload)
+        try:
+            self._events.put_nowait(payload)
+        except asyncio.QueueFull as error:
+            raise CanvasEventBackpressureError(
+                "protocol-v4 canvas event capacity was exhausted"
+            ) from error

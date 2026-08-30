@@ -10,7 +10,10 @@ from ava_backend.canvas.svg_delivery import (
 )
 from ava_backend.canvas.svg_document import SvgDocumentValidator
 from ava_backend.canvas.svg_session import SvgCanvasSessionState
-from ava_backend.canvas.svg_specialist import SvgCanvasSpecialistGeneration
+from ava_backend.canvas.svg_specialist import (
+    SvgCanvasSpecialistGeneration,
+    SvgCanvasVisibleDraft,
+)
 
 
 def _candidate(generation_id: str = "generation-1"):
@@ -50,6 +53,37 @@ async def test_store_serves_exact_svg_and_canonical_manifest_on_separate_paths()
     assert fetched.svg_path.endswith("/generation-1/svg")
     assert fetched.manifest_path.endswith("/generation-1/manifest")
     assert "/events" not in fetched.svg_path
+
+
+async def test_store_keeps_draft_separate_from_candidate_manifest_authority() -> None:
+    store = SvgCanvasDocumentStore()
+    candidate = _candidate()
+    draft = SvgCanvasVisibleDraft(
+        generation_id=candidate.generation_id,
+        draft_index=1,
+        attempt=0,
+        document=candidate.document,
+    )
+
+    stored = await store.publish_draft(
+        session_id="session-1",
+        source_turn_id="turn-1",
+        draft=draft,
+    )
+
+    assert (
+        await store.get_draft(
+            session_id="session-1",
+            generation_id="generation-1",
+            draft_index=1,
+        )
+        == stored
+    )
+    assert "/canvas-drafts/" in stored.svg_path
+    assert not hasattr(stored, "scene_id")
+    assert not hasattr(stored, "manifest_path")
+    assert store.document_count == 0
+    assert store.draft_count == 1
 
 
 async def test_publish_is_idempotent_only_for_identical_generation_content() -> None:

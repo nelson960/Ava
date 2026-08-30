@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+from ..canvas.render_profile import CanvasRenderProfile
 from ..canvas.svg_delivery import SvgCanvasDocumentStore
 from ..canvas.svg_session import SvgCanvasSessionState
 from ..canvas.svg_specialist import SvgCanvasSpecialist
@@ -57,6 +58,7 @@ class LiveRealtimeCoordinatorFactoryV4:
         request_id: str,
         subject: str,
         age_band: AgeBand,
+        canvas_render_profile: CanvasRenderProfile | None = None,
     ) -> RealtimeSessionCoordinatorV4:
         safety_id = self._safety_identifier(subject)
         realtime = OpenAIRealtimeProviderSession(
@@ -90,11 +92,15 @@ class LiveRealtimeCoordinatorFactoryV4:
         jobs = SvgCanvasJobCoordinator(
             session_id=session_id,
             age_band=age_band,
+            render_profile=canvas_render_profile,
             specialist=specialist,
             state=state,
             documents=self._documents,
             event_sink=canvas_events,
             generation_id_factory=lambda: f"generation-{uuid4().hex}",
+            presentation_timeout_seconds=(
+                self._settings.canvas_presentation_timeout_seconds
+            ),
         )
 
         suffix = uuid4().hex

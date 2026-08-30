@@ -18,6 +18,9 @@ XML_NAMESPACE: Final = "http://www.w3.org/XML/1998/namespace"
 SVG_VALIDATOR_VERSION: Final = "ava-svg-validator-v2"
 SVG_RENDERER_CAPABILITY_VERSION: Final = "ava-svg-renderer-v2"
 SVG_MANIFEST_VERSION: Final = "ava-svg-manifest-v2"
+SVG_DEFAULT_MAX_BYTES: Final = 384 * 1024
+SVG_PROTOCOL_MAX_BYTES: Final = 512 * 1024
+SVG_MAX_MANIFEST_BYTES: Final = 64 * 1024
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]{0,95}$")
 _NUMBER = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][-+]?\d+)?")
@@ -251,6 +254,8 @@ _REFERENCE_ATTRIBUTES: Final = frozenset(
         "stroke",
     }
 )
+
+
 class SvgInteractionMode(StrEnum):
     NONE = "none"
     EXPLORE = "explore"
@@ -258,9 +263,49 @@ class SvgInteractionMode(StrEnum):
     STEPS = "steps"
 
 
+class SvgValidationCategory(StrEnum):
+    ACCESSIBILITY = "accessibility"
+    CAPABILITY = "capability"
+    COMPLEXITY = "complexity"
+    INTERACTION = "interaction"
+    REFERENCE = "reference"
+    SECURITY = "security"
+    STRUCTURE = "structure"
+
+
+@dataclass(frozen=True, slots=True)
+class SvgValidationFeedback:
+    category: SvgValidationCategory
+    code: str
+    message: str
+    element_id: str | None = None
+    element_name: str | None = None
+    attribute: str | None = None
+    observed_value: str | int | float | None = None
+    observed_value_truncated: bool = False
+    limit_name: str | None = None
+    limit_value: str | int | float | None = None
+
+    def as_json(self) -> dict[str, object]:
+        values: dict[str, object | None] = {
+            "affectedAttribute": self.attribute,
+            "affectedElement": self.element_name,
+            "affectedElementId": self.element_id,
+            "category": self.category,
+            "code": self.code,
+            "limit": self.limit_value,
+            "limitName": self.limit_name,
+            "message": self.message,
+            "observedValue": self.observed_value,
+            "observedValueTruncated": (True if self.observed_value_truncated else None),
+        }
+        return {key: value for key, value in values.items() if value is not None}
+
+
 @dataclass(frozen=True, slots=True)
 class SvgValidationLimits:
-    max_bytes: int = 262_144
+    max_bytes: int = SVG_DEFAULT_MAX_BYTES
+    max_manifest_bytes: int = SVG_MAX_MANIFEST_BYTES
     max_elements: int = 384
     max_depth: int = 32
     max_attributes_per_element: int = 64
@@ -269,6 +314,8 @@ class SvgValidationLimits:
     max_text_characters: int = 24_000
     max_title_characters: int = 160
     max_description_characters: int = 800
+    max_binding_label_characters: int = 160
+    max_background_characters: int = 96
     max_path_characters: int = 96_000
     max_path_commands: int = 6_000
     max_transform_operations: int = 768
@@ -277,6 +324,7 @@ class SvgValidationLimits:
     max_expanded_elements: int = 2_048
     max_filter_primitives: int = 48
     max_bindings: int = 32
+    max_step_bindings: int = 12
     max_viewbox_extent: float = 10_000.0
 
 
@@ -322,9 +370,38 @@ class ValidatedSvgDocument:
 class SvgDocumentValidationError(ValueError):
     """The exact provider SVG is outside Ava's static renderer contract."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        category: SvgValidationCategory | None = None,
+        element_id: str | None = None,
+        element_name: str | None = None,
+        attribute: str | None = None,
+        observed_value: str | int | float | None = None,
+        limit_name: str | None = None,
+        limit_value: str | int | float | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        bounded_observed_value = observed_value
+        observed_value_truncated = False
+        if isinstance(observed_value, str) and len(observed_value) > 240:
+            bounded_observed_value = observed_value[:240]
+            observed_value_truncated = True
+        self.feedback = SvgValidationFeedback(
+            category=category or _validation_category(code),
+            code=code,
+            message=message,
+            element_id=element_id,
+            element_name=element_name,
+            attribute=attribute,
+            observed_value=bounded_observed_value,
+            observed_value_truncated=observed_value_truncated,
+            limit_name=limit_name,
+            limit_value=limit_value,
+        )
 
 
 class SvgDocumentValidator:
@@ -346,7 +423,13 @@ class SvgDocumentValidator:
         if not svg_bytes:
             self._fail("emptyDocument", "SVG output is empty")
         if len(svg_bytes) > self._limits.max_bytes:
-            self._fail("documentTooLarge", "SVG exceeds the byte limit")
+            self._fail(
+                "documentTooLarge",
+                "SVG exceeds the byte limit",
+                observed_value=len(svg_bytes),
+                limit_name="maxBytes",
+                limit_value=self._limits.max_bytes,
+            )
         uppercase = svg_text.upper()
         if "<!DOCTYPE" in uppercase or "<!ENTITY" in uppercase:
             self._fail(
@@ -408,21 +491,38 @@ class SvgDocumentValidator:
         total_references = 0
         total_filter_primitives = 0
 
-        stack: list[tuple[ET.Element, int, str, bool]] = [
-            (root, 1, "@root", True)
-        ]
+        stack: list[tuple[ET.Element, int, str, bool]] = [(root, 1, "@root", True)]
         while stack:
             element, depth, reference_owner, parent_is_rendered = stack.pop()
             total_elements += 1
             if total_elements > self._limits.max_elements:
-                self._fail("tooManyElements", "SVG exceeds the element limit")
+                self._fail(
+                    "tooManyElements",
+                    "SVG exceeds the element limit",
+                    observed_value=total_elements,
+                    limit_name="maxElements",
+                    limit_value=self._limits.max_elements,
+                )
             if depth > self._limits.max_depth:
-                self._fail("documentTooDeep", "SVG exceeds the XML depth limit")
+                self._fail(
+                    "documentTooDeep",
+                    "SVG exceeds the XML depth limit",
+                    observed_value=depth,
+                    limit_name="maxDepth",
+                    limit_value=self._limits.max_depth,
+                )
 
             self._validate_element_namespace(element.tag)
             tag = _local_element_name(element.tag)
             if tag not in _ALLOWED_ELEMENTS:
-                self._fail("elementForbidden", f"SVG element <{tag}> is not allowed")
+                self._fail(
+                    "elementForbidden",
+                    f"SVG element <{tag}> is not allowed",
+                    element_id=element.attrib.get("id"),
+                    element_name=tag,
+                    observed_value=tag,
+                    limit_name="allowedElements",
+                )
             if tag in {"title", "desc"} and id(element) not in direct_semantic_elements:
                 self._fail(
                     "semanticStructureInvalid",
@@ -434,6 +534,9 @@ class SvgDocumentValidator:
                     self._fail(
                         "tooManyFilterPrimitives",
                         "SVG exceeds the filter primitive limit",
+                        observed_value=total_filter_primitives,
+                        limit_name="maxFilterPrimitives",
+                        limit_value=self._limits.max_filter_primitives,
                     )
 
             attributes = element.attrib
@@ -443,10 +546,24 @@ class SvgDocumentValidator:
                 and _element_is_rendered(attributes)
             )
             if len(attributes) > self._limits.max_attributes_per_element:
-                self._fail("tooManyAttributes", f"<{tag}> has too many attributes")
+                self._fail(
+                    "tooManyAttributes",
+                    f"<{tag}> has too many attributes",
+                    element_id=element.attrib.get("id"),
+                    element_name=tag,
+                    observed_value=len(attributes),
+                    limit_name="maxAttributesPerElement",
+                    limit_value=self._limits.max_attributes_per_element,
+                )
             total_attributes += len(attributes)
             if total_attributes > self._limits.max_total_attributes:
-                self._fail("tooManyAttributes", "SVG exceeds the total attribute limit")
+                self._fail(
+                    "tooManyAttributes",
+                    "SVG exceeds the total attribute limit",
+                    observed_value=total_attributes,
+                    limit_name="maxTotalAttributes",
+                    limit_value=self._limits.max_total_attributes,
+                )
 
             element_id = attributes.get("id")
             if element_id is not None:
@@ -468,13 +585,22 @@ class SvgDocumentValidator:
                     name in _ALLOWED_ATTRIBUTES or name in _ALLOWED_DATA_ATTRIBUTES
                 ):
                     self._fail(
-                        "attributeForbidden", f"SVG attribute {name!r} is not allowed"
+                        "attributeForbidden",
+                        f"SVG attribute {name!r} is not allowed",
+                        element_id=element_id,
+                        element_name=tag,
+                        attribute=name,
+                        observed_value=value,
+                        limit_name="allowedAttributes",
                     )
                 total_attribute_characters += len(name) + len(value)
                 if total_attribute_characters > self._limits.max_attribute_characters:
                     self._fail(
                         "attributesTooLarge",
                         "SVG attributes exceed the character limit",
+                        observed_value=total_attribute_characters,
+                        limit_name="maxAttributeCharacters",
+                        limit_value=self._limits.max_attribute_characters,
                     )
                 if _CONTROL_CHARACTER.search(value):
                     self._fail(
@@ -507,20 +633,48 @@ class SvgDocumentValidator:
                     )
 
             if total_path_characters > self._limits.max_path_characters:
-                self._fail("pathsTooLarge", "SVG path data exceeds the character limit")
+                self._fail(
+                    "pathsTooLarge",
+                    "SVG path data exceeds the character limit",
+                    observed_value=total_path_characters,
+                    limit_name="maxPathCharacters",
+                    limit_value=self._limits.max_path_characters,
+                )
             if total_path_commands > self._limits.max_path_commands:
-                self._fail("tooManyPathCommands", "SVG exceeds the path command limit")
+                self._fail(
+                    "tooManyPathCommands",
+                    "SVG exceeds the path command limit",
+                    observed_value=total_path_commands,
+                    limit_name="maxPathCommands",
+                    limit_value=self._limits.max_path_commands,
+                )
             if total_transform_operations > self._limits.max_transform_operations:
                 self._fail(
-                    "tooManyTransforms", "SVG exceeds the transform operation limit"
+                    "tooManyTransforms",
+                    "SVG exceeds the transform operation limit",
+                    observed_value=total_transform_operations,
+                    limit_name="maxTransformOperations",
+                    limit_value=self._limits.max_transform_operations,
                 )
             if total_references > self._limits.max_references:
-                self._fail("tooManyReferences", "SVG exceeds the local reference limit")
+                self._fail(
+                    "tooManyReferences",
+                    "SVG exceeds the local reference limit",
+                    observed_value=total_references,
+                    limit_name="maxReferences",
+                    limit_value=self._limits.max_references,
+                )
 
             element_text = (element.text or "") + (element.tail or "")
             total_text_characters += len(element_text)
             if total_text_characters > self._limits.max_text_characters:
-                self._fail("textTooLarge", "SVG text exceeds the character limit")
+                self._fail(
+                    "textTooLarge",
+                    "SVG text exceeds the character limit",
+                    observed_value=total_text_characters,
+                    limit_name="maxTextCharacters",
+                    limit_value=self._limits.max_text_characters,
+                )
             if id(element) == id(direct_titles[0]):
                 title = _semantic_text(element)
             elif id(element) == id(direct_descriptions[0]):
@@ -549,7 +703,11 @@ class SvgDocumentValidator:
                 bindings[binding.binding_id] = binding
                 if len(bindings) > self._limits.max_bindings:
                     self._fail(
-                        "tooManyBindings", "SVG exceeds the interaction binding limit"
+                        "tooManyBindings",
+                        "SVG exceeds the interaction binding limit",
+                        observed_value=len(bindings),
+                        limit_name="maxBindings",
+                        limit_value=self._limits.max_bindings,
                     )
             elif any(
                 name in attributes
@@ -563,31 +721,46 @@ class SvgDocumentValidator:
             children = list(element)
             for child_index, child in reversed(list(enumerate(children))):
                 child_owner = element_id or f"{reference_owner}/{child_index}"
-                stack.append(
-                    (child, depth + 1, child_owner, element_is_rendered)
-                )
+                stack.append((child, depth + 1, child_owner, element_is_rendered))
 
         view_box = self._validate_view_box(root.attrib.get("viewBox"))
         title = self._validate_semantic_text(
             title,
             label="title",
             maximum=self._limits.max_title_characters,
+            limit_name="maxTitleCharacters",
         )
         description = self._validate_semantic_text(
             description,
             label="description",
             maximum=self._limits.max_description_characters,
+            limit_name="maxDescriptionCharacters",
         )
         missing = sorted(referenced_ids - ids)
         if missing:
-            self._fail("referenceMissing", f"SVG references unknown id {missing[0]!r}")
+            self._fail(
+                "referenceMissing",
+                f"SVG references unknown id {missing[0]!r}",
+                observed_value=missing[0],
+                limit_name="documentLocalReferences",
+            )
         self._validate_reference_graph(reference_graph, id_to_node)
         self._validate_binding_targets(bindings, ids)
         self._validate_interaction_mode(interaction_mode, bindings)
 
         background = root.attrib.get("data-ava-background")
-        if background is not None and len(background) > 96:
-            self._fail("backgroundTooLarge", "data-ava-background exceeds its limit")
+        if (
+            background is not None
+            and len(background) > self._limits.max_background_characters
+        ):
+            self._fail(
+                "backgroundTooLarge",
+                "data-ava-background exceeds its limit",
+                attribute="data-ava-background",
+                observed_value=background,
+                limit_name="maxBackgroundCharacters",
+                limit_value=self._limits.max_background_characters,
+            )
         manifest_dict: dict[str, object] = {
             "background": background,
             "bindings": [
@@ -611,6 +784,14 @@ class SvgDocumentValidator:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
+        if len(manifest_bytes) > self._limits.max_manifest_bytes:
+            self._fail(
+                "manifestTooLarge",
+                "derived SVG manifest exceeds its byte limit",
+                observed_value=len(manifest_bytes),
+                limit_name="maxManifestBytes",
+                limit_value=self._limits.max_manifest_bytes,
+            )
         return ValidatedSvgDocument(
             svg_text=svg_text,
             svg_bytes=svg_bytes,
@@ -633,19 +814,67 @@ class SvgDocumentValidator:
             "allowedAttributes": sorted(_ALLOWED_ATTRIBUTES),
             "allowedDataAttributes": sorted(_ALLOWED_DATA_ATTRIBUTES),
             "allowedElements": sorted(_ALLOWED_ELEMENTS),
+            "allowedFilterPrimitives": sorted(_FILTER_PRIMITIVES),
             "allowedInteractionModes": [mode.value for mode in SvgInteractionMode],
             "allowedStyleProperties": sorted(_ALLOWED_STYLE_PROPERTIES),
+            "documentContract": {
+                "canonicalBytes": "exactUtf8ProviderOutput",
+                "externalResources": False,
+                "resolutionIndependentViewBox": True,
+                "scripts": False,
+            },
+            "interactionEnvironment": {
+                "clientExpandsCompactTargets": True,
+                "defaultMinimumTargetPoints": 44,
+                "manifestRequiredForAuthority": True,
+            },
+            "interactionContract": {
+                "bindingCountByMode": {
+                    "explore": {"maximum": limits.max_bindings, "minimum": 1},
+                    "none": {"maximum": 0, "minimum": 0},
+                    "select": {"maximum": limits.max_bindings, "minimum": 1},
+                    "steps": {
+                        "maximum": min(
+                            limits.max_bindings,
+                            limits.max_step_bindings,
+                        ),
+                        "minimum": 2,
+                    },
+                },
+                "stepIndexes": "uniqueContiguousFromOne",
+            },
+            "referencePolicy": {
+                "allowedNamespaces": [
+                    "unqualified",
+                    SVG_NAMESPACE,
+                    XLINK_NAMESPACE,
+                    XML_NAMESPACE,
+                ],
+                "documentLocalFragmentsOnly": True,
+                "referenceAttributes": sorted(_REFERENCE_ATTRIBUTES | {"href"}),
+            },
             "limits": {
+                "attributeCharacters": limits.max_attribute_characters,
+                "attributesPerElement": limits.max_attributes_per_element,
                 "attributes": limits.max_total_attributes,
+                "backgroundCharacters": limits.max_background_characters,
+                "bindingLabelCharacters": limits.max_binding_label_characters,
                 "bindings": limits.max_bindings,
                 "bytes": limits.max_bytes,
+                "descriptionCharacters": limits.max_description_characters,
                 "depth": limits.max_depth,
                 "elements": limits.max_elements,
                 "expandedElements": limits.max_expanded_elements,
                 "filterPrimitives": limits.max_filter_primitives,
+                "manifestBytes": limits.max_manifest_bytes,
+                "pathCharacters": limits.max_path_characters,
                 "pathCommands": limits.max_path_commands,
                 "referenceDepth": limits.max_reference_depth,
                 "references": limits.max_references,
+                "textCharacters": limits.max_text_characters,
+                "titleCharacters": limits.max_title_characters,
+                "transformOperations": limits.max_transform_operations,
+                "viewBoxExtent": limits.max_viewbox_extent,
             },
             "manifestVersion": SVG_MANIFEST_VERSION,
             "rendererCapabilityVersion": SVG_RENDERER_CAPABILITY_VERSION,
@@ -669,7 +898,8 @@ class SvgDocumentValidator:
         accessibility_label = self._validate_semantic_text(
             accessibility_label,
             label=f"binding {binding_id!r} aria-label",
-            maximum=160,
+            maximum=self._limits.max_binding_label_characters,
+            limit_name="maxBindingLabelCharacters",
         )
         target_id = attributes.get("data-ava-target", element_id)
         self._validate_identifier(target_id, label="binding target id")
@@ -686,10 +916,15 @@ class SvgDocumentValidator:
                     f"binding {binding_id!r} data-ava-step must be an integer",
                 )
             step_index = int(step_text)
-            if not 1 <= step_index <= 12:
+            if not 1 <= step_index <= self._limits.max_step_bindings:
                 self._fail(
                     "bindingStepInvalid",
                     f"binding {binding_id!r} data-ava-step is out of range",
+                    element_id=element_id,
+                    attribute="data-ava-step",
+                    observed_value=step_index,
+                    limit_name="maxStepBindings",
+                    limit_value=self._limits.max_step_bindings,
                 )
         return SvgInteractionBinding(
             binding_id=binding_id,
@@ -735,10 +970,17 @@ class SvgDocumentValidator:
                     "select bindings cannot declare steps or reveals",
                 )
             return
-        if len(values) < 2 or len(values) > 12:
+        maximum_steps = min(
+            self._limits.max_bindings,
+            self._limits.max_step_bindings,
+        )
+        if len(values) < 2 or len(values) > maximum_steps:
             self._fail(
                 "interactionModeBindingsInvalid",
-                "steps mode requires between 2 and 12 bindings",
+                "steps mode requires a bounded ordered binding sequence",
+                observed_value=len(values),
+                limit_name="stepsBindingCount",
+                limit_value=f"2..{maximum_steps}",
             )
         if any(binding.reveal_ids for binding in values):
             self._fail(
@@ -834,25 +1076,56 @@ class SvgDocumentValidator:
         remainder = _NUMBER.sub("", value).replace(",", "").strip()
         if len(numbers) != 4 or remainder:
             self._fail(
-                "viewBoxInvalid", "SVG viewBox must contain exactly four finite numbers"
+                "viewBoxInvalid",
+                "SVG viewBox must contain exactly four finite numbers",
+                attribute="viewBox",
+                observed_value=value,
+                limit_name="viewBoxComponents",
+                limit_value=4,
             )
         parsed = tuple(float(number) for number in numbers)
         if not all(math.isfinite(number) for number in parsed):
-            self._fail("viewBoxInvalid", "SVG viewBox numbers must be finite")
+            self._fail(
+                "viewBoxInvalid",
+                "SVG viewBox numbers must be finite",
+                attribute="viewBox",
+                observed_value=value,
+            )
         if parsed[2] <= 0 or parsed[3] <= 0:
             self._fail(
-                "viewBoxInvalid", "SVG viewBox width and height must be positive"
+                "viewBoxInvalid",
+                "SVG viewBox width and height must be positive",
+                attribute="viewBox",
+                observed_value=value,
             )
         if any(abs(number) > self._limits.max_viewbox_extent for number in parsed):
-            self._fail("viewBoxInvalid", "SVG viewBox exceeds the renderer extent")
+            self._fail(
+                "viewBoxInvalid",
+                "SVG viewBox exceeds the renderer extent",
+                attribute="viewBox",
+                observed_value=value,
+                limit_name="maxViewBoxExtent",
+                limit_value=self._limits.max_viewbox_extent,
+            )
         return parsed  # type: ignore[return-value]
 
-    def _validate_semantic_text(self, value: str, *, label: str, maximum: int) -> str:
+    def _validate_semantic_text(
+        self,
+        value: str,
+        *,
+        label: str,
+        maximum: int,
+        limit_name: str,
+    ) -> str:
         if not value or not value.strip():
             self._fail("semanticTextMissing", f"SVG {label} is required")
         if len(value) > maximum:
             self._fail(
-                "semanticTextTooLarge", f"SVG {label} exceeds its character limit"
+                "semanticTextTooLarge",
+                f"SVG {label} exceeds its character limit",
+                observed_value=len(value),
+                limit_name=limit_name,
+                limit_value=maximum,
             )
         if _CONTROL_CHARACTER.search(value):
             self._fail(
@@ -874,6 +1147,9 @@ class SvgDocumentValidator:
                 self._fail(
                     "bindingTargetMissing",
                     f"binding {binding.binding_id!r} references unknown id {sorted(missing)[0]!r}",
+                    element_id=binding.element_id,
+                    observed_value=sorted(missing)[0],
+                    limit_name="documentLocalBindingReferences",
                 )
 
     def _validate_reference_graph(
@@ -889,6 +1165,9 @@ class SvgDocumentValidator:
                 self._fail(
                     "referenceGraphTooDeep",
                     "SVG reference graph exceeds its depth limit",
+                    observed_value=depth,
+                    limit_name="maxReferenceDepth",
+                    limit_value=self._limits.max_reference_depth,
                 )
             if state.get(node) == 1:
                 self._fail("referenceCycle", f"SVG reference cycle includes {node!r}")
@@ -902,6 +1181,9 @@ class SvgDocumentValidator:
                     self._fail(
                         "referenceExpansionTooLarge",
                         "SVG reference expansion exceeds its limit",
+                        observed_value=expanded,
+                        limit_name="maxExpandedElements",
+                        limit_value=self._limits.max_expanded_elements,
                     )
             state[node] = 2
             memo[node] = expanded
@@ -914,11 +1196,75 @@ class SvgDocumentValidator:
                 self._fail(
                     "referenceExpansionTooLarge",
                     "SVG reference expansion exceeds its limit",
+                    observed_value=expanded_total,
+                    limit_name="maxExpandedElements",
+                    limit_value=self._limits.max_expanded_elements,
                 )
 
     @staticmethod
-    def _fail(code: str, message: str) -> NoReturn:
-        raise SvgDocumentValidationError(code, message)
+    def _fail(
+        code: str,
+        message: str,
+        *,
+        element_id: str | None = None,
+        element_name: str | None = None,
+        attribute: str | None = None,
+        observed_value: str | int | float | None = None,
+        limit_name: str | None = None,
+        limit_value: str | int | float | None = None,
+    ) -> NoReturn:
+        raise SvgDocumentValidationError(
+            code,
+            message,
+            element_id=element_id,
+            element_name=element_name,
+            attribute=attribute,
+            observed_value=observed_value,
+            limit_name=limit_name,
+            limit_value=limit_value,
+        )
+
+
+def _validation_category(code: str) -> SvgValidationCategory:
+    if code in {
+        "documentTypeForbidden",
+        "eventHandlerForbidden",
+        "externalReferenceForbidden",
+        "forbiddenControlCharacter",
+        "namespaceForbidden",
+    }:
+        return SvgValidationCategory.SECURITY
+    if (
+        code.startswith("interaction")
+        or code.startswith("binding")
+        or code == "duplicateBinding"
+    ):
+        return SvgValidationCategory.INTERACTION
+    if "Reference" in code or code.startswith("reference"):
+        return SvgValidationCategory.REFERENCE
+    if code.startswith("semantic"):
+        return SvgValidationCategory.ACCESSIBILITY
+    if (
+        code.startswith("tooMany")
+        or code.endswith("TooLarge")
+        or code
+        in {
+            "documentTooDeep",
+            "documentTooLarge",
+            "pathsTooLarge",
+        }
+    ):
+        return SvgValidationCategory.COMPLEXITY
+    if code in {
+        "attributeForbidden",
+        "elementForbidden",
+        "styleInvalid",
+        "stylePropertyForbidden",
+        "viewBoxInvalid",
+        "viewBoxMissing",
+    }:
+        return SvgValidationCategory.CAPABILITY
+    return SvgValidationCategory.STRUCTURE
 
 
 def _namespace(raw_name: str) -> str | None:
@@ -957,8 +1303,7 @@ def _visible_semantic_text(
     def visit(node: ET.Element, inherited_is_rendered: bool) -> None:
         rendered = (
             inherited_is_rendered
-            and _local_element_name(node.tag)
-            not in _NON_RENDERED_SEMANTIC_CONTAINERS
+            and _local_element_name(node.tag) not in _NON_RENDERED_SEMANTIC_CONTAINERS
             and _element_is_rendered(node.attrib)
         )
         if rendered and node.text:

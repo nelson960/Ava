@@ -11,6 +11,7 @@ from .common import NonEmptyText, RealtimeProtocolModel
 
 
 INTERACTIVE_CANVAS_TOOL_NAME = "request_interactive_canvas"
+CANCEL_INTERACTIVE_CANVAS_TOOL_NAME = "cancel_interactive_canvas"
 INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS = 500
 CANVAS_MODEL_SAFE_REJECTION_REASON = "visualUnavailable"
 _CALL_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -52,6 +53,10 @@ class InteractiveCanvasRequest(RealtimeProtocolModel):
             "Back/Next progression."
         )
     )
+
+
+class InteractiveCanvasCancellationRequest(RealtimeProtocolModel):
+    """Explicit semantic request to stop unpresented canvas work."""
 class InteractiveCanvasToolStatus(StrEnum):
     READY = "ready"
     REJECTED = "rejected"
@@ -81,6 +86,22 @@ class InteractiveCanvasToolOutputV4(RealtimeProtocolModel):
                 raise ValueError("rejected canvas output requires reason")
             if self.generation_id is not None:
                 raise ValueError("rejected canvas output cannot include generationId")
+        return self
+
+
+class InteractiveCanvasCancellationToolOutputV4(RealtimeProtocolModel):
+    """Immediate result for an explicit cancellation of pending canvas work."""
+
+    status: InteractiveCanvasToolStatusV4
+    reason: Annotated[str, StringConstraints(max_length=240)] | None = None
+
+    @model_validator(mode="after")
+    def status_fields_are_atomic(self) -> InteractiveCanvasCancellationToolOutputV4:
+        if self.status == InteractiveCanvasToolStatusV4.ACCEPTED:
+            if self.reason is not None:
+                raise ValueError("accepted canvas cancellation cannot include reason")
+        elif not self.reason:
+            raise ValueError("rejected canvas cancellation requires reason")
         return self
 
 
@@ -131,6 +152,15 @@ class RealtimeCanvasToolCall:
 
 
 @dataclass(frozen=True, slots=True)
+class RealtimeCancelCanvasToolCall:
+    call_id: str
+
+    def __post_init__(self) -> None:
+        if not _CALL_ID.fullmatch(self.call_id):
+            raise ValueError("Realtime canvas call_id has an invalid format")
+
+
+@dataclass(frozen=True, slots=True)
 class RealtimeRejectedCanvasToolCall:
     call_id: str
     reason: str
@@ -143,5 +173,8 @@ class RealtimeRejectedCanvasToolCall:
 
 
 type RealtimeTurnEvent = (
-    RealtimeSpeechTextDelta | RealtimeCanvasToolCall | RealtimeRejectedCanvasToolCall
+    RealtimeSpeechTextDelta
+    | RealtimeCanvasToolCall
+    | RealtimeCancelCanvasToolCall
+    | RealtimeRejectedCanvasToolCall
 )

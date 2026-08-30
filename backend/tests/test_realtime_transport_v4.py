@@ -11,8 +11,12 @@ import pytest
 from ava_backend.app import create_app
 from ava_backend.canvas.svg_delivery import SvgCanvasDocumentStore
 from ava_backend.canvas.svg_document import SvgDocumentValidator
+from ava_backend.canvas.render_profile import CanvasRenderProfile
 from ava_backend.canvas.svg_session import SvgCanvasSessionState
-from ava_backend.canvas.svg_specialist import SvgCanvasSpecialistGeneration
+from ava_backend.canvas.svg_specialist import (
+    SvgCanvasSpecialistGeneration,
+    SvgCanvasVisibleDraft,
+)
 from ava_backend.config import AvaEnvironment, Settings
 from ava_backend.protocol import AgeBand
 from ava_backend.realtime.events_v4 import AvaClientEventUnionV4
@@ -64,6 +68,7 @@ class _Coordinator:
 class _Factory:
     def __init__(self) -> None:
         self.coordinators: list[_Coordinator] = []
+        self.render_profiles: list[CanvasRenderProfile | None] = []
 
     def create(
         self,
@@ -72,8 +77,12 @@ class _Factory:
         request_id: str,
         subject: str,
         age_band: AgeBand,
+        canvas_render_profile: CanvasRenderProfile | None = None,
     ) -> RealtimeSessionCoordinatorV4:
         assert session_id and request_id and subject and age_band
+        if canvas_render_profile is not None:
+            assert canvas_render_profile.usable_aspect_ratio > 0
+        self.render_profiles.append(canvas_render_profile)
         coordinator = _Coordinator()
         self.coordinators.append(coordinator)
         return coordinator
@@ -111,7 +120,25 @@ def test_v4_bootstrap_and_independent_exact_document_fetch() -> None:
         created = client.post(
             "/v4/realtime/sessions",
             headers={"X-Ava-Protocol-Version": "4"},
-            json={"protocolVersion": 4, "ageBand": "middleChildhood"},
+            json={
+                "protocolVersion": 4,
+                "ageBand": "middleChildhood",
+                "canvasRenderProfile": {
+                    "usableAspectRatio": 1.6,
+                    "orientation": "landscape",
+                    "widthClass": "regular",
+                    "heightClass": "compact",
+                    "safeInsets": {
+                        "top": 0.02,
+                        "right": 0.03,
+                        "bottom": 0.04,
+                        "left": 0.03,
+                    },
+                    "touchEnvironment": "direct",
+                    "minimumInteractionTargetPoints": 44,
+                    "textScaleFactor": 1.15,
+                },
+            },
         )
         assert created.status_code == 201
         bootstrap = created.json()
@@ -119,6 +146,12 @@ def test_v4_bootstrap_and_independent_exact_document_fetch() -> None:
         assert bootstrap["canvasToken"]
         assert bootstrap["canvasDocumentBaseUrl"].endswith("/canvas-documents")
         assert bootstrap["rendererCapabilityVersion"] == "ava-svg-renderer-v2"
+        assert bootstrap["limits"]["maxSvgBytes"] == 384 * 1024
+        assert bootstrap["limits"]["maxManifestBytes"] == 64 * 1024
+        render_profile = factory.render_profiles[0]
+        assert render_profile is not None
+        assert render_profile.usable_aspect_ratio == 1.6
+        assert render_profile.safe_insets.bottom == 0.04
 
         negotiated = client.post(
             f"/v4/realtime/sessions/{bootstrap['sessionId']}/webrtc",
@@ -158,6 +191,18 @@ def test_v4_bootstrap_and_independent_exact_document_fetch() -> None:
                 candidate=candidate,
             )
         )
+        client.portal.call(
+            lambda: documents.publish_draft(
+                session_id=bootstrap["sessionId"],
+                source_turn_id="turn-v4",
+                draft=SvgCanvasVisibleDraft(
+                    generation_id="generation-v4",
+                    draft_index=1,
+                    attempt=0,
+                    document=generation.document,
+                ),
+            )
+        )
 
         base = f"/v4/realtime/sessions/{bootstrap['sessionId']}/canvas-documents/generation-v4"
         headers = {
@@ -166,6 +211,11 @@ def test_v4_bootstrap_and_independent_exact_document_fetch() -> None:
         }
         svg_response = client.get(f"{base}/svg", headers=headers)
         manifest_response = client.get(f"{base}/manifest", headers=headers)
+        draft_response = client.get(
+            f"/v4/realtime/sessions/{bootstrap['sessionId']}/canvas-drafts/"
+            "generation-v4/1/svg",
+            headers=headers,
+        )
 
         assert svg_response.status_code == 200
         assert svg_response.content == generation.document.svg_bytes
@@ -173,11 +223,16 @@ def test_v4_bootstrap_and_independent_exact_document_fetch() -> None:
         assert svg_response.headers["x-content-sha256"] == (
             generation.document.svg_sha256
         )
+        assert svg_response.headers["x-ava-canvas-authority"] == "candidate"
         assert manifest_response.status_code == 200
         assert manifest_response.content == generation.document.manifest_bytes
         assert manifest_response.headers["x-content-sha256"] == (
             generation.document.manifest_sha256
         )
+        assert draft_response.status_code == 200
+        assert draft_response.content == generation.document.svg_bytes
+        assert draft_response.headers["x-ava-canvas-authority"] == "draft"
+        assert "manifest" not in draft_response.headers
 
         wrong_scope = client.get(
             f"{base}/svg",

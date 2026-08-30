@@ -74,6 +74,45 @@ void main() {
     expect(playback['renderedSampleCount'], 0);
   });
 
+  test('client v4 render-profile update is strict and session-scoped', () {
+    final profile = AvaCanvasRenderProfileV4.fromJson({
+      'usableAspectRatio': 1.6,
+      'orientation': 'landscape',
+      'widthClass': 'regular',
+      'heightClass': 'compact',
+      'safeInsets': {
+        'top': 0.02,
+        'right': 0.03,
+        'bottom': 0.04,
+        'left': 0.03,
+      },
+      'touchEnvironment': 'direct',
+      'minimumInteractionTargetPoints': 44.0,
+      'textScaleFactor': 1.15,
+    });
+    final update = AvaRealtimeClientEventV4.canvasRenderProfileUpdated(
+      sessionId: 'session-1234',
+      sequence: 1,
+      profileRevision: 7,
+      renderProfile: profile,
+    ).toJson();
+
+    expect(update['event'], 'canvasRenderProfileUpdated');
+    expect(update['profileRevision'], 7);
+    expect(update, isNot(contains('turnId')));
+    expect(
+      (update['renderProfile']! as Map)['usableAspectRatio'],
+      1.6,
+    );
+    expect(
+      () => AvaCanvasRenderProfileV4.fromJson({
+        ...profile.toJson(),
+        'orientation': 'portrait',
+      }),
+      throwsFormatException,
+    );
+  });
+
   test('canvas rejection identifies a call before generation exists', () {
     final event = AvaRealtimeServerEventV4.fromJson({
       'protocolVersion': 4,
@@ -121,6 +160,27 @@ void main() {
         ...event.toJson(),
         'unknown': true,
       }),
+      throwsFormatException,
+    );
+  });
+
+  test('canvas draft fixture decodes with fixed non-authoritative trust', () {
+    final fixture = _objectFixture('ava_realtime_canvas_draft_v4.json');
+    final event = AvaRealtimeServerEventV4.fromJson(fixture);
+
+    expect(event.type, AvaRealtimeServerEventTypeV4.canvasDraftAvailable);
+    expect(event.isCanvas, isTrue);
+    expect(event.toJson()['authoritative'], isFalse);
+    expect(event.toJson()['interactive'], isFalse);
+    expect(
+      () => AvaRealtimeServerEventV4.fromJson({
+        ...fixture,
+        'authoritative': true,
+      }),
+      throwsFormatException,
+    );
+    expect(
+      () => AvaRealtimeServerEventV4.fromJson({...fixture, 'sceneId': 'x'}),
       throwsFormatException,
     );
   });

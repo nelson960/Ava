@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from ava_backend.canvas.svg_delivery import SvgCanvasDocumentStore
 from ava_backend.canvas.svg_document import SvgDocumentValidator
 from ava_backend.canvas.svg_session import SvgCanvasSessionState
@@ -11,7 +13,10 @@ from ava_backend.canvas.svg_specialist import (
 )
 from ava_backend.protocol import AgeBand
 from ava_backend.realtime.coordinator import DeterministicRealtimeSessionCoordinator
-from ava_backend.realtime.coordinator_v4 import ProtocolV4CanvasEventSink
+from ava_backend.realtime.coordinator_v4 import (
+    CanvasEventBackpressureError,
+    ProtocolV4CanvasEventSink,
+)
 from ava_backend.realtime.events_v4 import (
     AVA_CLIENT_EVENT_ADAPTER_V4,
     AudioChunkEventV4,
@@ -48,7 +53,10 @@ class _SvgSpecialist:
     async def generate(
         self,
         request: SvgCanvasSpecialistRequest,
+        *,
+        draft_sink: object | None = None,
     ) -> SvgCanvasSpecialistGeneration:
+        del draft_sink
         self.requests.append(request)
         document = SvgDocumentValidator().validate(
             (FIXTURE_ROOT / "ava_svg_document_v4.svg").read_text(encoding="utf-8")
@@ -77,6 +85,21 @@ def _client(
             **payload,
         }
     )
+
+
+async def test_canvas_event_backpressure_fails_instead_of_blocking_lifecycle() -> None:
+    canvas_events = ProtocolV4CanvasEventSink(maximum_events=8)
+    for index in range(8):
+        await canvas_events.generation_started(
+            generation_id=f"generation-{index}",
+            source_turn_id=f"turn-{index}",
+        )
+
+    with pytest.raises(CanvasEventBackpressureError, match="capacity was exhausted"):
+        await canvas_events.generation_started(
+            generation_id="generation-overflow",
+            source_turn_id="turn-overflow",
+        )
 
 
 async def test_v4_coordinator_runs_exact_svg_lifecycle_without_pcm_interleaving() -> (
@@ -220,7 +243,13 @@ async def test_v4_coordinator_runs_exact_svg_lifecycle_without_pcm_interleaving(
         FIXTURE_ROOT / "ava_svg_document_v4.svg"
     ).read_text(encoding="utf-8")
     assert documents.document_count == 0
-    assert len(realtime.prepared_session_updates) == 2
+    assert len(realtime.prepared_session_updates) == 3
+    pending_instructions = realtime.prepared_session_updates[1]["session"][
+        "instructions"
+    ]
+    assert isinstance(pending_instructions, str)
+    assert '<pending_visual state="generating"' in pending_instructions
+    assert "generation-v4-adapter" not in pending_instructions
 
     for index, frame in enumerate(frames):
         if isinstance(frame, AvaServerControlFrameV4) and isinstance(

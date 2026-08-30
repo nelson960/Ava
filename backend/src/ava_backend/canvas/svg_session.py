@@ -13,6 +13,7 @@ from .svg_workspace import (
     RecordedSvgCanvasInteraction,
     SvgCanvasWorkspace,
     SvgCanvasWorkspaceError,
+    SvgCanvasExecutionStatus,
 )
 
 _MAX_REALTIME_CANVAS_CONTEXT_CHARACTERS = 2_400
@@ -138,6 +139,17 @@ class SvgCanvasSessionState:
             document=generation.document,
         )
         self._candidate = candidate
+        if self._workspace.execution(candidate.generation_id) is not None:
+            try:
+                self._workspace.advance_execution(
+                    candidate.generation_id,
+                    SvgCanvasExecutionStatus.VALIDATED_CANDIDATE,
+                    scene_id=candidate.scene_id,
+                    scene_revision=candidate.revision,
+                )
+            except SvgCanvasWorkspaceError as error:
+                self._candidate = None
+                self._fail(SvgCanvasStateErrorCode.CANONICAL_SCENE_CHANGED, str(error))
         return candidate
 
     def mark_document_prepared(
@@ -194,6 +206,54 @@ class SvgCanvasSessionState:
             presentation_sample_offset=presentation_sample_offset,
         )
         self._candidate = candidate
+        if self._workspace.execution(generation_id) is not None:
+            try:
+                self._workspace.advance_execution(
+                    generation_id,
+                    SvgCanvasExecutionStatus.PRESENTATION_SCHEDULED,
+                )
+            except SvgCanvasWorkspaceError as error:
+                self._fail(SvgCanvasStateErrorCode.CANONICAL_SCENE_CHANGED, str(error))
+        return SvgCanvasPresentationCue(
+            generation_id=candidate.generation_id,
+            scene_id=candidate.scene_id,
+            revision=candidate.revision,
+            presentation_sample_offset=presentation_sample_offset,
+            svg_sha256=candidate.document.svg_sha256,
+            manifest_sha256=candidate.document.manifest_sha256,
+        )
+
+    def reschedule_presentation_earlier(
+        self,
+        *,
+        generation_id: str,
+        presentation_sample_offset: int,
+    ) -> SvgCanvasPresentationCue:
+        """Move an unreachable source-turn cue to its final rendered sample."""
+
+        candidate = self._require_candidate(generation_id)
+        previous_offset = candidate.presentation_sample_offset
+        if (
+            candidate.status is not SvgCandidateStatus.PRESENTATION_SCHEDULED
+            or previous_offset is None
+        ):
+            self._fail(
+                SvgCanvasStateErrorCode.INVALID_CANDIDATE_TRANSITION,
+                "only a scheduled canvas presentation can be moved earlier",
+            )
+        if (
+            presentation_sample_offset < 0
+            or presentation_sample_offset >= previous_offset
+        ):
+            self._fail(
+                SvgCanvasStateErrorCode.INVALID_CANDIDATE_TRANSITION,
+                "replacement canvas cue must precede its unreachable source cue",
+            )
+        candidate = replace(
+            candidate,
+            presentation_sample_offset=presentation_sample_offset,
+        )
+        self._candidate = candidate
         return SvgCanvasPresentationCue(
             generation_id=candidate.generation_id,
             scene_id=candidate.scene_id,
@@ -241,6 +301,11 @@ class SvgCanvasSessionState:
             first_rendered_sample=first_rendered_sample,
         )
         try:
+            if self._workspace.execution(generation_id) is not None:
+                self._workspace.advance_execution(
+                    generation_id,
+                    SvgCanvasExecutionStatus.PRESENTED,
+                )
             self._workspace.commit(
                 activated,
                 base_scene_id=candidate.base_scene_id,
@@ -268,17 +333,6 @@ class SvgCanvasSessionState:
         """Return the exact pending generation or fail with its protocol code."""
 
         return self._require_candidate(generation_id)
-
-    def discard_candidate_for_interrupted_turn(
-        self,
-        *,
-        source_turn_id: str,
-    ) -> SvgCanvasCandidate | None:
-        candidate = self._candidate
-        if candidate is None or candidate.source_turn_id != source_turn_id:
-            return None
-        self._candidate = None
-        return candidate
 
     def require_active_identity(
         self,
@@ -380,10 +434,18 @@ class SvgCanvasSessionState:
         except SvgCanvasWorkspaceError as error:
             self._fail(SvgCanvasStateErrorCode.CANONICAL_SCENE_CHANGED, str(error))
 
-    def render_realtime_context(self) -> str:
+    def render_realtime_context(self, *, pending_visual: str = "") -> str:
         active = self.active
-        if active is None:
+        if active is None and not pending_visual:
             return ""
+        prefix = '<canvas_context trust="untrusted_model_generated_data">'
+        suffix = "</canvas_context>"
+        if active is None:
+            if len(prefix) + len(pending_visual) + len(suffix) > (
+                _MAX_REALTIME_CANVAS_CONTEXT_CHARACTERS
+            ):
+                raise ValueError("pending canvas context exceeds its bounded limit")
+            return f"{prefix}{pending_visual}{suffix}"
         interaction = self.last_interaction
         interaction_xml = ""
         if interaction is not None:
@@ -398,16 +460,13 @@ class SvgCanvasSessionState:
                 f"<target>{escape(interaction.accessibility_label)}</target>"
                 "</last_interaction>"
             )
-        prefix = (
-            '<canvas_context trust="untrusted_model_generated_data" '
-            f'scene_id="{escape(active.scene_id)}" revision="{active.revision}" '
-            f'svg_sha256="{active.document.svg_sha256}" '
-            f'interaction_mode="{escape(active.document.interaction_mode.value)}">'
+        active_prefix = (
+            f'<active_visual interaction_mode="{escape(active.document.interaction_mode.value)}">'
             f"<title>{escape(active.document.title)}</title>"
             f"<description>{escape(active.document.description)}</description>"
             f"{interaction_xml}"
         )
-        suffix = "</canvas_context>"
+        active_suffix = "</active_visual>"
         semantic_items = [
             f'<item kind="visibleText">{escape(label)}</item>'
             for label in active.document.visible_text_labels
@@ -428,13 +487,23 @@ class SvgCanvasSessionState:
         for item in semantic_items:
             semantic_xml = f"<semantics>{''.join((*selected, item))}</semantics>"
             if (
-                len(prefix) + len(semantic_xml) + len(suffix)
+                len(prefix)
+                + len(pending_visual)
+                + len(active_prefix)
+                + len(semantic_xml)
+                + len(active_suffix)
+                + len(suffix)
                 > _MAX_REALTIME_CANVAS_CONTEXT_CHARACTERS
             ):
                 break
             selected.append(item)
         semantic_xml = f"<semantics>{''.join(selected)}</semantics>" if selected else ""
-        return f"{prefix}{semantic_xml}{suffix}"
+        active_context = f"{active_prefix}{semantic_xml}{active_suffix}"
+        if len(prefix) + len(pending_visual) + len(active_context) + len(suffix) > (
+            _MAX_REALTIME_CANVAS_CONTEXT_CHARACTERS
+        ):
+            raise ValueError("canvas context exceeds its bounded limit")
+        return f"{prefix}{pending_visual}{active_context}{suffix}"
 
     def _require_candidate(self, generation_id: str) -> SvgCanvasCandidate:
         candidate = self._candidate

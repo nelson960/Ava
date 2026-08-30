@@ -5,7 +5,6 @@ import re
 from pydantic import ValidationError
 
 from .speech_contract import (
-    MAX_SPEECH_PHRASES,
     MAX_SPEECH_PHRASE_CHARACTERS,
     MAX_SPEECH_RESPONSE_CHARACTERS,
     SpeechDelivery,
@@ -36,15 +35,11 @@ class StreamingSpeechParser:
         *,
         max_total_characters: int = MAX_SPEECH_RESPONSE_CHARACTERS,
         max_segment_characters: int = MAX_SPEECH_PHRASE_CHARACTERS,
-        max_segments: int = MAX_SPEECH_PHRASES,
     ) -> None:
         if not 1 <= max_segment_characters <= max_total_characters:
             raise ValueError("invalid streaming speech character limits")
-        if not 1 <= max_segments <= MAX_SPEECH_PHRASES:
-            raise ValueError(f"max_segments must be between 1 and {MAX_SPEECH_PHRASES}")
         self._max_total_characters = max_total_characters
         self._max_segment_characters = max_segment_characters
-        self._max_segments = max_segments
         self._buffer = ""
         self._received_characters = 0
         self._segments: list[SpeechPhrase] = []
@@ -113,10 +108,6 @@ class StreamingSpeechParser:
             if len(speech) > self._max_segment_characters:
                 raise StreamingTurnParseError(
                     "assistant speech segment exceeded 600 characters"
-                )
-            if len(self._segments) >= self._max_segments:
-                raise StreamingTurnParseError(
-                    f"assistant speech exceeded the {self._max_segments}-segment limit"
                 )
             try:
                 segment = SpeechPhrase.model_validate(

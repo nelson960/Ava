@@ -1,10 +1,13 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/cupertino.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../services/ava_realtime_presentation.dart';
+import '../models/ava_realtime_protocol_v4.dart';
 import '../state/app_state.dart';
 import '../state/ava_session_state.dart';
 import 'avatar/avatar_view.dart';
@@ -121,6 +124,23 @@ class _MainScreenState extends ConsumerState<MainScreen>
       body: LayoutBuilder(
         builder: (context, constraints) {
           final dashboardHeight = constraints.maxHeight * 0.5;
+          final viewPadding = MediaQuery.viewPaddingOf(context);
+          final workspaceTop = constraints.maxHeight - dashboardHeight;
+          final safeTop = math.max(0.0, viewPadding.top - workspaceTop);
+          canvasHost.updateRenderProfile(
+            AvaCanvasRenderProfileV4.measure(
+              workspaceWidthPoints: constraints.maxWidth,
+              workspaceHeightPoints: dashboardHeight,
+              safeTopPoints: safeTop,
+              safeRightPoints: viewPadding.right,
+              safeBottomPoints: viewPadding.bottom,
+              safeLeftPoints: viewPadding.left,
+              directTouch: !kIsWeb &&
+                  (defaultTargetPlatform == TargetPlatform.iOS ||
+                      defaultTargetPlatform == TargetPlatform.android),
+              textScaleFactor: MediaQuery.textScalerOf(context).scale(1),
+            ),
+          );
           final canvasGenerating = canvasHost.generating;
           final canReopenCanvas = canvasHost.canReopen;
 

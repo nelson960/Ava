@@ -13,12 +13,14 @@ from pydantic import (
     model_validator,
 )
 
+from ..canvas.render_profile import CanvasRenderProfile
+from ..canvas.svg_document import SVG_MAX_MANIFEST_BYTES, SVG_PROTOCOL_MAX_BYTES
 from ..canvas.svg_session import SvgCanvasStateErrorCode
 from .common import NonEmptyText, ProtocolIdentifier, RealtimeProtocolModel
 from .speech_contract import (
     MAX_SPEECH_ALIGNMENT_SPANS,
-    MAX_SPEECH_PHRASES,
     MAX_SPEECH_RESPONSE_CHARACTERS,
+    MAX_SPEECH_SEGMENT_INDEX,
     SpeechAlignment,
     SpeechFailure,
     SpeechPhase,
@@ -38,6 +40,7 @@ class AvaServerEventTypeV4(StrEnum):
     ALIGNMENT_BATCH = "alignmentBatch"
     INTERRUPT_REQUESTED = "interruptRequested"
     CANVAS_GENERATION_STARTED = "canvasGenerationStarted"
+    CANVAS_DRAFT_AVAILABLE = "canvasDraftAvailable"
     CANVAS_DOCUMENT_AVAILABLE = "canvasDocumentAvailable"
     CANVAS_PRESENTATION_CUE = "canvasPresentationCue"
     CANVAS_ACTIVATED = "canvasActivated"
@@ -74,7 +77,7 @@ class TurnPhaseChangedEventV4(AvaTurnServerEventV4):
 
 class SegmentReadyEventV4(AvaTurnServerEventV4):
     event: Literal[AvaServerEventTypeV4.SEGMENT_READY]
-    segment_index: int = Field(ge=0, lt=MAX_SPEECH_PHRASES)
+    segment_index: int = Field(ge=0, le=MAX_SPEECH_SEGMENT_INDEX)
     segment: SpeechPhrase
 
 
@@ -138,6 +141,22 @@ class CanvasGenerationStartedEventV4(AvaServerEventV4):
     source_turn_id: ProtocolIdentifier
 
 
+class CanvasDraftAvailableEventV4(AvaServerEventV4):
+    """Validated non-canonical stream-prefix snapshot for display only."""
+
+    event: Literal[AvaServerEventTypeV4.CANVAS_DRAFT_AVAILABLE]
+    generation_id: ProtocolIdentifier
+    source_turn_id: ProtocolIdentifier
+    draft_index: int = Field(ge=1, le=32)
+    svg_path: Annotated[str, StringConstraints(pattern=r"^/[A-Za-z0-9_./:-]+$")]
+    svg_sha256: Sha256Digest
+    svg_byte_length: int = Field(gt=0, le=SVG_PROTOCOL_MAX_BYTES)
+    authoritative: Literal[False]
+    interactive: Literal[False]
+    renderer_capability_version: Literal["ava-svg-renderer-v2"]
+    validator_version: Literal["ava-svg-validator-v2"]
+
+
 class CanvasDocumentAvailableEventV4(AvaServerEventV4):
     event: Literal[AvaServerEventTypeV4.CANVAS_DOCUMENT_AVAILABLE]
     generation_id: ProtocolIdentifier
@@ -148,8 +167,8 @@ class CanvasDocumentAvailableEventV4(AvaServerEventV4):
     manifest_path: Annotated[str, StringConstraints(pattern=r"^/[A-Za-z0-9_./:-]+$")]
     svg_sha256: Sha256Digest
     manifest_sha256: Sha256Digest
-    svg_byte_length: int = Field(gt=0, le=262_144)
-    manifest_byte_length: int = Field(gt=0, le=65_536)
+    svg_byte_length: int = Field(gt=0, le=SVG_PROTOCOL_MAX_BYTES)
+    manifest_byte_length: int = Field(gt=0, le=SVG_MAX_MANIFEST_BYTES)
     renderer_capability_version: Literal["ava-svg-renderer-v2"]
     validator_version: Literal["ava-svg-validator-v2"]
     manifest_version: Literal["ava-svg-manifest-v2"]
@@ -178,10 +197,10 @@ class CanvasActivatedEventV4(AvaServerEventV4):
 
 
 class CanvasDocumentDiscardReason(StrEnum):
-    INTERRUPTED_BEFORE_PRESENTATION = "interruptedBeforePresentation"
     SUPERSEDED = "superseded"
     SESSION_CLOSED = "sessionClosed"
     RENDERER_FAILURE = "rendererFailure"
+    PRESENTATION_TIMEOUT = "presentationTimeout"
 
 
 class CanvasDocumentDiscardedEventV4(AvaServerEventV4):
@@ -199,6 +218,7 @@ class CanvasGenerationRejectionCode(StrEnum):
     GENERATION_LIMIT_EXCEEDED = "generationLimitExceeded"
     STATIC_VALIDATION_FAILED = "staticValidationFailed"
     PREPARATION_FAILED = "preparationFailed"
+    PRESENTATION_FAILED = "presentationFailed"
     CANCELLED = "cancelled"
 
 
@@ -275,6 +295,7 @@ AvaServerEventUnionV4 = Annotated[
     | AlignmentBatchEventV4
     | InterruptRequestedEventV4
     | CanvasGenerationStartedEventV4
+    | CanvasDraftAvailableEventV4
     | CanvasDocumentAvailableEventV4
     | CanvasPresentationCueEventV4
     | CanvasActivatedEventV4
@@ -310,6 +331,7 @@ def serialize_server_event_v4(event: AvaServerEventUnionV4) -> str:
 
 class AvaClientEventTypeV4(StrEnum):
     CLIENT_READY = "clientReady"
+    CANVAS_RENDER_PROFILE_UPDATED = "canvasRenderProfileUpdated"
     PLAYBACK_STARTED = "playbackStarted"
     PLAYBACK_PROGRESS = "playbackProgress"
     PLAYBACK_STOPPED = "playbackStopped"
@@ -332,6 +354,14 @@ class ClientReadyEventV4(AvaClientEventV4):
     event: Literal[AvaClientEventTypeV4.CLIENT_READY]
     renderer_capability_version: Literal["ava-svg-renderer-v2"]
     validator_version: Literal["ava-svg-validator-v2"]
+
+
+class CanvasRenderProfileUpdatedEventV4(AvaClientEventV4):
+    """Ordered session-scoped authoring environment for future generations."""
+
+    event: Literal[AvaClientEventTypeV4.CANVAS_RENDER_PROFILE_UPDATED]
+    profile_revision: int = Field(ge=1, le=1_000_000)
+    render_profile: CanvasRenderProfile
 
 
 class PlaybackStartedEventV4(AvaClientEventV4):
@@ -432,6 +462,7 @@ class CancelTurnEventV4(AvaClientEventV4):
 
 AvaClientEventUnionV4 = Annotated[
     ClientReadyEventV4
+    | CanvasRenderProfileUpdatedEventV4
     | PlaybackStartedEventV4
     | PlaybackProgressEventV4
     | PlaybackStoppedEventV4
@@ -454,8 +485,8 @@ class AvaSessionLimitsV4(RealtimeProtocolModel):
         ge=128,
         le=MAX_SPEECH_RESPONSE_CHARACTERS,
     )
-    max_svg_bytes: int = Field(gt=0, le=262_144)
-    max_manifest_bytes: int = Field(gt=0, le=65_536)
+    max_svg_bytes: int = Field(gt=0, le=SVG_PROTOCOL_MAX_BYTES)
+    max_manifest_bytes: int = Field(gt=0, le=SVG_MAX_MANIFEST_BYTES)
     max_audio_chunk_bytes: int = Field(ge=2_048, le=192_000)
     playback_progress_interval_ms: int = Field(ge=50, le=2_000)
 

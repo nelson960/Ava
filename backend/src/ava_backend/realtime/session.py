@@ -14,6 +14,7 @@ from enum import StrEnum
 from typing import Literal
 from uuid import uuid4
 
+from ..canvas.render_profile import CanvasRenderProfile
 from ..protocol import AgeBand
 from .common import RealtimeProtocolModel
 from .provider_session import NegotiatedRealtimeCall
@@ -23,6 +24,7 @@ from .websocket_v4 import RealtimeCoordinatorFactoryV4, RealtimeSessionCoordinat
 class AvaSessionCreateRequestV4(RealtimeProtocolModel):
     protocol_version: Literal[4]
     age_band: AgeBand = AgeBand.UNKNOWN
+    canvas_render_profile: CanvasRenderProfile | None = None
 
 
 class RealtimeSessionCapacityError(RuntimeError):
@@ -212,6 +214,7 @@ class RealtimeSessionRegistry:
         request_id: str,
         subject: str,
         age_band: AgeBand,
+        canvas_render_profile: CanvasRenderProfile | None = None,
     ) -> CreatedRealtimeSession:
         await self.purge_expired()
         async with self._lock:
@@ -250,6 +253,7 @@ class RealtimeSessionRegistry:
                 request_id=request_id,
                 subject=subject,
                 age_band=age_band,
+                canvas_render_profile=canvas_render_profile,
             )
             self._records[session_id] = _RealtimeSessionRecord(
                 session_id=session_id,

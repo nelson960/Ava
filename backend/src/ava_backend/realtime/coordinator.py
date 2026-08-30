@@ -35,6 +35,7 @@ from .events_v4 import (
     CanvasInteractionEventV4,
     CanvasPreparationFailedEventV4,
     CanvasPresentedEventV4,
+    CanvasRenderProfileUpdatedEventV4,
     CanvasRuntimeFailedEventV4,
     ClientReadyEventV4,
     PlaybackProgressEventV4,
@@ -70,8 +71,10 @@ from .speech_contract import (
 from .svg_canvas_jobs import SvgCanvasJobCoordinator
 from .tool_contract import (
     CANVAS_MODEL_SAFE_REJECTION_REASON,
+    InteractiveCanvasCancellationToolOutputV4,
     InteractiveCanvasToolOutputV4,
     InteractiveCanvasToolStatusV4,
+    RealtimeCancelCanvasToolCall,
     RealtimeCanvasToolCall,
     RealtimeRejectedCanvasToolCall,
     RealtimeSpeechTextDelta,
@@ -359,6 +362,17 @@ class DeterministicRealtimeSessionCoordinator:
             self._client_ready = True
             return
 
+        if isinstance(event, CanvasRenderProfileUpdatedEventV4):
+            if not self._client_ready:
+                raise CoordinatorStateError(
+                    "canvas render-profile update requires clientReady"
+                )
+            await self._canvas_jobs.update_render_profile(
+                profile_revision=event.profile_revision,
+                render_profile=event.render_profile,
+            )
+            return
+
         if isinstance(event, CanvasDocumentPreparedEventV4):
             await self._canvas_jobs.document_prepared(event)
             return
@@ -450,7 +464,6 @@ class DeterministicRealtimeSessionCoordinator:
                         }
                     },
                 )
-                await self._interrupt_canvas_turn()
             else:
                 should_enqueue = False
         else:
@@ -1012,13 +1025,37 @@ class DeterministicRealtimeSessionCoordinator:
             return
 
         if provider_incomplete_reason is not None:
-            async for frame in self._cancel_frames(
-                plan=plan,
-                ledger=ledger,
-                reason=f"providerResponseIncomplete:{provider_incomplete_reason}",
-                provider_response_terminal=True,
-            ):
-                yield frame
+            cancellation_reason = (
+                f"providerResponseIncomplete:{provider_incomplete_reason}"
+            )
+            if self._stopped_sample_count is not None:
+                async for frame in self._cancel_frames(
+                    plan=plan,
+                    ledger=ledger,
+                    reason=cancellation_reason,
+                    provider_response_terminal=True,
+                ):
+                    yield frame
+            elif self._playback_started:
+                yield self._interrupt_requested_frame(
+                    stream_id=self._stream_id,
+                    reason=cancellation_reason,
+                )
+                async for frame in self._await_client_cancellation_after_interruption(
+                    plan=plan,
+                    ledger=ledger,
+                    reason=cancellation_reason,
+                    provider_response_terminal=True,
+                ):
+                    yield frame
+            else:
+                async for frame in self._cancel_frames(
+                    plan=plan,
+                    ledger=ledger,
+                    reason=cancellation_reason,
+                    provider_response_terminal=True,
+                ):
+                    yield frame
             return
 
         if provider_error is not None:
@@ -1299,7 +1336,7 @@ class DeterministicRealtimeSessionCoordinator:
             )
 
     def _current_canvas_context(self) -> str | None:
-        context = self._canvas_jobs.state.render_realtime_context()
+        context = self._canvas_jobs.render_realtime_context()
         return context or None
 
     def _ensure_canvas_interaction_response_worker(self) -> None:
@@ -1498,6 +1535,16 @@ class DeterministicRealtimeSessionCoordinator:
                         message=event.reason,
                     )
                     continue
+                if isinstance(event, RealtimeCancelCanvasToolCall):
+                    for segment in parser.finish_response_chunk():
+                        await updates.put(segment)
+                    if state.canvas_call_id is not None:
+                        raise StreamingTurnParseError(
+                            "Realtime requested more than one canvas action in one turn"
+                        )
+                    state.canvas_call_id = event.call_id
+                    await self._run_canvas_cancellation_tool(event, state=state)
+                    continue
                 if not isinstance(event, RealtimeCanvasToolCall):
                     raise CoordinatorStateError(
                         f"unsupported Realtime provider event {type(event).__name__}"
@@ -1582,8 +1629,36 @@ class DeterministicRealtimeSessionCoordinator:
                 generation_id,
                 (monotonic() - state.canvas_started) * 1000,
             )
+            await self._refresh_canvas_context()
             return
         self._canvas_status = "rejected"
+
+    async def _run_canvas_cancellation_tool(
+        self,
+        call: RealtimeCancelCanvasToolCall,
+        *,
+        state: _PlanningState,
+    ) -> None:
+        state.canvas_started = monotonic()
+        retired = await self._canvas_jobs.cancel_pending()
+        await self._realtime.complete_canvas_tool(
+            turn_id=self._turn_id,
+            call_id=call.call_id,
+            output=InteractiveCanvasCancellationToolOutputV4.model_validate(
+                {"status": InteractiveCanvasToolStatusV4.ACCEPTED}
+            ),
+        )
+        self._canvas_status = "cancelled"
+        LOGGER.info(
+            "canvas_pending_work_cancelled session_id=%s turn_id=%s call_id=%s "
+            "retired_count=%d elapsed_ms=%.2f",
+            self._session_id,
+            self._turn_id,
+            call.call_id,
+            len(retired),
+            (monotonic() - state.canvas_started) * 1000,
+        )
+        await self._refresh_canvas_context()
 
     async def _complete_canvas_tool(
         self,
@@ -1622,14 +1697,7 @@ class DeterministicRealtimeSessionCoordinator:
                     self._session_id,
                     self._turn_id,
                 )
-        try:
-            await self._interrupt_canvas_turn()
-        except Exception:
-            LOGGER.exception(
-                "canvas_planning_cleanup_failed session_id=%s turn_id=%s",
-                self._session_id,
-                self._turn_id,
-            )
+        await self._schedule_interrupted_canvas_presentation()
         self._active_planning_task = None
 
     async def _cancel_provider_input_observer(self) -> None:
@@ -1805,6 +1873,8 @@ class DeterministicRealtimeSessionCoordinator:
         *,
         plan: _TurnResult | None,
         ledger: DeliveredTextLedger,
+        reason: str | None = None,
+        provider_response_terminal: bool = False,
     ) -> AsyncIterator[AvaServerOutboundFrameV4]:
         while True:
             try:
@@ -1813,7 +1883,17 @@ class DeterministicRealtimeSessionCoordinator:
                 return
             if not isinstance(control, CancelTurnEventV4):
                 continue
-            async for frame in self._cancel_frames(plan=plan, ledger=ledger):
+            if self._stopped_sample_count is None:
+                raise CoordinatorStateError(
+                    "client cancellation after interruptRequested requires "
+                    "playbackStopped"
+                )
+            async for frame in self._cancel_frames(
+                plan=plan,
+                ledger=ledger,
+                reason=reason,
+                provider_response_terminal=provider_response_terminal,
+            ):
                 yield frame
             return
 
@@ -1891,7 +1971,6 @@ class DeterministicRealtimeSessionCoordinator:
         if not self._terminal:
             await self._realtime.cancel(turn_id=self._turn_id)
             await self._speech.cancel(turn_id=self._turn_id)
-            await self._interrupt_canvas_turn()
         await self._realtime.close()
         await self._speech.close()
         await self._canvas_jobs.close()
@@ -2120,7 +2199,7 @@ class DeterministicRealtimeSessionCoordinator:
         if not provider_response_terminal:
             await self._realtime.cancel(turn_id=self._turn_id)
         await self._speech.cancel(turn_id=self._turn_id)
-        await self._interrupt_canvas_turn()
+        await self._schedule_interrupted_canvas_presentation()
 
         delivered_samples = self._bounded_rendered_sample_count()
         delivered_text = ledger.delivered_text(delivered_samples)
@@ -2396,8 +2475,21 @@ class DeterministicRealtimeSessionCoordinator:
             occurred_at=occurred_at,
         )
 
-    async def _interrupt_canvas_turn(self) -> None:
-        await self._canvas_jobs.interrupt_turn(source_turn_id=self._turn_id)
+    async def _schedule_interrupted_canvas_presentation(self) -> None:
+        if self._closed:
+            return
+        try:
+            await self._canvas_jobs.request_interrupted_presentation(
+                source_turn_id=self._turn_id,
+                presentation_sample_offset=self._bounded_rendered_sample_count(),
+            )
+        except Exception:
+            LOGGER.exception(
+                "canvas_interrupted_presentation_schedule_failed "
+                "session_id=%s turn_id=%s",
+                self._session_id,
+                self._turn_id,
+            )
 
     def _require_child_text(self) -> str:
         if self._child_text is None:

@@ -7,38 +7,76 @@ import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import '../../canvas/ava_svg_canvas_renderer.dart';
 import '../../models/ava_svg_canvas_protocol.dart';
 
+typedef _DraftRendererIdentity = ({
+  String generationId,
+  int draftIndex,
+  String svgSha256,
+});
+
+typedef _CandidateRendererIdentity = ({
+  String generationId,
+  String svgSha256,
+  String manifestSha256,
+});
+
+typedef AvaSvgCanvasRendererErrorHandler = void Function(
+  String message, {
+  String? generationId,
+});
+
+/// One persistent, sandboxed renderer for the retained active scene and the
+/// current generation's replaceable draft/final candidate layers.
 final class AvaSvgCanvasView extends StatefulWidget {
   const AvaSvgCanvasView({
     super.key,
-    required this.document,
-    required this.present,
-    required this.onPrepared,
-    required this.onFirstFramePresented,
+    required this.activeDocument,
+    required this.draft,
+    required this.candidate,
+    required this.presentCandidate,
+    required this.interactionsEnabled,
+    required this.onDraftPresented,
+    required this.onCandidatePrepared,
+    required this.onCandidateFirstFramePresented,
     required this.onBinding,
     required this.onError,
   });
 
-  final AvaValidatedSvgCanvasDocument document;
-  final bool present;
-  final VoidCallback onPrepared;
-  final VoidCallback onFirstFramePresented;
+  final AvaValidatedSvgCanvasDocument? activeDocument;
+  final AvaValidatedSvgCanvasDraft? draft;
+  final AvaValidatedSvgCanvasDocument? candidate;
+  final bool presentCandidate;
+  final bool interactionsEnabled;
+  final ValueChanged<AvaValidatedSvgCanvasDraft> onDraftPresented;
+  final ValueChanged<AvaValidatedSvgCanvasDocument> onCandidatePrepared;
+  final ValueChanged<AvaValidatedSvgCanvasDocument>
+      onCandidateFirstFramePresented;
   final ValueChanged<AvaSvgInteractionBinding> onBinding;
-  final ValueChanged<String> onError;
+  final AvaSvgCanvasRendererErrorHandler onError;
 
   @override
   State<AvaSvgCanvasView> createState() => _AvaSvgCanvasViewState();
 }
 
 class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
+  static const _renderer = AvaSvgCanvasHtmlRenderer();
+
   late final String _preparedHandler;
   late final String _presentedHandler;
+  late final String _draftPresentedHandler;
   late final String _bindingHandler;
   late final String _errorHandler;
   InAppWebViewController? _controller;
-  bool _prepared = false;
-  bool _presentationRequested = false;
-  bool _presented = false;
+  Future<void> _operationTail = Future<void>.value();
+  bool _runtimeReady = false;
   bool _unsupportedReported = false;
+  String? _mountedActiveGenerationId;
+  _DraftRendererIdentity? _visibleDraftIdentity;
+  final List<_DraftRendererIdentity> _issuedDraftIdentities = [];
+  final List<_CandidateRendererIdentity> _issuedPreparedIdentities = [];
+  final List<_CandidateRendererIdentity> _issuedPresentedIdentities = [];
+  String? _mountedCandidateGenerationId;
+  String? _presentedCandidateGenerationId;
+  bool? _activeInteractive;
 
   @override
   void initState() {
@@ -46,6 +84,7 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
     final suffix = identityHashCode(this).toRadixString(16);
     _preparedHandler = 'avaSvgPrepared_$suffix';
     _presentedHandler = 'avaSvgPresented_$suffix';
+    _draftPresentedHandler = 'avaSvgDraftPresented_$suffix';
     _bindingHandler = 'avaSvgBinding_$suffix';
     _errorHandler = 'avaSvgError_$suffix';
   }
@@ -53,19 +92,7 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
   @override
   void didUpdateWidget(AvaSvgCanvasView oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.document.descriptor.svgSha256 !=
-            widget.document.descriptor.svgSha256 ||
-        oldWidget.document.descriptor.manifestSha256 !=
-            widget.document.descriptor.manifestSha256) {
-      _controller = null;
-      _prepared = false;
-      _presentationRequested = false;
-      _presented = false;
-      return;
-    }
-    if (!oldWidget.present && widget.present) {
-      unawaited(_presentIfReady());
-    }
+    unawaited(_queueSync());
   }
 
   @override
@@ -81,23 +108,21 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
       }
       return const SizedBox.shrink();
     }
-    final html = const AvaSvgCanvasHtmlRenderer().build(
-      document: widget.document,
-      preparedHandler: _preparedHandler,
-      presentedHandler: _presentedHandler,
-      bindingHandler: _bindingHandler,
-      errorHandler: _errorHandler,
-    );
+    final title = widget.activeDocument?.manifest.title ??
+        widget.candidate?.manifest.title ??
+        'Ava is drawing a visual';
     return Semantics(
       container: true,
-      label: widget.document.manifest.title,
+      label: title,
       child: InAppWebView(
-        key: ValueKey(
-          '${widget.document.descriptor.svgSha256}:'
-          '${widget.document.descriptor.manifestSha256}',
-        ),
         initialData: InAppWebViewInitialData(
-          data: html,
+          data: _renderer.buildShell(
+            preparedHandler: _preparedHandler,
+            presentedHandler: _presentedHandler,
+            draftPresentedHandler: _draftPresentedHandler,
+            bindingHandler: _bindingHandler,
+            errorHandler: _errorHandler,
+          ),
           mimeType: 'text/html',
           encoding: 'utf-8',
         ),
@@ -127,6 +152,10 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
           isInspectable: false,
         ),
         onWebViewCreated: _onWebViewCreated,
+        onLoadStop: (_, __) {
+          _runtimeReady = true;
+          unawaited(_queueSync());
+        },
         shouldOverrideUrlLoading: (_, action) async {
           final value = action.request.url?.toString();
           return value == null || value == 'about:blank'
@@ -159,32 +188,46 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
     _controller = controller;
     controller.addJavaScriptHandler(
       handlerName: _preparedHandler,
-      callback: (arguments) {
-        try {
-          _validateContentIdentity(arguments, label: 'prepared');
-          if (_prepared) return true;
-          _prepared = true;
-          widget.onPrepared();
-          unawaited(_presentIfReady());
-          return true;
-        } on FormatException catch (error) {
-          widget.onError(error.message);
-          return false;
-        }
-      },
+      callback: (arguments) => _handleCandidateIdentity(
+        arguments,
+        label: 'prepared',
+        issuedIdentities: _issuedPreparedIdentities,
+        callback: widget.onCandidatePrepared,
+      ),
     );
     controller.addJavaScriptHandler(
       handlerName: _presentedHandler,
+      callback: (arguments) => _handleCandidateIdentity(
+        arguments,
+        label: 'presented',
+        issuedIdentities: _issuedPresentedIdentities,
+        callback: widget.onCandidateFirstFramePresented,
+      ),
+    );
+    controller.addJavaScriptHandler(
+      handlerName: _draftPresentedHandler,
       callback: (arguments) {
         try {
-          _validateContentIdentity(arguments, label: 'presented');
-          if (!_presentationRequested || _presented) {
+          final message = AvaSvgRendererBridgeMessage.fromArguments(arguments);
+          _requireExactFields(
+            message,
+            const {'generationId', 'draftIndex', 'svgSha256'},
+            'draft presented',
+          );
+          final identity = (
+            generationId: message.requiredString('generationId', maximum: 64),
+            draftIndex:
+                message.requiredInt('draftIndex', minimum: 1, maximum: 32),
+            svgSha256: message.requiredString('svgSha256', maximum: 64),
+          );
+          if (!_issuedDraftIdentities.contains(identity)) {
             throw const FormatException(
-              'SVG renderer sent canvasPresented in an invalid state.',
+              'SVG renderer reported a draft that was never issued.',
             );
           }
-          _presented = true;
-          widget.onFirstFramePresented();
+          final draft = widget.draft;
+          if (draft == null || _draftIdentity(draft) != identity) return true;
+          widget.onDraftPresented(draft);
           return true;
         } on FormatException catch (error) {
           widget.onError(error.message);
@@ -197,16 +240,22 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
       callback: (arguments) {
         try {
           final message = AvaSvgRendererBridgeMessage.fromArguments(arguments);
-          if (message.fields.keys
-                  .toSet()
-                  .difference({'bindingId'}).isNotEmpty ||
-              message.fields.length != 1) {
+          _requireExactFields(
+            message,
+            const {'bindingId', 'generationId'},
+            'binding',
+          );
+          final active = widget.activeDocument;
+          if (!widget.interactionsEnabled ||
+              active == null ||
+              message.requiredString('generationId', maximum: 64) !=
+                  active.descriptor.generationId) {
             throw const FormatException(
-              'SVG renderer binding event contains unknown fields.',
+              'SVG renderer emitted an interaction before activation.',
             );
           }
           final bindingId = message.requiredString('bindingId', maximum: 96);
-          final binding = widget.document.manifest.bindings[bindingId];
+          final binding = active.manifest.bindings[bindingId];
           if (binding == null) {
             throw const FormatException(
               'SVG renderer reported an unknown binding.',
@@ -225,14 +274,18 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
       callback: (arguments) {
         try {
           final message = AvaSvgRendererBridgeMessage.fromArguments(arguments);
-          if (message.fields.keys.toSet().difference({'code'}).isNotEmpty ||
-              message.fields.length != 1) {
-            throw const FormatException(
-              'SVG renderer error contains unknown fields.',
-            );
-          }
+          _requireExactFields(
+            message,
+            const {'code', 'generationId'},
+            'error',
+          );
           final code = message.requiredString('code', maximum: 80);
-          widget.onError('SVG renderer rejected the document ($code).');
+          final generationId =
+              message.requiredString('generationId', maximum: 64);
+          widget.onError(
+            'SVG renderer rejected the operation ($code).',
+            generationId: generationId,
+          );
           return true;
         } on FormatException catch (error) {
           widget.onError(error.message);
@@ -242,46 +295,189 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
     );
   }
 
-  void _validateContentIdentity(
+  bool _handleCandidateIdentity(
     List<dynamic> arguments, {
     required String label,
+    required List<_CandidateRendererIdentity> issuedIdentities,
+    required ValueChanged<AvaValidatedSvgCanvasDocument> callback,
   }) {
-    final message = AvaSvgRendererBridgeMessage.fromArguments(arguments);
-    if (message.fields.keys.toSet().difference({
-          'svgSha256',
-          'manifestSha256',
-        }).isNotEmpty ||
-        message.fields.length != 2 ||
-        message.requiredString('svgSha256', maximum: 64) !=
-            widget.document.descriptor.svgSha256 ||
-        message.requiredString('manifestSha256', maximum: 64) !=
-            widget.document.descriptor.manifestSha256) {
-      throw FormatException(
-        'SVG renderer $label content identity does not match the document.',
+    try {
+      final message = AvaSvgRendererBridgeMessage.fromArguments(arguments);
+      _requireExactFields(
+        message,
+        const {'generationId', 'svgSha256', 'manifestSha256'},
+        label,
       );
+      final identity = (
+        generationId: message.requiredString('generationId', maximum: 64),
+        svgSha256: message.requiredString('svgSha256', maximum: 64),
+        manifestSha256: message.requiredString('manifestSha256', maximum: 64),
+      );
+      if (!issuedIdentities.contains(identity)) {
+        throw FormatException(
+          'SVG renderer $label identity was never issued.',
+        );
+      }
+      final candidate = widget.candidate;
+      if (candidate == null || _candidateIdentity(candidate) != identity) {
+        return true;
+      }
+      callback(candidate);
+      return true;
+    } on FormatException catch (error) {
+      widget.onError(error.message);
+      return false;
     }
   }
 
-  Future<void> _presentIfReady() async {
-    if (!mounted || !widget.present || !_prepared || _presentationRequested) {
-      return;
-    }
+  Future<void> _queueSync() {
+    _operationTail = _operationTail.then((_) => _syncRenderer()).catchError(
+      (Object error) {
+        if (mounted) {
+          widget.onError(
+            'SVG renderer operation failed (${error.runtimeType}).',
+          );
+        }
+      },
+    );
+    return _operationTail;
+  }
+
+  Future<void> _syncRenderer() async {
+    if (!mounted || !_runtimeReady) return;
     final controller = _controller;
-    if (controller == null) {
-      widget.onError('SVG renderer lost its controller before presentation.');
-      return;
-    }
-    _presentationRequested = true;
-    try {
-      await controller.evaluateJavascript(
-        source: 'window.avaPresent && window.avaPresent();',
+    if (controller == null) return;
+
+    final active = widget.activeDocument;
+    if (active != null &&
+        _mountedActiveGenerationId != active.descriptor.generationId) {
+      if (_mountedCandidateGenerationId == active.descriptor.generationId) {
+        await _evaluate(
+          controller,
+          _renderer.activateCandidateScript(
+            active,
+            interactive: widget.interactionsEnabled,
+          ),
+        );
+        _mountedCandidateGenerationId = null;
+        _presentedCandidateGenerationId = null;
+        _visibleDraftIdentity = null;
+      } else {
+        await _evaluate(
+          controller,
+          _renderer.mountActiveScript(
+            active,
+            interactive: widget.interactionsEnabled,
+          ),
+        );
+      }
+      _mountedActiveGenerationId = active.descriptor.generationId;
+      _activeInteractive = widget.interactionsEnabled;
+    } else if (active != null &&
+        _activeInteractive != widget.interactionsEnabled) {
+      await _evaluate(
+        controller,
+        _renderer.setActiveInteractiveScript(
+          generationId: active.descriptor.generationId,
+          interactive: widget.interactionsEnabled,
+        ),
       );
-    } catch (error) {
-      _presentationRequested = false;
-      widget.onError(
-        'SVG renderer could not present the prepared document '
-        '(${error.runtimeType}).',
-      );
+      _activeInteractive = widget.interactionsEnabled;
     }
+
+    final draft = widget.draft;
+    final draftIdentity = draft == null ? null : _draftIdentity(draft);
+    if (draft != null && _visibleDraftIdentity != draftIdentity) {
+      _rememberIssued(_issuedDraftIdentities, draftIdentity!);
+      await _evaluate(controller, _renderer.replaceDraftScript(draft));
+      _visibleDraftIdentity = draftIdentity;
+    }
+
+    final candidate = widget.candidate;
+    if (candidate != null &&
+        _mountedCandidateGenerationId != candidate.descriptor.generationId) {
+      _rememberIssued(
+        _issuedPreparedIdentities,
+        _candidateIdentity(candidate),
+      );
+      await _evaluate(controller, _renderer.mountCandidateScript(candidate));
+      _mountedCandidateGenerationId = candidate.descriptor.generationId;
+      _presentedCandidateGenerationId = null;
+    }
+    if (candidate != null &&
+        widget.presentCandidate &&
+        _presentedCandidateGenerationId != candidate.descriptor.generationId) {
+      _rememberIssued(
+        _issuedPresentedIdentities,
+        _candidateIdentity(candidate),
+      );
+      await _evaluate(
+        controller,
+        _renderer.presentCandidateScript(candidate),
+      );
+      _presentedCandidateGenerationId = candidate.descriptor.generationId;
+      _visibleDraftIdentity = null;
+    }
+
+    if (candidate == null && _mountedCandidateGenerationId != null) {
+      final pendingGeneration = _mountedCandidateGenerationId!;
+      if (_mountedActiveGenerationId != pendingGeneration) {
+        await _evaluate(
+          controller,
+          _renderer.clearPendingScript(pendingGeneration),
+        );
+      }
+      _mountedCandidateGenerationId = null;
+      _presentedCandidateGenerationId = null;
+      _visibleDraftIdentity = null;
+    } else if (draft == null &&
+        candidate == null &&
+        _visibleDraftIdentity != null) {
+      final pendingGeneration = _visibleDraftIdentity!.generationId;
+      await _evaluate(
+        controller,
+        _renderer.clearPendingScript(pendingGeneration),
+      );
+      _visibleDraftIdentity = null;
+    }
+  }
+
+  Future<void> _evaluate(
+    InAppWebViewController controller,
+    String source,
+  ) async {
+    await controller.evaluateJavascript(source: source);
+  }
+}
+
+_DraftRendererIdentity _draftIdentity(AvaValidatedSvgCanvasDraft draft) => (
+      generationId: draft.descriptor.generationId,
+      draftIndex: draft.descriptor.draftIndex,
+      svgSha256: draft.descriptor.svgSha256,
+    );
+
+_CandidateRendererIdentity _candidateIdentity(
+  AvaValidatedSvgCanvasDocument document,
+) =>
+    (
+      generationId: document.descriptor.generationId,
+      svgSha256: document.descriptor.svgSha256,
+      manifestSha256: document.descriptor.manifestSha256,
+    );
+
+void _rememberIssued<T>(List<T> identities, T identity) {
+  if (identities.contains(identity)) return;
+  identities.add(identity);
+  if (identities.length > 32) identities.removeAt(0);
+}
+
+void _requireExactFields(
+  AvaSvgRendererBridgeMessage message,
+  Set<String> expected,
+  String label,
+) {
+  final actual = message.fields.keys.toSet();
+  if (actual.length != expected.length || !actual.containsAll(expected)) {
+    throw FormatException('SVG renderer $label contains unknown fields.');
   }
 }

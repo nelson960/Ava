@@ -10,6 +10,7 @@ from typing import Protocol, TypeAlias
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 
+from ..canvas.render_profile import CanvasRenderProfile
 from ..protocol import AgeBand
 from .events_v4 import (
     AVA_CLIENT_EVENT_ADAPTER_V4,
@@ -71,6 +72,7 @@ class RealtimeCoordinatorFactoryV4(Protocol):
         request_id: str,
         subject: str,
         age_band: AgeBand,
+        canvas_render_profile: CanvasRenderProfile | None = None,
     ) -> RealtimeSessionCoordinatorV4: ...
 
 

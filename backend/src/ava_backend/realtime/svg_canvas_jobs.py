@@ -5,12 +5,15 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from html import escape
 from typing import Protocol
 
 from ..canvas.svg_delivery import (
     StoredSvgCanvasDocument,
+    StoredSvgCanvasDraft,
     SvgCanvasDocumentStore,
 )
+from ..canvas.render_profile import CanvasRenderProfile
 from ..canvas.svg_session import (
     ActiveSvgCanvasScene,
     RecordedSvgCanvasInteraction,
@@ -28,7 +31,9 @@ from ..canvas.svg_specialist import (
     SvgCanvasSpecialistInvalidError,
     SvgCanvasSpecialistRequest,
     SvgCanvasSpecialistUnavailableError,
+    SvgCanvasVisibleDraft,
 )
+from ..canvas.svg_workspace import SvgCanvasExecutionStatus, SvgCanvasWorkspaceError
 from ..protocol import AgeBand
 from .events_v4 import (
     CanvasDocumentDiscardReason,
@@ -62,6 +67,8 @@ class SvgCanvasJobEventSink(Protocol):
         generation_id: str,
         source_turn_id: str,
     ) -> None: ...
+
+    async def draft_available(self, stored: StoredSvgCanvasDraft) -> None: ...
 
     async def document_available(self, stored: StoredSvgCanvasDocument) -> None: ...
 
@@ -116,6 +123,7 @@ class _AcceptedCanvasJob:
     source_turn_id: str
     request: SvgCanvasSpecialistRequest
     accepted_workspace_epoch: int
+    workspace_owned: bool = False
     task: asyncio.Task[None] | None = None
 
 
@@ -135,15 +143,25 @@ class SvgCanvasJobCoordinator:
         *,
         session_id: str,
         age_band: AgeBand,
+        render_profile: CanvasRenderProfile | None = None,
         specialist: SvgCanvasSpecialist,
         state: SvgCanvasSessionState,
         documents: SvgCanvasDocumentStore,
         event_sink: SvgCanvasJobEventSink,
         generation_id_factory: GenerationIdFactory,
         monotonic: Callable[[], float] = time.monotonic,
+        presentation_timeout_seconds: float = 30.0,
     ) -> None:
+        if not 0.01 <= presentation_timeout_seconds <= 180.0:
+            raise ValueError(
+                "canvas presentation timeout must be between 0.01 and 180 seconds"
+            )
         self._session_id = session_id
         self._age_band = age_band
+        self._render_profile = (
+            render_profile.model_copy(deep=True) if render_profile is not None else None
+        )
+        self._render_profile_revision = 0
         self._specialist = specialist
         self._state = state
         self._documents = documents
@@ -154,12 +172,35 @@ class SvgCanvasJobCoordinator:
         self._traces: dict[str, _CanvasGenerationTrace] = {}
         self._cancelled_generations: set[str] = set()
         self._presentation_offsets: dict[str, int] = {}
+        self._presentation_timeouts: dict[str, asyncio.Task[None]] = {}
+        self._presentation_timeout_seconds = presentation_timeout_seconds
         self._lock = asyncio.Lock()
         self._closed = False
 
     @property
     def state(self) -> SvgCanvasSessionState:
         return self._state
+
+    @property
+    def render_profile_revision(self) -> int:
+        return self._render_profile_revision
+
+    async def update_render_profile(
+        self,
+        *,
+        profile_revision: int,
+        render_profile: CanvasRenderProfile,
+    ) -> bool:
+        """Accept a newer session profile without touching reserved work."""
+
+        async with self._lock:
+            if self._closed:
+                raise RuntimeError("canvas generation is closed")
+            if profile_revision <= self._render_profile_revision:
+                return False
+            self._render_profile = render_profile.model_copy(deep=True)
+            self._render_profile_revision = profile_revision
+            return True
 
     async def accept_tool_call(
         self,
@@ -179,17 +220,15 @@ class SvgCanvasJobCoordinator:
                         "reason": CANVAS_MODEL_SAFE_REJECTION_REASON,
                     }
                 )
-            elif self._jobs or self._state.candidate is not None:
-                rejection_message = "another canvas generation is already pending"
-                output = InteractiveCanvasToolOutputV4.model_validate(
-                    {
-                        "status": InteractiveCanvasToolStatusV4.REJECTED,
-                        "reason": CANVAS_MODEL_SAFE_REJECTION_REASON,
-                    }
-                )
             elif (
                 call.request.operation == InteractiveCanvasOperation.REVISE_FOCUSED
                 and self._state.active is None
+                and not any(
+                    job.workspace_owned
+                    and job.generation_id not in self._cancelled_generations
+                    for job in self._jobs.values()
+                )
+                and self._state.candidate is None
             ):
                 rejection_message = "There is no current canvas to revise."
                 output = InteractiveCanvasToolOutputV4.model_validate(
@@ -215,6 +254,14 @@ class SvgCanvasJobCoordinator:
                         "brief": call.request.brief,
                         "interactionMode": call.request.interaction_mode,
                         "ageBand": self._age_band,
+                        "renderProfile": (
+                            self._render_profile.model_dump(
+                                mode="json",
+                                by_alias=True,
+                            )
+                            if self._render_profile is not None
+                            else None
+                        ),
                         "currentSceneId": active.scene_id if active else None,
                         "currentRevision": active.revision if active else None,
                         "currentSvg": active.document.svg_text if active else None,
@@ -252,6 +299,35 @@ class SvgCanvasJobCoordinator:
                     }
                 )
 
+        completion = asyncio.create_task(
+            self._complete_tool_and_start_accepted_job(
+                source_turn_id=source_turn_id,
+                call=call,
+                output=output,
+                rejection_message=rejection_message,
+                complete_tool=complete_tool,
+            ),
+            name=f"ava-svg-canvas-accept-{output.generation_id or call.call_id}",
+        )
+        try:
+            await asyncio.shield(completion)
+        except asyncio.CancelledError:
+            # Mechanical turn cancellation must settle the exactly-once tool
+            # output and transfer any accepted generation to the workspace
+            # before the turn-owned planning task is allowed to finish.
+            await completion
+            raise
+        return output
+
+    async def _complete_tool_and_start_accepted_job(
+        self,
+        *,
+        source_turn_id: str,
+        call: RealtimeCanvasToolCall,
+        output: InteractiveCanvasToolOutputV4,
+        rejection_message: str | None,
+        complete_tool: CompleteCanvasTool,
+    ) -> None:
         try:
             await complete_tool(source_turn_id, call.call_id, output)
         except Exception:
@@ -274,7 +350,54 @@ class SvgCanvasJobCoordinator:
                     rejection_message or "The optional visual request was rejected."
                 ),
             )
-            return output
+            return
+
+        async with self._lock:
+            reserved_job = self._jobs.get(output.generation_id)
+            if reserved_job is None:
+                raise RuntimeError(
+                    "accepted SVG canvas generation lost its reservation"
+                )
+            # The function output is now accepted by Realtime. From this point
+            # the generation belongs to the canvas workspace, not the speech
+            # turn that supplied its provenance.
+            reserved_job.workspace_owned = True
+            try:
+                self._state.workspace.start_execution(
+                    generation_id=reserved_job.generation_id,
+                    source_turn_id=reserved_job.source_turn_id,
+                    operation=str(call.request.operation),
+                )
+            except SvgCanvasWorkspaceError:
+                self._jobs.pop(output.generation_id, None)
+                self._traces.pop(output.generation_id, None)
+                raise
+            if self._closed or output.generation_id in self._cancelled_generations:
+                self._jobs.pop(output.generation_id, None)
+                self._cancelled_generations.discard(output.generation_id)
+                self._finish_execution_if_pending(
+                    output.generation_id,
+                    SvgCanvasExecutionStatus.CANCELLED,
+                    reason="cancelledBeforeGenerationStart",
+                )
+                self._log(
+                    "cancelled",
+                    generation_id=output.generation_id,
+                    source_turn_id=source_turn_id,
+                    cancellationPoint="beforeGenerationStart",
+                )
+                self._traces.pop(output.generation_id, None)
+                return
+
+        # A newly accepted visual operation is the only ordinary action that
+        # replaces pending workspace work. Retire older workspace work before
+        # starting this job so an older generation cannot stage a late candidate.
+        await self._cancel_workspace_pending(
+            exclude_generation_id=output.generation_id,
+            discard_reason=CanvasDocumentDiscardReason.SUPERSEDED,
+            rejection_message="canvas generation was superseded by a new visual request",
+            terminal_status=SvgCanvasExecutionStatus.SUPERSEDED,
+        )
 
         async with self._lock:
             reserved_job = self._jobs.get(output.generation_id)
@@ -285,6 +408,11 @@ class SvgCanvasJobCoordinator:
             if self._closed or output.generation_id in self._cancelled_generations:
                 self._jobs.pop(output.generation_id, None)
                 self._cancelled_generations.discard(output.generation_id)
+                self._finish_execution_if_pending(
+                    output.generation_id,
+                    SvgCanvasExecutionStatus.CANCELLED,
+                    reason="cancelledBeforeGenerationStart",
+                )
                 self._log(
                     "cancelled",
                     generation_id=output.generation_id,
@@ -292,7 +420,7 @@ class SvgCanvasJobCoordinator:
                     cancellationPoint="beforeGenerationStart",
                 )
                 self._traces.pop(output.generation_id, None)
-                return output
+                return
             try:
                 # Serialize the visible start with cancellation. Once this
                 # event is queued, an interrupt may follow with a rejection;
@@ -308,6 +436,11 @@ class SvgCanvasJobCoordinator:
                 )
             except Exception:
                 self._jobs.pop(output.generation_id, None)
+                self._finish_execution_if_pending(
+                    output.generation_id,
+                    SvgCanvasExecutionStatus.FAILED,
+                    reason="generationStartedDelivery",
+                )
                 self._log(
                     "failed",
                     generation_id=output.generation_id,
@@ -320,7 +453,6 @@ class SvgCanvasJobCoordinator:
                 self._run_generation(reserved_job),
                 name=f"ava-svg-canvas-{reserved_job.generation_id}",
             )
-        return output
 
     async def document_prepared(
         self,
@@ -439,6 +571,91 @@ class SvgCanvasJobCoordinator:
             )
         return cue
 
+    async def request_interrupted_presentation(
+        self,
+        *,
+        source_turn_id: str,
+        presentation_sample_offset: int,
+    ) -> SvgCanvasPresentationCue | None:
+        """Anchor accepted workspace work to its source clock's last sample.
+
+        The source turn identifies the existing rendered-sample clock only; it
+        does not own or terminate the accepted canvas generation.
+        """
+
+        replacement_cue: SvgCanvasPresentationCue | None = None
+        replacement_candidate: SvgCanvasCandidate | None = None
+        async with self._lock:
+            pending_generation_id: str | None = None
+            candidate = self._state.candidate
+            if candidate is not None and candidate.source_turn_id == source_turn_id:
+                pending_generation_id = candidate.generation_id
+            else:
+                matching_jobs = [
+                    job
+                    for job in self._jobs.values()
+                    if job.workspace_owned
+                    and job.source_turn_id == source_turn_id
+                    and job.generation_id not in self._cancelled_generations
+                ]
+                if matching_jobs:
+                    pending_generation_id = max(
+                        matching_jobs,
+                        key=lambda job: self._traces[job.generation_id].accepted_at,
+                    ).generation_id
+            if pending_generation_id is None:
+                return None
+            existing = self._presentation_offsets.get(pending_generation_id)
+            if existing is not None:
+                if existing <= presentation_sample_offset:
+                    return None
+                self._presentation_offsets[pending_generation_id] = (
+                    presentation_sample_offset
+                )
+                candidate = self._state.candidate
+                if (
+                    candidate is not None
+                    and candidate.generation_id == pending_generation_id
+                    and candidate.status is SvgCandidateStatus.PRESENTATION_SCHEDULED
+                ):
+                    replacement_cue = self._state.reschedule_presentation_earlier(
+                        generation_id=pending_generation_id,
+                        presentation_sample_offset=presentation_sample_offset,
+                    )
+                    replacement_candidate = self._state.candidate
+                self._log(
+                    "presentationRequested",
+                    generation_id=pending_generation_id,
+                    source_turn_id=source_turn_id,
+                    presentationSampleOffset=presentation_sample_offset,
+                    replacedUnreachableSampleOffset=existing,
+                )
+
+        if replacement_cue is not None:
+            if replacement_candidate is None:  # pragma: no cover - cue requires it
+                raise RuntimeError("replacement canvas cue lost its candidate")
+            await self._event_sink.presentation_cue(
+                replacement_candidate,
+                replacement_cue,
+            )
+            self._log(
+                "presentationCueSent",
+                generation_id=replacement_candidate.generation_id,
+                source_turn_id=replacement_candidate.source_turn_id,
+                sceneId=replacement_candidate.scene_id,
+                sceneRevision=replacement_candidate.revision,
+                presentationSampleOffset=(replacement_cue.presentation_sample_offset),
+                replacedUnreachableCue=True,
+            )
+            return replacement_cue
+        if existing is not None:
+            return None
+
+        return await self.request_presentation(
+            generation_id=pending_generation_id,
+            presentation_sample_offset=presentation_sample_offset,
+        )
+
     async def preparation_failed(
         self,
         event: CanvasPreparationFailedEventV4,
@@ -457,7 +674,17 @@ class SvgCanvasJobCoordinator:
             )
             discarded = self._state.discard_candidate(generation_id=event.generation_id)
             self._presentation_offsets.pop(event.generation_id, None)
+            self._cancel_presentation_timeout(event.generation_id)
+            self._finish_execution_if_pending(
+                event.generation_id,
+                SvgCanvasExecutionStatus.FAILED,
+                reason=f"clientPreparation:{event.failure_code}",
+            )
         await self._documents.discard(
+            session_id=self._session_id,
+            generation_id=event.generation_id,
+        )
+        await self._documents.discard_drafts(
             session_id=self._session_id,
             generation_id=event.generation_id,
         )
@@ -495,6 +722,7 @@ class SvgCanvasJobCoordinator:
                 first_rendered_sample=event.first_rendered_sample,
             )
             self._presentation_offsets.pop(event.generation_id, None)
+            self._cancel_presentation_timeout(event.generation_id)
             self._log(
                 "presentationAcknowledged",
                 generation_id=active.generation_id,
@@ -515,6 +743,10 @@ class SvgCanvasJobCoordinator:
             self._traces.pop(active.generation_id, None)
             raise
         await self._documents.discard(
+            session_id=self._session_id,
+            generation_id=active.generation_id,
+        )
+        await self._documents.discard_drafts(
             session_id=self._session_id,
             generation_id=active.generation_id,
         )
@@ -576,41 +808,65 @@ class SvgCanvasJobCoordinator:
             await self._event_sink.interaction_rejected(event, error)
             return None
 
-    async def interrupt_turn(self, *, source_turn_id: str) -> None:
-        await self._cancel_pending_turn(
-            source_turn_id=source_turn_id,
-            discard_reason=CanvasDocumentDiscardReason.INTERRUPTED_BEFORE_PRESENTATION,
-            rejection_message="canvas generation was cancelled by interruption",
-        )
+    async def cancel_pending(self) -> tuple[str, ...]:
+        """Explicitly cancel unpresented canvas-workspace work.
 
-    async def expire_turn(self, *, source_turn_id: str) -> tuple[str, ...]:
-        """Retire unpresented work when explicitly superseding its source."""
+        An active presented scene remains intact; only a generating or prepared
+        candidate is retired.
+        """
 
-        return await self._cancel_pending_turn(
-            source_turn_id=source_turn_id,
+        return await self._cancel_workspace_pending(
             discard_reason=CanvasDocumentDiscardReason.SUPERSEDED,
-            rejection_message="canvas generation was explicitly superseded",
+            rejection_message="canvas generation was explicitly cancelled",
+            terminal_status=SvgCanvasExecutionStatus.CANCELLED,
         )
 
-    async def _cancel_pending_turn(
+    async def _cancel_workspace_pending(
         self,
         *,
-        source_turn_id: str,
         discard_reason: CanvasDocumentDiscardReason,
         rejection_message: str,
+        terminal_status: SvgCanvasExecutionStatus,
+        exclude_generation_id: str | None = None,
     ) -> tuple[str, ...]:
         async with self._lock:
             jobs = [
                 job
                 for job in self._jobs.values()
-                if job.source_turn_id == source_turn_id
+                if job.workspace_owned
+                and job.generation_id != exclude_generation_id
+                and job.generation_id not in self._cancelled_generations
             ]
             self._cancelled_generations.update(job.generation_id for job in jobs)
-            candidate = self._state.discard_candidate_for_interrupted_turn(
-                source_turn_id=source_turn_id
-            )
+            candidate = self._state.candidate
+            if (
+                candidate is not None
+                and candidate.generation_id != exclude_generation_id
+            ):
+                candidate = self._state.discard_candidate(
+                    generation_id=candidate.generation_id
+                )
+            else:
+                candidate = None
             if candidate is not None:
                 self._presentation_offsets.pop(candidate.generation_id, None)
+        return await self._finalize_pending_cancellation(
+            jobs=jobs,
+            candidate=candidate,
+            discard_reason=discard_reason,
+            rejection_message=rejection_message,
+            terminal_status=terminal_status,
+        )
+
+    async def _finalize_pending_cancellation(
+        self,
+        *,
+        jobs: list[_AcceptedCanvasJob],
+        candidate: SvgCanvasCandidate | None,
+        discard_reason: CanvasDocumentDiscardReason,
+        rejection_message: str,
+        terminal_status: SvgCanvasExecutionStatus = SvgCanvasExecutionStatus.CANCELLED,
+    ) -> tuple[str, ...]:
         for job in jobs:
             try:
                 await self._specialist.cancel(generation_id=job.generation_id)
@@ -619,7 +875,7 @@ class SvgCanvasJobCoordinator:
                     "canvas_specialist_cancel_failed session_id=%s "
                     "source_turn_id=%s generation_id=%s",
                     self._session_id,
-                    source_turn_id,
+                    job.source_turn_id,
                     job.generation_id,
                 )
             finally:
@@ -628,12 +884,29 @@ class SvgCanvasJobCoordinator:
         tasks = [job.task for job in jobs if job.task is not None]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        for job in jobs:
+            self._finish_execution_if_pending(
+                job.generation_id,
+                terminal_status,
+                reason=rejection_message,
+            )
+        if candidate is not None:
+            self._finish_execution_if_pending(
+                candidate.generation_id,
+                terminal_status,
+                reason=rejection_message,
+            )
         retired: list[str] = []
         if candidate is not None:
             await self._documents.discard(
                 session_id=self._session_id,
                 generation_id=candidate.generation_id,
             )
+            await self._documents.discard_drafts(
+                session_id=self._session_id,
+                generation_id=candidate.generation_id,
+            )
+            self._cancel_presentation_timeout(candidate.generation_id)
             await self._event_sink.document_discarded(
                 candidate,
                 discard_reason,
@@ -667,6 +940,44 @@ class SvgCanvasJobCoordinator:
             self._traces.pop(candidate.generation_id, None)
         return tuple(retired)
 
+    def render_realtime_context(self) -> str:
+        """Render bounded semantic canvas state without transport identifiers."""
+
+        pending_visual = self._render_pending_visual_context()
+        return self._state.render_realtime_context(pending_visual=pending_visual)
+
+    def _render_pending_visual_context(self) -> str:
+        workspace_jobs = [
+            job
+            for job in self._jobs.values()
+            if job.workspace_owned
+            and job.generation_id not in self._cancelled_generations
+        ]
+        if workspace_jobs:
+            job = max(
+                workspace_jobs,
+                key=lambda item: self._traces[item.generation_id].accepted_at,
+            )
+            trace = self._traces[job.generation_id]
+            return (
+                '<pending_visual state="generating" '
+                f'operation="{escape(str(trace.operation))}" '
+                f'interaction_mode="{escape(str(job.request.interaction_mode))}">'
+                f"<purpose>{escape(job.request.brief)}</purpose>"
+                "</pending_visual>"
+            )
+        candidate = self._state.candidate
+        if candidate is None:
+            return ""
+        document = candidate.document
+        return (
+            '<pending_visual state="ready" '
+            f'interaction_mode="{escape(str(document.interaction_mode))}">'
+            f"<title>{escape(document.title)}</title>"
+            f"<description>{escape(document.description)}</description>"
+            "</pending_visual>"
+        )
+
     async def wait_for_background_work(self) -> None:
         async with self._lock:
             tasks = [job.task for job in self._jobs.values() if job.task is not None]
@@ -680,6 +991,29 @@ class SvgCanvasJobCoordinator:
             self._closed = True
             jobs = list(self._jobs.values())
             self._cancelled_generations.update(job.generation_id for job in jobs)
+            candidate = self._state.candidate
+            if candidate is not None:
+                self._state.discard_candidate(generation_id=candidate.generation_id)
+                self._presentation_offsets.pop(candidate.generation_id, None)
+            timeout_tasks = tuple(self._presentation_timeouts.values())
+            self._presentation_timeouts.clear()
+            for job in jobs:
+                if job.workspace_owned:
+                    self._finish_execution_if_pending(
+                        job.generation_id,
+                        SvgCanvasExecutionStatus.CANCELLED,
+                        reason="sessionClosed",
+                    )
+            if candidate is not None:
+                self._finish_execution_if_pending(
+                    candidate.generation_id,
+                    SvgCanvasExecutionStatus.CANCELLED,
+                    reason="sessionClosed",
+                )
+        for timeout_task in timeout_tasks:
+            timeout_task.cancel()
+        if timeout_tasks:
+            await asyncio.gather(*timeout_tasks, return_exceptions=True)
         for job in jobs:
             try:
                 await self._specialist.cancel(generation_id=job.generation_id)
@@ -713,7 +1047,10 @@ class SvgCanvasJobCoordinator:
                 generation_id=job.generation_id,
                 source_turn_id=job.source_turn_id,
             )
-            generation = await self._specialist.generate(job.request)
+            generation = await self._specialist.generate(
+                job.request,
+                draft_sink=lambda draft: self._publish_visible_draft(job, draft),
+            )
             async with self._lock:
                 if (
                     job.generation_id not in self._jobs
@@ -732,6 +1069,10 @@ class SvgCanvasJobCoordinator:
                     session_id=self._session_id,
                     candidate=candidate,
                 )
+                self._state.workspace.advance_execution(
+                    job.generation_id,
+                    SvgCanvasExecutionStatus.PREPARING,
+                )
                 self._log(
                     "documentPublished",
                     generation_id=job.generation_id,
@@ -745,6 +1086,11 @@ class SvgCanvasJobCoordinator:
                     manifestSha256=candidate.document.manifest_sha256,
                 )
             await self._event_sink.document_available(stored)
+            async with self._lock:
+                if self._state.candidate is not None and (
+                    self._state.candidate.generation_id == job.generation_id
+                ):
+                    self._start_presentation_timeout(job)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -756,13 +1102,24 @@ class SvgCanvasJobCoordinator:
                     and pending_candidate.generation_id == job.generation_id
                 ):
                     self._state.discard_candidate(generation_id=job.generation_id)
+                self._presentation_offsets.pop(job.generation_id, None)
+                self._cancel_presentation_timeout(job.generation_id)
+            if cancelled:
+                return
+            code, retryable = _generation_failure(error)
+            self._finish_execution_if_pending(
+                job.generation_id,
+                SvgCanvasExecutionStatus.FAILED,
+                reason=str(code),
+            )
             await self._documents.discard(
                 session_id=self._session_id,
                 generation_id=job.generation_id,
             )
-            if cancelled:
-                return
-            code, retryable = _generation_failure(error)
+            await self._documents.discard_drafts(
+                session_id=self._session_id,
+                generation_id=job.generation_id,
+            )
             await self._event_sink.generation_rejected(
                 generation_id=job.generation_id,
                 source_turn_id=job.source_turn_id,
@@ -782,6 +1139,126 @@ class SvgCanvasJobCoordinator:
             async with self._lock:
                 self._jobs.pop(job.generation_id, None)
                 self._cancelled_generations.discard(job.generation_id)
+
+    async def _publish_visible_draft(
+        self,
+        job: _AcceptedCanvasJob,
+        draft: SvgCanvasVisibleDraft,
+    ) -> None:
+        async with self._lock:
+            if (
+                self._closed
+                or job.generation_id not in self._jobs
+                or job.generation_id in self._cancelled_generations
+            ):
+                return
+            if draft.generation_id != job.generation_id:
+                raise RuntimeError(
+                    "SVG draft generation identity does not match its job"
+                )
+            self._state.workspace.advance_execution(
+                job.generation_id,
+                SvgCanvasExecutionStatus.DRAFT_VISIBLE,
+            )
+            stored = await self._documents.publish_draft(
+                session_id=self._session_id,
+                source_turn_id=job.source_turn_id,
+                draft=draft,
+            )
+        await self._event_sink.draft_available(stored)
+        self._log(
+            "draftAvailable",
+            generation_id=job.generation_id,
+            source_turn_id=job.source_turn_id,
+            draftIndex=draft.draft_index,
+            attempt=draft.attempt,
+            svgByteLength=len(draft.document.svg_bytes),
+            svgSha256=draft.document.svg_sha256,
+            authoritative=False,
+            interactive=False,
+        )
+
+    def _start_presentation_timeout(self, job: _AcceptedCanvasJob) -> None:
+        if job.generation_id in self._presentation_timeouts:
+            raise RuntimeError("canvas presentation timeout was already started")
+        self._presentation_timeouts[job.generation_id] = asyncio.create_task(
+            self._expire_unpresented_candidate(job),
+            name=f"ava-svg-presentation-timeout-{job.generation_id}",
+        )
+
+    async def _expire_unpresented_candidate(self, job: _AcceptedCanvasJob) -> None:
+        timeout_task = asyncio.current_task()
+        try:
+            await asyncio.sleep(self._presentation_timeout_seconds)
+            async with self._lock:
+                candidate = self._state.candidate
+                if (
+                    self._closed
+                    or candidate is None
+                    or candidate.generation_id != job.generation_id
+                ):
+                    return
+                discarded = self._state.discard_candidate(
+                    generation_id=job.generation_id
+                )
+                self._presentation_offsets.pop(job.generation_id, None)
+                self._finish_execution_if_pending(
+                    job.generation_id,
+                    SvgCanvasExecutionStatus.FAILED,
+                    reason="presentationTimeout",
+                )
+            await self._documents.discard(
+                session_id=self._session_id,
+                generation_id=job.generation_id,
+            )
+            await self._documents.discard_drafts(
+                session_id=self._session_id,
+                generation_id=job.generation_id,
+            )
+            await self._event_sink.document_discarded(
+                discarded,
+                CanvasDocumentDiscardReason.PRESENTATION_TIMEOUT,
+            )
+            await self._event_sink.generation_rejected(
+                generation_id=job.generation_id,
+                source_turn_id=job.source_turn_id,
+                code=CanvasGenerationRejectionCode.PRESENTATION_FAILED,
+                message="The canvas was not presented before its deadline.",
+                retryable=False,
+            )
+            self._log(
+                "failed",
+                generation_id=job.generation_id,
+                source_turn_id=job.source_turn_id,
+                failureKind="presentationTimeout",
+            )
+            self._traces.pop(job.generation_id, None)
+        finally:
+            async with self._lock:
+                current = self._presentation_timeouts.get(job.generation_id)
+                if current is timeout_task:
+                    self._presentation_timeouts.pop(job.generation_id, None)
+
+    def _cancel_presentation_timeout(self, generation_id: str) -> None:
+        task = self._presentation_timeouts.pop(generation_id, None)
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    def _finish_execution_if_pending(
+        self,
+        generation_id: str,
+        status: SvgCanvasExecutionStatus,
+        *,
+        reason: str,
+    ) -> None:
+        execution = self._state.workspace.execution(generation_id)
+        if execution is None or execution.status.terminal:
+            return
+        self._state.workspace.finish_execution(
+            generation_id,
+            status,
+            reason=reason,
+        )
 
     def _log(
         self,

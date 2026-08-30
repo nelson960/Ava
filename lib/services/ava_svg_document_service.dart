@@ -36,6 +36,9 @@ final class AvaSvgDocumentFetchResponse {
     required this.contentSha256,
     required this.cacheControl,
     required this.bytes,
+    this.canvasAuthority,
+    this.rendererCapabilityVersion,
+    this.validatorVersion,
     this.requestId,
   });
 
@@ -44,6 +47,9 @@ final class AvaSvgDocumentFetchResponse {
   final String? protocolVersion;
   final String? contentSha256;
   final String? cacheControl;
+  final String? canvasAuthority;
+  final String? rendererCapabilityVersion;
+  final String? validatorVersion;
   final Stream<List<int>> bytes;
   final String? requestId;
 }
@@ -80,6 +86,10 @@ final class IoAvaSvgDocumentTransport implements AvaSvgDocumentTransport {
       protocolVersion: response.headers.value('x-ava-protocol-version'),
       contentSha256: response.headers.value('x-content-sha256'),
       cacheControl: response.headers.value(HttpHeaders.cacheControlHeader),
+      canvasAuthority: response.headers.value('x-ava-canvas-authority'),
+      rendererCapabilityVersion:
+          response.headers.value('x-ava-renderer-capability-version'),
+      validatorVersion: response.headers.value('x-ava-validator-version'),
       bytes: response.timeout(timeout),
       requestId: response.headers.value('x-request-id'),
     );
@@ -92,6 +102,10 @@ final class IoAvaSvgDocumentTransport implements AvaSvgDocumentTransport {
 abstract interface class AvaSvgDocumentLoader {
   Future<AvaValidatedSvgCanvasDocument> fetch(
     AvaSvgCanvasDocumentDescriptorV4 descriptor,
+  );
+
+  Future<AvaValidatedSvgCanvasDraft> fetchDraft(
+    AvaSvgCanvasDraftDescriptorV4 descriptor,
   );
 
   void close();
@@ -156,6 +170,7 @@ final class AvaSvgDocumentService implements AvaSvgDocumentLoader {
         expectedHash: descriptor.svgSha256,
         expectedLength: descriptor.svgByteLength,
         maximumLength: avaSvgMaximumDocumentBytes,
+        expectedAuthority: 'candidate',
       );
       svgRead.stop();
       _record(
@@ -172,6 +187,7 @@ final class AvaSvgDocumentService implements AvaSvgDocumentLoader {
         expectedHash: descriptor.manifestSha256,
         expectedLength: descriptor.manifestByteLength,
         maximumLength: avaSvgMaximumManifestBytes,
+        expectedAuthority: 'candidate',
       );
       manifestRead.stop();
       _record(
@@ -217,6 +233,50 @@ final class AvaSvgDocumentService implements AvaSvgDocumentLoader {
   }
 
   @override
+  Future<AvaValidatedSvgCanvasDraft> fetchDraft(
+    AvaSvgCanvasDraftDescriptorV4 descriptor,
+  ) async {
+    final total = Stopwatch()..start();
+    _recordDraft('canvas.draft.fetch_started', descriptor);
+    try {
+      final response = await _transport.get(
+        endpoint: _resolveDraftPath(descriptor),
+        headers: _headers('image/svg+xml'),
+        timeout: _timeout,
+      );
+      final svgBytes = await _read(
+        response,
+        expectedContentType: 'image/svg+xml',
+        expectedHash: descriptor.svgSha256,
+        expectedLength: descriptor.svgByteLength,
+        maximumLength: avaSvgMaximumDocumentBytes,
+        expectedAuthority: 'draft',
+      );
+      final draft = AvaValidatedSvgCanvasDraft.verify(
+        descriptor: descriptor,
+        svgBytes: svgBytes,
+      );
+      total.stop();
+      _recordDraft(
+        'canvas.draft.fetch_completed',
+        descriptor,
+        stageDuration: total.elapsed,
+        fields: {'svgByteLength': svgBytes.length},
+      );
+      return draft;
+    } on Object catch (error) {
+      total.stop();
+      _recordDraft(
+        'canvas.draft.fetch_failed',
+        descriptor,
+        stageDuration: total.elapsed,
+        fields: {'failureType': error.runtimeType.toString()},
+      );
+      rethrow;
+    }
+  }
+
+  @override
   void close() => _transport.close();
 
   void _record(
@@ -236,6 +296,27 @@ final class AvaSvgDocumentService implements AvaSvgDocumentLoader {
           'sceneRevision': descriptor.sceneRevision,
           'svgSha256': descriptor.svgSha256,
           'manifestSha256': descriptor.manifestSha256,
+          ...fields,
+        },
+      ),
+    );
+  }
+
+  void _recordDraft(
+    String stage,
+    AvaSvgCanvasDraftDescriptorV4 descriptor, {
+    Duration stageDuration = Duration.zero,
+    Map<String, Object?> fields = const {},
+  }) {
+    _telemetry?.call(
+      AvaSvgCanvasTelemetryEvent(
+        stage: stage,
+        stageDuration: stageDuration,
+        fields: {
+          'generationId': descriptor.generationId,
+          'sourceTurnId': descriptor.sourceTurnId,
+          'draftIndex': descriptor.draftIndex,
+          'svgSha256': descriptor.svgSha256,
           ...fields,
         },
       ),
@@ -272,12 +353,62 @@ final class AvaSvgDocumentService implements AvaSvgDocumentLoader {
     return resolved;
   }
 
+  Uri _resolveDraftPath(AvaSvgCanvasDraftDescriptorV4 descriptor) {
+    final base = _documentBaseUrl;
+    final segments = base.pathSegments;
+    if (segments.length < 2 ||
+        segments.last != 'canvas-documents' ||
+        segments[segments.length - 2] != descriptor.sessionId) {
+      throw const FormatException(
+        'Canvas document base URL does not identify the draft session.',
+      );
+    }
+    final expectedSegments = [
+      ...segments.take(segments.length - 1),
+      'canvas-drafts',
+      descriptor.generationId,
+      '${descriptor.draftIndex}',
+      'svg',
+    ];
+    final expectedPath = '/${expectedSegments.join('/')}';
+    if (descriptor.svgPath != expectedPath) {
+      throw const FormatException(
+        'Canvas draft path does not match its authenticated identity.',
+      );
+    }
+    return _resolveSameOriginPath(descriptor.svgPath);
+  }
+
+  Uri _resolveSameOriginPath(String path) {
+    final base = _documentBaseUrl;
+    if (!base.hasScheme ||
+        !base.hasAuthority ||
+        base.userInfo.isNotEmpty ||
+        base.query.isNotEmpty ||
+        base.fragment.isNotEmpty ||
+        !path.startsWith('/')) {
+      throw const FormatException(
+        'Canvas asset path escaped its authenticated origin.',
+      );
+    }
+    final resolved = base.replace(path: path, query: null, fragment: null);
+    if (resolved.scheme != base.scheme ||
+        resolved.host != base.host ||
+        resolved.port != base.port) {
+      throw const FormatException(
+        'Canvas asset path changed its authenticated origin.',
+      );
+    }
+    return resolved;
+  }
+
   Future<Uint8List> _read(
     AvaSvgDocumentFetchResponse response, {
     required String expectedContentType,
     required String expectedHash,
     required int expectedLength,
     required int maximumLength,
+    required String expectedAuthority,
   }) async {
     if (response.statusCode != HttpStatus.ok) {
       await _drainBounded(response.bytes, maximumLength: 4096);
@@ -290,7 +421,10 @@ final class AvaSvgDocumentService implements AvaSvgDocumentLoader {
     if (response.protocolVersion != '4' ||
         response.contentType != expectedContentType ||
         response.contentSha256 != expectedHash ||
-        response.cacheControl?.toLowerCase() != 'no-store') {
+        response.cacheControl?.toLowerCase() != 'no-store' ||
+        response.canvasAuthority != expectedAuthority ||
+        response.rendererCapabilityVersion != avaSvgRendererCapabilityVersion ||
+        response.validatorVersion != avaSvgValidatorVersion) {
       await _drainBounded(response.bytes, maximumLength: maximumLength);
       throw AvaSvgDocumentFetchException(
         message: 'Ava backend returned invalid canvas document metadata.',

@@ -146,31 +146,10 @@ void main() {
     expect(cancelled['turnId'], 'turn-v4-vad');
     expect(cancelled['reason'], 'providerSpeechStarted');
     expect(scenario.media.microphoneEnabled, isTrue);
-    final canvasCancelled = Completer<void>();
-    void observeCanvasCancellation() {
-      if (scenario.runtime.canvasController.generation == null &&
-          !canvasCancelled.isCompleted) {
-        canvasCancelled.complete();
-      }
-    }
-
-    scenario.runtime.canvasController.addListener(observeCanvasCancellation);
-    scenario.addControl({
-      'protocolVersion': 4,
-      'event': 'canvasRejected',
-      'sessionId': _sessionId,
-      'revision': 1,
-      'generationId': 'generation-v4-vad',
-      'sourceTurnId': 'turn-v4-vad',
-      'rejectionCode': 'cancelled',
-      'message': 'Canvas generation was cancelled by interruption.',
-      'retryable': false,
-    });
-    await canvasCancelled.future;
-    scenario.runtime.canvasController.removeListener(
-      observeCanvasCancellation,
+    expect(
+      scenario.runtime.canvasController.generation?.generationId,
+      'generation-v4-vad',
     );
-    expect(scenario.runtime.canvasController.generation, isNull);
     expect(scenario.runtime.canvasController.lastIssue, isNull);
 
     scenario.addControl({
@@ -196,6 +175,44 @@ void main() {
     );
     expect(scenario.presentation.state.renderedSampleCount, 3);
     expect(scenario.presentation.state.deliveredText, 'A');
+
+    await scenario.close();
+  });
+
+  test('tap interruption preserves accepted workspace canvas', () async {
+    final scenario = _DirectV4Scenario(
+      sessionId: _sessionId,
+      fadeStopSample: 4,
+    );
+    await scenario.start();
+    await scenario.sendTurnUntilSpeaking(
+      turnId: 'turn-v4-tap',
+      streamId: 'stream-v4-tap',
+    );
+    scenario.addControl({
+      'protocolVersion': 4,
+      'event': 'canvasGenerationStarted',
+      'sessionId': _sessionId,
+      'revision': 1,
+      'generationId': 'generation-v4-tap',
+      'sourceTurnId': 'turn-v4-tap',
+    });
+
+    await scenario.runtime.interrupt(reason: 'userTap');
+
+    final stopped = await scenario.raw.waitForSent(
+      (event) => event['event'] == 'playbackStopped',
+    );
+    final cancelled = await scenario.raw.waitForSent(
+      (event) => event['event'] == 'cancelTurn',
+    );
+    expect(stopped['renderedSampleCount'], 4);
+    expect(cancelled['reason'], 'userTap');
+    expect(
+      scenario.runtime.canvasController.generation?.generationId,
+      'generation-v4-tap',
+    );
+    expect(scenario.runtime.canvasController.lastIssue, isNull);
 
     await scenario.close();
   });
@@ -598,6 +615,15 @@ final class _UnexpectedDocumentLoader implements AvaSvgDocumentLoader {
   ) {
     throw StateError(
       'No canvas document should be fetched in this speech characterization.',
+    );
+  }
+
+  @override
+  Future<AvaValidatedSvgCanvasDraft> fetchDraft(
+    AvaSvgCanvasDraftDescriptorV4 descriptor,
+  ) {
+    throw StateError(
+      'No canvas draft should be fetched in this speech characterization.',
     );
   }
 

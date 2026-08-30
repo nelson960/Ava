@@ -1,0 +1,17 @@
+{
+  "protocolVersion": 4,
+  "event": "canvasDraftAvailable",
+  "sessionId": "session-1234",
+  "sequence": 1,
+  "revision": 2,
+  "generationId": "generation-1234",
+  "sourceTurnId": "turn-1234",
+  "draftIndex": 1,
+  "svgPath": "/v4/realtime/sessions/session-1234/canvas-drafts/generation-1234/1/svg",
+  "svgSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "svgByteLength": 2048,
+  "authoritative": false,
+  "interactive": false,
+  "rendererCapabilityVersion": "ava-svg-renderer-v2",
+  "validatorVersion": "ava-svg-validator-v2"
+}

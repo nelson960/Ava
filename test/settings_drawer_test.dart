@@ -266,6 +266,12 @@ final class _CanvasLoader implements AvaSvgDocumentLoader {
   }
 
   @override
+  Future<AvaValidatedSvgCanvasDraft> fetchDraft(
+    AvaSvgCanvasDraftDescriptorV4 descriptor,
+  ) =>
+      throw StateError('Unexpected canvas draft fetch.');
+
+  @override
   void close() {}
 }
 

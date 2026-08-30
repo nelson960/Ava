@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:ava/models/ava_realtime_protocol.dart';
@@ -9,6 +10,7 @@ import 'package:ava/services/ava_realtime_turn_runtime.dart';
 import 'package:ava/services/ava_realtime_webrtc.dart';
 import 'package:ava/services/ava_svg_document_service.dart';
 import 'package:ava/services/pcm_speech_output_service.dart';
+import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 const _sessionId = 'session-runtime-v4';
@@ -22,6 +24,59 @@ const _offerSdp = 'v=0\r\n'
     'm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n';
 
 void main() {
+  test('canvas draft event routes independently of a speech turn', () async {
+    final svgBytes = Uint8List.fromList(
+      utf8.encode('<svg xmlns="http://www.w3.org/2000/svg"></svg>'),
+    );
+    final loader = _RecordingDraftLoader(svgBytes);
+    final transport = DeterministicAvaRealtimeRawTransportV4([
+      _control({
+        'protocolVersion': 4,
+        'event': 'canvasGenerationStarted',
+        'sessionId': _sessionId,
+        'sequence': 0,
+        'revision': 1,
+        'generationId': 'generation-runtime-draft',
+        'sourceTurnId': 'turn-runtime-draft',
+      }),
+      _control({
+        'protocolVersion': 4,
+        'event': 'canvasDraftAvailable',
+        'sessionId': _sessionId,
+        'sequence': 1,
+        'revision': 2,
+        'generationId': 'generation-runtime-draft',
+        'sourceTurnId': 'turn-runtime-draft',
+        'draftIndex': 1,
+        'svgPath': '/v4/realtime/sessions/$_sessionId/canvas-drafts/'
+            'generation-runtime-draft/1/svg',
+        'svgSha256': sha256.convert(svgBytes).toString(),
+        'svgByteLength': svgBytes.length,
+        'authoritative': false,
+        'interactive': false,
+        'rendererCapabilityVersion': avaSvgRendererCapabilityVersion,
+        'validatorVersion': avaSvgValidatorVersion,
+      }),
+    ]);
+    final runtime = _runtimeWith(
+      transport: transport,
+      output: _RecordingPcmOutput(),
+      documents: loader,
+    );
+
+    await expectLater(
+      runtime.run(),
+      throwsA(isA<AvaRealtimeRuntimeException>()),
+    );
+    await Future<void>.delayed(Duration.zero);
+
+    expect(loader.fetched?.draftIndex, 1);
+    expect(runtime.canvasController.draft?.document.svgBytes,
+        orderedEquals(svgBytes));
+    expect(runtime.canvasController.active, isNull);
+    await runtime.close();
+  });
+
   test(
       'interruptRequested during synthesizing uses existing fade-stop after metadata',
       () async {
@@ -241,6 +296,7 @@ AvaRealtimeTurnRuntime _runtime(List<AvaRealtimeInboundFrameV4> frames) =>
 AvaRealtimeTurnRuntime _runtimeWith({
   required DeterministicAvaRealtimeRawTransportV4 transport,
   required _RecordingPcmOutput output,
+  AvaSvgDocumentLoader documents = const _UnexpectedDocumentLoader(),
 }) =>
     AvaRealtimeTurnRuntime(
       sessionId: _sessionId,
@@ -254,7 +310,7 @@ AvaRealtimeTurnRuntime _runtimeWith({
       ),
       mediaSession: DeterministicAvaRealtimeMediaSession(offerSdp: _offerSdp),
       transport: transport,
-      documents: const _UnexpectedDocumentLoader(),
+      documents: documents,
       speechOutput: output,
       presentation: AvaRealtimePresentationController(),
       volume: 0.8,
@@ -360,6 +416,39 @@ final class _UnexpectedDocumentLoader implements AvaSvgDocumentLoader {
     AvaSvgCanvasDocumentDescriptorV4 descriptor,
   ) =>
       throw StateError('Unexpected canvas document fetch.');
+
+  @override
+  Future<AvaValidatedSvgCanvasDraft> fetchDraft(
+    AvaSvgCanvasDraftDescriptorV4 descriptor,
+  ) =>
+      throw StateError('Unexpected canvas draft fetch.');
+
+  @override
+  void close() {}
+}
+
+final class _RecordingDraftLoader implements AvaSvgDocumentLoader {
+  _RecordingDraftLoader(this.svgBytes);
+
+  final Uint8List svgBytes;
+  AvaSvgCanvasDraftDescriptorV4? fetched;
+
+  @override
+  Future<AvaValidatedSvgCanvasDocument> fetch(
+    AvaSvgCanvasDocumentDescriptorV4 descriptor,
+  ) =>
+      throw StateError('Unexpected canvas document fetch.');
+
+  @override
+  Future<AvaValidatedSvgCanvasDraft> fetchDraft(
+    AvaSvgCanvasDraftDescriptorV4 descriptor,
+  ) async {
+    fetched = descriptor;
+    return AvaValidatedSvgCanvasDraft.verify(
+      descriptor: descriptor,
+      svgBytes: svgBytes,
+    );
+  }
 
   @override
   void close() {}

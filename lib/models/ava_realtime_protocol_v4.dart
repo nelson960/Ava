@@ -12,6 +12,7 @@ enum AvaRealtimeServerEventTypeV4 {
   alignmentBatch,
   interruptRequested,
   canvasGenerationStarted,
+  canvasDraftAvailable,
   canvasDocumentAvailable,
   canvasPresentationCue,
   canvasActivated,
@@ -22,6 +23,283 @@ enum AvaRealtimeServerEventTypeV4 {
   turnCompleted,
   turnCancelled,
   turnFailed,
+}
+
+enum AvaCanvasOrientationV4 { portrait, landscape, square }
+
+enum AvaCanvasLayoutClassV4 { compact, regular }
+
+enum AvaCanvasTouchEnvironmentV4 { direct, none }
+
+final class AvaCanvasNormalizedInsetsV4 {
+  const AvaCanvasNormalizedInsetsV4._({
+    required this.top,
+    required this.right,
+    required this.bottom,
+    required this.left,
+  });
+
+  final double top;
+  final double right;
+  final double bottom;
+  final double left;
+
+  Map<String, Object?> toJson() => {
+        'top': top,
+        'right': right,
+        'bottom': bottom,
+        'left': left,
+      };
+}
+
+/// Client-measured semantic composition context for the lower canvas panel.
+///
+/// Pixel dimensions never become SVG coordinates. The 600-point layout-class
+/// boundary is Flutter's ordinary compact/regular layout breakpoint and is
+/// applied independently to the measured usable width and height.
+final class AvaCanvasRenderProfileV4 {
+  const AvaCanvasRenderProfileV4._({
+    required this.usableAspectRatio,
+    required this.orientation,
+    required this.widthClass,
+    required this.heightClass,
+    required this.safeInsets,
+    required this.touchEnvironment,
+    required this.minimumInteractionTargetPoints,
+    required this.textScaleFactor,
+  });
+
+  static const double regularLayoutMinimumPoints = 600;
+  static const double directTouchMinimumTargetPoints = 44;
+
+  final double usableAspectRatio;
+  final AvaCanvasOrientationV4 orientation;
+  final AvaCanvasLayoutClassV4 widthClass;
+  final AvaCanvasLayoutClassV4 heightClass;
+  final AvaCanvasNormalizedInsetsV4 safeInsets;
+  final AvaCanvasTouchEnvironmentV4 touchEnvironment;
+  final double? minimumInteractionTargetPoints;
+  final double textScaleFactor;
+
+  factory AvaCanvasRenderProfileV4.measure({
+    required double workspaceWidthPoints,
+    required double workspaceHeightPoints,
+    required double safeTopPoints,
+    required double safeRightPoints,
+    required double safeBottomPoints,
+    required double safeLeftPoints,
+    required bool directTouch,
+    required double textScaleFactor,
+  }) {
+    final values = {
+      'workspaceWidthPoints': workspaceWidthPoints,
+      'workspaceHeightPoints': workspaceHeightPoints,
+      'safeTopPoints': safeTopPoints,
+      'safeRightPoints': safeRightPoints,
+      'safeBottomPoints': safeBottomPoints,
+      'safeLeftPoints': safeLeftPoints,
+      'textScaleFactor': textScaleFactor,
+    };
+    for (final entry in values.entries) {
+      if (!entry.value.isFinite) {
+        throw ArgumentError.value(entry.value, entry.key, 'must be finite');
+      }
+    }
+    if (workspaceWidthPoints <= 0 || workspaceHeightPoints <= 0) {
+      throw const FormatException(
+        'Canvas workspace dimensions must be positive.',
+      );
+    }
+    if (safeTopPoints < 0 ||
+        safeRightPoints < 0 ||
+        safeBottomPoints < 0 ||
+        safeLeftPoints < 0) {
+      throw const FormatException('Canvas safe insets cannot be negative.');
+    }
+    final usableWidth = workspaceWidthPoints - safeLeftPoints - safeRightPoints;
+    final usableHeight =
+        workspaceHeightPoints - safeTopPoints - safeBottomPoints;
+    if (usableWidth <= 0 || usableHeight <= 0) {
+      throw const FormatException(
+        'Canvas safe insets leave no usable presentation area.',
+      );
+    }
+    final normalized = AvaCanvasNormalizedInsetsV4._(
+      top: safeTopPoints / workspaceHeightPoints,
+      right: safeRightPoints / workspaceWidthPoints,
+      bottom: safeBottomPoints / workspaceHeightPoints,
+      left: safeLeftPoints / workspaceWidthPoints,
+    );
+    final normalizedValues = [
+      normalized.top,
+      normalized.right,
+      normalized.bottom,
+      normalized.left,
+    ];
+    if (normalizedValues.any((value) => value > 0.4) ||
+        normalized.left + normalized.right >= 0.8 ||
+        normalized.top + normalized.bottom >= 0.8) {
+      throw const FormatException(
+        'Canvas safe insets exceed protocol-v4 bounds.',
+      );
+    }
+    if (textScaleFactor < 0.75 || textScaleFactor > 3.0) {
+      throw const FormatException(
+        'Canvas text scale factor is outside protocol-v4 bounds.',
+      );
+    }
+    final ratio = usableWidth / usableHeight;
+    if (ratio < 0.25 || ratio > 4.0) {
+      throw const FormatException(
+        'Canvas usable aspect ratio is outside protocol-v4 bounds.',
+      );
+    }
+    final orientation = ratio >= 1.05
+        ? AvaCanvasOrientationV4.landscape
+        : ratio <= 0.95
+            ? AvaCanvasOrientationV4.portrait
+            : AvaCanvasOrientationV4.square;
+    return AvaCanvasRenderProfileV4._(
+      usableAspectRatio: ratio,
+      orientation: orientation,
+      widthClass: usableWidth < regularLayoutMinimumPoints
+          ? AvaCanvasLayoutClassV4.compact
+          : AvaCanvasLayoutClassV4.regular,
+      heightClass: usableHeight < regularLayoutMinimumPoints
+          ? AvaCanvasLayoutClassV4.compact
+          : AvaCanvasLayoutClassV4.regular,
+      safeInsets: normalized,
+      touchEnvironment: directTouch
+          ? AvaCanvasTouchEnvironmentV4.direct
+          : AvaCanvasTouchEnvironmentV4.none,
+      minimumInteractionTargetPoints:
+          directTouch ? directTouchMinimumTargetPoints : null,
+      textScaleFactor: textScaleFactor,
+    );
+  }
+
+  factory AvaCanvasRenderProfileV4.fromJson(Map<String, Object?> json) {
+    _requireExactKeys(
+      json,
+      const {
+        'usableAspectRatio',
+        'orientation',
+        'widthClass',
+        'heightClass',
+        'safeInsets',
+        'touchEnvironment',
+        'minimumInteractionTargetPoints',
+        'textScaleFactor',
+      },
+      'canvas render profile',
+    );
+    final ratio = _boundedFiniteNumber(
+      json,
+      'usableAspectRatio',
+      'canvas render profile',
+      minimum: 0.25,
+      maximum: 4,
+    );
+    final orientation = _enumValue(
+      AvaCanvasOrientationV4.values,
+      _requiredString(json, 'orientation', 'canvas render profile'),
+      'canvas render profile.orientation',
+    );
+    if ((orientation == AvaCanvasOrientationV4.portrait && ratio >= 1.05) ||
+        (orientation == AvaCanvasOrientationV4.landscape && ratio <= 0.95) ||
+        (orientation == AvaCanvasOrientationV4.square &&
+            (ratio <= 0.95 || ratio >= 1.05))) {
+      throw const FormatException(
+        'Canvas render profile orientation does not match its aspect ratio.',
+      );
+    }
+    final safeJson = _requiredObject(
+      json['safeInsets'],
+      'canvas render profile.safeInsets',
+    );
+    _requireExactKeys(
+      safeJson,
+      const {'top', 'right', 'bottom', 'left'},
+      'canvas render profile.safeInsets',
+    );
+    double inset(String key) => _boundedFiniteNumber(
+          safeJson,
+          key,
+          'canvas render profile.safeInsets',
+          minimum: 0,
+          maximum: 0.4,
+        );
+    final safeInsets = AvaCanvasNormalizedInsetsV4._(
+      top: inset('top'),
+      right: inset('right'),
+      bottom: inset('bottom'),
+      left: inset('left'),
+    );
+    if (safeInsets.left + safeInsets.right >= 0.8 ||
+        safeInsets.top + safeInsets.bottom >= 0.8) {
+      throw const FormatException(
+        'Canvas render profile safe insets leave too little drawable area.',
+      );
+    }
+    final touchEnvironment = _enumValue(
+      AvaCanvasTouchEnvironmentV4.values,
+      _requiredString(json, 'touchEnvironment', 'canvas render profile'),
+      'canvas render profile.touchEnvironment',
+    );
+    final rawMinimumTarget = json['minimumInteractionTargetPoints'];
+    final minimumTarget = rawMinimumTarget == null
+        ? null
+        : _boundedFiniteNumber(
+            json,
+            'minimumInteractionTargetPoints',
+            'canvas render profile',
+            minimum: 24,
+            maximum: 96,
+          );
+    if ((touchEnvironment == AvaCanvasTouchEnvironmentV4.direct &&
+            minimumTarget == null) ||
+        (touchEnvironment == AvaCanvasTouchEnvironmentV4.none &&
+            minimumTarget != null)) {
+      throw const FormatException(
+        'Canvas render profile touch environment and target size disagree.',
+      );
+    }
+    return AvaCanvasRenderProfileV4._(
+      usableAspectRatio: ratio,
+      orientation: orientation,
+      widthClass: _enumValue(
+        AvaCanvasLayoutClassV4.values,
+        _requiredString(json, 'widthClass', 'canvas render profile'),
+        'canvas render profile.widthClass',
+      ),
+      heightClass: _enumValue(
+        AvaCanvasLayoutClassV4.values,
+        _requiredString(json, 'heightClass', 'canvas render profile'),
+        'canvas render profile.heightClass',
+      ),
+      safeInsets: safeInsets,
+      touchEnvironment: touchEnvironment,
+      minimumInteractionTargetPoints: minimumTarget,
+      textScaleFactor: _boundedFiniteNumber(
+        json,
+        'textScaleFactor',
+        'canvas render profile',
+        minimum: 0.75,
+        maximum: 3,
+      ),
+    );
+  }
+
+  Map<String, Object?> toJson() => {
+        'usableAspectRatio': usableAspectRatio,
+        'orientation': orientation.name,
+        'widthClass': widthClass.name,
+        'heightClass': heightClass.name,
+        'safeInsets': safeInsets.toJson(),
+        'touchEnvironment': touchEnvironment.name,
+        'minimumInteractionTargetPoints': minimumInteractionTargetPoints,
+        'textScaleFactor': textScaleFactor,
+      };
 }
 
 final class AvaSessionLimitsV4 {
@@ -85,13 +363,18 @@ final class AvaSessionLimitsV4 {
 }
 
 final class AvaSessionCreateRequestV4 {
-  const AvaSessionCreateRequestV4({required this.ageBand});
+  const AvaSessionCreateRequestV4({
+    required this.ageBand,
+    required this.canvasRenderProfile,
+  });
 
   final AvaRealtimeAgeBand ageBand;
+  final AvaCanvasRenderProfileV4 canvasRenderProfile;
 
   Map<String, Object?> toJson() => {
         'protocolVersion': avaRealtimeProtocolVersionV4,
         'ageBand': ageBand.name,
+        'canvasRenderProfile': canvasRenderProfile.toJson(),
       };
 }
 
@@ -252,6 +535,7 @@ final class AvaRealtimeServerEventV4 {
 
   bool get isCanvas => switch (type) {
         AvaRealtimeServerEventTypeV4.canvasGenerationStarted ||
+        AvaRealtimeServerEventTypeV4.canvasDraftAvailable ||
         AvaRealtimeServerEventTypeV4.canvasDocumentAvailable ||
         AvaRealtimeServerEventTypeV4.canvasPresentationCue ||
         AvaRealtimeServerEventTypeV4.canvasActivated ||
@@ -325,6 +609,9 @@ final class AvaRealtimeServerEventV4 {
         _identifier(json, 'generationId', 'canvasGenerationStarted');
         _identifier(json, 'sourceTurnId', 'canvasGenerationStarted');
         break;
+      case AvaRealtimeServerEventTypeV4.canvasDraftAvailable:
+        AvaSvgCanvasDraftDescriptorV4.fromJson(json);
+        break;
       case AvaRealtimeServerEventTypeV4.canvasDocumentAvailable:
         AvaSvgCanvasDocumentDescriptorV4.fromJson(json);
         break;
@@ -368,10 +655,10 @@ final class AvaRealtimeServerEventV4 {
           'reason',
           'canvasDocumentDiscarded',
           const {
-            'interruptedBeforePresentation',
             'superseded',
             'sessionClosed',
             'rendererFailure',
+            'presentationTimeout',
           },
         );
         break;
@@ -412,6 +699,7 @@ final class AvaRealtimeServerEventV4 {
             'generationLimitExceeded',
             'staticValidationFailed',
             'preparationFailed',
+            'presentationFailed',
             'cancelled',
           },
         );
@@ -496,7 +784,7 @@ final class AvaRealtimeServerEventV4 {
               'segmentIndex',
               'segmentReady',
               minimum: 0,
-              maximum: 11,
+              maximum: 900,
             );
             final segmentJson =
                 _requiredObject(json['segment'], 'segmentReady.segment');
@@ -643,6 +931,7 @@ final class AvaRealtimeServerEventV4 {
             );
             break;
           case AvaRealtimeServerEventTypeV4.canvasGenerationStarted:
+          case AvaRealtimeServerEventTypeV4.canvasDraftAvailable:
           case AvaRealtimeServerEventTypeV4.canvasDocumentAvailable:
           case AvaRealtimeServerEventTypeV4.canvasPresentationCue:
           case AvaRealtimeServerEventTypeV4.canvasActivated:
@@ -700,6 +989,21 @@ final class AvaRealtimeClientEventV4 {
     _validateClientEvent(json);
     return AvaRealtimeClientEventV4._(json);
   }
+
+  factory AvaRealtimeClientEventV4.canvasRenderProfileUpdated({
+    required String sessionId,
+    required int sequence,
+    required int profileRevision,
+    required AvaCanvasRenderProfileV4 renderProfile,
+  }) =>
+      AvaRealtimeClientEventV4._validated({
+        'protocolVersion': avaRealtimeProtocolVersionV4,
+        'event': 'canvasRenderProfileUpdated',
+        'sessionId': sessionId,
+        'sequence': sequence,
+        'profileRevision': profileRevision,
+        'renderProfile': renderProfile.toJson(),
+      });
 
   factory AvaRealtimeClientEventV4.playbackStarted({
     required String sessionId,
@@ -870,6 +1174,23 @@ void _validateClientEvent(Map<String, Object?> json) {
             'clientReady SVG versions are unsupported.');
       }
       _speechIdentifier(json, 'sessionId', event);
+      break;
+    case 'canvasRenderProfileUpdated':
+      _requireExactKeys(
+        json,
+        {...common, 'profileRevision', 'renderProfile'},
+        event,
+      );
+      _boundedInt(
+        json,
+        'profileRevision',
+        event,
+        minimum: 1,
+        maximum: 1000000,
+      );
+      AvaCanvasRenderProfileV4.fromJson(
+        _requiredObject(json['renderProfile'], '$event.renderProfile'),
+      );
       break;
     case 'playbackStarted':
       _requireExactKeys(
@@ -1181,6 +1502,20 @@ int _boundedInt(
     throw FormatException('$label.$key is outside its bound.');
   }
   return value;
+}
+
+double _boundedFiniteNumber(
+  Map<String, Object?> json,
+  String key,
+  String label, {
+  required double minimum,
+  required double maximum,
+}) {
+  final value = json[key];
+  if (value is! num || !value.isFinite || value < minimum || value > maximum) {
+    throw FormatException('$label.$key is outside its finite bound.');
+  }
+  return value.toDouble();
 }
 
 bool _requiredBool(Map<String, Object?> json, String key, String label) {
