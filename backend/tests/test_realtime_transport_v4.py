@@ -10,7 +10,10 @@ import pytest
 
 from ava_backend.app import create_app
 from ava_backend.canvas.svg_delivery import SvgCanvasDocumentStore
-from ava_backend.canvas.svg_document import SvgDocumentValidator
+from ava_backend.canvas.svg_document import (
+    SvgDocumentValidator,
+    SvgDraftSafetyValidator,
+)
 from ava_backend.canvas.render_profile import CanvasRenderProfile
 from ava_backend.canvas.svg_session import SvgCanvasSessionState
 from ava_backend.canvas.svg_specialist import (
@@ -199,7 +202,9 @@ def test_v4_bootstrap_and_independent_exact_document_fetch() -> None:
                     generation_id="generation-v4",
                     draft_index=1,
                     attempt=0,
-                    document=generation.document,
+                    document=SvgDraftSafetyValidator(
+                        SvgDocumentValidator()
+                    ).validate(generation.document.svg_text),
                 ),
             )
         )

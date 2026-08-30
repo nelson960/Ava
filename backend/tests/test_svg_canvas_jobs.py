@@ -13,7 +13,10 @@ from ava_backend.canvas.svg_delivery import (
     SvgDocumentNotFoundError,
 )
 from ava_backend.canvas.render_profile import CanvasRenderProfile
-from ava_backend.canvas.svg_document import SvgDocumentValidator
+from ava_backend.canvas.svg_document import (
+    SvgDocumentValidator,
+    SvgDraftSafetyValidator,
+)
 from ava_backend.canvas.svg_session import (
     ActiveSvgCanvasScene,
     SvgCanvasCandidate,
@@ -63,6 +66,11 @@ def _document():
  aria-label="Rain cloud"><ellipse cx="500" cy="220" rx="140" ry="60"/></g>
 </svg>"""
     return SvgDocumentValidator().validate(svg)
+
+
+def _draft_document():
+    document = _document()
+    return SvgDraftSafetyValidator(SvgDocumentValidator()).validate(document.svg_text)
 
 
 class _Specialist:
@@ -142,7 +150,7 @@ class _ProgressiveSpecialist(_Specialist):
                 generation_id=request.generation_id,
                 draft_index=1,
                 attempt=0,
-                document=_document(),
+                document=_draft_document(),
             )
         )
         self.draft_emitted.set()
@@ -1051,7 +1059,10 @@ async def test_progressive_draft_is_visible_without_candidate_authority() -> Non
     assert state.candidate is None
     assert len(sink.drafts) == 1
     stored_draft = sink.drafts[0]
-    assert stored_draft.draft.document.bindings
+    assert stored_draft.draft.document.authoritative is False
+    assert stored_draft.draft.document.interactive is False
+    assert not hasattr(stored_draft.draft.document, "bindings")
+    assert not hasattr(stored_draft.draft.document, "manifest")
     assert "/canvas-drafts/" in stored_draft.svg_path
     assert (
         await documents.get_draft(

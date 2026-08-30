@@ -58,7 +58,7 @@ MAX_FUNCTION_ARGUMENT_BYTES = 256 * 1024
 MAX_PROVIDER_ERROR_BYTES = 64 * 1024
 _SIDEBAND_SEQUENCE_FIELD = "__ava_sideband_sequence"
 _CANVAS_INTERACTION_RESPONSE_MAX_OUTPUT_TOKENS = 256
-_CANVAS_TOOL_CONTINUATION_MAX_OUTPUT_TOKENS = 128
+_CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS = 512
 _MAX_CONSUMED_TERMINAL_RESPONSE_IDS = 64
 
 
@@ -689,7 +689,10 @@ class _OpenAIRealtimeEventChannel:
                     "conversation": "auto",
                     "output_modalities": ["text"],
                     "tool_choice": "none",
-                    "max_output_tokens": _CANVAS_TOOL_CONTINUATION_MAX_OUTPUT_TOKENS,
+                    "max_output_tokens": min(
+                        _CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS,
+                        self._max_output_tokens,
+                    ),
                 },
             }
         )

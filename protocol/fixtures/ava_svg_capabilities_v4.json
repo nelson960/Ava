@@ -193,11 +193,22 @@
     "visibility",
     "word-spacing"
   ],
+  "authoringContractVersion": "ava-svg-authoring-contract-v1",
   "documentContract": {
     "canonicalBytes": "exactUtf8ProviderOutput",
     "externalResources": false,
     "resolutionIndependentViewBox": true,
     "scripts": false
+  },
+  "identifierContract": {
+    "appliesTo": [
+      "bindingId",
+      "elementId",
+      "revealId",
+      "targetId"
+    ],
+    "maximumCharacters": 96,
+    "pattern": "^[A-Za-z_][A-Za-z0-9_.:-]{0,95}$"
   },
   "interactionEnvironment": {
     "clientExpandsCompactTargets": true,
@@ -205,6 +216,7 @@
     "manifestRequiredForAuthority": true
   },
   "interactionContract": {
+    "bindingElementRequiresId": true,
     "bindingCountByMode": {
       "explore": {
         "maximum": 32,
@@ -223,7 +235,48 @@
         "minimum": 2
       }
     },
-    "stepIndexes": "uniqueContiguousFromOne"
+    "bindingId": {
+      "required": true,
+      "syntax": "identifierContract",
+      "unique": true
+    },
+    "metadataRequiresBinding": [
+      "data-ava-reveal",
+      "data-ava-step",
+      "data-ava-target"
+    ],
+    "modeRules": {
+      "explore": {
+        "bindings": "required",
+        "reveals": "optionalDocumentLocalIds",
+        "stepIndexes": "forbidden"
+      },
+      "none": {
+        "bindings": "forbidden",
+        "reveals": "forbidden",
+        "stepIndexes": "forbidden"
+      },
+      "select": {
+        "bindings": "required",
+        "reveals": "forbidden",
+        "stepIndexes": "forbidden"
+      },
+      "steps": {
+        "bindings": "required",
+        "reveals": "forbidden",
+        "stepIndexes": "requiredUniqueContiguousFromOne"
+      }
+    },
+    "revealIds": {
+      "mustResolveToDocumentElementIds": true,
+      "syntax": "identifierContract"
+    },
+    "stepIndexes": "uniqueContiguousFromOne",
+    "targetId": {
+      "explicitMustResolveToDocumentElementId": true,
+      "omittedDefaultsToBindingElement": true,
+      "syntax": "identifierContract"
+    }
   },
   "limits": {
     "attributeCharacters": 131072,
@@ -257,6 +310,8 @@
       "http://www.w3.org/XML/1998/namespace"
     ],
     "documentLocalFragmentsOnly": true,
+    "externalUrlsAllowed": false,
+    "finalReferencesMustResolve": true,
     "referenceAttributes": [
       "clip-path",
       "fill",

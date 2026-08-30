@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import xml.etree.ElementTree as ET
 
-from .svg_document import SvgDocumentValidationError, SvgDocumentValidator
+from .svg_document import SvgDocumentValidationError, SvgDraftSafetyValidator
 from .svg_specialist import SvgCanvasVisibleDraft
 
 _VISIBLE_GEOMETRY = frozenset(
@@ -11,14 +11,14 @@ _VISIBLE_GEOMETRY = frozenset(
 
 
 class ProgressiveSvgDraftBuilder:
-    """Projects complete, validated root-child prefixes from streamed Sol SVG."""
+    """Projects safe, non-authoritative root-child prefixes from streamed SVG."""
 
     def __init__(
         self,
         *,
         generation_id: str,
         attempt: int,
-        validator: SvgDocumentValidator,
+        validator: SvgDraftSafetyValidator,
         first_draft_index: int,
         maximum_drafts: int = 8,
         minimum_growth_characters: int = 128,

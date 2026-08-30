@@ -33,7 +33,8 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
   final List<AvaValidatedSvgCanvasDocument> _workspaceDocuments = [];
   AvaValidatedSvgCanvasDocument? _presentedDocument;
   bool _panelDismissed = false;
-  String? _lastPresentationGeneration;
+  String? _dismissedGenerationId;
+  String? _observedPendingGenerationId;
   AvaCanvasRenderProfileV4? _renderProfile;
   AvaCanvasRenderProfileV4? _lastSentRenderProfile;
   AvaCanvasRenderProfileUpdateSink? _renderProfileUpdateSink;
@@ -80,11 +81,10 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
 
   bool get panelVisible {
     if (_panelDismissed) return false;
-    return _presentedDocument != null ||
-        (_controller?.hasPendingVisual ?? false);
+    return _hasMeaningfulCanvasState;
   }
 
-  bool get canReopen => _panelDismissed && _presentedDocument != null;
+  bool get canReopen => _panelDismissed && _hasMeaningfulCanvasState;
 
   bool get generating {
     final phase = _controller?.lifecyclePhase;
@@ -120,8 +120,10 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     _renderProfileUpdateSink = renderProfileUpdateSink;
     _lastSentRenderProfile = initialRenderProfile;
     _renderProfileRevision = 0;
-    _lastPresentationGeneration = null;
+    _observedPendingGenerationId = null;
     controller.addListener(_handleControllerChanged);
+    _observePendingGeneration(controller);
+    _clearDismissalWithoutCanvasState();
     if (renderProfileUpdateSink != null &&
         !_sameRenderProfile(_renderProfile, initialRenderProfile)) {
       _renderProfileTimer = Timer(
@@ -142,19 +144,24 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     _lastSentRenderProfile = null;
     _renderProfileRevision = 0;
     _controller = null;
-    _lastPresentationGeneration = null;
+    _observedPendingGenerationId = null;
+    _clearDismissalWithoutCanvasState();
     notifyListeners();
   }
 
   void dismissPanel() {
     if (!panelVisible) return;
+    final generationId = _displayGenerationId;
+    if (generationId == null) return;
     _panelDismissed = true;
+    _dismissedGenerationId = generationId;
     notifyListeners();
   }
 
   void reopenPanel() {
     if (!canReopen) return;
     _panelDismissed = false;
+    _dismissedGenerationId = null;
     notifyListeners();
   }
 
@@ -168,13 +175,15 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     if (_workspaceDocuments.isEmpty &&
         _presentedDocument == null &&
         !_panelDismissed &&
-        _lastPresentationGeneration == null) {
+        _dismissedGenerationId == null &&
+        _observedPendingGenerationId == null) {
       return;
     }
     _workspaceDocuments.clear();
     _presentedDocument = null;
     _panelDismissed = false;
-    _lastPresentationGeneration = null;
+    _dismissedGenerationId = null;
+    _observedPendingGenerationId = null;
     notifyListeners();
   }
 
@@ -182,19 +191,43 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     final controller = _controller;
     if (controller == null) return;
     _retainPresentedDocument(controller);
-    final candidate = controller.candidate;
-    if (controller.hasPendingVisual) {
-      _panelDismissed = false;
-    }
-    if (candidate != null && controller.shouldPresentCandidate) {
-      final generation = candidate.descriptor.generationId;
-      if (_lastPresentationGeneration != generation) {
-        _lastPresentationGeneration = generation;
-        _panelDismissed = false;
-      }
-    }
+    _observePendingGeneration(controller);
+    _clearDismissalWithoutCanvasState();
     notifyListeners();
   }
+
+  bool get _hasMeaningfulCanvasState =>
+      _presentedDocument != null || (_controller?.hasPendingVisual ?? false);
+
+  String? get _displayGenerationId =>
+      _pendingGenerationId(_controller) ??
+      _controller?.active?.document.descriptor.generationId ??
+      _presentedDocument?.descriptor.generationId;
+
+  void _observePendingGeneration(AvaSvgCanvasController controller) {
+    final generationId = _pendingGenerationId(controller);
+    if (generationId == null) {
+      _observedPendingGenerationId = null;
+      return;
+    }
+    if (_observedPendingGenerationId == generationId) return;
+    _observedPendingGenerationId = generationId;
+    if (_panelDismissed && _dismissedGenerationId != generationId) {
+      _panelDismissed = false;
+      _dismissedGenerationId = null;
+    }
+  }
+
+  void _clearDismissalWithoutCanvasState() {
+    if (_hasMeaningfulCanvasState) return;
+    _panelDismissed = false;
+    _dismissedGenerationId = null;
+  }
+
+  String? _pendingGenerationId(AvaSvgCanvasController? controller) =>
+      controller?.candidate?.descriptor.generationId ??
+      controller?.draft?.document.descriptor.generationId ??
+      controller?.generation?.generationId;
 
   void _retainPresentedDocument(AvaSvgCanvasController controller) {
     final active = controller.active?.document;
@@ -281,6 +314,9 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     _controller = null;
     _workspaceDocuments.clear();
     _presentedDocument = null;
+    _panelDismissed = false;
+    _dismissedGenerationId = null;
+    _observedPendingGenerationId = null;
     super.dispose();
   }
 }

@@ -37,6 +37,9 @@ final class AvaSvgCanvasPanel extends StatelessWidget {
       return controller;
     }
 
+    final hasVisualContent =
+        active != null || draft != null || candidate != null;
+
     return Material(
       color: const Color(0xFFF8FBFB),
       elevation: 18,
@@ -100,7 +103,13 @@ final class AvaSvgCanvasPanel extends StatelessWidget {
               },
             ),
           ),
-          if (hasPending)
+          if (!hasVisualContent)
+            const Positioned.fill(
+              child: IgnorePointer(
+                child: _CanvasGeneratingPlaceholder(),
+              ),
+            ),
+          if (hasPending && hasVisualContent)
             Positioned(
               left: 16,
               top: 12,
@@ -128,6 +137,57 @@ final class AvaSvgCanvasPanel extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+final class _CanvasGeneratingPlaceholder extends StatelessWidget {
+  const _CanvasGeneratingPlaceholder();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      color: const Color(0xFFF8FBFB),
+      alignment: Alignment.center,
+      child: Semantics(
+        liveRegion: true,
+        label: 'Ava is drawing a visual',
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 56,
+              height: 56,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: AvaColors.tealSoft,
+                border: Border.all(
+                  color: AvaColors.teal.withValues(alpha: 0.2),
+                ),
+              ),
+              child: const Center(
+                child: SizedBox.square(
+                  dimension: 24,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2.5,
+                    color: AvaColors.teal,
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            const Text(
+              'Ava is drawing…',
+              style: TextStyle(
+                color: AvaColors.ink,
+                fontSize: 16,
+                fontWeight: FontWeight.w700,
+                letterSpacing: -0.2,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

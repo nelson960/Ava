@@ -20,6 +20,7 @@ from openai import (
 from ..canvas.svg_document import (
     SvgDocumentValidationError,
     SvgDocumentValidator,
+    SvgDraftSafetyValidator,
     SvgValidationFeedback,
     SvgValidationLimits,
 )
@@ -122,6 +123,7 @@ class OpenAISvgCanvasSpecialist:
         self._validator = validator or SvgDocumentValidator(
             SvgValidationLimits(max_bytes=settings.canvas_max_svg_bytes)
         )
+        self._draft_validator = SvgDraftSafetyValidator(self._validator)
         self._monotonic = monotonic
         self._active: dict[str, asyncio.Task[object]] = {}
         self._closed = False
@@ -169,6 +171,7 @@ class OpenAISvgCanvasSpecialist:
                             if validation_feedback is not None
                             else None
                         ),
+                        **_validation_diagnostic_fields(validation_feedback),
                     )
                 attempt_budget = (
                     self._settings.openai_canvas_timeout_seconds
@@ -298,6 +301,9 @@ class OpenAISvgCanvasSpecialist:
                 except SvgDocumentValidationError as error:
                     validation_feedback = error.feedback
                     failed_svg = svg_text
+                    validation_diagnostics = _validation_diagnostic_fields(
+                        validation_feedback
+                    )
                     self._log(
                         "validationCompleted",
                         request=request,
@@ -307,6 +313,7 @@ class OpenAISvgCanvasSpecialist:
                         failureCode=error.code,
                         providerRequestId=provider_request_id,
                         svgByteLength=len(svg_text.encode("utf-8")),
+                        **validation_diagnostics,
                     )
                     if attempt > 0:
                         self._log(
@@ -316,6 +323,7 @@ class OpenAISvgCanvasSpecialist:
                             elapsed_from=generation_started_at,
                             result="rejected",
                             failureCode=error.code,
+                            **validation_diagnostics,
                         )
                     if (
                         attempt < self._settings.openai_canvas_max_quality_repairs
@@ -329,6 +337,7 @@ class OpenAISvgCanvasSpecialist:
                         elapsed_from=generation_started_at,
                         failureCode=error.code,
                         failureKind="validation",
+                        **validation_diagnostics,
                     )
                     raise SvgCanvasSpecialistInvalidError(
                         "SVG canvas specialist returned a rejected static document "
@@ -510,8 +519,13 @@ class OpenAISvgCanvasSpecialist:
             )
             model_input += (
                 '\n<validation_repair trust="deterministic_validator_feedback">\n'
-                "Return one complete replacement SVG addressing the deterministic "
-                "rejection. Application validation remains authoritative.\n"
+                "Return one complete replacement SVG satisfying the entire versioned "
+                "renderer capability contract in the system instructions, not merely "
+                "patching the reported symptom. Application validation remains "
+                "authoritative. Before returning the replacement, re-check every "
+                "element ID, binding ID, binding target ID, reveal ID, and local SVG "
+                "reference for valid syntax, uniqueness where required, and resolution "
+                "against an element ID in the replacement document.\n"
                 f"<validation_feedback>{escape(feedback_json)}"
                 "</validation_feedback>\n"
                 f"{failed_document}"
@@ -619,7 +633,7 @@ class OpenAISvgCanvasSpecialist:
             ProgressiveSvgDraftBuilder(
                 generation_id=request.generation_id,
                 attempt=attempt,
-                validator=self._validator,
+                validator=self._draft_validator,
                 first_draft_index=first_draft_index,
                 maximum_drafts=max(1, 8 - first_draft_index + 1),
             )
@@ -982,6 +996,20 @@ def _provider_error_field(body: object, *names: str) -> str | None:
         if isinstance(value, str) and value.strip():
             return value.strip()[:120]
     return None
+
+
+def _validation_diagnostic_fields(
+    feedback: SvgValidationFeedback | None,
+) -> dict[str, object]:
+    if feedback is None:
+        return {}
+    values: dict[str, object | None] = {
+        "validationCategory": feedback.category.value,
+        "affectedElementName": feedback.element_name,
+        "affectedAttribute": feedback.attribute,
+        "limitName": feedback.limit_name,
+    }
+    return {key: value for key, value in values.items() if value is not None}
 
 
 _REPAIRABLE_VALIDATION_CODES = frozenset(

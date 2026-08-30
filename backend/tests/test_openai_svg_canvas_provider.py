@@ -7,7 +7,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from ava_backend.canvas.svg_document import SafeSvgDraftDocument
 from ava_backend.canvas.svg_specialist import (
+    SvgCanvasSpecialistGeneration,
     SvgCanvasVisibleDraft,
     SvgCanvasSpecialistGenerationLimitError,
     SvgCanvasSpecialistInvalidError,
@@ -322,7 +324,7 @@ async def test_none_interaction_mode_prefers_a_static_svg() -> None:
     assert generation.document.bindings == {}
     instructions = client.responses.arguments[0]["instructions"]
     assert isinstance(instructions, str)
-    assert "`none` is static" in instructions
+    assert '"none":{"bindings":"forbidden"' in instructions
 
 
 async def test_explicit_interaction_mode_allows_matching_bindings() -> None:
@@ -352,7 +354,8 @@ async def test_explicit_interaction_mode_allows_matching_bindings() -> None:
     assert "`aria-label` describes the exact semantic meaning" in instructions
     assert "self-contained enough to ground a short spoken response" in instructions
     assert "`data-ava-target` is visual/identity metadata" in instructions
-    assert "Omit `data-ava-target`" in instructions
+    assert '"omittedDefaultsToBindingElement":true' in instructions
+    assert '"explicitMustResolveToDocumentElementId":true' in instructions
 
 
 @pytest.mark.parametrize(
@@ -466,7 +469,9 @@ def test_exact_extractor_rejects_every_noncanonical_envelope(response: object) -
         extract_completed_svg_output_text(response)
 
 
-async def test_provider_permits_one_deterministic_repair() -> None:
+async def test_provider_permits_one_deterministic_repair(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     invalid = _svg().replace(
         '<ellipse id="cloud"',
         '<ellipse id="cloud" foo="bar"',
@@ -480,7 +485,8 @@ async def test_provider_permits_one_deterministic_repair() -> None:
         client=client,  # type: ignore[arg-type]
     )
 
-    generation = await provider.generate(_request())
+    with caplog.at_level(logging.INFO, logger="ava_backend.openai_svg_canvas"):
+        generation = await provider.generate(_request())
 
     assert generation.document.svg_text == valid
     assert generation.provider_request_id == "resp_456"
@@ -493,6 +499,31 @@ async def test_provider_permits_one_deterministic_repair() -> None:
     assert "&quot;affectedAttribute&quot;:&quot;foo&quot;" in repair_input
     assert "&quot;affectedElementId&quot;:&quot;cloud&quot;" in repair_input
     assert "foo=&quot;bar&quot;" in repair_input
+    assert "satisfying the entire versioned renderer capability contract" in (
+        repair_input
+    )
+    assert "re-check every element ID, binding ID, binding target ID, reveal ID" in (
+        repair_input
+    )
+    repair_instructions = client.responses.arguments[1]["instructions"]
+    assert isinstance(repair_instructions, str)
+    assert '"authoringContractVersion":"ava-svg-authoring-contract-v1"' in (
+        repair_instructions
+    )
+    assert '"identifierContract"' in repair_instructions
+    rejected_validation = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage() == "svg_canvas_latency"
+        and record.ava_context["stage"] == "validationCompleted"
+        and record.ava_context["result"] == "rejected"
+    )
+    assert rejected_validation["validationCategory"] == "capability"
+    assert rejected_validation["failureCode"] == "attributeForbidden"
+    assert rejected_validation["affectedElementName"] == "ellipse"
+    assert rejected_validation["affectedAttribute"] == "foo"
+    assert rejected_validation["limitName"] == "allowedAttributes"
+    assert invalid not in caplog.text
 
 
 async def test_repair_receives_its_own_bounded_lifecycle_budget() -> None:
@@ -665,14 +696,19 @@ async def test_streaming_observability_uses_only_terminal_exact_svg(
     assert svg not in caplog.text
 
 
-async def test_streaming_publishes_only_validated_noncanonical_svg_prefixes() -> None:
+async def test_streaming_publishes_safe_noncanonical_svg_prefixes() -> None:
     first = (
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 480" '
-        'data-ava-interaction-mode="none">'
+        'data-ava-interaction-mode="explore">'
         "<title>Growing cloud</title><desc>A cloud forming in two visible parts.</desc>"
-        '<ellipse cx="260" cy="220" rx="130" ry="65" fill="#dff5ff"/>'
+        '<ellipse id="cloud" data-ava-binding="explore_cloud" '
+        'data-ava-reveal="detail" aria-label="Show how rain forms" '
+        'cx="260" cy="220" rx="130" ry="65" fill="#dff5ff"/>'
     )
-    second = '<circle cx="430" cy="210" r="72" fill="#c9eafa"/></svg>'
+    second = (
+        '<g id="detail"><circle cx="430" cy="210" r="72" fill="#c9eafa"/>'
+        '<text x="400" y="215">Rain</text></g></svg>'
+    )
     svg = first + second
     response = _response(svg)
     stream = _ResponseStream(response, fragments=[first, second])
@@ -689,7 +725,7 @@ async def test_streaming_publishes_only_validated_noncanonical_svg_prefixes() ->
     )
 
     generation = await provider.generate(
-        _request(interactionMode="none"),
+        _request(interactionMode="explore"),
         draft_sink=record_draft,
     )
 
@@ -697,10 +733,16 @@ async def test_streaming_publishes_only_validated_noncanonical_svg_prefixes() ->
     assert [draft.draft_index for draft in drafts] == [1, 2]
     assert drafts[0].document.svg_text == f"{first}</svg>"
     assert drafts[1].document.svg_text == svg
-    assert all(
-        draft.document.manifest["sourceTrust"] == "modelGeneratedData"
-        for draft in drafts
-    )
+    assert all(isinstance(draft.document, SafeSvgDraftDocument) for draft in drafts)
+    assert all(draft.document.authoritative is False for draft in drafts)
+    assert all(draft.document.interactive is False for draft in drafts)
+    assert all(not hasattr(draft.document, "manifest") for draft in drafts)
+    assert all(not hasattr(draft.document, "bindings") for draft in drafts)
+    with pytest.raises(TypeError, match="validated document"):
+        SvgCanvasSpecialistGeneration(
+            generation_id="generation_draft_cannot_be_final",
+            document=drafts[0].document,  # type: ignore[arg-type]
+        )
 
 
 async def test_security_rejection_does_not_consume_repair_budget() -> None:

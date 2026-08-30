@@ -13,10 +13,13 @@ from ava_backend.canvas.svg_document import SvgDocumentValidator
 from ava_backend.canvas.svg_session import SvgCanvasSessionState
 from ava_backend.canvas.svg_workspace import (
     RecordedSvgCanvasInteraction,
+    SvgCanvasExecutionStatus,
     SvgCanvasWorkspace,
 )
 from ava_backend.canvas.svg_specialist import (
+    SvgCanvasSpecialist,
     SvgCanvasSpecialistGeneration,
+    SvgCanvasSpecialistInvalidError,
     SvgCanvasSpecialistRequest,
 )
 from ava_backend.protocol import AgeBand
@@ -30,7 +33,11 @@ from ava_backend.realtime.events_v4 import (
     AudioChunkEventV4,
     AudioMetadataEventV4,
     AvaClientEventUnionV4,
+    CanvasDocumentAvailableEventV4,
+    CanvasGenerationRejectionCode,
+    CanvasGenerationStartedEventV4,
     CanvasInteractionEventV4,
+    CanvasRejectedEventV4,
     InterruptRequestedEventV4,
     MemoryPersistenceFailedEventV4,
     SegmentReadyEventV4,
@@ -64,6 +71,7 @@ from ava_backend.realtime.speech_contract import (
 from ava_backend.realtime.svg_canvas_jobs import SvgCanvasJobCoordinator
 from ava_backend.realtime.tool_contract import (
     InteractiveCanvasToolOutputV4,
+    RealtimeCanvasToolCall,
     RealtimeSpeechTextDelta,
 )
 from ava_backend.realtime.websocket_v4 import (
@@ -114,6 +122,60 @@ class _NoCanvasSpecialist:
 
     async def close(self) -> None:
         return
+
+
+class _FailFirstCanvasSpecialist:
+    def __init__(self) -> None:
+        self.requests: list[SvgCanvasSpecialistRequest] = []
+
+    async def generate(
+        self,
+        request: SvgCanvasSpecialistRequest,
+        *,
+        draft_sink: object | None = None,
+    ) -> SvgCanvasSpecialistGeneration:
+        del draft_sink
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            raise SvgCanvasSpecialistInvalidError(
+                "deterministic final SVG validation failed"
+            )
+        return SvgCanvasSpecialistGeneration(
+            generation_id=request.generation_id,
+            document=SvgDocumentValidator().validate(
+                """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600"
+ data-ava-interaction-mode="none">
+<title>Fresh visual</title><desc>A valid visual from a later turn.</desc>
+<circle id="fresh_visual" cx="500" cy="300" r="120"/>
+</svg>"""
+            ),
+        )
+
+    async def cancel(self, *, generation_id: str) -> None:
+        del generation_id
+
+    async def close(self) -> None:
+        return
+
+
+class _DistinctCanvasCallRealtimeProvider(DeterministicRealtimePlanProvider):
+    """Emit one provider-owned, distinct Canvas call identity per turn."""
+
+    def __init__(self, plan: AvaTurnPlan) -> None:
+        super().__init__(plan, canvas_brief="Show the water cycle.")
+        self.canvas_call_ids: list[str] = []
+
+    async def _stream(self) -> AsyncIterator[RealtimeProviderTurnEvent]:
+        async for event in super()._stream():
+            if isinstance(event, RealtimeCanvasToolCall):
+                call_id = f"call_canvas_turn_{len(self.canvas_call_ids) + 1}"
+                self.canvas_call_ids.append(call_id)
+                self._pending_call_id = call_id
+                event = RealtimeCanvasToolCall(
+                    call_id=call_id,
+                    request=event.request,
+                )
+            yield event
 
 
 class _BlockingCanvasInteractionJobs:
@@ -235,16 +297,20 @@ class _IncompleteAfterSpeechRealtimeProvider(DeterministicRealtimePlanProvider):
 def _canvas_runtime(
     *,
     state: SvgCanvasSessionState | None = None,
+    specialist: SvgCanvasSpecialist | None = None,
+    generation_id_factory: Callable[[], str] | None = None,
 ) -> tuple[SvgCanvasJobCoordinator, ProtocolV4CanvasEventSink]:
     events = ProtocolV4CanvasEventSink()
     jobs = SvgCanvasJobCoordinator(
         session_id=SESSION_ID,
         age_band=AgeBand.MIDDLE_CHILDHOOD,
-        specialist=_NoCanvasSpecialist(),
+        specialist=specialist or _NoCanvasSpecialist(),
         state=state or SvgCanvasSessionState(),
         documents=SvgCanvasDocumentStore(),
         event_sink=events,
-        generation_id_factory=lambda: "generation-coordinator",
+        generation_id_factory=(
+            generation_id_factory or (lambda: "generation-coordinator")
+        ),
     )
     return jobs, events
 
@@ -408,6 +474,132 @@ async def test_provider_owned_source_turn_transcript_grounds_exact_canvas_reques
         await coordinator.close()
 
 
+async def test_failed_canvas_generation_does_not_poison_later_realtime_canvas_use() -> (
+    None
+):
+    payload = _plan().model_dump(mode="json", by_alias=True)
+    payload["canvasDecision"] = {
+        "complexity": "specialistRequired",
+        "specialistBrief": "Show the water cycle.",
+    }
+    plan = AvaTurnPlan.model_validate(payload)
+    provider = _DistinctCanvasCallRealtimeProvider(plan)
+    specialist = _FailFirstCanvasSpecialist()
+    canvas_state = SvgCanvasSessionState()
+    generation_ids = iter(("generation-failed-a", "generation-accepted-b"))
+    coordinator, _, _, _ = _coordinator(
+        plan=plan,
+        realtime=provider,
+        persistent=True,
+        canvas_state=canvas_state,
+        canvas_specialist=specialist,
+        canvas_generation_id_factory=lambda: next(generation_ids),
+    )
+    await _ready(coordinator)
+
+    frames = coordinator.frames()
+    client_sequence = 1
+    stream_ids: dict[str, str] = {}
+    events: list[object] = []
+    try:
+        while True:
+            frame = await anext(frames)
+            if not isinstance(frame, AvaServerControlFrameV4):
+                continue
+            event = frame.event
+            events.append(event)
+            if isinstance(event, AudioMetadataEventV4):
+                stream_ids[event.turn_id] = event.stream_id
+                await coordinator.receive(
+                    _client(
+                        {
+                            "event": "playbackStarted",
+                            "sequence": client_sequence,
+                            "turnId": event.turn_id,
+                            "streamId": event.stream_id,
+                            "renderedSampleCount": 0,
+                        }
+                    )
+                )
+                client_sequence += 1
+            elif (
+                isinstance(event, TurnPhaseChangedEventV4)
+                and event.phase == SpeechPhase.SPEAKING
+            ):
+                await coordinator.receive(
+                    _client(
+                        {
+                            "event": "playbackProgress",
+                            "sequence": client_sequence,
+                            "turnId": event.turn_id,
+                            "streamId": stream_ids[event.turn_id],
+                            "renderedSampleCount": coordinator.received_sample_count,
+                            "bufferedSampleCount": 0,
+                        }
+                    )
+                )
+                client_sequence += 1
+            elif (
+                isinstance(event, CanvasDocumentAvailableEventV4)
+                and event.generation_id == "generation-accepted-b"
+            ):
+                break
+
+        await coordinator._canvas_jobs.wait_for_background_work()
+
+        rejected_a = next(
+            event
+            for event in events
+            if isinstance(event, CanvasRejectedEventV4)
+            and event.generation_id == "generation-failed-a"
+        )
+        rearmed = next(
+            event
+            for event in events
+            if isinstance(event, TurnCreatedEventV4) and event.turn_id != TURN_ID
+        )
+        started_b = next(
+            event
+            for event in events
+            if isinstance(event, CanvasGenerationStartedEventV4)
+            and event.generation_id == "generation-accepted-b"
+        )
+        assert rejected_a.rejection_code == CanvasGenerationRejectionCode.PROVIDER_INVALID
+        assert rejected_a.source_turn_id == TURN_ID
+        assert rearmed.turn_id == "turn-coordinator-2"
+        assert started_b.source_turn_id == rearmed.turn_id
+        assert events.index(rejected_a) < events.index(rearmed) < events.index(started_b)
+
+        assert provider.canvas_call_ids == [
+            "call_canvas_turn_1",
+            "call_canvas_turn_2",
+        ]
+        assert [output.generation_id for output in provider.completed_canvas_outputs] == [
+            "generation-failed-a",
+            "generation-accepted-b",
+        ]
+        assert [request.source_turn_id for request in specialist.requests] == [
+            TURN_ID,
+            "turn-coordinator-2",
+        ]
+
+        failed_a = canvas_state.workspace.execution("generation-failed-a")
+        accepted_b = canvas_state.workspace.execution("generation-accepted-b")
+        assert failed_a is not None
+        assert failed_a.status == SvgCanvasExecutionStatus.FAILED
+        assert failed_a.terminal_reason == "providerInvalid"
+        assert accepted_b is not None
+        assert accepted_b.status == SvgCanvasExecutionStatus.PREPARING
+        assert canvas_state.candidate is not None
+        assert canvas_state.candidate.generation_id == "generation-accepted-b"
+        assert canvas_state.active is None
+        assert canvas_state.workspace.current is None
+        assert canvas_state.workspace.scenes == ()
+    finally:
+        await frames.aclose()
+        await coordinator.close()
+
+
 def _client(payload: dict[str, object]) -> AvaClientEventUnionV4:
     return AVA_CLIENT_EVENT_ADAPTER_V4.validate_python(
         {
@@ -427,6 +619,8 @@ def _coordinator(
     unexpected_rearm: bool = False,
     occurrence_time_factory: Callable[[], datetime] | None = None,
     canvas_state: SvgCanvasSessionState | None = None,
+    canvas_specialist: SvgCanvasSpecialist | None = None,
+    canvas_generation_id_factory: Callable[[], str] | None = None,
 ) -> tuple[
     DeterministicRealtimeSessionCoordinator,
     DeterministicRealtimePlanProvider | object,
@@ -441,7 +635,11 @@ def _coordinator(
     )
     resolved_memory = memory or DevelopmentAuthoritativeMemoryStore()
     speech = DeterministicStreamingSpeechSynthesizer(chunk_sample_count=31)
-    jobs, events = _canvas_runtime(state=canvas_state)
+    jobs, events = _canvas_runtime(
+        state=canvas_state,
+        specialist=canvas_specialist,
+        generation_id_factory=canvas_generation_id_factory,
+    )
 
     def next_id() -> str:
         if unexpected_rearm:

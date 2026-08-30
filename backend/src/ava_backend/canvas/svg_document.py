@@ -9,20 +9,24 @@ from dataclasses import dataclass
 from enum import StrEnum
 from hashlib import sha256
 from types import MappingProxyType
-from typing import Final, Mapping, NoReturn
+from typing import Final, Literal, Mapping, NoReturn
 
 SVG_NAMESPACE: Final = "http://www.w3.org/2000/svg"
 XLINK_NAMESPACE: Final = "http://www.w3.org/1999/xlink"
 XML_NAMESPACE: Final = "http://www.w3.org/XML/1998/namespace"
 
 SVG_VALIDATOR_VERSION: Final = "ava-svg-validator-v2"
+SVG_DRAFT_VALIDATOR_VERSION: Final = "ava-svg-draft-validator-v1"
 SVG_RENDERER_CAPABILITY_VERSION: Final = "ava-svg-renderer-v2"
 SVG_MANIFEST_VERSION: Final = "ava-svg-manifest-v2"
+SVG_AUTHORING_CONTRACT_VERSION: Final = "ava-svg-authoring-contract-v1"
 SVG_DEFAULT_MAX_BYTES: Final = 384 * 1024
 SVG_PROTOCOL_MAX_BYTES: Final = 512 * 1024
 SVG_MAX_MANIFEST_BYTES: Final = 64 * 1024
 
-_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]{0,95}$")
+_IDENTIFIER_MAX_CHARACTERS: Final = 96
+_IDENTIFIER_PATTERN: Final = r"^[A-Za-z_][A-Za-z0-9_.:-]{0,95}$"
+_IDENTIFIER = re.compile(_IDENTIFIER_PATTERN)
 _NUMBER = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][-+]?\d+)?")
 _PATH_COMMAND = re.compile(r"[AaCcHhLlMmQqSsTtVvZz]")
 _TRANSFORM_FUNCTION = re.compile(r"[A-Za-z][A-Za-z0-9]*\s*\(")
@@ -332,6 +336,7 @@ class SvgValidationLimits:
 class SvgInteractionBinding:
     binding_id: str
     element_id: str
+    element_name: str
     target_id: str
     accessibility_label: str
     reveal_ids: tuple[str, ...] = ()
@@ -365,6 +370,21 @@ class ValidatedSvgDocument:
     named_objects: tuple[str, ...]
     view_box: tuple[float, float, float, float]
     bindings: Mapping[str, SvgInteractionBinding]
+
+
+@dataclass(frozen=True, slots=True)
+class SafeSvgDraftDocument:
+    """Exact safe-to-mount bytes with no canonical or interaction authority."""
+
+    svg_text: str
+    svg_bytes: bytes
+    svg_sha256: str
+    view_box: tuple[float, float, float, float]
+    validator_version: Literal["ava-svg-draft-validator-v1"] = (
+        SVG_DRAFT_VALIDATOR_VERSION
+    )
+    authoritative: Literal[False] = False
+    interactive: Literal[False] = False
 
 
 class SvgDocumentValidationError(ValueError):
@@ -415,6 +435,23 @@ class SvgDocumentValidator:
         return self._limits
 
     def validate(self, svg_text: str) -> ValidatedSvgDocument:
+        document = self._validate_document(svg_text, require_final_authority=True)
+        if not isinstance(document, ValidatedSvgDocument):  # pragma: no cover
+            raise RuntimeError("final SVG validation returned a draft document")
+        return document
+
+    def validate_draft_safety(self, svg_text: str) -> SafeSvgDraftDocument:
+        document = self._validate_document(svg_text, require_final_authority=False)
+        if not isinstance(document, SafeSvgDraftDocument):  # pragma: no cover
+            raise RuntimeError("draft SVG validation returned a canonical document")
+        return document
+
+    def _validate_document(
+        self,
+        svg_text: str,
+        *,
+        require_final_authority: bool,
+    ) -> ValidatedSvgDocument | SafeSvgDraftDocument:
         if not isinstance(svg_text, str):
             raise TypeError("svg_text must be a Unicode string")
         if _CONTROL_CHARACTER.search(svg_text):
@@ -444,32 +481,42 @@ class SvgDocumentValidator:
             self._fail("invalidRoot", "SVG root element must be <svg>")
         self._validate_element_namespace(root.tag)
         interaction_mode_text = root.attrib.get("data-ava-interaction-mode")
-        if interaction_mode_text is None:
+        interaction_mode: SvgInteractionMode | None = None
+        if interaction_mode_text is None and require_final_authority:
             self._fail(
                 "interactionModeInvalid",
                 "SVG root requires a supported data-ava-interaction-mode",
             )
-        try:
-            interaction_mode = SvgInteractionMode(interaction_mode_text)
-        except ValueError:
-            self._fail(
-                "interactionModeInvalid",
-                "SVG root requires a supported data-ava-interaction-mode",
-            )
+        if interaction_mode_text is not None:
+            try:
+                interaction_mode = SvgInteractionMode(interaction_mode_text)
+            except ValueError:
+                if require_final_authority:
+                    self._fail(
+                        "interactionModeInvalid",
+                        "SVG root requires a supported data-ava-interaction-mode",
+                    )
         direct_titles = [
             child for child in root if _local_element_name(child.tag) == "title"
         ]
         direct_descriptions = [
             child for child in root if _local_element_name(child.tag) == "desc"
         ]
-        if len(direct_titles) != 1 or len(direct_descriptions) != 1:
+        if require_final_authority and (
+            len(direct_titles) != 1 or len(direct_descriptions) != 1
+        ):
             self._fail(
                 "semanticStructureInvalid",
                 "SVG requires exactly one direct-child <title> and <desc>",
             )
+        direct_title = direct_titles[0] if len(direct_titles) == 1 else None
+        direct_description = (
+            direct_descriptions[0] if len(direct_descriptions) == 1 else None
+        )
         direct_semantic_elements = {
-            id(direct_titles[0]),
-            id(direct_descriptions[0]),
+            id(element)
+            for element in (direct_title, direct_description)
+            if element is not None
         }
 
         ids: set[str] = set()
@@ -523,7 +570,11 @@ class SvgDocumentValidator:
                     observed_value=tag,
                     limit_name="allowedElements",
                 )
-            if tag in {"title", "desc"} and id(element) not in direct_semantic_elements:
+            if (
+                require_final_authority
+                and tag in {"title", "desc"}
+                and id(element) not in direct_semantic_elements
+            ):
                 self._fail(
                     "semanticStructureInvalid",
                     f"SVG <{tag}> must be a direct child of the root",
@@ -567,7 +618,12 @@ class SvgDocumentValidator:
 
             element_id = attributes.get("id")
             if element_id is not None:
-                self._validate_identifier(element_id, label="element id")
+                self._validate_identifier(
+                    element_id,
+                    label="element id",
+                    element_name=tag,
+                    attribute="id",
+                )
                 if element_id in ids:
                     self._fail("duplicateId", f"SVG id {element_id!r} is duplicated")
                 ids.add(element_id)
@@ -675,9 +731,11 @@ class SvgDocumentValidator:
                     limit_name="maxTextCharacters",
                     limit_value=self._limits.max_text_characters,
                 )
-            if id(element) == id(direct_titles[0]):
+            if direct_title is not None and id(element) == id(direct_title):
                 title = _semantic_text(element)
-            elif id(element) == id(direct_descriptions[0]):
+            elif direct_description is not None and id(element) == id(
+                direct_description
+            ):
                 description = _semantic_text(element)
             elif tag == "text" and element_is_rendered:
                 _append_semantic_projection_item(
@@ -693,7 +751,7 @@ class SvgDocumentValidator:
                 )
 
             binding_id = attributes.get("data-ava-binding")
-            if binding_id is not None:
+            if binding_id is not None and require_final_authority:
                 binding = self._binding_from_element(element, element_id)
                 if binding.binding_id in bindings:
                     self._fail(
@@ -709,7 +767,7 @@ class SvgDocumentValidator:
                         limit_name="maxBindings",
                         limit_value=self._limits.max_bindings,
                     )
-            elif any(
+            elif require_final_authority and any(
                 name in attributes
                 for name in ("data-ava-target", "data-ava-reveal", "data-ava-step")
             ):
@@ -724,29 +782,33 @@ class SvgDocumentValidator:
                 stack.append((child, depth + 1, child_owner, element_is_rendered))
 
         view_box = self._validate_view_box(root.attrib.get("viewBox"))
-        title = self._validate_semantic_text(
-            title,
-            label="title",
-            maximum=self._limits.max_title_characters,
-            limit_name="maxTitleCharacters",
-        )
-        description = self._validate_semantic_text(
-            description,
-            label="description",
-            maximum=self._limits.max_description_characters,
-            limit_name="maxDescriptionCharacters",
-        )
-        missing = sorted(referenced_ids - ids)
-        if missing:
-            self._fail(
-                "referenceMissing",
-                f"SVG references unknown id {missing[0]!r}",
-                observed_value=missing[0],
-                limit_name="documentLocalReferences",
+        if require_final_authority:
+            title = self._validate_semantic_text(
+                title,
+                label="title",
+                maximum=self._limits.max_title_characters,
+                limit_name="maxTitleCharacters",
             )
+            description = self._validate_semantic_text(
+                description,
+                label="description",
+                maximum=self._limits.max_description_characters,
+                limit_name="maxDescriptionCharacters",
+            )
+            missing = sorted(referenced_ids - ids)
+            if missing:
+                self._fail(
+                    "referenceMissing",
+                    f"SVG references unknown id {missing[0]!r}",
+                    observed_value=missing[0],
+                    limit_name="documentLocalReferences",
+                )
         self._validate_reference_graph(reference_graph, id_to_node)
-        self._validate_binding_targets(bindings, ids)
-        self._validate_interaction_mode(interaction_mode, bindings)
+        if require_final_authority:
+            self._validate_binding_targets(bindings, ids)
+            if interaction_mode is None:  # pragma: no cover - checked above
+                raise RuntimeError("final SVG lost its interaction mode")
+            self._validate_interaction_mode(interaction_mode, bindings)
 
         background = root.attrib.get("data-ava-background")
         if (
@@ -761,6 +823,15 @@ class SvgDocumentValidator:
                 limit_name="maxBackgroundCharacters",
                 limit_value=self._limits.max_background_characters,
             )
+        if not require_final_authority:
+            return SafeSvgDraftDocument(
+                svg_text=svg_text,
+                svg_bytes=svg_bytes,
+                svg_sha256=sha256(svg_bytes).hexdigest(),
+                view_box=view_box,
+            )
+        if interaction_mode is None:  # pragma: no cover - checked above
+            raise RuntimeError("final SVG lost its interaction mode")
         manifest_dict: dict[str, object] = {
             "background": background,
             "bindings": [
@@ -817,6 +888,7 @@ class SvgDocumentValidator:
             "allowedFilterPrimitives": sorted(_FILTER_PRIMITIVES),
             "allowedInteractionModes": [mode.value for mode in SvgInteractionMode],
             "allowedStyleProperties": sorted(_ALLOWED_STYLE_PROPERTIES),
+            "authoringContractVersion": SVG_AUTHORING_CONTRACT_VERSION,
             "documentContract": {
                 "canonicalBytes": "exactUtf8ProviderOutput",
                 "externalResources": False,
@@ -828,7 +900,18 @@ class SvgDocumentValidator:
                 "defaultMinimumTargetPoints": 44,
                 "manifestRequiredForAuthority": True,
             },
+            "identifierContract": {
+                "appliesTo": [
+                    "bindingId",
+                    "elementId",
+                    "revealId",
+                    "targetId",
+                ],
+                "maximumCharacters": _IDENTIFIER_MAX_CHARACTERS,
+                "pattern": _IDENTIFIER_PATTERN,
+            },
             "interactionContract": {
+                "bindingElementRequiresId": True,
                 "bindingCountByMode": {
                     "explore": {"maximum": limits.max_bindings, "minimum": 1},
                     "none": {"maximum": 0, "minimum": 0},
@@ -841,7 +924,48 @@ class SvgDocumentValidator:
                         "minimum": 2,
                     },
                 },
+                "bindingId": {
+                    "required": True,
+                    "syntax": "identifierContract",
+                    "unique": True,
+                },
+                "metadataRequiresBinding": [
+                    "data-ava-reveal",
+                    "data-ava-step",
+                    "data-ava-target",
+                ],
+                "modeRules": {
+                    "explore": {
+                        "bindings": "required",
+                        "reveals": "optionalDocumentLocalIds",
+                        "stepIndexes": "forbidden",
+                    },
+                    "none": {
+                        "bindings": "forbidden",
+                        "reveals": "forbidden",
+                        "stepIndexes": "forbidden",
+                    },
+                    "select": {
+                        "bindings": "required",
+                        "reveals": "forbidden",
+                        "stepIndexes": "forbidden",
+                    },
+                    "steps": {
+                        "bindings": "required",
+                        "reveals": "forbidden",
+                        "stepIndexes": "requiredUniqueContiguousFromOne",
+                    },
+                },
+                "revealIds": {
+                    "mustResolveToDocumentElementIds": True,
+                    "syntax": "identifierContract",
+                },
                 "stepIndexes": "uniqueContiguousFromOne",
+                "targetId": {
+                    "explicitMustResolveToDocumentElementId": True,
+                    "omittedDefaultsToBindingElement": True,
+                    "syntax": "identifierContract",
+                },
             },
             "referencePolicy": {
                 "allowedNamespaces": [
@@ -851,6 +975,8 @@ class SvgDocumentValidator:
                     XML_NAMESPACE,
                 ],
                 "documentLocalFragmentsOnly": True,
+                "externalUrlsAllowed": False,
+                "finalReferencesMustResolve": True,
                 "referenceAttributes": sorted(_REFERENCE_ATTRIBUTES | {"href"}),
             },
             "limits": {
@@ -887,12 +1013,21 @@ class SvgDocumentValidator:
         element_id: str | None,
     ) -> SvgInteractionBinding:
         attributes = element.attrib
+        element_name = _local_element_name(element.tag)
         binding_id = attributes["data-ava-binding"]
-        self._validate_identifier(binding_id, label="binding id")
+        self._validate_identifier(
+            binding_id,
+            label="binding id",
+            element_id=element_id,
+            element_name=element_name,
+            attribute="data-ava-binding",
+        )
         if element_id is None:
             self._fail(
                 "bindingElementMissingId",
                 f"binding {binding_id!r} requires an element id",
+                element_name=element_name,
+                attribute="id",
             )
         accessibility_label = attributes.get("aria-label", "")
         accessibility_label = self._validate_semantic_text(
@@ -902,11 +1037,23 @@ class SvgDocumentValidator:
             limit_name="maxBindingLabelCharacters",
         )
         target_id = attributes.get("data-ava-target", element_id)
-        self._validate_identifier(target_id, label="binding target id")
+        self._validate_identifier(
+            target_id,
+            label="binding target id",
+            element_id=element_id,
+            element_name=element_name,
+            attribute="data-ava-target",
+        )
         reveal_text = attributes.get("data-ava-reveal", "")
         reveal_ids = tuple(filter(None, re.split(r"[\s,]+", reveal_text)))
         for reveal_id in reveal_ids:
-            self._validate_identifier(reveal_id, label="binding reveal id")
+            self._validate_identifier(
+                reveal_id,
+                label="binding reveal id",
+                element_id=element_id,
+                element_name=element_name,
+                attribute="data-ava-reveal",
+            )
         step_text = attributes.get("data-ava-step")
         step_index: int | None = None
         if step_text is not None:
@@ -929,6 +1076,7 @@ class SvgDocumentValidator:
         return SvgInteractionBinding(
             binding_id=binding_id,
             element_id=element_id,
+            element_name=element_name,
             target_id=target_id,
             accessibility_label=accessibility_label,
             reveal_ids=reveal_ids,
@@ -1022,9 +1170,26 @@ class SvgDocumentValidator:
                 f"XML attribute {_local_attribute_name(raw_name)!r} is forbidden",
             )
 
-    def _validate_identifier(self, value: str, *, label: str) -> None:
+    def _validate_identifier(
+        self,
+        value: str,
+        *,
+        label: str,
+        element_id: str | None = None,
+        element_name: str | None = None,
+        attribute: str | None = None,
+    ) -> None:
         if not _IDENTIFIER.fullmatch(value):
-            self._fail("identifierInvalid", f"{label} {value!r} is invalid")
+            self._fail(
+                "identifierInvalid",
+                f"{label} {value!r} is invalid",
+                element_id=element_id,
+                element_name=element_name,
+                attribute=attribute,
+                observed_value=value,
+                limit_name="identifierContract",
+                limit_value=f"{_IDENTIFIER_MAX_CHARACTERS}:{_IDENTIFIER_PATTERN}",
+            )
 
     def _validate_style(self, style: str) -> set[str]:
         if any(token in style for token in ("{", "}", "@", "/*", "*/")):
@@ -1139,16 +1304,26 @@ class SvgDocumentValidator:
         ids: set[str],
     ) -> None:
         for binding in bindings.values():
-            missing = {
-                binding.target_id,
-                *binding.reveal_ids,
-            } - ids
-            if missing:
+            if binding.target_id not in ids:
                 self._fail(
                     "bindingTargetMissing",
-                    f"binding {binding.binding_id!r} references unknown id {sorted(missing)[0]!r}",
+                    f"binding {binding.binding_id!r} references unknown id {binding.target_id!r}",
                     element_id=binding.element_id,
-                    observed_value=sorted(missing)[0],
+                    element_name=binding.element_name,
+                    attribute="data-ava-target",
+                    observed_value=binding.target_id,
+                    limit_name="documentLocalBindingReferences",
+                )
+            for reveal_id in binding.reveal_ids:
+                if reveal_id in ids:
+                    continue
+                self._fail(
+                    "bindingTargetMissing",
+                    f"binding {binding.binding_id!r} references unknown id {reveal_id!r}",
+                    element_id=binding.element_id,
+                    element_name=binding.element_name,
+                    attribute="data-ava-reveal",
+                    observed_value=reveal_id,
                     limit_name="documentLocalBindingReferences",
                 )
 
@@ -1223,6 +1398,20 @@ class SvgDocumentValidator:
             limit_name=limit_name,
             limit_value=limit_value,
         )
+
+
+class SvgDraftSafetyValidator:
+    """Validate exact draft bytes for mounting without granting final authority."""
+
+    def __init__(self, document_validator: SvgDocumentValidator) -> None:
+        self._document_validator = document_validator
+
+    @property
+    def limits(self) -> SvgValidationLimits:
+        return self._document_validator.limits
+
+    def validate(self, svg_text: str) -> SafeSvgDraftDocument:
+        return self._document_validator.validate_draft_safety(svg_text)
 
 
 def _validation_category(code: str) -> SvgValidationCategory:

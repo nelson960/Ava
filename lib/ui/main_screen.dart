@@ -161,7 +161,12 @@ class _MainScreenState extends ConsumerState<MainScreen>
                 bottom: dashboardVisible ? 0 : -dashboardHeight,
                 child: AvaSvgCanvasPanel(host: canvasHost),
               ),
-              Positioned.fill(
+              AnimatedPositioned(
+                duration: AvaDurations.sheet,
+                curve: Curves.easeOutCubic,
+                left: 0,
+                right: 0,
+                bottom: dashboardVisible ? dashboardHeight : 0,
                 child: IgnorePointer(
                   child: CaptionTicker(
                     dashboardVisible: dashboardVisible,
@@ -204,7 +209,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
                 right: 16,
                 bottom: 16,
                 child: CanvasGenerationPill(
-                  visible: canvasGenerating,
+                  visible: canvasGenerating && !canReopenCanvas,
                 ),
               ),
               Positioned(

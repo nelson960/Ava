@@ -9,8 +9,10 @@ from ava_backend.canvas.svg_document import (
     SVG_MANIFEST_VERSION,
     SVG_RENDERER_CAPABILITY_VERSION,
     SVG_VALIDATOR_VERSION,
+    SafeSvgDraftDocument,
     SvgDocumentValidationError,
     SvgDocumentValidator,
+    SvgDraftSafetyValidator,
     SvgValidationLimits,
 )
 
@@ -236,6 +238,38 @@ def test_validator_requires_binding_targets_to_exist() -> None:
     assert raised.value.code == "bindingTargetMissing"
 
 
+def test_draft_safety_accepts_incomplete_binding_without_final_authority() -> None:
+    svg = _document(
+        '<ellipse id="cloud" data-ava-binding="cloud_reveal" '
+        'data-ava-reveal="rain" aria-label="Show rain" '
+        'cx="500" cy="200" rx="120" ry="60"/>',
+        root_attributes='data-ava-interaction-mode="explore"',
+    )
+    validator = SvgDocumentValidator()
+
+    draft = SvgDraftSafetyValidator(validator).validate(svg)
+
+    assert isinstance(draft, SafeSvgDraftDocument)
+    assert draft.svg_text == svg
+    assert draft.svg_bytes == svg.encode("utf-8")
+    assert draft.authoritative is False
+    assert draft.interactive is False
+    assert not hasattr(draft, "manifest")
+    assert not hasattr(draft, "bindings")
+    with pytest.raises(SvgDocumentValidationError) as raised:
+        validator.validate(svg)
+    assert raised.value.code == "bindingTargetMissing"
+
+
+def test_draft_safety_still_rejects_unsafe_mountable_content() -> None:
+    unsafe = _document('<script id="payload">alert(1)</script>')
+
+    with pytest.raises(SvgDocumentValidationError) as raised:
+        SvgDraftSafetyValidator(SvgDocumentValidator()).validate(unsafe)
+
+    assert raised.value.code == "elementForbidden"
+
+
 def test_explore_manifest_declares_reveals() -> None:
     svg = _document(
         """
@@ -292,6 +326,30 @@ def test_capability_manifest_is_versioned_and_bounded() -> None:
         "maximum": 12,
         "minimum": 2,
     }
+    assert manifest["identifierContract"] == {
+        "appliesTo": ["bindingId", "elementId", "revealId", "targetId"],
+        "maximumCharacters": 96,
+        "pattern": r"^[A-Za-z_][A-Za-z0-9_.:-]{0,95}$",
+    }
+    interaction = manifest["interactionContract"]
+    assert interaction["bindingElementRequiresId"] is True
+    assert interaction["bindingId"]["syntax"] == "identifierContract"
+    assert interaction["targetId"] == {
+        "explicitMustResolveToDocumentElementId": True,
+        "omittedDefaultsToBindingElement": True,
+        "syntax": "identifierContract",
+    }
+    assert interaction["revealIds"]["mustResolveToDocumentElementIds"] is True
+    assert interaction["metadataRequiresBinding"] == [
+        "data-ava-reveal",
+        "data-ava-step",
+        "data-ava-target",
+    ]
+    assert interaction["modeRules"]["steps"]["stepIndexes"] == (
+        "requiredUniqueContiguousFromOne"
+    )
+    assert manifest["referencePolicy"]["documentLocalFragmentsOnly"] is True
+    assert manifest["referencePolicy"]["finalReferencesMustResolve"] is True
     assert manifest["limits"]["manifestBytes"] == 64 * 1024
     assert manifest["limits"]["titleCharacters"] == 160
     assert manifest["limits"]["descriptionCharacters"] == 800

@@ -396,6 +396,8 @@ def _canvas_response_events(
 
 def _channel(
     events: list[dict[str, object]],
+    *,
+    max_output_tokens: int = 800,
 ) -> tuple[
     _OpenAIRealtimeEventChannel,
     _FakeRealtimeSocket,
@@ -406,7 +408,7 @@ def _channel(
     channel = _OpenAIRealtimeEventChannel(
         socket,
         model="gpt-realtime-test",
-        max_output_tokens=800,
+        max_output_tokens=max_output_tokens,
         turn_timeout_seconds=5,
     )
     _TEST_CHANNELS.add(channel)
@@ -1470,7 +1472,7 @@ async def test_canvas_call_gets_one_output_then_tool_disabled_continuation(
         sent for sent in socket.sent if sent.get("type") == "response.create"
     ]
     assert continuation_requests[-1]["response"]["tool_choice"] == "none"
-    assert continuation_requests[-1]["response"]["max_output_tokens"] == 128
+    assert continuation_requests[-1]["response"]["max_output_tokens"] == 512
     assert continuation_requests[-1]["response"]["conversation"] == "auto"
     assert "instructions" not in continuation_requests[-1]["response"]
     assert "input" not in continuation_requests[-1]["response"]
@@ -1539,7 +1541,8 @@ async def test_rejected_canvas_continuation_is_outcome_owned_and_bounded() -> No
                 response_id=CONTINUATION_RESPONSE_ID,
                 text="The optional visual is unavailable.",
             ),
-        ]
+        ],
+        max_output_tokens=400,
     )
 
     async for event in channel.stream_turn(
@@ -1574,7 +1577,7 @@ async def test_rejected_canvas_continuation_is_outcome_owned_and_bounded() -> No
         sent for sent in socket.sent if sent.get("type") == "response.create"
     ][-1]["response"]
     assert continuation["tool_choice"] == "none"
-    assert continuation["max_output_tokens"] == 128
+    assert continuation["max_output_tokens"] == 400
     assert continuation["conversation"] == "auto"
     assert "instructions" not in continuation
     assert "input" not in continuation

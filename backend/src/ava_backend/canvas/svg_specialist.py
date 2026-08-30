@@ -17,11 +17,12 @@ from ..realtime.tool_contract import (
 from .render_profile import CanvasRenderProfile
 from .svg_document import (
     SVG_PROTOCOL_MAX_BYTES,
+    SafeSvgDraftDocument,
     SvgDocumentValidator,
     ValidatedSvgDocument,
 )
 
-SVG_CANVAS_SPECIALIST_PROMPT_VERSION = "ava-svg-canvas-vnext-1"
+SVG_CANVAS_SPECIALIST_PROMPT_VERSION = "ava-svg-canvas-vnext-2"
 SVG_CANVAS_SPECIALIST_BRIEF_MAX_CHARACTERS = INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS
 SVG_CANVAS_SOURCE_TRANSCRIPT_MAX_CHARACTERS = 2_000
 
@@ -161,6 +162,8 @@ class SvgCanvasSpecialistGeneration:
     cached_input_tokens: int | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.document, ValidatedSvgDocument):
+            raise TypeError("final SVG generation requires a validated document")
         for name in ("input_tokens", "output_tokens", "cached_input_tokens"):
             value = getattr(self, name)
             if value is not None and value < 0:
@@ -174,9 +177,11 @@ class SvgCanvasVisibleDraft:
     generation_id: str
     draft_index: int
     attempt: int
-    document: ValidatedSvgDocument
+    document: SafeSvgDraftDocument
 
     def __post_init__(self) -> None:
+        if not isinstance(self.document, SafeSvgDraftDocument):
+            raise TypeError("visible SVG draft requires a draft-safe document")
         if self.draft_index < 1:
             raise ValueError("draft_index must be positive")
         if self.attempt < 0:
@@ -245,18 +250,13 @@ ART DIRECTION
 
 INTERACTION METADATA
 - Copy the requested mode exactly to the SVG root as `data-ava-interaction-mode`.
-- `none` is static and has no bindings or step metadata.
 - For every binding, `aria-label` describes the exact semantic meaning of that
   tappable binding and is self-contained enough to ground a short spoken response.
+- Follow `interactionContract`, `identifierContract`, and `referencePolicy` in
+  the versioned capability exactly for binding IDs, element IDs, targets,
+  reveals, step indexes, mode-specific rules, and document-local resolution.
 - `data-ava-target` is visual/identity metadata, not spoken semantic focus.
-- Omit `data-ava-target` when a distinct visual target is unnecessary.
-- `explore` uses visible hotspots with unique `id`, `data-ava-binding`,
-  `aria-label`, optional `data-ava-target`, and optional `data-ava-reveal` IDs.
-- `select` uses visible choices with unique `id`, `data-ava-binding`,
-  `aria-label`, and optional `data-ava-target`; it has no reveals.
-- `steps` uses ordered groups with unique `id`, `data-ava-binding`, contiguous
-  `data-ava-step` indexes from 1, and `aria-label`. Flutter supplies Back/Next
-  controls; never draw navigation controls in the SVG.
+- Flutter supplies any required navigation controls; never draw them in the SVG.
 - Flutter owns all deterministic interaction behavior. Do not add JavaScript,
   event handlers, spoken responses, action types, or unrelated interactions.
 

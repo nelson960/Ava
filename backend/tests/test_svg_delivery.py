@@ -8,7 +8,10 @@ from ava_backend.canvas.svg_delivery import (
     SvgDocumentStoreCapacityError,
     SvgDocumentStoreError,
 )
-from ava_backend.canvas.svg_document import SvgDocumentValidator
+from ava_backend.canvas.svg_document import (
+    SvgDocumentValidator,
+    SvgDraftSafetyValidator,
+)
 from ava_backend.canvas.svg_session import SvgCanvasSessionState
 from ava_backend.canvas.svg_specialist import (
     SvgCanvasSpecialistGeneration,
@@ -62,7 +65,9 @@ async def test_store_keeps_draft_separate_from_candidate_manifest_authority() ->
         generation_id=candidate.generation_id,
         draft_index=1,
         attempt=0,
-        document=candidate.document,
+        document=SvgDraftSafetyValidator(SvgDocumentValidator()).validate(
+            candidate.document.svg_text
+        ),
     )
 
     stored = await store.publish_draft(
