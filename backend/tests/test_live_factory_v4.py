@@ -35,24 +35,29 @@ async def test_live_factory_resolves_subject_workspace_for_each_session() -> Non
         request_id="request-factory-1",
         subject="child:X",
         age_band=AgeBand.MIDDLE_CHILDHOOD,
+        timezone_id="Asia/Kolkata",
     )
     second = factory.create(
         session_id="session-factory-2",
         request_id="request-factory-2",
         subject="child:X",
         age_band=AgeBand.MIDDLE_CHILDHOOD,
+        timezone_id="Asia/Kolkata",
     )
     isolated = factory.create(
         session_id="session-factory-y",
         request_id="request-factory-y",
         subject="child:Y",
         age_band=AgeBand.MIDDLE_CHILDHOOD,
+        timezone_id="Europe/London",
     )
     assert isinstance(first, DeterministicRealtimeSessionCoordinator)
     assert isinstance(second, DeterministicRealtimeSessionCoordinator)
     assert isinstance(isolated, DeterministicRealtimeSessionCoordinator)
     assert first._realtime._truncation_post_instructions_tokens == 64_000
     assert first._realtime._truncation_retention_ratio == 0.75
+    assert first._timezone_id == "Asia/Kolkata"
+    assert isolated._timezone_id == "Europe/London"
 
     first_workspace = first._canvas_jobs.state.workspace
     second_workspace = second._canvas_jobs.state.workspace

@@ -10,6 +10,7 @@ import '../services/memory_service.dart';
 import '../services/pcm_speech_output_service.dart';
 import '../services/ava_realtime_presentation.dart';
 import '../services/ava_realtime_bootstrap_service.dart';
+import '../services/ava_device_context_service.dart';
 import '../services/ava_realtime_runtime_factory.dart';
 import '../services/ava_realtime_runtime_factory_v4.dart';
 import '../services/ava_realtime_session_v4.dart';
@@ -67,6 +68,7 @@ final avaRealtimeBootstrapServiceProvider =
   return AvaRealtimeBootstrapService(
     configuration: ref.watch(avaBackendConfigurationProvider),
     transport: ref.watch(avaRealtimeBootstrapTransportProvider),
+    deviceContext: const AvaDeviceContextService(),
   );
 });
 

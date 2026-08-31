@@ -179,6 +179,96 @@ void main() {
     await scenario.close();
   });
 
+  test('manual microphone toggles own capture while Ava is speaking', () async {
+    final scenario = _DirectV4Scenario(sessionId: _sessionId);
+    await scenario.start();
+    await scenario.sendTurnUntilSpeaking(
+      turnId: 'turn-v4-speaking-mic',
+      streamId: 'stream-v4-speaking-mic',
+    );
+    final controlsBeforeToggle = scenario.raw.sentEvents.length;
+
+    await scenario.runtime.setMicrophoneEnabled(true);
+    expect(scenario.media.microphoneEnabled, isTrue);
+    await scenario.runtime.setMicrophoneEnabled(false);
+    expect(scenario.media.microphoneEnabled, isFalse);
+    expect(
+      scenario.raw.sentEvents.length,
+      controlsBeforeToggle,
+      reason: 'Muting capture must not send playbackStopped or cancelTurn.',
+    );
+    expect(scenario.media.offerCount, 0);
+    expect(scenario.media.appliedAnswerSdp, isNull);
+
+    await scenario.close();
+  });
+
+  test('rapid microphone toggles preserve the final requested track state',
+      () async {
+    final onScenario = _DirectV4Scenario(sessionId: 'session-v4-mic-on');
+    await onScenario.start();
+    await onScenario.sendTurnUntilSpeaking(
+      turnId: 'turn-v4-mic-on',
+      streamId: 'stream-v4-mic-on',
+    );
+    await Future.wait([
+      onScenario.runtime.setMicrophoneEnabled(true),
+      onScenario.runtime.setMicrophoneEnabled(false),
+      onScenario.runtime.setMicrophoneEnabled(true),
+    ]);
+    expect(onScenario.runtime.microphoneTrackEnabled, isTrue);
+    expect(onScenario.media.microphoneEnabled, isTrue);
+    expect(onScenario.media.offerCount, 0);
+    await onScenario.close();
+
+    final offScenario = _DirectV4Scenario(sessionId: 'session-v4-mic-off');
+    await offScenario.start();
+    await offScenario.sendTurnUntilSpeaking(
+      turnId: 'turn-v4-mic-off',
+      streamId: 'stream-v4-mic-off',
+    );
+    await Future.wait([
+      offScenario.runtime.setMicrophoneEnabled(false),
+      offScenario.runtime.setMicrophoneEnabled(true),
+      offScenario.runtime.setMicrophoneEnabled(false),
+    ]);
+    expect(offScenario.runtime.microphoneTrackEnabled, isFalse);
+    expect(offScenario.media.microphoneEnabled, isFalse);
+    expect(offScenario.media.offerCount, 0);
+    await offScenario.close();
+  });
+
+  test('speech after manual re-enable uses normal provider VAD interruption',
+      () async {
+    final scenario = _DirectV4Scenario(
+      sessionId: 'session-v4-reenabled-vad',
+      fadeStopSample: 2,
+    );
+    await scenario.start();
+    await scenario.sendTurnUntilSpeaking(
+      turnId: 'turn-v4-reenabled-vad',
+      streamId: 'stream-v4-reenabled-vad',
+    );
+    await scenario.runtime.setMicrophoneEnabled(true);
+
+    scenario.addControl({
+      'protocolVersion': 4,
+      'event': 'interruptRequested',
+      'sessionId': 'session-v4-reenabled-vad',
+      'turnId': 'turn-v4-reenabled-vad',
+      'revision': 5,
+      'streamId': 'stream-v4-reenabled-vad',
+      'reason': 'providerSpeechStarted',
+    });
+
+    final cancelled = await scenario.raw.waitForSent(
+      (event) => event['event'] == 'cancelTurn',
+    );
+    expect(cancelled['reason'], 'providerSpeechStarted');
+    expect(scenario.media.microphoneEnabled, isTrue);
+    await scenario.close();
+  });
+
   test('tap interruption preserves accepted workspace canvas', () async {
     final scenario = _DirectV4Scenario(
       sessionId: _sessionId,

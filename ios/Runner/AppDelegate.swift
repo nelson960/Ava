@@ -6,6 +6,7 @@ import UIKit
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
   private var pcmSpeechChannelHandler: PcmSpeechChannelHandler?
   private var audioDiagnosticsChannel: FlutterMethodChannel?
+  private var deviceContextChannel: FlutterMethodChannel?
 
   override func application(
     _ application: UIApplication,
@@ -42,6 +43,17 @@ import UIKit
         "inputAvailable": session.isInputAvailable,
         "sampleRateHz": session.sampleRate,
       ])
+    }
+    deviceContextChannel = FlutterMethodChannel(
+      name: "ava/device_context",
+      binaryMessenger: messenger
+    )
+    deviceContextChannel?.setMethodCallHandler { call, result in
+      guard call.method == "currentTimezoneId" else {
+        result(FlutterMethodNotImplemented)
+        return
+      }
+      result(TimeZone.current.identifier)
     }
   }
 }

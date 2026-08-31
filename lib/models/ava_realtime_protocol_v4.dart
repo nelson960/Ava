@@ -365,15 +365,18 @@ final class AvaSessionLimitsV4 {
 final class AvaSessionCreateRequestV4 {
   const AvaSessionCreateRequestV4({
     required this.ageBand,
+    required this.timezoneId,
     required this.canvasRenderProfile,
   });
 
   final AvaRealtimeAgeBand ageBand;
+  final String timezoneId;
   final AvaCanvasRenderProfileV4 canvasRenderProfile;
 
   Map<String, Object?> toJson() => {
         'protocolVersion': avaRealtimeProtocolVersionV4,
         'ageBand': ageBand.name,
+        'timezoneId': timezoneId,
         'canvasRenderProfile': canvasRenderProfile.toJson(),
       };
 }

@@ -10,6 +10,7 @@ import 'package:ava/models/ava_realtime_protocol.dart';
 import 'package:ava/models/ava_realtime_protocol_v4.dart';
 import 'package:ava/models/ava_svg_canvas_protocol.dart';
 import 'package:ava/services/ava_realtime_bootstrap_service.dart';
+import 'package:ava/services/ava_device_context_service.dart';
 import 'package:ava/services/ava_realtime_presentation.dart';
 import 'package:ava/services/ava_realtime_runtime_factory_v4.dart';
 import 'package:ava/services/ava_realtime_session_v4.dart';
@@ -42,6 +43,7 @@ void main() {
           'https://ava.example.test',
         ),
         transport: bootstrapTransport,
+        deviceContext: const _DeviceContextFake(),
       ),
       mediaConnector: (_) async => media,
       transportConnector: (_) async => raw,
@@ -125,6 +127,7 @@ void main() {
           'https://ava.example.test',
         ),
         transport: bootstrapTransport,
+        deviceContext: const _DeviceContextFake(),
       ),
       mediaConnector: (_) async => media,
       transportConnector: (_) async => raw,
@@ -162,6 +165,7 @@ void main() {
           'https://ava.example.test',
         ),
         transport: bootstrapTransport,
+        deviceContext: const _DeviceContextFake(),
       ),
       mediaConnector: (_) async => media,
       transportConnector: (_) async => raw,
@@ -224,6 +228,13 @@ void main() {
     await runtime.close();
     await run;
   });
+}
+
+final class _DeviceContextFake implements AvaDeviceContext {
+  const _DeviceContextFake();
+
+  @override
+  Future<String> currentTimezoneId() async => 'UTC';
 }
 
 final _profile = AvaCanvasRenderProfileV4.measure(

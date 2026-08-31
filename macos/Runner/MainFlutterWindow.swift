@@ -6,6 +6,7 @@ import FlutterMacOS
 class MainFlutterWindow: NSWindow {
   private var pcmSpeechChannelHandler: PcmSpeechChannelHandler?
   private var audioDiagnosticsChannel: FlutterMethodChannel?
+  private var deviceContextChannel: FlutterMethodChannel?
 
   override func awakeFromNib() {
     let flutterViewController = FlutterViewController()
@@ -35,6 +36,17 @@ class MainFlutterWindow: NSWindow {
         "inputSampleRateHz": audioSampleRate(input),
         "outputSampleRateHz": audioSampleRate(output),
       ])
+    }
+    deviceContextChannel = FlutterMethodChannel(
+      name: "ava/device_context",
+      binaryMessenger: flutterViewController.engine.binaryMessenger
+    )
+    deviceContextChannel?.setMethodCallHandler { call, result in
+      guard call.method == "currentTimezoneId" else {
+        result(FlutterMethodNotImplemented)
+        return
+      }
+      result(TimeZone.current.identifier)
     }
 
     super.awakeFromNib()

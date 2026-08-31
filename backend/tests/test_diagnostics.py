@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from ava_backend.diagnostics import (
     AvaJsonLogFormatter,
@@ -54,6 +54,10 @@ def test_development_json_log_is_persistent_structured_and_idempotent(
         handler.flush()
 
     payload = json.loads(log_path.read_text(encoding="utf-8").splitlines()[-1])
+    diagnostic_timestamp = datetime.fromisoformat(
+        payload["timestamp"].replace("Z", "+00:00")
+    )
+    assert diagnostic_timestamp.utcoffset() == timedelta(0)
     assert payload["message"] == "synthetic failure"
     assert payload["context"] == {
         "failureId": "failure-test",

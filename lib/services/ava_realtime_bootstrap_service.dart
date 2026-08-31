@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import '../config/ava_backend_configuration.dart';
 import '../models/ava_realtime_protocol.dart';
 import '../models/ava_realtime_protocol_v4.dart';
+import 'ava_device_context_service.dart';
 
 final class AvaRealtimeBootstrapException implements Exception {
   const AvaRealtimeBootstrapException({
@@ -93,20 +94,25 @@ final class AvaRealtimeBootstrapService {
   const AvaRealtimeBootstrapService({
     required AvaBackendConfiguration configuration,
     required AvaRealtimeBootstrapTransport transport,
+    required AvaDeviceContext deviceContext,
   })  : _configuration = configuration,
-        _transport = transport;
+        _transport = transport,
+        _deviceContext = deviceContext;
 
   static const int maximumResponseBytes = 64 * 1024;
 
   final AvaBackendConfiguration _configuration;
   final AvaRealtimeBootstrapTransport _transport;
+  final AvaDeviceContext _deviceContext;
 
   Future<AvaSessionBootstrapV4> createSessionV4({
     required AvaRealtimeAgeBand ageBand,
     required AvaCanvasRenderProfileV4 canvasRenderProfile,
   }) async {
+    final timezoneId = await _deviceContext.currentTimezoneId();
     final request = AvaSessionCreateRequestV4(
       ageBand: ageBand,
+      timezoneId: timezoneId,
       canvasRenderProfile: canvasRenderProfile,
     );
     final response = await _transport.postJson(

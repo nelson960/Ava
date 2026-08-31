@@ -14,17 +14,26 @@ from enum import StrEnum
 from typing import Literal
 from uuid import uuid4
 
+from pydantic import field_validator
+
 from ..canvas.render_profile import CanvasRenderProfile
 from ..protocol import AgeBand
 from .common import RealtimeProtocolModel
 from .provider_session import NegotiatedRealtimeCall
+from .timezone import validate_iana_timezone_id
 from .websocket_v4 import RealtimeCoordinatorFactoryV4, RealtimeSessionCoordinatorV4
 
 
 class AvaSessionCreateRequestV4(RealtimeProtocolModel):
     protocol_version: Literal[4]
     age_band: AgeBand = AgeBand.UNKNOWN
+    timezone_id: str
     canvas_render_profile: CanvasRenderProfile | None = None
+
+    @field_validator("timezone_id", mode="before")
+    @classmethod
+    def timezone_id_is_iana(cls, value: object) -> str:
+        return validate_iana_timezone_id(value)
 
 
 class RealtimeSessionCapacityError(RuntimeError):
@@ -214,6 +223,7 @@ class RealtimeSessionRegistry:
         request_id: str,
         subject: str,
         age_band: AgeBand,
+        timezone_id: str,
         canvas_render_profile: CanvasRenderProfile | None = None,
     ) -> CreatedRealtimeSession:
         await self.purge_expired()
@@ -253,6 +263,7 @@ class RealtimeSessionRegistry:
                 request_id=request_id,
                 subject=subject,
                 age_band=age_band,
+                timezone_id=timezone_id,
                 canvas_render_profile=canvas_render_profile,
             )
             self._records[session_id] = _RealtimeSessionRecord(

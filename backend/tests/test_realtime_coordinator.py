@@ -674,6 +674,7 @@ def _coordinator(
     persistent: bool = False,
     unexpected_rearm: bool = False,
     occurrence_time_factory: Callable[[], datetime] | None = None,
+    timezone_id: str = "UTC",
     canvas_state: SvgCanvasSessionState | None = None,
     canvas_specialist: SvgCanvasSpecialist | None = None,
     canvas_generation_id_factory: Callable[[], str] | None = None,
@@ -710,6 +711,7 @@ def _coordinator(
         stream_id=STREAM_ID,
         subject="child:coordinator",
         age_band=AgeBand.MIDDLE_CHILDHOOD,
+        timezone_id=timezone_id,
         realtime=resolved_realtime,  # type: ignore[arg-type]
         speech=speech,
         canvas_jobs=jobs,
@@ -2766,6 +2768,7 @@ async def test_late_turn_a_commit_preserves_cross_turn_memory_chronology() -> No
         memory=memory,
         persistent=True,
         occurrence_time_factory=lambda: next(occurrence_times),
+        timezone_id="Asia/Kolkata",
     )
     await _ready(coordinator)
 
@@ -2819,6 +2822,9 @@ async def test_late_turn_a_commit_preserves_cross_turn_memory_chronology() -> No
     provider.complete_turn_a_transcription()
     await memory.wait_for_turn(provider.turn_a)
     assert memory.committed_turn_ids == [provider.turn_b, provider.turn_a]
+    assert {event.timezone_id for event in memory._turns["child:coordinator"]} == {
+        "Asia/Kolkata"
+    }
     await frames.aclose()
     await coordinator.close()
 

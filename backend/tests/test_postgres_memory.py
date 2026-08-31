@@ -30,8 +30,11 @@ from ava_backend.realtime.fakes import (
 )
 from ava_backend.realtime.memory import (
     AvaMemoryProposal,
+    ConversationEpisode,
     DeliveredConversationTurn,
     MemoryResetRevisionMismatchError,
+    RAW_RETENTION_HIGH_WATER,
+    RAW_RETENTION_LOW_WATER,
 )
 from ava_backend.realtime.plan import AvaTurnPlan
 from ava_backend.realtime.postgres_memory import PostgresAuthoritativeMemoryStore
@@ -78,6 +81,17 @@ class _PausingFencePostgresStore(PostgresAuthoritativeMemoryStore):
         return await super()._lock_subject(connection, subject)
 
 
+class _FailingEpisodeInsertPostgresStore(PostgresAuthoritativeMemoryStore):
+    async def _insert_episode(  # type: ignore[no-untyped-def]
+        self,
+        connection,
+        *,
+        episode: ConversationEpisode,
+    ) -> None:
+        del connection, episode
+        raise RuntimeError("injected episode insert failure")
+
+
 def _turn(index: int) -> DeliveredConversationTurn:
     return DeliveredConversationTurn.model_validate(
         {
@@ -116,7 +130,7 @@ def _interaction_turn(index: int) -> DeliveredConversationTurn:
     )
 
 
-async def test_postgres_v3_memory_round_trip_compaction_recap_and_reset() -> None:
+async def test_postgres_memory_round_trip_does_not_compact_at_event_nine() -> None:
     assert TEST_DATABASE_URL is not None
     store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
     subject = f"test:{uuid4()}"
@@ -142,6 +156,7 @@ async def test_postgres_v3_memory_round_trip_compaction_recap_and_reset() -> Non
                 turn=_turn(index),
                 proposal=proposal,
                 memory_id=memory_id,
+                timezone_id="Asia/Kolkata",
             )
 
         snapshot = await store.load_snapshot(
@@ -151,8 +166,23 @@ async def test_postgres_v3_memory_round_trip_compaction_recap_and_reset() -> Non
         assert [turn.turn_id for turn in snapshot.delivered_turns] == [
             f"turn-{index}" for index in range(2, 10)
         ]
-        assert snapshot.current_session_summary == ("Talked about astronomy topic 1.")
+        assert snapshot.current_session_summary is None
         assert [memory.id for memory in snapshot.stable_memories] == ["memory-1"]
+        connection = await AsyncConnection.connect(TEST_DATABASE_URL)
+        try:
+            counts_cursor = await connection.execute(
+                """
+                select
+                  (select count(*) from ava_private.delivered_turns where subject = %s),
+                  (select count(*) from ava_private.conversation_episodes where subject = %s),
+                  (select count(*) from ava_private.delivered_turns
+                    where subject = %s and timezone_id = 'Asia/Kolkata')
+                """,
+                (subject, subject, subject),
+            )
+            assert await counts_cursor.fetchone() == (9, 0, 9)
+        finally:
+            await connection.close()
 
         now = datetime.now(UTC)
         recap = await store.load_weekly_recap(
@@ -216,6 +246,404 @@ async def test_postgres_typed_canvas_interaction_round_trip_and_reset() -> None:
         await store.close()
 
 
+async def test_postgres_event_257_atomically_compacts_to_128_raw_events() -> None:
+    assert TEST_DATABASE_URL is not None
+    store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
+    subject = f"test:{uuid4()}"
+    base = datetime.now(UTC) - timedelta(days=1)
+    await store.open()
+    try:
+        for index in range(1, RAW_RETENTION_HIGH_WATER + 2):
+            turn = _turn(index)
+            if index == 1:
+                turn = DeliveredConversationTurn.model_validate(
+                    {
+                        "turnId": "turn-1",
+                        "childText": "Saturn has beautiful rings.",
+                        "avaDeliveredText": "Saturn's rings contain ice and rock.",
+                        "deliveredSampleCount": 24_000,
+                        "childTurnSummary": "Discussed Saturn's icy rings.",
+                        "terminal": "completed",
+                    }
+                )
+            await store.commit_delivered_turn(
+                subject=subject,
+                expected_reset_revision=0,
+                turn=turn,
+                proposal=None,
+                memory_id=None,
+                occurred_at=base + timedelta(minutes=index),
+                timezone_id=("Asia/Kolkata" if index <= 48 else "America/New_York"),
+            )
+
+        connection = await AsyncConnection.connect(TEST_DATABASE_URL)
+        try:
+            raw_cursor = await connection.execute(
+                """
+                select turn_id
+                from ava_private.delivered_turns
+                where subject = %s
+                order by occurred_at asc, turn_id asc
+                """,
+                (subject,),
+            )
+            episode_cursor = await connection.execute(
+                """
+                select episode_id, source_turn_ids, source_event_count,
+                       timezone_id, digest
+                from ava_private.conversation_episodes
+                where subject = %s
+                order by started_at asc, episode_id asc
+                """,
+                (subject,),
+            )
+            raw_rows = await raw_cursor.fetchall()
+            episode_rows = await episode_cursor.fetchall()
+        finally:
+            await connection.close()
+
+        assert len(raw_rows) == RAW_RETENTION_LOW_WATER
+        assert raw_rows[0][0] == "turn-130"
+        assert [row[2] for row in episode_rows] == [32, 32, 32, 32, 1]
+        source_turn_ids = [turn_id for row in episode_rows for turn_id in row[1]]
+        assert source_turn_ids == [f"turn-{index}" for index in range(1, 130)]
+        assert all(len(row[1]) <= 32 for row in episode_rows)
+        assert episode_rows[1][3] == "Asia/Kolkata"
+        combined_digest = "\n".join(row[4] for row in episode_rows)
+        assert "turn=" not in combined_digest
+        assert "occurredAt=" not in combined_digest
+        assert "timezone=" not in combined_digest
+        assert "Asia/Kolkata" not in combined_digest
+        assert "America/New_York" not in combined_digest
+
+        snapshot = await store.load_snapshot(
+            subject=subject,
+            age_band=AgeBand.MIDDLE_CHILDHOOD,
+        )
+        assert [turn.turn_id for turn in snapshot.delivered_turns] == [
+            f"turn-{index}" for index in range(250, 258)
+        ]
+
+        episode_candidates = await store.search_memory_candidates(
+            subject=subject,
+            query="Saturn icy rings",
+            from_instant=base - timedelta(seconds=1),
+            to_instant=base + timedelta(minutes=2),
+        )
+        assert len(episode_candidates) == 1
+        assert episode_candidates[0].source_kind == "episode"
+        assert "turn-1" in episode_candidates[0].source_turn_ids
+
+        connection = await AsyncConnection.connect(TEST_DATABASE_URL, autocommit=True)
+        try:
+            await connection.execute(
+                """
+                insert into ava_private.delivered_turns (
+                  subject, turn_id, input_kind, child_text, child_text_source,
+                  ava_delivered_text, delivered_sample_count, child_turn_summary,
+                  terminal, occurred_at, timezone_id
+                ) values (
+                  %s, 'turn-1', 'speech', 'Saturn has beautiful rings.',
+                  'transcript', 'Saturn rings contain ice.', 24000,
+                  'Discussed Saturn icy rings.', 'completed', %s, 'Asia/Kolkata'
+                )
+                """,
+                (subject, base),
+            )
+            overlapping = await store.search_memory_candidates(
+                subject=subject,
+                query="Saturn icy rings",
+            )
+            assert [candidate.source_kind for candidate in overlapping] == ["rawEvent"]
+            await connection.execute(
+                "delete from ava_private.delivered_turns where subject = %s and turn_id = 'turn-1'",
+                (subject,),
+            )
+            await connection.execute(
+                "delete from ava_private.weekly_records where subject = %s and turn_id = 'turn-1'",
+                (subject,),
+            )
+            await connection.execute(
+                """
+                update ava_private.turn_receipts
+                set committed_at = %s
+                where subject = %s and turn_id = 'turn-1'
+                """,
+                (datetime.now(UTC) - timedelta(days=365), subject),
+            )
+            async with store._connection() as pooled:
+                async with pooled.transaction():
+                    await store._prune_retention(pooled, subject=subject)
+            receipt_cursor = await connection.execute(
+                """
+                select count(*)
+                from ava_private.turn_receipts
+                where subject = %s and turn_id = 'turn-1'
+                """,
+                (subject,),
+            )
+            assert await receipt_cursor.fetchone() == (1,)
+        finally:
+            await connection.close()
+
+        await store.reset_conversation(subject=subject)
+        reset_connection = await AsyncConnection.connect(TEST_DATABASE_URL)
+        try:
+            reset_cursor = await reset_connection.execute(
+                "select count(*) from ava_private.conversation_episodes where subject = %s",
+                (subject,),
+            )
+            assert await reset_cursor.fetchone() == (0,)
+        finally:
+            await reset_connection.close()
+    finally:
+        await store.close()
+
+
+async def test_postgres_repeated_high_water_compaction_preserves_exact_partition() -> (
+    None
+):
+    assert TEST_DATABASE_URL is not None
+    store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
+    subject = f"test:{uuid4()}"
+    base = datetime.now(UTC) - timedelta(days=2)
+
+    async def retained_partition() -> tuple[list[str], list[list[str]]]:
+        connection = await AsyncConnection.connect(TEST_DATABASE_URL)
+        try:
+            raw_cursor = await connection.execute(
+                """
+                select turn_id
+                from ava_private.delivered_turns
+                where subject = %s
+                order by occurred_at asc, turn_id asc
+                """,
+                (subject,),
+            )
+            episode_cursor = await connection.execute(
+                """
+                select source_turn_ids
+                from ava_private.conversation_episodes
+                where subject = %s
+                order by started_at asc, episode_id asc
+                """,
+                (subject,),
+            )
+            raw_ids = [row[0] for row in await raw_cursor.fetchall()]
+            episode_batches = [list(row[0]) for row in await episode_cursor.fetchall()]
+            return raw_ids, episode_batches
+        finally:
+            await connection.close()
+
+    def assert_exact_partition(
+        *,
+        total_turns: int,
+        expected_raw_start: int,
+        raw_ids: list[str],
+        episode_batches: list[list[str]],
+    ) -> None:
+        episode_ids = [turn_id for batch in episode_batches for turn_id in batch]
+        retained_ids = [*episode_ids, *raw_ids]
+        expected_ids = [f"turn-{index}" for index in range(1, total_turns + 1)]
+        assert retained_ids == expected_ids
+        assert len(retained_ids) == len(set(retained_ids))
+        assert raw_ids == [
+            f"turn-{index}" for index in range(expected_raw_start, total_turns + 1)
+        ]
+        assert episode_ids == [
+            f"turn-{index}" for index in range(1, expected_raw_start)
+        ]
+        assert all(1 <= len(batch) <= 32 for batch in episode_batches)
+
+    await store.open()
+    try:
+        for index in range(1, RAW_RETENTION_HIGH_WATER + 2):
+            await store.commit_delivered_turn(
+                subject=subject,
+                expected_reset_revision=0,
+                turn=_turn(index),
+                proposal=None,
+                memory_id=None,
+                occurred_at=base + timedelta(minutes=index),
+                timezone_id="UTC",
+            )
+
+        raw_ids, episode_batches = await retained_partition()
+        assert len(raw_ids) == RAW_RETENTION_LOW_WATER
+        assert_exact_partition(
+            total_turns=257,
+            expected_raw_start=130,
+            raw_ids=raw_ids,
+            episode_batches=episode_batches,
+        )
+
+        for index in range(258, 386):
+            await store.commit_delivered_turn(
+                subject=subject,
+                expected_reset_revision=0,
+                turn=_turn(index),
+                proposal=None,
+                memory_id=None,
+                occurred_at=base + timedelta(minutes=index),
+                timezone_id="UTC",
+            )
+
+        raw_ids, episode_batches = await retained_partition()
+        assert len(raw_ids) == RAW_RETENTION_HIGH_WATER
+        assert_exact_partition(
+            total_turns=385,
+            expected_raw_start=130,
+            raw_ids=raw_ids,
+            episode_batches=episode_batches,
+        )
+
+        await store.commit_delivered_turn(
+            subject=subject,
+            expected_reset_revision=0,
+            turn=_turn(386),
+            proposal=None,
+            memory_id=None,
+            occurred_at=base + timedelta(minutes=386),
+            timezone_id="UTC",
+        )
+
+        raw_ids, episode_batches = await retained_partition()
+        assert len(raw_ids) == RAW_RETENTION_LOW_WATER
+        assert_exact_partition(
+            total_turns=386,
+            expected_raw_start=259,
+            raw_ids=raw_ids,
+            episode_batches=episode_batches,
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("query", ["???", "!@#"])
+async def test_postgres_search_rejects_non_lexical_queries_before_sql(
+    query: str,
+) -> None:
+    assert TEST_DATABASE_URL is not None
+    store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
+    await store.open()
+    try:
+        with pytest.raises(ValueError, match="must contain searchable text"):
+            await store.search_memory_candidates(
+                subject=f"test:{uuid4()}",
+                query=query,
+            )
+    finally:
+        await store.close()
+
+
+async def test_postgres_episode_insert_failure_rolls_back_new_raw_event() -> None:
+    assert TEST_DATABASE_URL is not None
+    store = _FailingEpisodeInsertPostgresStore(TEST_DATABASE_URL)
+    subject = f"test:{uuid4()}"
+    await store.open()
+    try:
+        for index in range(1, RAW_RETENTION_HIGH_WATER + 1):
+            await store.commit_delivered_turn(
+                subject=subject,
+                expected_reset_revision=0,
+                turn=_turn(index),
+                proposal=None,
+                memory_id=None,
+                timezone_id="UTC",
+            )
+
+        with pytest.raises(RuntimeError, match="injected episode insert failure"):
+            await store.commit_delivered_turn(
+                subject=subject,
+                expected_reset_revision=0,
+                turn=_turn(RAW_RETENTION_HIGH_WATER + 1),
+                proposal=None,
+                memory_id=None,
+                timezone_id="UTC",
+            )
+
+        connection = await AsyncConnection.connect(TEST_DATABASE_URL)
+        try:
+            cursor = await connection.execute(
+                """
+                select
+                  (select count(*) from ava_private.delivered_turns where subject = %s),
+                  (select count(*) from ava_private.conversation_episodes where subject = %s),
+                  (select count(*) from ava_private.turn_receipts where subject = %s)
+                """,
+                (subject, subject, subject),
+            )
+            assert await cursor.fetchone() == (
+                RAW_RETENTION_HIGH_WATER,
+                0,
+                RAW_RETENTION_HIGH_WATER,
+            )
+        finally:
+            await connection.close()
+    finally:
+        await store.close()
+
+
+async def test_postgres_episode_retention_enforces_age_and_count_bounds() -> None:
+    assert TEST_DATABASE_URL is not None
+    store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
+    subject = f"test:{uuid4()}"
+    now = datetime.now(UTC)
+    await store.open()
+    connection = await AsyncConnection.connect(TEST_DATABASE_URL, autocommit=True)
+    try:
+        await connection.execute(
+            "insert into ava_private.memory_state (subject) values (%s)",
+            (subject,),
+        )
+        for index in range(130):
+            ended_at = (
+                now - timedelta(days=181)
+                if index == 0
+                else now - timedelta(hours=129 - index)
+            )
+            await connection.execute(
+                """
+                insert into ava_private.conversation_episodes (
+                  subject, episode_id, started_at, ended_at, timezone_id,
+                  digest, source_turn_ids, source_event_count, created_at
+                ) values (%s, %s, %s, %s, 'UTC', %s, %s, 1, %s)
+                """,
+                (
+                    subject,
+                    f"episode-retention-{index}",
+                    ended_at,
+                    ended_at,
+                    f"retention episode {index}",
+                    [f"turn-retention-{index}"],
+                    now,
+                ),
+            )
+
+        async with store._connection() as pooled:
+            async with pooled.transaction():
+                await store._prune_retention(pooled, subject=subject)
+
+        cursor = await connection.execute(
+            """
+            select count(*), min(ended_at)
+            from ava_private.conversation_episodes
+            where subject = %s
+            """,
+            (subject,),
+        )
+        count, oldest = await cursor.fetchone()
+        assert count == 128
+        assert oldest >= now - timedelta(days=180)
+    finally:
+        await connection.execute(
+            "delete from ava_private.memory_state where subject = %s",
+            (subject,),
+        )
+        await connection.close()
+        await store.close()
+
+
 async def test_postgres_rejects_ambiguous_hybrid_delivered_input() -> None:
     assert TEST_DATABASE_URL is not None
     subject = f"test:{uuid4()}"
@@ -242,14 +670,14 @@ async def test_postgres_rejects_ambiguous_hybrid_delivered_input() -> None:
                 insert into ava_private.delivered_turns (
                   subject, turn_id, input_kind, child_text, child_text_source,
                   ava_delivered_text, delivered_sample_count,
-                  child_turn_summary, terminal,
+                  child_turn_summary, terminal, timezone_id,
                   canvas_scene_id, canvas_scene_revision,
                   canvas_interaction_revision, canvas_interaction_mode,
                   canvas_binding_id, canvas_target_id,
                   canvas_accessibility_label, canvas_step_index
                 ) values (
                   %s, %s, 'canvasInteraction', %s, 'transcript',
-                  '', 0, 'Canvas interaction.', 'completed',
+                  '', 0, 'Canvas interaction.', 'completed', 'UTC',
                   'scene-A', 1, 1, 'explore', 'binding-A', 'target-A',
                   'target-A label', null
                 )
@@ -302,14 +730,14 @@ async def test_postgres_rejects_null_or_blank_canvas_interaction_fields() -> Non
                     insert into ava_private.delivered_turns (
                       subject, turn_id, input_kind, child_text, child_text_source,
                       ava_delivered_text, delivered_sample_count,
-                      child_turn_summary, terminal,
+                      child_turn_summary, terminal, timezone_id,
                       canvas_scene_id, canvas_scene_revision,
                       canvas_interaction_revision, canvas_interaction_mode,
                       canvas_binding_id, canvas_target_id,
                       canvas_accessibility_label, canvas_step_index
                     ) values (
                       %s, %s, 'canvasInteraction', null, null,
-                      '', 0, 'Canvas interaction.', 'completed',
+                      '', 0, 'Canvas interaction.', 'completed', 'UTC',
                       %s, %s, %s, %s, %s, %s, %s, %s
                     )
                     """,
@@ -416,6 +844,7 @@ async def test_fake_realtime_tts_delivery_pipeline_commits_to_postgres() -> None
 
         assert terminal is not None
         assert terminal.delivered_text == plan.speech
+        await coordinator.close()
         snapshot = await store.load_snapshot(
             subject=subject,
             age_band=AgeBand.MIDDLE_CHILDHOOD,

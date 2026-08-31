@@ -7,9 +7,15 @@ import pytest
 from ava_backend.realtime.memory import (
     AuthoritativeMemorySnapshot,
     ChildTurnTextSource,
+    ConversationEpisode,
     DeliveredConversationTurn,
     DevelopmentAuthoritativeMemoryStore,
     MemoryResetRevisionMismatchError,
+    RAW_RETENTION_HIGH_WATER,
+    RAW_RETENTION_LOW_WATER,
+    StoredDeliveredConversationEvent,
+    build_conversation_episodes,
+    conversation_episode_id,
     evaluate_memory_proposal,
 )
 from ava_backend.realtime.memory import AvaMemoryProposal
@@ -114,9 +120,10 @@ async def test_v3_store_rejects_duplicate_turn_commit_and_reset_clears_context()
     assert second_receipt.revision == 2
 
 
-async def test_v3_store_compacts_evicted_turns_without_a_model_call() -> None:
-    store = DevelopmentAuthoritativeMemoryStore(max_turns_per_subject=2)
-    for index in range(1, 4):
+async def test_raw_retention_compacts_only_above_high_water_into_episodes() -> None:
+    store = DevelopmentAuthoritativeMemoryStore()
+    base = datetime.now(UTC) - timedelta(days=1)
+    for index in range(1, RAW_RETENTION_HIGH_WATER + 1):
         await store.commit_delivered_turn(
             subject="child:123",
             expected_reset_revision=0,
@@ -127,17 +134,145 @@ async def test_v3_store_compacts_evicted_turns_without_a_model_call() -> None:
             ).model_copy(update={"child_turn_summary": f"Topic {index}."}),
             proposal=None,
             memory_id=None,
+            occurred_at=base + timedelta(minutes=index),
+            timezone_id="Asia/Kolkata",
         )
+        if index == 8:
+            assert len(store._turns["child:123"]) == 8
+            assert store._episodes["child:123"] == []
+
+    assert len(store._turns["child:123"]) == RAW_RETENTION_HIGH_WATER
+    assert store._episodes["child:123"] == []
+
+    await store.commit_delivered_turn(
+        subject="child:123",
+        expected_reset_revision=0,
+        turn=_turn(
+            turn_id="turn-257",
+            child_text="Child statement 257.",
+            delivered_text="Ava response 257.",
+        ).model_copy(update={"child_turn_summary": "Topic 257."}),
+        proposal=None,
+        memory_id=None,
+        occurred_at=base + timedelta(minutes=257),
+        timezone_id="America/New_York",
+    )
+
+    raw = store._turns["child:123"]
+    episodes: list[ConversationEpisode] = store._episodes["child:123"]
+    assert len(raw) == RAW_RETENTION_LOW_WATER
+    assert [len(episode.source_turn_ids) for episode in episodes] == [32, 32, 32, 32, 1]
+    assert [turn_id for episode in episodes for turn_id in episode.source_turn_ids] == [
+        f"turn-{index}" for index in range(1, 130)
+    ]
+    assert all(episode.source_event_count <= 32 for episode in episodes)
+    combined_digest = "\n".join(episode.digest for episode in episodes)
+    assert all(f"Topic {index}." in combined_digest for index in range(1, 130))
+    assert "turn=" not in combined_digest
+    assert "occurredAt=" not in combined_digest
+    assert "timezone=" not in combined_digest
+    assert "Asia/Kolkata" not in combined_digest
+    assert episodes[-1].timezone_id == "Asia/Kolkata"
+    assert raw[0].turn.turn_id == "turn-130"
 
     snapshot = await store.load_snapshot(
-        subject="child:123",
-        age_band="middleChildhood",
+        subject="child:123", age_band="middleChildhood"
     )
     assert [turn.turn_id for turn in snapshot.delivered_turns] == [
-        "turn-2",
-        "turn-3",
+        f"turn-{index}" for index in range(250, 258)
     ]
-    assert snapshot.current_session_summary == "Topic 1."
+    assert snapshot.current_session_summary is None
+
+
+def test_episode_identity_is_deterministic_for_exact_ordered_source_batch() -> None:
+    ordered = ("turn-1", "turn-2", "turn-3")
+    assert conversation_episode_id(ordered) == conversation_episode_id(ordered)
+    assert conversation_episode_id(tuple(reversed(ordered))) != conversation_episode_id(
+        ordered
+    )
+
+
+def test_episode_digest_contains_only_ordered_bounded_semantic_material() -> None:
+    occurred_at = datetime(2026, 8, 31, 10, 30, tzinfo=UTC)
+    speech = _turn(
+        turn_id="turn-speech-protocol-id",
+        child_text="Why does Saturn have rings?",
+        delivered_text="Its rings are made of ice and rock.",
+    ).model_copy(update={"child_turn_summary": "Asked about Saturn's rings."})
+    interaction = DeliveredConversationTurn.model_validate(
+        {
+            "turnId": "turn-canvas-protocol-id",
+            "inputKind": "canvasInteraction",
+            "childText": None,
+            "childTextSource": None,
+            "canvasInteraction": {
+                "sceneId": "scene-protocol-id",
+                "sceneRevision": 2,
+                "interactionRevision": 7,
+                "interactionMode": "explore",
+                "bindingId": "binding-protocol-id",
+                "targetId": "target-protocol-id",
+                "accessibilityLabel": "Saturn's outer ring",
+                "stepIndex": None,
+            },
+            "avaDeliveredText": "That outer ring is especially bright.",
+            "deliveredSampleCount": 24_000,
+            "childTurnSummary": "Explored Saturn's ring diagram.",
+            "terminal": "completed",
+        }
+    )
+
+    episode = build_conversation_episodes(
+        subject="child:semantic-episode",
+        source_events=(
+            StoredDeliveredConversationEvent(
+                occurred_at=occurred_at,
+                timezone_id="Asia/Kolkata",
+                turn=speech,
+            ),
+            StoredDeliveredConversationEvent(
+                occurred_at=occurred_at + timedelta(minutes=1),
+                timezone_id="America/New_York",
+                turn=interaction,
+            ),
+        ),
+        created_at=occurred_at + timedelta(minutes=2),
+    )[0]
+
+    assert episode.digest.splitlines() == [
+        (
+            "Asked about Saturn's rings. Why does Saturn have rings? "
+            "Its rings are made of ice and rock."
+        ),
+        (
+            "Explored Saturn's ring diagram. Saturn's outer ring "
+            "That outer ring is especially bright."
+        ),
+    ]
+    assert episode.source_turn_ids == [
+        "turn-speech-protocol-id",
+        "turn-canvas-protocol-id",
+    ]
+    assert episode.started_at == occurred_at
+    assert episode.ended_at == occurred_at + timedelta(minutes=1)
+    assert episode.timezone_id == "Asia/Kolkata"
+    assert episode.source_event_count == 2
+    assert "protocol-id" not in episode.digest
+    assert occurred_at.isoformat() not in episode.digest
+    assert "Asia/Kolkata" not in episode.digest
+    assert "America/New_York" not in episode.digest
+    assert all(
+        marker not in episode.digest
+        for marker in (
+            "turn=",
+            "occurredAt=",
+            "timezone=",
+            "summary=",
+            "child=",
+            "canvasLabel=",
+            "avaDelivered=",
+        )
+    )
 
 
 async def test_v3_weekly_recap_is_bounded_factual_and_resettable() -> None:
@@ -525,3 +660,186 @@ async def test_fresh_post_reset_epoch_writes_and_duplicate_behavior_is_unchanged
         age_band="middleChildhood",
     )
     assert [turn.turn_id for turn in after.delivered_turns] == ["turn-after-reset"]
+
+
+async def test_timezone_round_trip_uses_canonical_utc_instant() -> None:
+    store = DevelopmentAuthoritativeMemoryStore()
+    occurred_at = datetime.fromisoformat("2026-08-31T12:30:00+05:30")
+    await store.commit_delivered_turn(
+        subject="child:timezone",
+        expected_reset_revision=0,
+        turn=_turn(turn_id="turn-timezone"),
+        proposal=None,
+        memory_id=None,
+        occurred_at=occurred_at,
+        timezone_id="Asia/Kolkata",
+    )
+
+    stored = store._turns["child:timezone"][0]
+    assert stored.occurred_at == datetime(2026, 8, 31, 7, 0, tzinfo=UTC)
+    assert stored.occurred_at.tzinfo is UTC
+    assert stored.timezone_id == "Asia/Kolkata"
+
+
+async def test_invalid_timezone_is_rejected_before_memory_write() -> None:
+    store = DevelopmentAuthoritativeMemoryStore()
+    with pytest.raises(ValueError, match="IANA timezone"):
+        await store.commit_delivered_turn(
+            subject="child:timezone",
+            expected_reset_revision=0,
+            turn=_turn(turn_id="turn-invalid-timezone"),
+            proposal=None,
+            memory_id=None,
+            timezone_id="Mars/Olympus_Mons",
+        )
+    assert store._turns["child:timezone"] == []
+
+
+async def test_candidate_search_prefers_text_relevance_and_applies_utc_bounds() -> None:
+    store = DevelopmentAuthoritativeMemoryStore()
+    base = datetime(2025, 1, 1, tzinfo=UTC)
+    await store.commit_delivered_turn(
+        subject="child:search",
+        expected_reset_revision=0,
+        turn=_turn(
+            turn_id="turn-old-relevant",
+            child_text="Saturn has beautiful rings.",
+            delivered_text="Saturn's rings are made of ice and rock.",
+        ).model_copy(update={"child_turn_summary": "Discussed Saturn rings."}),
+        proposal=None,
+        memory_id=None,
+        occurred_at=base,
+        timezone_id="Europe/London",
+    )
+    await store.commit_delivered_turn(
+        subject="child:search",
+        expected_reset_revision=0,
+        turn=_turn(
+            turn_id="turn-new-unrelated",
+            child_text="Tell me about bread.",
+            delivered_text="Bread rises when yeast makes gas.",
+        ).model_copy(update={"child_turn_summary": "Discussed baking bread."}),
+        proposal=None,
+        memory_id=None,
+        occurred_at=base + timedelta(days=100),
+        timezone_id="America/New_York",
+    )
+
+    candidates = await store.search_memory_candidates(
+        subject="child:search",
+        query="Saturn rings ice",
+        from_instant=base - timedelta(seconds=1),
+        to_instant=base + timedelta(days=1),
+        limit=5,
+    )
+
+    assert [candidate.source_id for candidate in candidates] == ["turn-old-relevant"]
+    assert candidates[0].source_kind == "rawEvent"
+    assert candidates[0].timezone_ids == ["Europe/London"]
+    assert candidates[0].source_turn_ids == ["turn-old-relevant"]
+
+
+@pytest.mark.parametrize("query", ["???", "!@#"])
+async def test_development_search_rejects_non_lexical_queries_safely(
+    query: str,
+) -> None:
+    store = DevelopmentAuthoritativeMemoryStore()
+
+    with pytest.raises(ValueError, match="must contain searchable text"):
+        await store.search_memory_candidates(
+            subject="child:non-lexical-search",
+            query=query,
+        )
+
+
+async def test_reset_clears_compacted_episodes() -> None:
+    store = DevelopmentAuthoritativeMemoryStore()
+    for index in range(1, RAW_RETENTION_HIGH_WATER + 2):
+        await store.commit_delivered_turn(
+            subject="child:episode-reset",
+            expected_reset_revision=0,
+            turn=_turn(turn_id=f"turn-{index}"),
+            proposal=None,
+            memory_id=None,
+            timezone_id="UTC",
+        )
+    assert store._episodes["child:episode-reset"]
+
+    await store.reset_conversation(subject="child:episode-reset")
+
+    assert store._episodes["child:episode-reset"] == []
+
+
+async def test_development_episode_retention_and_raw_overlap_deduplication() -> None:
+    store = DevelopmentAuthoritativeMemoryStore()
+    subject = "child:episode-retention"
+    now = datetime.now(UTC)
+    await store.commit_delivered_turn(
+        subject=subject,
+        expected_reset_revision=0,
+        turn=_turn(
+            turn_id="turn-overlap",
+            child_text="Saturn has rings.",
+            delivered_text="Saturn's rings contain ice.",
+        ),
+        proposal=None,
+        memory_id=None,
+        occurred_at=now,
+        timezone_id="UTC",
+    )
+    overlap = ConversationEpisode.model_validate(
+        {
+            "subject": subject,
+            "episodeId": "episode-overlap",
+            "startedAt": now,
+            "endedAt": now,
+            "timezoneId": "UTC",
+            "digest": "Saturn rings ice",
+            "sourceTurnIds": ["turn-overlap"],
+            "sourceEventCount": 1,
+            "createdAt": now,
+        }
+    )
+    store._episodes[subject].append(overlap)
+    candidates = await store.search_memory_candidates(
+        subject=subject,
+        query="Saturn rings ice",
+    )
+    assert [candidate.source_kind for candidate in candidates] == ["rawEvent"]
+
+    store._episodes[subject] = [
+        ConversationEpisode.model_validate(
+            {
+                "subject": subject,
+                "episodeId": f"episode-{index}",
+                "startedAt": (
+                    now - timedelta(days=181)
+                    if index == 0
+                    else now - timedelta(hours=129 - index)
+                ),
+                "endedAt": (
+                    now - timedelta(days=181)
+                    if index == 0
+                    else now - timedelta(hours=129 - index)
+                ),
+                "timezoneId": "UTC",
+                "digest": f"retained episode {index}",
+                "sourceTurnIds": [f"turn-episode-{index}"],
+                "sourceEventCount": 1,
+                "createdAt": now,
+            }
+        )
+        for index in range(130)
+    ]
+    await store.commit_delivered_turn(
+        subject=subject,
+        expected_reset_revision=0,
+        turn=_turn(turn_id="turn-prune-trigger"),
+        proposal=None,
+        memory_id=None,
+        occurred_at=now,
+        timezone_id="UTC",
+    )
+    retained = store._episodes[subject]
+    assert len(retained) == 128
+    assert all(episode.ended_at >= now - timedelta(days=180) for episode in retained)

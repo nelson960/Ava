@@ -72,6 +72,7 @@ class RealtimeCoordinatorFactoryV4(Protocol):
         request_id: str,
         subject: str,
         age_band: AgeBand,
+        timezone_id: str,
         canvas_render_profile: CanvasRenderProfile | None = None,
     ) -> RealtimeSessionCoordinatorV4: ...
 

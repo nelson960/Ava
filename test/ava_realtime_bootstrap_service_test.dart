@@ -6,9 +6,13 @@ import 'package:ava/config/ava_backend_configuration.dart';
 import 'package:ava/models/ava_realtime_protocol.dart';
 import 'package:ava/models/ava_realtime_protocol_v4.dart';
 import 'package:ava/services/ava_realtime_bootstrap_service.dart';
+import 'package:ava/services/ava_device_context_service.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   test('creates a strict v4 session without sending profile identity',
       () async {
     final bootstrapJson =
@@ -28,6 +32,7 @@ void main() {
         'https://ava.example/api/',
       ),
       transport: transport,
+      deviceContext: const _DeviceContextFake('Asia/Kolkata'),
     );
 
     final bootstrap = await service.createSessionV4(
@@ -51,6 +56,7 @@ void main() {
       {
         'protocolVersion': 4,
         'ageBand': 'middleChildhood',
+        'timezoneId': 'Asia/Kolkata',
         'canvasRenderProfile': _profile.toJson(),
       },
     );
@@ -75,6 +81,7 @@ void main() {
       final service = AvaRealtimeBootstrapService(
         configuration: AvaBackendConfiguration.parse('https://ava.example/'),
         transport: _BootstrapTransportFake(response),
+        deviceContext: const _DeviceContextFake('UTC'),
       );
       await expectLater(
         service.createSessionV4(
@@ -155,6 +162,7 @@ void main() {
           bytes: body.stream,
         ),
       ),
+      deviceContext: const _DeviceContextFake('Europe/London'),
     );
 
     await expectLater(
@@ -165,6 +173,23 @@ void main() {
       throwsA(isA<TimeoutException>()),
     );
     await body.close();
+  });
+
+  test('Apple device-context bridge returns the native timezone identifier',
+      () async {
+    const channel = MethodChannel('test/ava_device_context');
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      expect(call.method, 'currentTimezoneId');
+      return 'America/New_York';
+    });
+    addTearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null);
+    });
+
+    final service = AvaDeviceContextService(channel: channel);
+    expect(await service.currentTimezoneId(), 'America/New_York');
   });
 }
 
@@ -205,4 +230,13 @@ final class _BootstrapTransportFake implements AvaRealtimeBootstrapTransport {
   void close() {
     closed = true;
   }
+}
+
+final class _DeviceContextFake implements AvaDeviceContext {
+  const _DeviceContextFake(this.timezoneId);
+
+  final String timezoneId;
+
+  @override
+  Future<String> currentTimezoneId() async => timezoneId;
 }

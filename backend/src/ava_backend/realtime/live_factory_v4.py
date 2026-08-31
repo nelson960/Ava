@@ -58,6 +58,7 @@ class LiveRealtimeCoordinatorFactoryV4:
         request_id: str,
         subject: str,
         age_band: AgeBand,
+        timezone_id: str,
         canvas_render_profile: CanvasRenderProfile | None = None,
     ) -> RealtimeSessionCoordinatorV4:
         safety_id = self._safety_identifier(subject)
@@ -117,6 +118,7 @@ class LiveRealtimeCoordinatorFactoryV4:
             stream_id=f"stream-{suffix}",
             subject=subject,
             age_band=age_band,
+            timezone_id=timezone_id,
             realtime=realtime,
             speech=self._create_speech_synthesizer(),
             canvas_jobs=jobs,

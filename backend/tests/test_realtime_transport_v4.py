@@ -72,6 +72,7 @@ class _Factory:
     def __init__(self) -> None:
         self.coordinators: list[_Coordinator] = []
         self.render_profiles: list[CanvasRenderProfile | None] = []
+        self.timezone_ids: list[str] = []
 
     def create(
         self,
@@ -80,12 +81,14 @@ class _Factory:
         request_id: str,
         subject: str,
         age_band: AgeBand,
+        timezone_id: str,
         canvas_render_profile: CanvasRenderProfile | None = None,
     ) -> RealtimeSessionCoordinatorV4:
         assert session_id and request_id and subject and age_band
         if canvas_render_profile is not None:
             assert canvas_render_profile.usable_aspect_ratio > 0
         self.render_profiles.append(canvas_render_profile)
+        self.timezone_ids.append(timezone_id)
         coordinator = _Coordinator()
         self.coordinators.append(coordinator)
         return coordinator
@@ -104,6 +107,33 @@ class _RejectingCanvasRegistry:
     ) -> None:
         assert session_id and token and subject
         raise RealtimeSessionAuthenticationError(self._failure)
+
+
+@pytest.mark.parametrize("timezone_id", ["Not/A_Real_Zone", "", " Asia/Kolkata"])
+def test_v4_session_rejects_invalid_device_timezone(timezone_id: str) -> None:
+    factory = _Factory()
+    app = create_app(
+        Settings(
+            environment=AvaEnvironment.TEST,
+            realtime_session_token_secret=SecretStr("v" * 32),
+        ),
+        authoritative_memory=DevelopmentAuthoritativeMemoryStore(),
+        realtime_v4_coordinator_factory=factory,
+    )
+
+    with TestClient(app, base_url="https://127.0.0.1") as client:
+        response = client.post(
+            "/v4/realtime/sessions",
+            headers={"X-Ava-Protocol-Version": "4"},
+            json={
+                "protocolVersion": 4,
+                "ageBand": "unknown",
+                "timezoneId": timezone_id,
+            },
+        )
+
+    assert response.status_code == 422
+    assert factory.timezone_ids == []
 
 
 def test_v4_bootstrap_and_independent_exact_document_fetch() -> None:
@@ -126,6 +156,7 @@ def test_v4_bootstrap_and_independent_exact_document_fetch() -> None:
             json={
                 "protocolVersion": 4,
                 "ageBand": "middleChildhood",
+                "timezoneId": "Asia/Kolkata",
                 "canvasRenderProfile": {
                     "usableAspectRatio": 1.6,
                     "orientation": "landscape",
@@ -155,6 +186,7 @@ def test_v4_bootstrap_and_independent_exact_document_fetch() -> None:
         assert render_profile is not None
         assert render_profile.usable_aspect_ratio == 1.6
         assert render_profile.safe_insets.bottom == 0.04
+        assert factory.timezone_ids == ["Asia/Kolkata"]
 
         negotiated = client.post(
             f"/v4/realtime/sessions/{bootstrap['sessionId']}/webrtc",
@@ -202,9 +234,9 @@ def test_v4_bootstrap_and_independent_exact_document_fetch() -> None:
                     generation_id="generation-v4",
                     draft_index=1,
                     attempt=0,
-                    document=SvgDraftSafetyValidator(
-                        SvgDocumentValidator()
-                    ).validate(generation.document.svg_text),
+                    document=SvgDraftSafetyValidator(SvgDocumentValidator()).validate(
+                        generation.document.svg_text
+                    ),
                 ),
             )
         )
@@ -258,7 +290,7 @@ def test_v4_routes_are_unavailable_until_v4_factory_is_configured() -> None:
         response = client.post(
             "/v4/realtime/sessions",
             headers={"X-Ava-Protocol-Version": "4"},
-            json={"protocolVersion": 4, "ageBand": "unknown"},
+            json={"protocolVersion": 4, "ageBand": "unknown", "timezoneId": "UTC"},
         )
 
     assert response.status_code == 503
@@ -281,6 +313,7 @@ async def test_v4_registry_tokens_expire_cannot_replay_and_close_owners() -> Non
         request_id="request-registry-1",
         subject="child:registry",
         age_band=AgeBand.MIDDLE_CHILDHOOD,
+        timezone_id="UTC",
     )
     await registry.negotiate(
         session_id=first.session_id,
@@ -318,6 +351,7 @@ async def test_v4_registry_tokens_expire_cannot_replay_and_close_owners() -> Non
         request_id="request-registry-2",
         subject="child:registry",
         age_band=AgeBand.PRETEEN,
+        timezone_id="UTC",
     )
     current += timedelta(seconds=31)
     with pytest.raises(
@@ -345,6 +379,7 @@ async def test_claimed_v4_session_keeps_canvas_authorization_until_release() -> 
         request_id="request-canvas-lifetime",
         subject="child:canvas-lifetime",
         age_band=AgeBand.MIDDLE_CHILDHOOD,
+        timezone_id="UTC",
     )
     await registry.negotiate(
         session_id=created.session_id,
@@ -402,16 +437,19 @@ async def test_v4_event_and_webrtc_admission_remain_short_lived() -> None:
         request_id="request-event-admission",
         subject="child:admission",
         age_band=AgeBand.MIDDLE_CHILDHOOD,
+        timezone_id="UTC",
     )
     webrtc_admission = await registry.create(
         request_id="request-webrtc-admission",
         subject="child:admission",
         age_band=AgeBand.MIDDLE_CHILDHOOD,
+        timezone_id="UTC",
     )
     unclaimed_canvas = await registry.create(
         request_id="request-unclaimed-canvas",
         subject="child:admission",
         age_band=AgeBand.MIDDLE_CHILDHOOD,
+        timezone_id="UTC",
     )
     await registry.negotiate(
         session_id=unclaimed_canvas.session_id,
@@ -467,6 +505,7 @@ async def test_claimed_v4_canvas_authorization_expires_at_active_deadline() -> N
         request_id="request-active-deadline",
         subject="child:active-deadline",
         age_band=AgeBand.MIDDLE_CHILDHOOD,
+        timezone_id="UTC",
     )
     await registry.negotiate(
         session_id=created.session_id,

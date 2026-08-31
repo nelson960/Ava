@@ -464,9 +464,7 @@ final class AvaRealtimeTurnRuntime {
     if (!_started || _closed) return;
     _microphoneRequested = enabled;
     if (enabled) {
-      if (!_terminal &&
-          _turnId != null &&
-          snapshot.phase == AvaRealtimeTurnPhase.listening) {
+      if (_canEnableMicrophoneNow()) {
         await _setMicrophoneEnabled(true);
       }
     } else {
@@ -480,9 +478,7 @@ final class AvaRealtimeTurnRuntime {
       throw StateError('Cannot resume an inactive realtime conversation.');
     }
     _microphoneRequested = true;
-    if (!_terminal &&
-        _turnId != null &&
-        snapshot.phase == AvaRealtimeTurnPhase.listening) {
+    if (_canEnableMicrophoneNow()) {
       await _setMicrophoneEnabled(true);
     }
   }
@@ -1483,6 +1479,25 @@ final class AvaRealtimeTurnRuntime {
     });
     _microphoneTail = operation;
     return operation;
+  }
+
+  bool _canEnableMicrophoneNow() {
+    if (_terminal || _turnId == null || _interrupting) return false;
+    return switch (snapshot.phase) {
+      AvaRealtimeTurnPhase.listening ||
+      AvaRealtimeTurnPhase.planning ||
+      AvaRealtimeTurnPhase.synthesizing ||
+      AvaRealtimeTurnPhase.speaking =>
+        true,
+      AvaRealtimeTurnPhase.created ||
+      AvaRealtimeTurnPhase.connecting ||
+      AvaRealtimeTurnPhase.cancelling ||
+      AvaRealtimeTurnPhase.completed ||
+      AvaRealtimeTurnPhase.cancelled ||
+      AvaRealtimeTurnPhase.failed ||
+      null =>
+        false,
+    };
   }
 
   Future<void> _sendClient(

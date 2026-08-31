@@ -83,6 +83,7 @@ from .tool_contract import (
     RealtimeSpeechTextDelta,
 )
 from .turn_parser import StreamingSpeechParser, StreamingTurnParseError
+from .timezone import validate_iana_timezone_id
 from .websocket_v4 import (
     AvaServerControlFrameV4,
     AvaServerOutboundFrameV4,
@@ -124,6 +125,7 @@ class _CapturedMemoryCommit:
     sequence: int
     turn_id: str
     occurred_at: datetime
+    timezone_id: str
     expected_reset_revision: int
     child_turn_summary: str | None
     child_text: str | None
@@ -152,6 +154,7 @@ class DeterministicRealtimeSessionCoordinator:
         stream_id: str,
         subject: str,
         age_band: AgeBand,
+        timezone_id: str = "UTC",
         realtime: RealtimeProviderSession,
         speech: StreamingSpeechSynthesizer,
         canvas_jobs: SvgCanvasJobCoordinator,
@@ -179,6 +182,7 @@ class DeterministicRealtimeSessionCoordinator:
         self._stream_id = stream_id
         self._subject = subject
         self._age_band = age_band
+        self._timezone_id = validate_iana_timezone_id(timezone_id)
         self._child_text: str | None = None
         self._child_text_source: ChildTurnTextSource | None = None
         self._realtime = realtime
@@ -354,13 +358,16 @@ class DeterministicRealtimeSessionCoordinator:
         self._harness = harness
         self._negotiated_call = negotiated
         LOGGER.info(
-            "realtime_session_prepared session_id=%s prompt_version=%s elapsed_ms=%.2f",
+            "realtime_session_prepared session_id=%s timezone_id=%s "
+            "prompt_version=%s elapsed_ms=%.2f",
             self._session_id,
+            self._timezone_id,
             harness.prompt_version,
             (monotonic() - preparation_started) * 1000,
             extra={
                 "ava_context": {
                     "sessionId": self._session_id,
+                    "timezoneId": self._timezone_id,
                     "promptVersion": harness.prompt_version,
                     "toolContractVersion": harness.tool_contract_version,
                     "providerCallId": negotiated.provider_call_id,
@@ -2351,6 +2358,7 @@ class DeterministicRealtimeSessionCoordinator:
             sequence=sequence,
             turn_id=turn_id,
             occurred_at=occurred_at,
+            timezone_id=self._timezone_id,
             expected_reset_revision=expected_reset_revision,
             child_turn_summary=(plan.child_turn_summary if plan is not None else None),
             child_text=child_text,
@@ -2429,6 +2437,7 @@ class DeterministicRealtimeSessionCoordinator:
                 proposal=None,
                 memory_id=None,
                 occurred_at=payload.occurred_at,
+                timezone_id=payload.timezone_id,
             )
             if payload.sequence == self._latest_memory_commit_sequence:
                 self._last_memory_decision = decision

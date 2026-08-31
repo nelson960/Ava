@@ -10,26 +10,37 @@ from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from ..protocol import AgeBand
 from .memory import (
-    MAX_DELIVERED_TURNS,
+    EPISODE_RETENTION_DAYS,
+    MAX_EPISODES,
+    MAX_SNAPSHOT_DELIVERED_TURNS,
     MAX_STABLE_MEMORIES,
     MAX_WEEKLY_RECORDS,
+    RAW_RETENTION_HIGH_WATER,
+    RAW_RETENTION_LOW_WATER,
     AvaMemoryProposal,
     AuthoritativeMemorySnapshot,
+    ConversationEpisode,
     ConversationResetReceipt,
     DeliveredConversationTurn,
     DeliveredInputKind,
+    MemorySearchCandidate,
     MemoryResetRevisionMismatchError,
     MemoryProposalDecision,
+    StoredDeliveredConversationEvent,
     WeeklyConversationRecap,
     WeeklyConversationRecord,
     _validate_aware_datetime,
     _validate_reset_revision,
+    _validate_search_bounds,
+    _validate_search_limit,
+    _validate_search_query,
     _validate_subject,
     _validate_weekly_summary,
-    compact_session_summary,
+    build_conversation_episodes,
     evaluate_delivered_turn_memory_proposal,
     _validate_optional_summary,
 )
+from .timezone import validate_iana_timezone_id
 
 
 class PostgresMemoryStoreError(RuntimeError):
@@ -92,19 +103,19 @@ class PostgresAuthoritativeMemoryStore:
                     """
                     select version
                     from ava_private.schema_migrations
-                    where name = 'realtime_memory_v4'
+                    where name = 'realtime_memory_v5'
                     """
                 )
                 row = await cursor.fetchone()
         except (PsycopgError, PoolTimeout) as error:
             await self._pool.close()
             raise PostgresMemoryStoreError(
-                "PostgreSQL memory is unavailable or its v4 migration is missing"
+                "PostgreSQL memory is unavailable or its v5 migration is missing"
             ) from error
         if row is None or cast(int, row["version"]) != 1:
             await self._pool.close()
             raise PostgresMemoryStoreError(
-                "PostgreSQL memory schema realtime_memory_v4 version 1 is required"
+                "PostgreSQL memory schema realtime_memory_v5 version 1 is required"
             )
         self._opened = True
 
@@ -153,12 +164,16 @@ class PostgresAuthoritativeMemoryStore:
                            canvas_interaction_revision, canvas_interaction_mode,
                            canvas_binding_id, canvas_target_id,
                            canvas_accessibility_label, canvas_step_index
-                    from ava_private.delivered_turns
-                    where subject = %s
+                    from (
+                      select *
+                      from ava_private.delivered_turns
+                      where subject = %s
+                      order by occurred_at desc, turn_id desc
+                      limit %s
+                    ) as newest
                     order by occurred_at asc, turn_id asc
-                    limit %s
                     """,
-                    (normalized_subject, MAX_DELIVERED_TURNS),
+                    (normalized_subject, MAX_SNAPSHOT_DELIVERED_TURNS),
                 )
                 turn_rows = await turns_cursor.fetchall()
                 memories_cursor = await connection.execute(
@@ -232,6 +247,7 @@ class PostgresAuthoritativeMemoryStore:
         proposal: AvaMemoryProposal | None,
         memory_id: str | None,
         occurred_at: datetime | None = None,
+        timezone_id: str = "UTC",
     ) -> MemoryProposalDecision:
         normalized_subject = _validate_subject(subject)
         validated_expected_reset_revision = _validate_reset_revision(
@@ -242,6 +258,7 @@ class PostgresAuthoritativeMemoryStore:
             occurred_at or datetime.now(UTC),
             field_name="occurred_at",
         )
+        validated_timezone_id = validate_iana_timezone_id(timezone_id)
         validated_turn = DeliveredConversationTurn.model_validate(
             turn.model_dump(mode="json", by_alias=True)
         )
@@ -279,13 +296,14 @@ class PostgresAuthoritativeMemoryStore:
                           subject, turn_id, input_kind, child_text, child_text_source,
                           ava_delivered_text, delivered_sample_count,
                           child_turn_summary, terminal, occurred_at,
+                          timezone_id,
                           canvas_scene_id, canvas_scene_revision,
                           canvas_interaction_revision, canvas_interaction_mode,
                           canvas_binding_id, canvas_target_id,
                           canvas_accessibility_label, canvas_step_index
                         ) values (
                           %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                          %s, %s, %s, %s, %s, %s, %s, %s
+                          %s, %s, %s, %s, %s, %s, %s, %s, %s
                         )
                         """,
                         (
@@ -303,6 +321,7 @@ class PostgresAuthoritativeMemoryStore:
                             validated_turn.child_turn_summary,
                             str(validated_turn.terminal),
                             normalized_occurred_at,
+                            validated_timezone_id,
                             interaction.scene_id if interaction else None,
                             interaction.scene_revision if interaction else None,
                             interaction.interaction_revision if interaction else None,
@@ -331,9 +350,10 @@ class PostgresAuthoritativeMemoryStore:
                         subject=normalized_subject,
                         decision=decision,
                     )
-                    await self._compact_delivered_turns(
+                    await self._compact_delivered_turns_into_episodes(
                         connection,
                         subject=normalized_subject,
+                        created_at=normalized_occurred_at,
                     )
                     await self._prune_retention(
                         connection,
@@ -344,6 +364,193 @@ class PostgresAuthoritativeMemoryStore:
                     f"delivered turn {validated_turn.turn_id!r} is already committed"
                 ) from error
         return decision
+
+    async def search_memory_candidates(
+        self,
+        *,
+        subject: str,
+        query: str,
+        limit: int = 5,
+        from_instant: datetime | None = None,
+        to_instant: datetime | None = None,
+    ) -> list[MemorySearchCandidate]:
+        normalized_subject = _validate_subject(subject)
+        query_text = " ".join(_validate_search_query(query))
+        validated_limit = _validate_search_limit(limit)
+        lower, upper = _validate_search_bounds(from_instant, to_instant)
+        async with self._connection() as connection:
+            cursor = await connection.execute(
+                """
+                with search_query as (
+                  select plainto_tsquery('simple', %s) as value
+                ),
+                raw_candidates as (
+                  select
+                    turn.turn_id as source_id,
+                    'rawEvent'::text as source_kind,
+                    turn.occurred_at as started_at,
+                    turn.occurred_at as ended_at,
+                    array[turn.timezone_id]::text[] as timezone_ids,
+                    left(
+                      regexp_replace(
+                        coalesce(turn.child_text, '') || ' ' ||
+                        turn.child_turn_summary || ' ' ||
+                        turn.ava_delivered_text || ' ' ||
+                        coalesce(turn.canvas_accessibility_label, ''),
+                        '\\s+', ' ', 'g'
+                      ),
+                      1200
+                    ) as reference_text,
+                    array[turn.turn_id]::text[] as source_turn_ids,
+                    ts_rank_cd(
+                      to_tsvector(
+                        'simple',
+                        coalesce(turn.child_text, '') || ' ' ||
+                        turn.child_turn_summary || ' ' ||
+                        turn.ava_delivered_text || ' ' ||
+                        coalesce(turn.canvas_accessibility_label, '')
+                      ),
+                      search_query.value
+                    ) as relevance
+                  from ava_private.delivered_turns as turn
+                  cross join search_query
+                  where turn.subject = %s
+                    and to_tsvector(
+                      'simple',
+                      coalesce(turn.child_text, '') || ' ' ||
+                      turn.child_turn_summary || ' ' ||
+                      turn.ava_delivered_text || ' ' ||
+                      coalesce(turn.canvas_accessibility_label, '')
+                    ) @@ search_query.value
+                    and (%s::timestamptz is null or turn.occurred_at >= %s)
+                    and (%s::timestamptz is null or turn.occurred_at < %s)
+                ),
+                episode_candidates as (
+                  select
+                    episode.episode_id as source_id,
+                    'episode'::text as source_kind,
+                    episode.started_at,
+                    episode.ended_at,
+                    array[episode.timezone_id]::text[] as timezone_ids,
+                    left(episode.digest, 1200) as reference_text,
+                    episode.source_turn_ids,
+                    ts_rank_cd(
+                      to_tsvector('simple', episode.digest),
+                      search_query.value
+                    ) as relevance
+                  from ava_private.conversation_episodes as episode
+                  cross join search_query
+                  where episode.subject = %s
+                    and to_tsvector('simple', episode.digest) @@ search_query.value
+                    and (%s::timestamptz is null or episode.ended_at >= %s)
+                    and (%s::timestamptz is null or episode.started_at < %s)
+                    and not exists (
+                      select 1
+                      from ava_private.delivered_turns as overlapping_raw
+                      where overlapping_raw.subject = episode.subject
+                        and overlapping_raw.turn_id = any(episode.source_turn_ids)
+                    )
+                ),
+                stable_candidates as (
+                  select
+                    memory.memory_id as source_id,
+                    'stableMemory'::text as source_kind,
+                    coalesce(raw.occurred_at, episode.started_at, memory.created_at)
+                      as started_at,
+                    coalesce(raw.occurred_at, episode.ended_at, memory.created_at)
+                      as ended_at,
+                    case
+                      when raw.timezone_id is not null
+                        then array[raw.timezone_id]::text[]
+                      when episode.timezone_id is not null
+                        then array[episode.timezone_id]::text[]
+                      else array[]::text[]
+                    end as timezone_ids,
+                    left(memory.summary || ' ' || memory.evidence, 1200)
+                      as reference_text,
+                    array[memory.source_turn_id]::text[] as source_turn_ids,
+                    ts_rank_cd(
+                      to_tsvector('simple', memory.summary || ' ' || memory.evidence),
+                      search_query.value
+                    ) as relevance
+                  from ava_private.stable_memories as memory
+                  cross join search_query
+                  left join ava_private.delivered_turns as raw
+                    on raw.subject = memory.subject
+                   and raw.turn_id = memory.source_turn_id
+                  left join lateral (
+                    select candidate.started_at, candidate.ended_at,
+                           candidate.timezone_id
+                    from ava_private.conversation_episodes as candidate
+                    where candidate.subject = memory.subject
+                      and memory.source_turn_id = any(candidate.source_turn_ids)
+                    order by candidate.ended_at desc, candidate.episode_id desc
+                    limit 1
+                  ) as episode on true
+                  where memory.subject = %s
+                    and to_tsvector(
+                      'simple', memory.summary || ' ' || memory.evidence
+                    ) @@ search_query.value
+                    and (
+                      %s::timestamptz is null
+                      or coalesce(raw.occurred_at, episode.ended_at, memory.created_at)
+                         >= %s
+                    )
+                    and (
+                      %s::timestamptz is null
+                      or coalesce(raw.occurred_at, episode.started_at, memory.created_at)
+                         < %s
+                    )
+                ),
+                candidates as (
+                  select * from raw_candidates
+                  union all
+                  select * from episode_candidates
+                  union all
+                  select * from stable_candidates
+                )
+                select source_id, source_kind, started_at, ended_at,
+                       timezone_ids, reference_text, source_turn_ids, relevance
+                from candidates
+                order by relevance desc, ended_at desc, source_id asc
+                limit %s
+                """,
+                (
+                    query_text,
+                    normalized_subject,
+                    lower,
+                    lower,
+                    upper,
+                    upper,
+                    normalized_subject,
+                    lower,
+                    lower,
+                    upper,
+                    upper,
+                    normalized_subject,
+                    lower,
+                    lower,
+                    upper,
+                    upper,
+                    validated_limit,
+                ),
+            )
+            rows = await cursor.fetchall()
+        return [
+            MemorySearchCandidate.model_validate(
+                {
+                    "sourceId": row["source_id"],
+                    "sourceKind": row["source_kind"],
+                    "startedAt": row["started_at"],
+                    "endedAt": row["ended_at"],
+                    "timezoneIds": row["timezone_ids"],
+                    "referenceText": row["reference_text"],
+                    "sourceTurnIds": row["source_turn_ids"],
+                    "relevance": row["relevance"],
+                }
+            )
+            for row in rows
+        ]
 
     async def set_session_summary(
         self,
@@ -483,6 +690,10 @@ class PostgresAuthoritativeMemoryStore:
                     (normalized_subject,),
                 )
                 await connection.execute(
+                    "delete from ava_private.conversation_episodes where subject = %s",
+                    (normalized_subject,),
+                )
+                await connection.execute(
                     "delete from ava_private.turn_receipts where subject = %s",
                     (normalized_subject,),
                 )
@@ -615,55 +826,94 @@ class PostgresAuthoritativeMemoryStore:
         )
         return decision
 
-    @staticmethod
-    async def _compact_delivered_turns(
+    async def _compact_delivered_turns_into_episodes(
+        self,
         connection: AsyncConnection[dict[str, object]],
         *,
         subject: str,
+        created_at: datetime,
     ) -> None:
-        overflow_cursor = await connection.execute(
+        count_cursor = await connection.execute(
             """
-            select turn_id, child_turn_summary
+            select count(*) as raw_count
             from ava_private.delivered_turns
             where subject = %s
-            order by occurred_at desc, turn_id desc
-            offset %s
-            """,
-            (subject, MAX_DELIVERED_TURNS),
-        )
-        overflow = await overflow_cursor.fetchall()
-        if not overflow:
-            return
-        state_cursor = await connection.execute(
-            """
-            select current_session_summary
-            from ava_private.memory_state
-            where subject = %s
-            for update
             """,
             (subject,),
         )
-        state = await state_cursor.fetchone()
-        if state is None:
-            raise PostgresMemoryStoreError("PostgreSQL memory subject disappeared")
-        summary = compact_session_summary(
-            cast(str | None, state["current_session_summary"]),
-            tuple(cast(str, row["child_turn_summary"]) for row in reversed(overflow)),
-        )
-        await connection.execute(
+        count_row = await count_cursor.fetchone()
+        raw_count = cast(int, count_row["raw_count"]) if count_row else 0
+        if raw_count <= RAW_RETENTION_HIGH_WATER:
+            return
+        compact_count = raw_count - RAW_RETENTION_LOW_WATER
+        source_cursor = await connection.execute(
             """
-            update ava_private.memory_state
-            set current_session_summary = %s, updated_at = now()
+            select turn_id, input_kind, child_text, child_text_source,
+                   ava_delivered_text, delivered_sample_count,
+                   child_turn_summary, terminal, occurred_at, timezone_id,
+                   canvas_scene_id, canvas_scene_revision,
+                   canvas_interaction_revision, canvas_interaction_mode,
+                   canvas_binding_id, canvas_target_id,
+                   canvas_accessibility_label, canvas_step_index
+            from ava_private.delivered_turns
             where subject = %s
+            order by occurred_at asc, turn_id asc
+            limit %s
             """,
-            (summary, subject),
+            (subject, compact_count),
         )
+        source_rows = await source_cursor.fetchall()
+        if len(source_rows) != compact_count:
+            raise PostgresMemoryStoreError(
+                "PostgreSQL raw memory count changed while subject lock was held"
+            )
+        source_events = tuple(
+            StoredDeliveredConversationEvent(
+                occurred_at=cast(datetime, row["occurred_at"]).astimezone(UTC),
+                timezone_id=validate_iana_timezone_id(cast(str, row["timezone_id"])),
+                turn=_delivered_turn_from_row(row),
+            )
+            for row in source_rows
+        )
+        episodes = build_conversation_episodes(
+            subject=subject,
+            source_events=source_events,
+            created_at=created_at,
+        )
+        for episode in episodes:
+            await self._insert_episode(connection, episode=episode)
         await connection.execute(
             """
             delete from ava_private.delivered_turns
             where subject = %s and turn_id = any(%s)
             """,
-            (subject, [row["turn_id"] for row in overflow]),
+            (subject, [event.turn.turn_id for event in source_events]),
+        )
+
+    @staticmethod
+    async def _insert_episode(
+        connection: AsyncConnection[dict[str, object]],
+        *,
+        episode: ConversationEpisode,
+    ) -> None:
+        await connection.execute(
+            """
+            insert into ava_private.conversation_episodes (
+              subject, episode_id, started_at, ended_at, timezone_id,
+              digest, source_turn_ids, source_event_count, created_at
+            ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                episode.subject,
+                episode.episode_id,
+                episode.started_at,
+                episode.ended_at,
+                episode.timezone_id,
+                episode.digest,
+                episode.source_turn_ids,
+                episode.source_event_count,
+                episode.created_at,
+            ),
         )
 
     async def _prune_retention(
@@ -679,6 +929,28 @@ class PostgresAuthoritativeMemoryStore:
             where subject = %s and occurred_at < %s
             """,
             (subject, threshold),
+        )
+        episode_threshold = datetime.now(UTC) - timedelta(days=EPISODE_RETENTION_DAYS)
+        await connection.execute(
+            """
+            delete from ava_private.conversation_episodes
+            where subject = %s and ended_at < %s
+            """,
+            (subject, episode_threshold),
+        )
+        await connection.execute(
+            """
+            delete from ava_private.conversation_episodes as episode
+            where episode.subject = %s
+              and (episode.ended_at, episode.episode_id) not in (
+                select retained.ended_at, retained.episode_id
+                from ava_private.conversation_episodes as retained
+                where retained.subject = %s
+                order by retained.ended_at desc, retained.episode_id desc
+                limit %s
+              )
+            """,
+            (subject, subject, MAX_EPISODES),
         )
         await connection.execute(
             """
@@ -700,6 +972,11 @@ class PostgresAuthoritativeMemoryStore:
                 where weekly.subject = receipt.subject
                   and weekly.turn_id = receipt.turn_id
               )
+              and not exists (
+                select 1 from ava_private.conversation_episodes as episode
+                where episode.subject = receipt.subject
+                  and receipt.turn_id = any(episode.source_turn_ids)
+              )
             """,
             (subject, threshold),
         )
@@ -708,4 +985,33 @@ class PostgresAuthoritativeMemoryStore:
 def _rejected_decision(reason: str) -> MemoryProposalDecision:
     return MemoryProposalDecision.model_validate(
         {"accepted": False, "reason": reason, "record": None}
+    )
+
+
+def _delivered_turn_from_row(row: dict[str, object]) -> DeliveredConversationTurn:
+    return DeliveredConversationTurn.model_validate(
+        {
+            "turnId": row["turn_id"],
+            "inputKind": row["input_kind"],
+            "childText": row["child_text"],
+            "childTextSource": row["child_text_source"],
+            "canvasInteraction": (
+                {
+                    "sceneId": row["canvas_scene_id"],
+                    "sceneRevision": row["canvas_scene_revision"],
+                    "interactionRevision": row["canvas_interaction_revision"],
+                    "interactionMode": row["canvas_interaction_mode"],
+                    "bindingId": row["canvas_binding_id"],
+                    "targetId": row["canvas_target_id"],
+                    "accessibilityLabel": row["canvas_accessibility_label"],
+                    "stepIndex": row["canvas_step_index"],
+                }
+                if row["input_kind"] == DeliveredInputKind.CANVAS_INTERACTION
+                else None
+            ),
+            "avaDeliveredText": row["ava_delivered_text"],
+            "deliveredSampleCount": row["delivered_sample_count"],
+            "childTurnSummary": row["child_turn_summary"],
+            "terminal": row["terminal"],
+        }
     )

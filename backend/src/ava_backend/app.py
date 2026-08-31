@@ -309,6 +309,7 @@ def create_app(
                 request_id=request.state.request_id,
                 subject=client.subject,
                 age_band=AgeBand(envelope.age_band),
+                timezone_id=envelope.timezone_id,
                 canvas_render_profile=envelope.canvas_render_profile,
             )
         except RealtimeSessionCapacityError:
