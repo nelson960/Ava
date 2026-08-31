@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import cast
 
@@ -159,6 +159,7 @@ class _OwnedInputRealtimeProvider(DeterministicRealtimePlanProvider):
         )
         self._owner_by_item_id: dict[str, str | None] = {}
         self._transcript_by_item_id: dict[str, str] = {}
+        self._transcript_events_by_item_id: dict[str, asyncio.Event] = {}
         self.input_event_observed: dict[str, asyncio.Event] = {}
         self.admissions: list[tuple[str, tuple[str, ...]]] = []
 
@@ -233,8 +234,12 @@ class _OwnedInputRealtimeProvider(DeterministicRealtimePlanProvider):
         if item_id not in self._owner_by_item_id:
             raise AssertionError("transcription completed before item observation")
         self._transcript_by_item_id[item_id] = transcript
+        self._transcript_events_by_item_id.setdefault(item_id, asyncio.Event()).set()
 
     async def child_transcript(self, *, turn_id: str) -> str | None:
+        return self.available_child_transcript(turn_id=turn_id)
+
+    def available_child_transcript(self, *, turn_id: str) -> str | None:
         transcripts = [
             self._transcript_by_item_id[item_id]
             for item_id, owner in self._owner_by_item_id.items()
@@ -243,6 +248,35 @@ class _OwnedInputRealtimeProvider(DeterministicRealtimePlanProvider):
         if len(transcripts) > 1:
             raise AssertionError("one turn received multiple provider transcripts")
         return transcripts[0] if transcripts else None
+
+    def wait_for_child_transcript(
+        self,
+        *,
+        turn_id: str,
+    ) -> Awaitable[str | None]:
+        owned_item_ids = tuple(
+            item_id
+            for item_id, owner in self._owner_by_item_id.items()
+            if owner == turn_id
+        )
+        if len(owned_item_ids) > 1:
+            raise AssertionError("one turn received multiple provider input items")
+
+        async def wait() -> str | None:
+            if not owned_item_ids:
+                return None
+            item_id = owned_item_ids[0]
+            transcript = self._transcript_by_item_id.get(item_id)
+            if transcript is not None:
+                return transcript
+            terminal = self._transcript_events_by_item_id.setdefault(
+                item_id,
+                asyncio.Event(),
+            )
+            await terminal.wait()
+            return self._transcript_by_item_id[item_id]
+
+        return wait()
 
 
 class _FailingSpeech(DeterministicStreamingSpeechSynthesizer):
@@ -1633,6 +1667,7 @@ async def test_barge_in_item_is_admitted_next_and_stale_origin_cannot_mutate_it(
             ]
             == "item-barge-turn-b"
         )
+        await _advance_ready_callbacks()
         snapshot = await memory.load_snapshot(
             subject="child:v4-next-input-ownership",
             age_band=AGE_BAND,
@@ -1779,7 +1814,7 @@ async def test_canvas_failure_is_nonterminal_while_v4_speech_completes() -> None
 
 
 @pytest.mark.asyncio
-async def test_memory_failure_warns_but_does_not_gate_v4_rearm() -> None:
+async def test_memory_failure_is_nonfatal_and_does_not_poison_v4_rearm() -> None:
     scenario = _V4ConversationScenario(
         session_id="session-v4-memory-failure",
         turn_ids=("turn-v4-memory-one", "turn-v4-memory-two"),
@@ -1787,6 +1822,7 @@ async def test_memory_failure_warns_but_does_not_gate_v4_rearm() -> None:
     )
     await scenario.start()
     terminals = [await scenario.complete_turn(), await scenario.complete_turn()]
+    await _advance_ready_callbacks()
 
     warnings = [
         event
@@ -1797,8 +1833,7 @@ async def test_memory_failure_warns_but_does_not_gate_v4_rearm() -> None:
         "turn-v4-memory-one",
         "turn-v4-memory-two",
     ]
-    assert len(warnings) == 2
-    assert all(warning.failure.component == "memoryStore" for warning in warnings)
+    assert warnings == []
     assert not any(isinstance(event, TurnFailedEventV4) for event in scenario.controls)
     await scenario.close()
 

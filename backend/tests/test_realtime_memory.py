@@ -9,6 +9,7 @@ from ava_backend.realtime.memory import (
     ChildTurnTextSource,
     DeliveredConversationTurn,
     DevelopmentAuthoritativeMemoryStore,
+    MemoryResetRevisionMismatchError,
     evaluate_memory_proposal,
 )
 from ava_backend.realtime.memory import AvaMemoryProposal
@@ -56,6 +57,7 @@ async def test_v3_store_commits_only_the_alignment_derived_delivered_prefix() ->
 
     decision = await store.commit_delivered_turn(
         subject="child:123",
+        expected_reset_revision=0,
         turn=turn,
         proposal=_proposal(),
         memory_id="memory-1",
@@ -80,6 +82,7 @@ async def test_v3_store_rejects_duplicate_turn_commit_and_reset_clears_context()
     store = DevelopmentAuthoritativeMemoryStore()
     await store.commit_delivered_turn(
         subject="child:123",
+        expected_reset_revision=0,
         turn=_turn(),
         proposal=None,
         memory_id=None,
@@ -87,6 +90,7 @@ async def test_v3_store_rejects_duplicate_turn_commit_and_reset_clears_context()
     with pytest.raises(ValueError, match="already committed"):
         await store.commit_delivered_turn(
             subject="child:123",
+            expected_reset_revision=0,
             turn=_turn(),
             proposal=None,
             memory_id=None,
@@ -94,6 +98,7 @@ async def test_v3_store_rejects_duplicate_turn_commit_and_reset_clears_context()
 
     await store.set_session_summary(
         subject="child:123",
+        expected_reset_revision=0,
         summary="A bounded factual summary.",
     )
     receipt = await store.reset_conversation(subject="child:123")
@@ -114,6 +119,7 @@ async def test_v3_store_compacts_evicted_turns_without_a_model_call() -> None:
     for index in range(1, 4):
         await store.commit_delivered_turn(
             subject="child:123",
+            expected_reset_revision=0,
             turn=_turn(
                 turn_id=f"turn-{index}",
                 child_text=f"Child statement {index}.",
@@ -138,6 +144,7 @@ async def test_v3_weekly_recap_is_bounded_factual_and_resettable() -> None:
     store = DevelopmentAuthoritativeMemoryStore()
     await store.commit_delivered_turn(
         subject="child:123",
+        expected_reset_revision=0,
         turn=_turn().model_copy(
             update={"child_turn_summary": "Talked about model airplanes."}
         ),
@@ -171,6 +178,7 @@ async def test_v3_rejects_sensitive_weekly_summary_without_partial_commit() -> N
     with pytest.raises(ValueError, match="sensitive"):
         await store.commit_delivered_turn(
             subject="child:123",
+            expected_reset_revision=0,
             turn=_turn().model_copy(
                 update={"child_turn_summary": "Home address is 12 River Street."}
             ),
@@ -189,6 +197,7 @@ async def test_v3_rejects_emotional_certainty_in_recap_and_session_summary() -> 
     with pytest.raises(ValueError, match="hidden inference"):
         await store.commit_delivered_turn(
             subject="child:123",
+            expected_reset_revision=0,
             turn=_turn().model_copy(
                 update={"child_turn_summary": "The child was sad."}
             ),
@@ -198,6 +207,7 @@ async def test_v3_rejects_emotional_certainty_in_recap_and_session_summary() -> 
     with pytest.raises(ValueError, match="hidden inference"):
         await store.set_session_summary(
             subject="child:123",
+            expected_reset_revision=0,
             summary="The child seems angry.",
         )
 
@@ -206,12 +216,14 @@ async def test_v3_rejects_semantically_duplicate_stable_memory() -> None:
     store = DevelopmentAuthoritativeMemoryStore()
     await store.commit_delivered_turn(
         subject="child:123",
+        expected_reset_revision=0,
         turn=_turn(turn_id="turn-1"),
         proposal=_proposal(),
         memory_id="memory-1",
     )
     decision = await store.commit_delivered_turn(
         subject="child:123",
+        expected_reset_revision=0,
         turn=_turn(turn_id="turn-2"),
         proposal=_proposal(summary="THE CHILD ENJOYS BUILDING MODEL AIRPLANES."),
         memory_id="memory-2",
@@ -224,6 +236,7 @@ async def test_memory_capacity_rejects_proposal_but_keeps_delivered_turn() -> No
     store = DevelopmentAuthoritativeMemoryStore(max_memories_per_subject=1)
     await store.commit_delivered_turn(
         subject="child:123",
+        expected_reset_revision=0,
         turn=_turn(turn_id="turn-1"),
         proposal=_proposal(),
         memory_id="memory-1",
@@ -244,6 +257,7 @@ async def test_memory_capacity_rejects_proposal_but_keeps_delivered_turn() -> No
     )
     decision = await store.commit_delivered_turn(
         subject="child:123",
+        expected_reset_revision=0,
         turn=second_turn,
         proposal=second_proposal,
         memory_id="memory-2",
@@ -395,6 +409,7 @@ async def test_canvas_interaction_never_creates_stable_memory_without_speech() -
 
     decision = await store.commit_delivered_turn(
         subject="child:interaction-stable",
+        expected_reset_revision=0,
         turn=interaction_turn,
         proposal=_proposal(),
         memory_id="memory-from-tap",
@@ -416,8 +431,97 @@ def test_snapshot_rejects_duplicate_records() -> None:
         AuthoritativeMemorySnapshot.model_validate(
             {
                 "ageBand": "middleChildhood",
+                "resetRevision": 0,
                 "currentSessionSummary": None,
                 "deliveredTurns": [turn, turn],
                 "stableMemories": [],
             }
         )
+
+
+async def test_stale_delivered_commit_after_reset_is_rejected_without_restore() -> None:
+    store = DevelopmentAuthoritativeMemoryStore()
+    snapshot = await store.load_snapshot(
+        subject="child:reset-fence",
+        age_band="middleChildhood",
+    )
+    assert snapshot.reset_revision == 0
+
+    receipt = await store.reset_conversation(subject="child:reset-fence")
+    assert receipt.revision == 1
+
+    with pytest.raises(MemoryResetRevisionMismatchError) as caught:
+        await store.commit_delivered_turn(
+            subject="child:reset-fence",
+            expected_reset_revision=snapshot.reset_revision,
+            turn=_turn(turn_id="turn-before-reset"),
+            proposal=None,
+            memory_id=None,
+        )
+
+    assert caught.value.expected_reset_revision == 0
+    assert caught.value.current_reset_revision == 1
+    after = await store.load_snapshot(
+        subject="child:reset-fence",
+        age_band="middleChildhood",
+    )
+    assert after.reset_revision == 1
+    assert after.delivered_turns == []
+    assert after.stable_memories == []
+    assert after.current_session_summary is None
+
+
+async def test_stale_session_summary_after_reset_is_rejected() -> None:
+    store = DevelopmentAuthoritativeMemoryStore()
+    snapshot = await store.load_snapshot(
+        subject="child:summary-reset-fence",
+        age_band="middleChildhood",
+    )
+    await store.reset_conversation(subject="child:summary-reset-fence")
+
+    with pytest.raises(MemoryResetRevisionMismatchError):
+        await store.set_session_summary(
+            subject="child:summary-reset-fence",
+            expected_reset_revision=snapshot.reset_revision,
+            summary="This stale summary must not return.",
+        )
+
+    after = await store.load_snapshot(
+        subject="child:summary-reset-fence",
+        age_band="middleChildhood",
+    )
+    assert after.current_session_summary is None
+
+
+async def test_fresh_post_reset_epoch_writes_and_duplicate_behavior_is_unchanged() -> (
+    None
+):
+    store = DevelopmentAuthoritativeMemoryStore()
+    await store.reset_conversation(subject="child:fresh-reset-epoch")
+    snapshot = await store.load_snapshot(
+        subject="child:fresh-reset-epoch",
+        age_band="middleChildhood",
+    )
+    assert snapshot.reset_revision == 1
+
+    await store.commit_delivered_turn(
+        subject="child:fresh-reset-epoch",
+        expected_reset_revision=snapshot.reset_revision,
+        turn=_turn(turn_id="turn-after-reset"),
+        proposal=None,
+        memory_id=None,
+    )
+    with pytest.raises(ValueError, match="already committed"):
+        await store.commit_delivered_turn(
+            subject="child:fresh-reset-epoch",
+            expected_reset_revision=snapshot.reset_revision,
+            turn=_turn(turn_id="turn-after-reset"),
+            proposal=None,
+            memory_id=None,
+        )
+
+    after = await store.load_snapshot(
+        subject="child:fresh-reset-epoch",
+        age_band="middleChildhood",
+    )
+    assert [turn.turn_id for turn in after.delivered_turns] == ["turn-after-reset"]

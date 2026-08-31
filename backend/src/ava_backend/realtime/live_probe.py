@@ -76,6 +76,7 @@ async def _run(arguments: argparse.Namespace) -> int:
         AuthoritativeMemorySnapshot.model_validate(
             {
                 "ageBand": age_band,
+                "resetRevision": 0,
                 "currentSessionSummary": None,
                 "deliveredTurns": [],
                 "stableMemories": [],
@@ -89,6 +90,12 @@ async def _run(arguments: argparse.Namespace) -> int:
         connect_timeout_seconds=(settings.openai_realtime_connect_timeout_seconds),
         turn_timeout_seconds=settings.realtime_max_turn_seconds,
         max_output_tokens=settings.openai_realtime_max_output_tokens,
+        truncation_post_instructions_tokens=(
+            settings.openai_realtime_truncation_post_instructions_tokens
+        ),
+        truncation_retention_ratio=(
+            settings.openai_realtime_truncation_retention_ratio
+        ),
     )
     try:
         result = await probe.run(

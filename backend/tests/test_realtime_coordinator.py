@@ -26,6 +26,7 @@ from ava_backend.protocol import AgeBand
 from ava_backend.realtime.coordinator import (
     CoordinatorStateError,
     DeterministicRealtimeSessionCoordinator,
+    _canvas_interaction_summary,
 )
 from ava_backend.realtime.coordinator_v4 import ProtocolV4CanvasEventSink
 from ava_backend.realtime.events_v4 import (
@@ -38,8 +39,12 @@ from ava_backend.realtime.events_v4 import (
     CanvasGenerationStartedEventV4,
     CanvasInteractionEventV4,
     CanvasRejectedEventV4,
+    CancelTurnEventV4,
     InterruptRequestedEventV4,
     MemoryPersistenceFailedEventV4,
+    PlaybackProgressEventV4,
+    PlaybackStartedEventV4,
+    PlaybackStoppedEventV4,
     SegmentReadyEventV4,
     TurnCancelledEventV4,
     TurnCompletedEventV4,
@@ -53,7 +58,10 @@ from ava_backend.realtime.fakes import (
     DeterministicRealtimePlanProvider,
     DeterministicStreamingSpeechSynthesizer,
 )
-from ava_backend.realtime.memory import DevelopmentAuthoritativeMemoryStore
+from ava_backend.realtime.memory import (
+    DevelopmentAuthoritativeMemoryStore,
+    MemoryResetRevisionMismatchError,
+)
 from ava_backend.realtime.plan import AvaTurnPlan
 from ava_backend.realtime.provider_session import (
     NegotiatedRealtimeCall,
@@ -244,6 +252,48 @@ class _BlockingInteractionContextProvider(DeterministicRealtimePlanProvider):
         if triggered:
             self.interaction_response_requested.set()
         return triggered
+
+
+class _TemporarilyUnreadyRealtimeProvider(DeterministicRealtimePlanProvider):
+    def __init__(self, plan: AvaTurnPlan) -> None:
+        super().__init__(plan, wait_for_canvas_interaction_response=True)
+        self.trigger_attempts = 0
+        self.allow_trigger = False
+        self.trigger_readiness_changed = asyncio.Event()
+        self.readiness_waits = 0
+
+    async def wait_until_canvas_interaction_response_ready(
+        self,
+        *,
+        turn_id: str,
+    ) -> bool:
+        self.readiness_waits += 1
+        if self.readiness_waits == 1:
+            return await super().wait_until_canvas_interaction_response_ready(
+                turn_id=turn_id
+            )
+        while not self.allow_trigger:
+            self.trigger_readiness_changed.clear()
+            if self.allow_trigger:
+                break
+            await self.trigger_readiness_changed.wait()
+        return await super().wait_until_canvas_interaction_response_ready(
+            turn_id=turn_id
+        )
+
+    async def request_canvas_interaction_response(
+        self,
+        *,
+        turn_id: str,
+        interaction: RecordedSvgCanvasInteraction,
+    ) -> bool:
+        self.trigger_attempts += 1
+        if not self.allow_trigger:
+            return False
+        return await super().request_canvas_interaction_response(
+            turn_id=turn_id,
+            interaction=interaction,
+        )
 
 
 class _InteractionThenChildRealtimeProvider(DeterministicRealtimePlanProvider):
@@ -564,17 +614,23 @@ async def test_failed_canvas_generation_does_not_poison_later_realtime_canvas_us
             if isinstance(event, CanvasGenerationStartedEventV4)
             and event.generation_id == "generation-accepted-b"
         )
-        assert rejected_a.rejection_code == CanvasGenerationRejectionCode.PROVIDER_INVALID
+        assert (
+            rejected_a.rejection_code == CanvasGenerationRejectionCode.PROVIDER_INVALID
+        )
         assert rejected_a.source_turn_id == TURN_ID
         assert rearmed.turn_id == "turn-coordinator-2"
         assert started_b.source_turn_id == rearmed.turn_id
-        assert events.index(rejected_a) < events.index(rearmed) < events.index(started_b)
+        assert (
+            events.index(rejected_a) < events.index(rearmed) < events.index(started_b)
+        )
 
         assert provider.canvas_call_ids == [
             "call_canvas_turn_1",
             "call_canvas_turn_2",
         ]
-        assert [output.generation_id for output in provider.completed_canvas_outputs] == [
+        assert [
+            output.generation_id for output in provider.completed_canvas_outputs
+        ] == [
             "generation-failed-a",
             "generation-accepted-b",
         ]
@@ -621,6 +677,7 @@ def _coordinator(
     canvas_state: SvgCanvasSessionState | None = None,
     canvas_specialist: SvgCanvasSpecialist | None = None,
     canvas_generation_id_factory: Callable[[], str] | None = None,
+    memory_commit_drain_timeout_seconds: float = 2.0,
 ) -> tuple[
     DeterministicRealtimeSessionCoordinator,
     DeterministicRealtimePlanProvider | object,
@@ -665,6 +722,7 @@ def _coordinator(
         occurrence_time_factory=(
             occurrence_time_factory or (lambda: datetime.now(UTC))
         ),
+        memory_commit_drain_timeout_seconds=memory_commit_drain_timeout_seconds,
     )
     return coordinator, resolved_realtime, speech, resolved_memory
 
@@ -691,6 +749,14 @@ async def _advance_ready_callbacks(*, rounds: int = 12) -> None:
         checkpoint: asyncio.Future[None] = loop.create_future()
         loop.call_soon(checkpoint.set_result, None)
         await checkpoint
+
+
+async def _wait_for_memory_tasks(
+    coordinator: DeterministicRealtimeSessionCoordinator,
+) -> None:
+    tasks = tuple(coordinator._memory_commit_tasks.values())
+    if tasks:
+        await asyncio.gather(*tasks)
 
 
 async def test_coordinator_streams_seven_phrases_pcm_and_memory_directly_as_v4() -> (
@@ -758,6 +824,255 @@ async def test_coordinator_streams_seven_phrases_pcm_and_memory_directly_as_v4()
     assert [turn.turn_id for turn in snapshot.delivered_turns] == [TURN_ID]
     assert isinstance(realtime, DeterministicRealtimePlanProvider)
     await coordinator.close()
+
+
+async def test_playback_progress_is_coalesced_state_and_cannot_fill_controls() -> None:
+    coordinator, _, _, _ = _coordinator()
+    await _ready(coordinator)
+    frames = coordinator.frames()
+    try:
+        while True:
+            frame = await anext(frames)
+            if (
+                isinstance(frame, AvaServerControlFrameV4)
+                and isinstance(
+                    frame.event,
+                    TurnPhaseChangedEventV4,
+                )
+                and frame.event.phase == SpeechPhase.SPEAKING
+            ):
+                break
+
+        await coordinator.receive(
+            _client(
+                {
+                    "event": "playbackStarted",
+                    "sequence": 1,
+                    "turnId": TURN_ID,
+                    "streamId": STREAM_ID,
+                    "renderedSampleCount": 0,
+                }
+            )
+        )
+        received = coordinator.received_sample_count
+        for index in range(100):
+            await coordinator.receive(
+                _client(
+                    {
+                        "event": "playbackProgress",
+                        "sequence": index + 2,
+                        "turnId": TURN_ID,
+                        "streamId": STREAM_ID,
+                        "renderedSampleCount": received * (index + 1) // 100,
+                        "bufferedSampleCount": 0,
+                    }
+                )
+            )
+
+        assert coordinator._controls.item_count == 1
+        assert coordinator._last_rendered_sample_count == received
+
+        remaining = [frame async for frame in frames]
+        terminal = next(
+            frame.event
+            for frame in remaining
+            if isinstance(frame, AvaServerControlFrameV4)
+            and isinstance(frame.event, TurnCompletedEventV4)
+        )
+        assert terminal.delivered_sample_count == received
+        assert coordinator._controls.item_count == 0
+    finally:
+        await frames.aclose()
+        await coordinator.close()
+
+
+async def test_progress_validation_and_sequence_remain_strict_without_queueing() -> (
+    None
+):
+    coordinator, _, _, _ = _coordinator()
+    await _ready(coordinator)
+    frames = coordinator.frames()
+    try:
+        while True:
+            frame = await anext(frames)
+            if (
+                isinstance(frame, AvaServerControlFrameV4)
+                and isinstance(
+                    frame.event,
+                    TurnPhaseChangedEventV4,
+                )
+                and frame.event.phase == SpeechPhase.SPEAKING
+            ):
+                break
+
+        await coordinator.receive(
+            _client(
+                {
+                    "event": "playbackStarted",
+                    "sequence": 1,
+                    "turnId": TURN_ID,
+                    "streamId": STREAM_ID,
+                    "renderedSampleCount": 0,
+                }
+            )
+        )
+        await coordinator.receive(
+            _client(
+                {
+                    "event": "playbackProgress",
+                    "sequence": 2,
+                    "turnId": TURN_ID,
+                    "streamId": STREAM_ID,
+                    "renderedSampleCount": 1,
+                    "bufferedSampleCount": 0,
+                }
+            )
+        )
+        with pytest.raises(CoordinatorStateError, match="move backwards"):
+            await coordinator.receive(
+                _client(
+                    {
+                        "event": "playbackProgress",
+                        "sequence": 3,
+                        "turnId": TURN_ID,
+                        "streamId": STREAM_ID,
+                        "renderedSampleCount": 0,
+                        "bufferedSampleCount": 0,
+                    }
+                )
+            )
+        with pytest.raises(CoordinatorStateError, match="expected client sequence 4"):
+            await coordinator.receive(
+                _client(
+                    {
+                        "event": "playbackProgress",
+                        "sequence": 5,
+                        "turnId": TURN_ID,
+                        "streamId": STREAM_ID,
+                        "renderedSampleCount": 1,
+                        "bufferedSampleCount": 0,
+                    }
+                )
+            )
+
+        await coordinator.receive(
+            _client(
+                {
+                    "event": "playbackStopped",
+                    "sequence": 4,
+                    "turnId": TURN_ID,
+                    "streamId": STREAM_ID,
+                    "renderedSampleCount": 1,
+                    "reason": "childStartedSpeaking",
+                }
+            )
+        )
+        await coordinator.receive(
+            _client(
+                {
+                    "event": "cancelTurn",
+                    "sequence": 5,
+                    "turnId": TURN_ID,
+                    "requestId": "request-progress-cancel",
+                    "reason": "childStartedSpeaking",
+                }
+            )
+        )
+
+        queued = [await coordinator._controls.get() for _ in range(3)]
+        assert [type(event) for event in queued] == [
+            PlaybackStartedEventV4,
+            PlaybackStoppedEventV4,
+            CancelTurnEventV4,
+        ]
+        assert not any(isinstance(event, PlaybackProgressEventV4) for event in queued)
+        assert coordinator._controls.item_count == 0
+        assert coordinator._cancel_event is queued[-1]
+    finally:
+        await frames.aclose()
+        await coordinator.close()
+
+
+async def test_lossless_cancel_controls_win_over_ready_final_progress_state() -> None:
+    coordinator, _, _, _ = _coordinator()
+    await _ready(coordinator)
+    frames = coordinator.frames()
+    try:
+        while True:
+            frame = await anext(frames)
+            if (
+                isinstance(frame, AvaServerControlFrameV4)
+                and isinstance(
+                    frame.event,
+                    TurnPhaseChangedEventV4,
+                )
+                and frame.event.phase == SpeechPhase.SPEAKING
+            ):
+                break
+
+        received = coordinator.received_sample_count
+        for event in (
+            _client(
+                {
+                    "event": "playbackStarted",
+                    "sequence": 1,
+                    "turnId": TURN_ID,
+                    "streamId": STREAM_ID,
+                    "renderedSampleCount": 0,
+                }
+            ),
+            _client(
+                {
+                    "event": "playbackProgress",
+                    "sequence": 2,
+                    "turnId": TURN_ID,
+                    "streamId": STREAM_ID,
+                    "renderedSampleCount": received,
+                    "bufferedSampleCount": 0,
+                }
+            ),
+            _client(
+                {
+                    "event": "playbackStopped",
+                    "sequence": 3,
+                    "turnId": TURN_ID,
+                    "streamId": STREAM_ID,
+                    "renderedSampleCount": received,
+                    "reason": "childStartedSpeaking",
+                }
+            ),
+            _client(
+                {
+                    "event": "cancelTurn",
+                    "sequence": 4,
+                    "turnId": TURN_ID,
+                    "requestId": "request-final-progress-cancel",
+                    "reason": "childStartedSpeaking",
+                }
+            ),
+        ):
+            await coordinator.receive(event)
+
+        terminals = [
+            frame.event
+            async for frame in frames
+            if isinstance(frame, AvaServerControlFrameV4)
+            and isinstance(frame.event, TurnCancelledEventV4 | TurnCompletedEventV4)
+        ]
+
+        assert len(terminals) == 1
+        assert isinstance(terminals[0], TurnCancelledEventV4)
+        assert coordinator._controls.item_count == 3
+        queued = [await coordinator._controls.get() for _ in range(3)]
+        assert [type(event) for event in queued] == [
+            PlaybackStartedEventV4,
+            PlaybackStoppedEventV4,
+            CancelTurnEventV4,
+        ]
+        assert coordinator._controls.item_count == 0
+    finally:
+        await frames.aclose()
+        await coordinator.close()
 
 
 class _MalformedRealtimeProvider:
@@ -921,6 +1236,43 @@ class _ObservedMemoryStore(DevelopmentAuthoritativeMemoryStore):
         await event.wait()
 
 
+class _BlockingCommitMemoryStore(_ObservedMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.commit_started = asyncio.Event()
+        self.allow_commit = asyncio.Event()
+        self.commit_cancelled = asyncio.Event()
+        self.captured_turn_ids: list[str] = []
+        self.captured_expected_reset_revisions: list[int] = []
+
+    async def commit_delivered_turn(self, **kwargs: object):  # type: ignore[no-untyped-def]
+        turn = kwargs["turn"]
+        self.captured_turn_ids.append(turn.turn_id)  # type: ignore[union-attr]
+        self.captured_expected_reset_revisions.append(
+            kwargs["expected_reset_revision"]  # type: ignore[arg-type]
+        )
+        self.commit_started.set()
+        try:
+            await self.allow_commit.wait()
+        except asyncio.CancelledError:
+            self.commit_cancelled.set()
+            raise
+        return await super().commit_delivered_turn(**kwargs)  # type: ignore[arg-type]
+
+
+class _ResetFenceObservedMemoryStore(DevelopmentAuthoritativeMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stale_commit_rejected = asyncio.Event()
+
+    async def commit_delivered_turn(self, **kwargs: object):  # type: ignore[no-untyped-def]
+        try:
+            return await super().commit_delivered_turn(**kwargs)  # type: ignore[arg-type]
+        except MemoryResetRevisionMismatchError:
+            self.stale_commit_rejected.set()
+            raise
+
+
 class _LateTranscriptRealtimeProvider(DeterministicRealtimePlanProvider):
     def __init__(self, plan: AvaTurnPlan, *, transcript: str) -> None:
         super().__init__(plan, child_text=None)
@@ -975,6 +1327,13 @@ class _CrossTurnTranscriptRealtimeProvider(DeterministicRealtimePlanProvider):
         if turn_id == self.turn_b:
             return self.child_b
         raise AssertionError(f"unexpected turn transcript request: {turn_id}")
+
+    def available_child_transcript(self, *, turn_id: str) -> str | None:
+        if turn_id == self.turn_a:
+            return self._transcript_a
+        if turn_id == self.turn_b:
+            return self.child_b
+        raise AssertionError(f"unexpected turn transcript peek: {turn_id}")
 
     def wait_for_child_transcript(
         self,
@@ -1038,6 +1397,8 @@ async def _complete_delivered_turn(
 
 async def _complete_first_persistent_turn_and_rearm(
     coordinator: DeterministicRealtimeSessionCoordinator,
+    *,
+    first_client_sequence: int = 2,
 ) -> None:
     frames = coordinator.frames()
     try:
@@ -1050,7 +1411,7 @@ async def _complete_first_persistent_turn_and_rearm(
                     _client(
                         {
                             "event": "playbackStarted",
-                            "sequence": 2,
+                            "sequence": first_client_sequence,
                             "turnId": TURN_ID,
                             "streamId": STREAM_ID,
                             "renderedSampleCount": 0,
@@ -1065,7 +1426,7 @@ async def _complete_first_persistent_turn_and_rearm(
                     _client(
                         {
                             "event": "playbackProgress",
-                            "sequence": 3,
+                            "sequence": first_client_sequence + 1,
                             "turnId": TURN_ID,
                             "streamId": STREAM_ID,
                             "renderedSampleCount": coordinator.received_sample_count,
@@ -1121,6 +1482,182 @@ async def test_late_owned_transcription_commits_delivered_turn_exactly_once() ->
     )
     assert snapshot.delivered_turns[0].ava_delivered_text == plan.speech
     await coordinator.close()
+
+
+async def test_blocked_memory_store_cannot_delay_terminal_frame() -> None:
+    memory = _BlockingCommitMemoryStore()
+    coordinator, _, _, _ = _coordinator(memory=memory)
+    await _ready(coordinator)
+
+    delivery = asyncio.create_task(_complete_delivered_turn(coordinator))
+    await memory.commit_started.wait()
+    events = await asyncio.wait_for(delivery, timeout=1.0)
+
+    assert isinstance(events[-1], TurnCompletedEventV4)
+    snapshot_while_blocked = await memory.load_snapshot(
+        subject="child:coordinator",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+    )
+    assert snapshot_while_blocked.delivered_turns == []
+
+    memory.allow_commit.set()
+    await memory.committed.wait()
+    await coordinator.close()
+
+
+async def test_blocked_memory_store_cannot_delay_persistent_rearm() -> None:
+    memory = _BlockingCommitMemoryStore()
+    coordinator, _, _, _ = _coordinator(
+        memory=memory,
+        persistent=True,
+    )
+    await _ready(coordinator)
+
+    rearm = asyncio.create_task(
+        _complete_first_persistent_turn_and_rearm(
+            coordinator,
+            first_client_sequence=1,
+        )
+    )
+    await memory.commit_started.wait()
+    await asyncio.wait_for(rearm, timeout=1.0)
+
+    assert coordinator.turn_id == "turn-coordinator-2"
+    assert memory.captured_turn_ids == [TURN_ID]
+    assert memory.captured_expected_reset_revisions == [0]
+
+    memory.allow_commit.set()
+    await memory.wait_for_turn(TURN_ID)
+    snapshot = await memory.load_snapshot(
+        subject="child:coordinator",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+    )
+    assert [turn.turn_id for turn in snapshot.delivered_turns] == [TURN_ID]
+    assert snapshot.delivered_turns[0].child_text == "Tell me something gentle."
+    await coordinator.close()
+
+
+async def test_close_drains_fast_pending_memory_commit() -> None:
+    memory = _BlockingCommitMemoryStore()
+    coordinator, _, _, _ = _coordinator(memory=memory)
+    await _ready(coordinator)
+    await _complete_delivered_turn(coordinator)
+    await memory.commit_started.wait()
+
+    memory.allow_commit.set()
+    await coordinator.close()
+
+    snapshot = await memory.load_snapshot(
+        subject="child:coordinator",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+    )
+    assert [turn.turn_id for turn in snapshot.delivered_turns] == [TURN_ID]
+
+
+async def test_close_cancels_hung_memory_commit_after_bounded_drain() -> None:
+    memory = _BlockingCommitMemoryStore()
+    coordinator, _, _, _ = _coordinator(
+        memory=memory,
+        memory_commit_drain_timeout_seconds=0.02,
+    )
+    await _ready(coordinator)
+    await _complete_delivered_turn(coordinator)
+    await memory.commit_started.wait()
+
+    await asyncio.wait_for(coordinator.close(), timeout=0.5)
+
+    assert memory.commit_cancelled.is_set()
+    snapshot = await memory.load_snapshot(
+        subject="child:coordinator",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+    )
+    assert snapshot.delivered_turns == []
+
+
+async def test_pre_reset_deferred_commit_cannot_resurrect_memory() -> None:
+    plan = _plan()
+    provider = _LateTranscriptRealtimeProvider(
+        plan,
+        transcript="Please tell me something gentle.",
+    )
+    memory = _ResetFenceObservedMemoryStore()
+    coordinator, _, _, _ = _coordinator(
+        plan=plan,
+        realtime=provider,
+        memory=memory,
+    )
+    await _ready(coordinator)
+    await _complete_delivered_turn(coordinator)
+
+    receipt = await memory.reset_conversation(subject="child:coordinator")
+    assert receipt.revision == 1
+    provider.complete_transcription()
+    await memory.stale_commit_rejected.wait()
+
+    snapshot = await memory.load_snapshot(
+        subject="child:coordinator",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+    )
+    assert snapshot.reset_revision == 1
+    assert snapshot.delivered_turns == []
+    assert snapshot.stable_memories == []
+    await coordinator.close()
+
+
+@pytest.mark.parametrize(
+    ("mode", "step_index", "label", "expected"),
+    [
+        ("explore", None, "Great Red Spot", "Explored “Great Red Spot”."),
+        ("select", None, "Saturn", "Selected “Saturn”."),
+        ("steps", 4, "Add the leaves", "Viewed step 4: “Add the leaves”."),
+    ],
+)
+def test_canvas_interaction_memory_summary_uses_validated_semantics(
+    mode: str,
+    step_index: int | None,
+    label: str,
+    expected: str,
+) -> None:
+    interaction = RecordedSvgCanvasInteraction(
+        scene_id="scene-summary",
+        scene_revision=2,
+        interaction_revision=3,
+        svg_sha256="a" * 64,
+        manifest_sha256="b" * 64,
+        binding_id="binding-summary",
+        interaction_mode=mode,
+        target_id="target-summary",
+        accessibility_label=label,
+        step_index=step_index,
+    )
+
+    summary = _canvas_interaction_summary(interaction)
+
+    assert summary == expected
+    assert summary != "Canvas interaction."
+    assert len(summary) <= 240
+
+
+def test_canvas_interaction_memory_summary_safely_bounds_long_validated_label() -> None:
+    interaction = RecordedSvgCanvasInteraction(
+        scene_id="scene-long-summary",
+        scene_revision=1,
+        interaction_revision=1,
+        svg_sha256="a" * 64,
+        manifest_sha256="b" * 64,
+        binding_id="binding-long-summary",
+        interaction_mode="explore",
+        target_id="target-long-summary",
+        accessibility_label="L" * 160,
+        step_index=None,
+    )
+
+    summary = _canvas_interaction_summary(interaction)
+
+    assert summary.startswith("Explored “")
+    assert summary.endswith("”.")
+    assert len(summary) <= 240
+    assert summary != "Canvas interaction."
 
 
 async def test_committed_turn_is_loaded_into_fresh_session_harness() -> None:
@@ -1318,6 +1855,53 @@ async def test_rapid_canvas_interactions_coalesce_optional_speech_to_latest() ->
             delivery.cancel()
             await asyncio.gather(delivery, return_exceptions=True)
         await coordinator.close()
+
+
+async def test_canvas_interaction_retries_when_provider_temporarily_unready() -> None:
+    state = _active_multi_binding_canvas_state()
+    active = state.active
+    assert active is not None
+    provider = _TemporarilyUnreadyRealtimeProvider(_plan())
+    coordinator, _, _, _ = _coordinator(
+        realtime=provider,
+        canvas_state=state,
+    )
+    await _ready(coordinator)
+    delivery = asyncio.create_task(
+        _complete_delivered_turn(coordinator, first_client_sequence=2)
+    )
+    await provider.turn_stream_started.wait()
+
+    await coordinator.receive(
+        _client(
+            {
+                "event": "canvasInteraction",
+                "sequence": 1,
+                "sceneId": active.scene_id,
+                "sceneRevision": active.revision,
+                "interactionRevision": 1,
+                "svgSha256": active.document.svg_sha256,
+                "manifestSha256": active.document.manifest_sha256,
+                "bindingId": "explore_nucleus",
+            }
+        )
+    )
+    await _advance_ready_callbacks()
+    assert provider.trigger_attempts == 1
+    assert len(provider.canvas_interaction_response_interactions) == 0
+
+    provider.allow_trigger = True
+    provider.trigger_readiness_changed.set()
+    await delivery
+
+    assert provider.readiness_waits >= 2
+    assert provider.trigger_attempts == 2
+    assert len(provider.canvas_interaction_response_interactions) == 1
+    assert (
+        provider.canvas_interaction_response_interactions[0].binding_id
+        == "explore_nucleus"
+    )
+    await coordinator.close()
 
 
 async def test_child_speech_supersedes_interaction_while_context_refresh_is_pending() -> (
@@ -1539,6 +2123,7 @@ async def test_tap_during_interaction_speech_rearms_only_latest_reaction() -> No
             interaction.interaction_revision
             for interaction in provider.canvas_interaction_response_interactions
         ] == [1, 2]
+        await _wait_for_memory_tasks(coordinator)
         snapshot = await memory.load_snapshot(
             subject="child:coordinator",
             age_band=AgeBand.MIDDLE_CHILDHOOD,
@@ -1717,6 +2302,7 @@ async def test_child_speech_during_canvas_fade_does_not_repeat_interruption() ->
             isinstance(event, InterruptRequestedEventV4) for event in controls
         )
         assert not any(isinstance(event, TurnFailedEventV4) for event in controls)
+        await _wait_for_memory_tasks(coordinator)
         snapshot = await memory.load_snapshot(
             subject="child:coordinator",
             age_band=AgeBand.MIDDLE_CHILDHOOD,
@@ -1860,6 +2446,7 @@ async def test_idle_interaction_response_persists_typed_input_without_child_spee
     assert events[-1].delivered_text == _plan().speech
     assert speech.synthesized_segment_ids
     assert provider.canvas_interaction_response_turn_ids == [TURN_ID]
+    await _wait_for_memory_tasks(coordinator)
     snapshot = await memory.load_snapshot(
         subject="child:coordinator",
         age_band=AgeBand.MIDDLE_CHILDHOOD,
@@ -1878,6 +2465,8 @@ async def test_idle_interaction_response_persists_typed_input_without_child_spee
     )
     assert persisted.canvas_interaction.binding_id == state.last_interaction.binding_id
     assert persisted.ava_delivered_text == _plan().speech
+    assert persisted.child_turn_summary == "Explored “Explore condensation”."
+    assert persisted.child_turn_summary != "Canvas interaction."
     await coordinator.close()
 
 
@@ -1918,6 +2507,7 @@ async def test_incomplete_interaction_response_is_cancelled_not_completed() -> N
     assert isinstance(terminal, TurnCancelledEventV4)
     assert terminal.reason == "providerResponseIncomplete:max_output_tokens"
     assert not any(isinstance(event, TurnCompletedEventV4) for event in events)
+    await _wait_for_memory_tasks(coordinator)
     snapshot = await memory.load_snapshot(
         subject="child:coordinator",
         age_band=AgeBand.MIDDLE_CHILDHOOD,
@@ -2256,7 +2846,9 @@ async def test_late_turn_a_commit_preserves_cross_turn_memory_chronology() -> No
     await fresh.close()
 
 
-async def test_memory_failure_warns_then_speech_completes() -> None:
+async def test_memory_failure_does_not_delay_or_poison_speech(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     plan = _plan()
     coordinator, _, _, _ = _coordinator(
         plan=plan,
@@ -2298,12 +2890,23 @@ async def test_memory_failure_warns_then_speech_completes() -> None:
                 )
             )
 
-    warning = next(
-        event for event in events if isinstance(event, MemoryPersistenceFailedEventV4)
+    await _wait_for_memory_tasks(coordinator)
+    assert not any(
+        isinstance(event, MemoryPersistenceFailedEventV4) for event in events
     )
-    assert warning.failure.code == SpeechFailureCode.MEMORY_UNAVAILABLE
     assert isinstance(events[-1], TurnCompletedEventV4)
     assert events[-1].delivered_text == plan.speech
+    failure_record = next(
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("memory_commit_failed")
+    )
+    assert failure_record.ava_context["sessionId"] == SESSION_ID
+    assert failure_record.ava_context["turnId"] == TURN_ID
+    assert failure_record.ava_context["component"] == "memoryStore"
+    assert failure_record.ava_context["reasonCategory"] == "storeFailure"
+    assert "Tell me something gentle" not in caplog.text
+    assert plan.speech not in caplog.text
     await coordinator.close()
 
 

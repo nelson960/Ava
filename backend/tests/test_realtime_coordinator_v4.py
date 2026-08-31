@@ -248,7 +248,8 @@ async def test_v4_coordinator_runs_exact_svg_lifecycle_without_pcm_interleaving(
         "instructions"
     ]
     assert isinstance(pending_instructions, str)
-    assert '<pending_visual state="generating"' in pending_instructions
+    assert '<pending_visual state="ready"' in pending_instructions
+    assert '<pending_visual state="generating"' not in pending_instructions
     assert "generation-v4-adapter" not in pending_instructions
 
     for index, frame in enumerate(frames):

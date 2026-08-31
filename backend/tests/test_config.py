@@ -40,6 +40,8 @@ def test_development_configuration_does_not_hide_missing_model_key() -> None:
     assert settings.openai_realtime_vad_threshold == 0.45
     assert settings.openai_realtime_vad_prefix_padding_ms == 500
     assert settings.openai_realtime_vad_silence_duration_ms == 450
+    assert settings.openai_realtime_truncation_post_instructions_tokens == 80_000
+    assert settings.openai_realtime_truncation_retention_ratio == 0.8
     assert settings.openai_canvas_timeout_seconds == 90
     assert settings.openai_canvas_first_progress_timeout_seconds == 20
     assert settings.openai_canvas_stream_stall_timeout_seconds == 15
@@ -53,6 +55,24 @@ def test_development_configuration_does_not_hide_missing_model_key() -> None:
     assert settings.openai_tts_voice == "marin"
     with pytest.raises(BackendConfigurationError, match="AVA_OPENAI_API_KEY"):
         settings.require_openai_api_key()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("openai_realtime_truncation_post_instructions_tokens", 0),
+        ("openai_realtime_truncation_post_instructions_tokens", True),
+        ("openai_realtime_truncation_retention_ratio", 0),
+        ("openai_realtime_truncation_retention_ratio", 1),
+        ("openai_realtime_truncation_retention_ratio", 1.1),
+    ],
+)
+def test_realtime_truncation_configuration_rejects_nonsensical_values(
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings(**{field: value})
 
 
 def test_canvas_specialist_model_is_sol_only() -> None:

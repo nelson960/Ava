@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "promptVersion": "ava-realtime-v4.6",
+  "promptVersion": "ava-realtime-v4.8",
   "cases": [
     {
       "id": "ordinary_greeting",
@@ -20,6 +20,16 @@
     {
       "id": "spatial_comparison_visual",
       "input": "Compare a seed and a flower in a simple visual so I can see how they are related.",
+      "expectCanvas": true
+    },
+    {
+      "id": "explore_interaction_visual",
+      "input": "Show me an interactive solar-system visual where I can tap the planets to explore them.",
+      "expectCanvas": true
+    },
+    {
+      "id": "steps_interaction_visual",
+      "input": "Show butterfly metamorphosis as ordered interactive steps with Back and Next.",
       "expectCanvas": true
     }
   ]

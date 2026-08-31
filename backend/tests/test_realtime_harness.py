@@ -26,6 +26,7 @@ def _snapshot() -> AuthoritativeMemorySnapshot:
     return AuthoritativeMemorySnapshot.model_validate(
         {
             "ageBand": "middleChildhood",
+            "resetRevision": 0,
             "currentSessionSummary": "The child changed from space to music.",
             "deliveredTurns": [
                 {
@@ -62,7 +63,7 @@ def test_v4_prompt_is_conversation_first_and_semantically_canvas_aware() -> None
     instructions = render_stable_instructions()
     normalized = " ".join(instructions.split())
 
-    assert REALTIME_PROMPT_VERSION == "ava-realtime-v4.7"
+    assert REALTIME_PROMPT_VERSION == "ava-realtime-v4.8"
     assert REALTIME_TOOL_CONTRACT_VERSION == "ava-realtime-tools-v4.5"
     assert {layer.name for layer in PROMPT_LAYERS} == {
         "identity_and_personality",
@@ -72,13 +73,30 @@ def test_v4_prompt_is_conversation_first_and_semantically_canvas_aware() -> None
         "tool_availability",
     }
     assert "Ordinary conversation is the primary experience" in normalized
+    assert "respond directly to the child's intended meaning" in normalized
+    assert "Acknowledgment is optional" in normalized
+    assert "Avoid repetitive conversational openings" in normalized
+    assert "spoken and conversational rather than lecture-like" in normalized
     assert "semantic and optional" in normalized
     assert "intended outcome is itself a visual" in normalized
-    assert "Normal conversation about a pending or active visual does not itself imply a revision" in normalized
+    assert (
+        "Normal conversation about a pending or active visual does not itself imply a revision"
+        in normalized
+    )
     assert CANCEL_INTERACTIVE_CANVAS_TOOL_NAME in normalized
     assert "operation=new" in normalized
     assert "operation=reviseFocused" in normalized
     assert "semantic_focus is the active referent" in normalized
+    assert "one conversational thought" in normalized
+    assert "continue the existing thought" in normalized
+    assert "Do not greet again" in normalized
+    assert "repeat the child's request" in normalized
+    assert "second acknowledgment" in normalized
+    assert "narrate application or tool internals" in normalized
+    assert "tap declared interactive parts" in normalized
+    assert "choose declared visible options" in normalized
+    assert "ordered Back/Next progression" in normalized
+    assert "zoom, pinch, pan, drag, rotate, or free editing" in normalized
     assert "Application identifiers have no language meaning" in normalized
     assert "function_call_output" not in normalized
 
@@ -133,7 +151,7 @@ def test_harness_exposes_bounded_semantic_canvas_actions() -> None:
     assert cancellation["parameters"]["type"] == "object"
     assert cancellation["parameters"]["additionalProperties"] is False
     assert cancellation["parameters"]["properties"] == {}
-    assert parameters["properties"]["brief"]["maxLength"] == 500
+    assert parameters["properties"]["brief"]["maxLength"] == 1000
     serialized = str(tool)
     assert "'title':" not in serialized
     for forbidden_field in (
@@ -155,6 +173,47 @@ def test_harness_exposes_bounded_semantic_canvas_actions() -> None:
     ]
     session["tools"][0]["name"] = "mutated"
     assert harness.tools[0]["name"] == INTERACTIVE_CANVAS_TOOL_NAME
+
+
+@pytest.mark.parametrize(
+    ("brief_len", "should_succeed"),
+    [
+        (50, True),
+        (500, True),
+        (750, True),
+        (1000, True),
+        (1001, False),
+    ],
+)
+def test_tool_brief_character_bounds(brief_len: int, should_succeed: bool) -> None:
+    brief_text = "x" * brief_len
+    payload = {
+        "operation": "new",
+        "brief": brief_text,
+        "interactionMode": "explore",
+    }
+    if should_succeed:
+        req = InteractiveCanvasRequest.model_validate(payload)
+        assert len(req.brief) == brief_len
+    else:
+        with pytest.raises(ValidationError):
+            InteractiveCanvasRequest.model_validate(payload)
+
+
+def test_consecutive_and_revision_requests_accept_bounded_briefs() -> None:
+    for operation in ("new", "new", "new", "reviseFocused"):
+        req = InteractiveCanvasRequest.model_validate(
+            {
+                "operation": operation,
+                "brief": (
+                    "Show an interactive model of the solar system with central "
+                    "Sun, revolving terrestrial planets, gas giants, asteroid belt, "
+                    "and orbital ellipses with labeled orbital speeds."
+                ),
+                "interactionMode": "explore",
+            }
+        )
+        assert req.operation == operation
 
 
 @pytest.mark.parametrize("operation", ["new", "reviseFocused"])
@@ -198,7 +257,9 @@ def test_interaction_mode_is_required_and_exact(interaction_mode: str) -> None:
     assert request.interaction_mode == interaction_mode
 
 
-def test_removed_interaction_goal_is_rejected_instead_of_disagreeing_with_schema() -> None:
+def test_removed_interaction_goal_is_rejected_instead_of_disagreeing_with_schema() -> (
+    None
+):
     with pytest.raises(ValidationError):
         InteractiveCanvasRequest.model_validate(
             {
@@ -239,6 +300,7 @@ def test_recent_context_contains_speech_but_excludes_canvas_interaction() -> Non
     snapshot = AuthoritativeMemorySnapshot.model_validate(
         {
             "ageBand": "middleChildhood",
+            "resetRevision": 0,
             "currentSessionSummary": None,
             "deliveredTurns": [
                 {

@@ -9,6 +9,10 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+DEFAULT_OPENAI_REALTIME_TRUNCATION_POST_INSTRUCTIONS_TOKENS = 80_000
+DEFAULT_OPENAI_REALTIME_TRUNCATION_RETENTION_RATIO = 0.8
+
+
 class AvaEnvironment(StrEnum):
     DEVELOPMENT = "development"
     TEST = "test"
@@ -66,6 +70,17 @@ class Settings(BaseSettings):
         default=450,
         ge=100,
         le=2_000,
+    )
+    openai_realtime_truncation_post_instructions_tokens: int = Field(
+        default=DEFAULT_OPENAI_REALTIME_TRUNCATION_POST_INSTRUCTIONS_TOKENS,
+        ge=1_024,
+        le=1_000_000,
+        strict=True,
+    )
+    openai_realtime_truncation_retention_ratio: float = Field(
+        default=DEFAULT_OPENAI_REALTIME_TRUNCATION_RETENTION_RATIO,
+        gt=0,
+        lt=1,
     )
     openai_canvas_model: Literal["gpt-5.6-sol"] = "gpt-5.6-sol"
     openai_canvas_reasoning_effort: Literal["none", "low"] = "none"

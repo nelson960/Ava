@@ -709,16 +709,22 @@ void main() {
     controller.dispose();
   });
 
-  test('explore A then A emits one semantic interaction', () async {
+  test('explore A then A emits two semantic interactions', () async {
     final commands = await _interactionCommands(
       mode: AvaSvgInteractionMode.explore,
       declaredBindings: const ['A'],
       selections: const ['A', 'A'],
     );
 
-    expect(commands, hasLength(1));
-    expect(commands.single.fields['bindingId'], 'binding-A');
-    expect(commands.single.fields['interactionRevision'], 1);
+    expect(commands, hasLength(2));
+    expect(
+      commands.map((command) => command.fields['bindingId']),
+      orderedEquals(['binding-A', 'binding-A']),
+    );
+    expect(
+      commands.map((command) => command.fields['interactionRevision']),
+      orderedEquals([1, 2]),
+    );
   });
 
   test('explore A then B then A emits three semantic interactions', () async {
@@ -747,6 +753,14 @@ void main() {
 
     expect(commands, hasLength(1));
     expect(commands.single.fields['interactionRevision'], 1);
+  });
+
+  test('none mode has no interactive bindings', () async {
+    final interactionDocument = _interactionDocument(
+      mode: AvaSvgInteractionMode.none,
+      bindingNames: const [],
+    );
+    expect(interactionDocument.manifest.bindings, isEmpty);
   });
 
   test('steps callbacks remain progressive semantic interactions', () async {

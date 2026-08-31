@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from time import monotonic
@@ -18,6 +18,10 @@ from pydantic import ValidationError
 from websockets.asyncio.client import connect as connect_websocket
 
 from ..canvas.svg_workspace import RecordedSvgCanvasInteraction
+from ..config import (
+    DEFAULT_OPENAI_REALTIME_TRUNCATION_POST_INSTRUCTIONS_TOKENS,
+    DEFAULT_OPENAI_REALTIME_TRUNCATION_RETENTION_RATIO,
+)
 from ..realtime.harness import RealtimeHarness
 from ..realtime.provider_session import (
     MAX_SDP_BYTES,
@@ -138,7 +142,15 @@ class _OutstandingCancelOutcome:
     response_id: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class _ResolvedCancelOutcome:
+    cancel_event_id: str
+    cancelled_turn_id: str
+    response_id: str
+
+
 _MAX_OUTSTANDING_CANCEL_OUTCOMES = 64
+_MAX_RECENTLY_RESOLVED_CANCEL_OUTCOMES = 32
 
 
 class OpenAIRealtimeOutputValidationError(OpenAIRealtimeProtocolError):
@@ -251,6 +263,12 @@ class _OpenAIRealtimeEventChannel:
         vad_threshold: float = 0.45,
         vad_prefix_padding_ms: int = 500,
         vad_silence_duration_ms: int = 450,
+        truncation_post_instructions_tokens: int = (
+            DEFAULT_OPENAI_REALTIME_TRUNCATION_POST_INSTRUCTIONS_TOKENS
+        ),
+        truncation_retention_ratio: float = (
+            DEFAULT_OPENAI_REALTIME_TRUNCATION_RETENTION_RATIO
+        ),
     ) -> None:
         self._socket = socket
         self._model = model
@@ -273,6 +291,14 @@ class _OpenAIRealtimeEventChannel:
         )
         self._vad_silence_duration_ms = _validated_vad_silence_duration_ms(
             vad_silence_duration_ms
+        )
+        self._truncation_post_instructions_tokens = (
+            _validated_truncation_post_instructions_tokens(
+                truncation_post_instructions_tokens
+            )
+        )
+        self._truncation_retention_ratio = _validated_truncation_retention_ratio(
+            truncation_retention_ratio
         )
         self._received_event_count = 0
         self._sideband_event_sequence = 0
@@ -297,6 +323,9 @@ class _OpenAIRealtimeEventChannel:
         self._response_owner_by_id: dict[str, str | None] = {}
         self._consumed_terminal_response_owner_by_id: dict[str, str] = {}
         self._outstanding_cancel_outcomes: list[_OutstandingCancelOutcome] = []
+        self._recently_resolved_cancel_outcomes: OrderedDict[
+            str, _ResolvedCancelOutcome
+        ] = OrderedDict()
         self._next_cancel_sequence = 1
         self._prepared_session_update: str | None = None
         self._cancelled_turn_ids: set[str] = set()
@@ -707,6 +736,31 @@ class _OpenAIRealtimeEventChannel:
         )
         self._completed_canvas_call_ids.add(call_id)
         self._pending_canvas_call_id = None
+        self._interaction_response_readiness_changed.set()
+
+    def _canvas_interaction_response_readiness(
+        self,
+        turn_id: str,
+    ) -> str | None:
+        if self._closed:
+            return "providerClosed"
+        if turn_id in self._cancelled_turn_ids or turn_id in self._settled_turn_ids:
+            return "turnSettledOrCancelled"
+        if self._active_turn_id != turn_id:
+            return "turnMismatch"
+        if any(owner is None for owner in self._input_item_turn_ids.values()):
+            return "unresolvedInputOwner"
+        if any(owner is None for owner in self._response_owner_by_id.values()):
+            return "unresolvedResponseOwner"
+        if any(owner == turn_id for owner in self._input_item_turn_ids.values()):
+            return "turnAlreadyOwnsInput"
+        if self._active_response_id is not None:
+            return "activeResponse"
+        if self._pending_canvas_call_id is not None:
+            return "pendingCanvasCall"
+        if self._awaiting_response_trigger_turn_id != turn_id:
+            return "notAwaitingTrigger"
+        return None
 
     async def request_canvas_interaction_response(
         self,
@@ -716,16 +770,19 @@ class _OpenAIRealtimeEventChannel:
     ) -> bool:
         if not turn_id.strip():
             raise ValueError("turn_id cannot be empty")
-        if (
-            self._closed
-            or self._active_turn_id != turn_id
-            or self._awaiting_response_trigger_turn_id != turn_id
-            or self._active_response_id is not None
-            or self._pending_canvas_call_id is not None
-            or any(owner is None for owner in self._input_item_turn_ids.values())
-            or any(owner == turn_id for owner in self._input_item_turn_ids.values())
-            or any(owner is None for owner in self._response_owner_by_id.values())
-        ):
+        unready_reason = self._canvas_interaction_response_readiness(turn_id)
+        if unready_reason is not None:
+            LOGGER.info(
+                "openai_canvas_interaction_response_not_ready turn_id=%s reason=%s",
+                turn_id,
+                unready_reason,
+                extra={
+                    "ava_context": {
+                        "turnId": turn_id,
+                        "unreadyReason": unready_reason,
+                    }
+                },
+            )
             return False
         semantic_context = _canvas_interaction_context_text(interaction)
         self._awaiting_response_trigger_turn_id = None
@@ -776,26 +833,19 @@ class _OpenAIRealtimeEventChannel:
     ) -> bool:
         if not turn_id.strip():
             raise ValueError("turn_id cannot be empty")
-        while not self._closed:
-            if turn_id in self._cancelled_turn_ids or turn_id in self._settled_turn_ids:
+        while True:
+            readiness = self._canvas_interaction_response_readiness(turn_id)
+            if readiness is None:
+                return True
+            if readiness in {"providerClosed", "turnSettledOrCancelled"}:
                 return False
-            if (
-                self._active_turn_id == turn_id
-                and self._awaiting_response_trigger_turn_id == turn_id
-                and self._active_response_id is None
-                and self._pending_canvas_call_id is None
-            ):
-                return True
             self._interaction_response_readiness_changed.clear()
-            if (
-                self._active_turn_id == turn_id
-                and self._awaiting_response_trigger_turn_id == turn_id
-                and self._active_response_id is None
-                and self._pending_canvas_call_id is None
-            ):
+            readiness = self._canvas_interaction_response_readiness(turn_id)
+            if readiness is None:
                 return True
+            if readiness in {"providerClosed", "turnSettledOrCancelled"}:
+                return False
             await self._interaction_response_readiness_changed.wait()
-        return False
 
     async def prepare(self, *, harness: RealtimeHarness) -> None:
         """Prepare the sideband before Flutter is told to unmute the mic."""
@@ -809,6 +859,10 @@ class _OpenAIRealtimeEventChannel:
             vad_threshold=self._vad_threshold,
             vad_prefix_padding_ms=self._vad_prefix_padding_ms,
             vad_silence_duration_ms=self._vad_silence_duration_ms,
+            truncation_post_instructions_tokens=(
+                self._truncation_post_instructions_tokens
+            ),
+            truncation_retention_ratio=self._truncation_retention_ratio,
         )
         serialized = json.dumps(
             payload,
@@ -832,15 +886,23 @@ class _OpenAIRealtimeEventChannel:
         self._prepared_session_update = serialized
         LOGGER.info(
             "openai_realtime_prompt_installed prompt_version=%s "
-            "tool_contract_version=%s acknowledged=%s",
+            "tool_contract_version=%s acknowledged=%s "
+            "truncation_post_instructions_tokens=%d "
+            "truncation_retention_ratio=%.2f",
             harness.prompt_version,
             harness.tool_contract_version,
             initial_prepare,
+            self._truncation_post_instructions_tokens,
+            self._truncation_retention_ratio,
             extra={
                 "ava_context": {
                     "promptVersion": harness.prompt_version,
                     "toolContractVersion": harness.tool_contract_version,
                     "providerAcknowledged": initial_prepare,
+                    "truncationPostInstructionsTokens": (
+                        self._truncation_post_instructions_tokens
+                    ),
+                    "truncationRetentionRatio": self._truncation_retention_ratio,
                 }
             },
         )
@@ -926,7 +988,19 @@ class _OpenAIRealtimeEventChannel:
                 if _provider_error_code(event) == "response_cancel_not_active":
                     outcome = self._consume_correlated_cancel_outcome(event)
                     if outcome is None:
-                        raise _provider_error(event)
+                        resolved = self._consume_recently_resolved_cancel_outcome(event)
+                        if resolved is None:
+                            raise _provider_error(event)
+                        LOGGER.info(
+                            "openai_realtime_late_cancel_error_consumed "
+                            "cancel_event_id=%s cancelled_turn_id=%s "
+                            "cancelled_response_id=%s consumer_turn_id=%s",
+                            resolved.cancel_event_id,
+                            resolved.cancelled_turn_id,
+                            resolved.response_id,
+                            cancelled_turn_id,
+                        )
+                        continue
                     if outcome.cancel_event_id != active_cancel_outcome.cancel_event_id:
                         LOGGER.info(
                             "openai_realtime_late_cancel_error_consumed "
@@ -1231,6 +1305,7 @@ class _OpenAIRealtimeEventChannel:
                 "OpenAI input item changed Ava turn ownership"
             )
         self._input_item_turn_ids[item_id] = turn_id
+        self._interaction_response_readiness_changed.set()
         outcome = self._input_transcription_outcomes.get(item_id)
         if outcome is not None:
             if outcome.turn_id is not None and outcome.turn_id != turn_id:
@@ -1297,6 +1372,7 @@ class _OpenAIRealtimeEventChannel:
             raise OpenAIRealtimeProtocolError(
                 "OpenAI response event belongs to a different Ava turn"
             )
+
     def _admit_response(self, *, response_id: str, turn_id: str) -> None:
         if not turn_id.strip():
             raise ValueError("turn_id cannot be empty")
@@ -1310,6 +1386,7 @@ class _OpenAIRealtimeEventChannel:
                 "OpenAI response changed Ava turn ownership"
             )
         self._response_owner_by_id[response_id] = turn_id
+        self._interaction_response_readiness_changed.set()
 
     def _mark_response_terminal_consumed(
         self,
@@ -1333,6 +1410,7 @@ class _OpenAIRealtimeEventChannel:
             self._consumed_terminal_response_owner_by_id,
             maximum=_MAX_CONSUMED_TERMINAL_RESPONSE_IDS,
         )
+        self._interaction_response_readiness_changed.set()
         _log_response_diagnostic(
             "openai_realtime_response_terminal_consumed",
             event=event,
@@ -1519,7 +1597,21 @@ class _OpenAIRealtimeEventChannel:
                     if _provider_error_code(event) == "response_cancel_not_active":
                         outcome = self._consume_correlated_cancel_outcome(event)
                         if outcome is None:
-                            raise _provider_error(event)
+                            resolved = self._consume_recently_resolved_cancel_outcome(
+                                event
+                            )
+                            if resolved is None:
+                                raise _provider_error(event)
+                            LOGGER.info(
+                                "openai_realtime_late_cancel_error_consumed "
+                                "cancel_event_id=%s cancelled_turn_id=%s "
+                                "cancelled_response_id=%s consumer_turn_id=%s",
+                                resolved.cancel_event_id,
+                                resolved.cancelled_turn_id,
+                                resolved.response_id,
+                                turn_id,
+                            )
+                            continue
                         LOGGER.info(
                             "openai_realtime_late_cancel_error_consumed "
                             "cancel_event_id=%s cancel_sequence=%d "
@@ -1558,6 +1650,7 @@ class _OpenAIRealtimeEventChannel:
                 if event_type == "response.created":
                     response_created_at = monotonic()
                     self._awaiting_response_trigger_turn_id = None
+                    self._interaction_response_readiness_changed.set()
                     if not response_expected:
                         trigger_started = monotonic()
                     response_expected = True
@@ -1598,9 +1691,7 @@ class _OpenAIRealtimeEventChannel:
                                     "ava_context": {
                                         "turnId": turn_id,
                                         "providerResponseId": candidate,
-                                        "stage": (
-                                            "inputTerminalToResponseCreated"
-                                        ),
+                                        "stage": ("inputTerminalToResponseCreated"),
                                         "elapsedMs": elapsed_ms,
                                     }
                                 },
@@ -1645,9 +1736,7 @@ class _OpenAIRealtimeEventChannel:
                                     "ava_context": {
                                         "turnId": turn_id,
                                         "providerResponseId": candidate_response_id,
-                                        "stage": (
-                                            "responseCreatedToFirstTextDelta"
-                                        ),
+                                        "stage": ("responseCreatedToFirstTextDelta"),
                                         "elapsedMs": created_to_delta_ms,
                                     }
                                 },
@@ -1765,9 +1854,7 @@ class _OpenAIRealtimeEventChannel:
                             response_id=completed_response_id,
                             turn_id=turn_id,
                             consumer_phase=(
-                                "canvasContinuation"
-                                if continuation
-                                else "turnResponse"
+                                "canvasContinuation" if continuation else "turnResponse"
                             ),
                         )
                         self._active_response_id = None
@@ -1781,6 +1868,7 @@ class _OpenAIRealtimeEventChannel:
                     usage = _parse_usage(event)
                     accumulated_usage = _merge_usage(accumulated_usage, usage)
                     self._active_response_id = None
+                    self._interaction_response_readiness_changed.set()
 
                     function_items = [
                         _mapping(item, "response output item")
@@ -2037,6 +2125,18 @@ class _OpenAIRealtimeEventChannel:
             if outcome.response_id not in {None, response_id}:
                 continue
             self._outstanding_cancel_outcomes.pop(index)
+            self._recently_resolved_cancel_outcomes[outcome.cancel_event_id] = (
+                _ResolvedCancelOutcome(
+                    cancel_event_id=outcome.cancel_event_id,
+                    cancelled_turn_id=outcome.cancelled_turn_id,
+                    response_id=response_id,
+                )
+            )
+            if (
+                len(self._recently_resolved_cancel_outcomes)
+                > _MAX_RECENTLY_RESOLVED_CANCEL_OUTCOMES
+            ):
+                self._recently_resolved_cancel_outcomes.popitem(last=False)
             LOGGER.info(
                 "openai_realtime_cancel_outcome_resolved cancel_event_id=%s "
                 "cancel_sequence=%d "
@@ -2049,6 +2149,16 @@ class _OpenAIRealtimeEventChannel:
                 terminal_status,
             )
             return
+
+    def _consume_recently_resolved_cancel_outcome(
+        self,
+        event: Mapping[str, object],
+    ) -> _ResolvedCancelOutcome | None:
+        error = _mapping(event.get("error"), "provider error")
+        cancel_event_id = error.get("event_id")
+        if not isinstance(cancel_event_id, str) or not cancel_event_id:
+            return None
+        return self._recently_resolved_cancel_outcomes.pop(cancel_event_id, None)
 
     async def _send_json(self, payload: Mapping[str, object]) -> None:
         if self._closed:
@@ -2165,6 +2275,12 @@ class OpenAIRealtimeProviderSession:
         vad_threshold: float = 0.45,
         vad_prefix_padding_ms: int = 500,
         vad_silence_duration_ms: int = 450,
+        truncation_post_instructions_tokens: int = (
+            DEFAULT_OPENAI_REALTIME_TRUNCATION_POST_INSTRUCTIONS_TOKENS
+        ),
+        truncation_retention_ratio: float = (
+            DEFAULT_OPENAI_REALTIME_TRUNCATION_RETENTION_RATIO
+        ),
         http_client: httpx.AsyncClient | None = None,
         websocket_connector: RealtimeWebSocketConnector = (
             _default_websocket_connector
@@ -2195,6 +2311,14 @@ class OpenAIRealtimeProviderSession:
         )
         self._vad_silence_duration_ms = _validated_vad_silence_duration_ms(
             vad_silence_duration_ms
+        )
+        self._truncation_post_instructions_tokens = (
+            _validated_truncation_post_instructions_tokens(
+                truncation_post_instructions_tokens
+            )
+        )
+        self._truncation_retention_ratio = _validated_truncation_retention_ratio(
+            truncation_retention_ratio
         )
         self._api_origin = _validated_origin(api_origin, scheme="https")
         self._realtime_websocket_url = _validated_websocket_url(realtime_websocket_url)
@@ -2326,6 +2450,10 @@ class OpenAIRealtimeProviderSession:
                 vad_threshold=self._vad_threshold,
                 vad_prefix_padding_ms=self._vad_prefix_padding_ms,
                 vad_silence_duration_ms=self._vad_silence_duration_ms,
+                truncation_post_instructions_tokens=(
+                    self._truncation_post_instructions_tokens
+                ),
+                truncation_retention_ratio=self._truncation_retention_ratio,
             )
             await channel.start_receiver()
         except Exception as error:
@@ -2429,8 +2557,10 @@ class OpenAIRealtimeProviderSession:
         *,
         turn_id: str,
     ) -> bool:
-        return await self._require_channel().wait_until_canvas_interaction_response_ready(
-            turn_id=turn_id
+        return (
+            await self._require_channel().wait_until_canvas_interaction_response_ready(
+                turn_id=turn_id
+            )
         )
 
     async def child_transcript(self, *, turn_id: str) -> str | None:
@@ -2559,6 +2689,12 @@ class OpenAIRealtimeLiveProbe:
         connect_timeout_seconds: float,
         turn_timeout_seconds: float,
         max_output_tokens: int,
+        truncation_post_instructions_tokens: int = (
+            DEFAULT_OPENAI_REALTIME_TRUNCATION_POST_INSTRUCTIONS_TOKENS
+        ),
+        truncation_retention_ratio: float = (
+            DEFAULT_OPENAI_REALTIME_TRUNCATION_RETENTION_RATIO
+        ),
         websocket_connector: RealtimeWebSocketConnector = (
             _default_websocket_connector
         ),
@@ -2576,6 +2712,14 @@ class OpenAIRealtimeLiveProbe:
         self._connect_timeout_seconds = connect_timeout_seconds
         self._turn_timeout_seconds = turn_timeout_seconds
         self._max_output_tokens = max_output_tokens
+        self._truncation_post_instructions_tokens = (
+            _validated_truncation_post_instructions_tokens(
+                truncation_post_instructions_tokens
+            )
+        )
+        self._truncation_retention_ratio = _validated_truncation_retention_ratio(
+            truncation_retention_ratio
+        )
         self._websocket_connector = websocket_connector
         self._realtime_websocket_url = _validated_websocket_url(realtime_websocket_url)
 
@@ -2635,6 +2779,10 @@ class OpenAIRealtimeLiveProbe:
             model=self._model,
             max_output_tokens=self._max_output_tokens,
             turn_timeout_seconds=self._turn_timeout_seconds,
+            truncation_post_instructions_tokens=(
+                self._truncation_post_instructions_tokens
+            ),
+            truncation_retention_ratio=self._truncation_retention_ratio,
         )
         try:
             await channel.expect_session_created()
@@ -2833,6 +2981,12 @@ def _session_update(
     vad_threshold: float = 0.45,
     vad_prefix_padding_ms: int = 500,
     vad_silence_duration_ms: int = 450,
+    truncation_post_instructions_tokens: int = (
+        DEFAULT_OPENAI_REALTIME_TRUNCATION_POST_INSTRUCTIONS_TOKENS
+    ),
+    truncation_retention_ratio: float = (
+        DEFAULT_OPENAI_REALTIME_TRUNCATION_RETENTION_RATIO
+    ),
 ) -> dict[str, object]:
     provider_neutral = harness.session_update()
     raw_session = provider_neutral.get("session")
@@ -2849,6 +3003,19 @@ def _session_update(
             "max_output_tokens": max_output_tokens,
             "parallel_tool_calls": False,
             "reasoning": {"effort": harness.reasoning_effort},
+            "truncation": {
+                "type": "retention_ratio",
+                "retention_ratio": _validated_truncation_retention_ratio(
+                    truncation_retention_ratio
+                ),
+                "token_limits": {
+                    "post_instructions": (
+                        _validated_truncation_post_instructions_tokens(
+                            truncation_post_instructions_tokens
+                        )
+                    )
+                },
+            },
             "audio": {
                 "input": {
                     "transcription": {
@@ -2901,6 +3068,27 @@ def _validated_vad_silence_duration_ms(value: int) -> int:
     if isinstance(value, bool) or not 100 <= value <= 2_000:
         raise ValueError("vad_silence_duration_ms must be between 100 and 2000")
     return value
+
+
+def _validated_truncation_post_instructions_tokens(value: int) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1_024 <= value <= 1_000_000
+    ):
+        raise ValueError(
+            "truncation_post_instructions_tokens must be between 1024 and 1000000"
+        )
+    return value
+
+
+def _validated_truncation_retention_ratio(value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("truncation_retention_ratio must be a number")
+    normalized = float(value)
+    if not 0 < normalized < 1:
+        raise ValueError("truncation_retention_ratio must be between 0 and 1")
+    return normalized
 
 
 def _validate_semantic_response_done(

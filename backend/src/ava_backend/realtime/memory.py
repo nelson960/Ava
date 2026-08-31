@@ -18,7 +18,22 @@ MAX_DELIVERED_TURNS = 8
 MAX_STABLE_MEMORIES = 12
 MAX_WEEKLY_RECORDS = 64
 MAX_SESSION_SUMMARY_CHARACTERS = 1_200
+MAX_CHILD_TURN_SUMMARY_CHARACTERS = 240
 MINIMUM_STABLE_MEMORY_CONFIDENCE = 0.8
+
+
+class MemoryResetRevisionMismatchError(RuntimeError):
+    """A session attempted to write memory after its reset epoch ended."""
+
+    def __init__(
+        self,
+        *,
+        expected_reset_revision: int,
+        current_reset_revision: int,
+    ) -> None:
+        super().__init__("stale-session memory write rejected after conversation reset")
+        self.expected_reset_revision = expected_reset_revision
+        self.current_reset_revision = current_reset_revision
 
 
 class MemoryProposalKind(StrEnum):
@@ -82,14 +97,17 @@ class DeliveredConversationTurn(RealtimeProtocolModel):
 
     turn_id: ProtocolIdentifier
     input_kind: DeliveredInputKind = DeliveredInputKind.SPEECH
-    child_text: (
-        Annotated[NonEmptyText, StringConstraints(max_length=2_000)] | None
-    ) = None
+    child_text: Annotated[NonEmptyText, StringConstraints(max_length=2_000)] | None = (
+        None
+    )
     child_text_source: ChildTurnTextSource | None = ChildTurnTextSource.TRANSCRIPT
     canvas_interaction: DeliveredCanvasInteraction | None = None
     ava_delivered_text: Annotated[str, StringConstraints(max_length=1_800)]
     delivered_sample_count: int = Field(ge=0, le=2_147_483_647)
-    child_turn_summary: Annotated[NonEmptyText, StringConstraints(max_length=240)]
+    child_turn_summary: Annotated[
+        NonEmptyText,
+        StringConstraints(max_length=MAX_CHILD_TURN_SUMMARY_CHARACTERS),
+    ]
     terminal: DeliveredTurnTerminal
 
     @model_validator(mode="after")
@@ -166,6 +184,7 @@ class ConversationResetReceipt(RealtimeProtocolModel):
 
 class AuthoritativeMemorySnapshot(RealtimeProtocolModel):
     age_band: AgeBand
+    reset_revision: int = Field(ge=0)
     current_session_summary: (
         Annotated[str, StringConstraints(min_length=1, max_length=1_200)] | None
     )
@@ -215,6 +234,7 @@ class AuthoritativeMemoryStore(Protocol):
         self,
         *,
         subject: str,
+        expected_reset_revision: int,
         turn: DeliveredConversationTurn,
         proposal: AvaMemoryProposal | None,
         memory_id: str | None,
@@ -225,6 +245,7 @@ class AuthoritativeMemoryStore(Protocol):
         self,
         *,
         subject: str,
+        expected_reset_revision: int,
         summary: str | None,
     ) -> None: ...
 
@@ -258,9 +279,7 @@ class DevelopmentAuthoritativeMemoryStore:
             raise ValueError("max_memories_per_subject must be between 1 and 12")
         self._turns: defaultdict[
             str, list[tuple[datetime, DeliveredConversationTurn]]
-        ] = defaultdict(
-            list
-        )
+        ] = defaultdict(list)
         self._memories: defaultdict[str, dict[str, StableMemoryRecord]] = defaultdict(
             dict
         )
@@ -294,6 +313,7 @@ class DevelopmentAuthoritativeMemoryStore:
             return AuthoritativeMemorySnapshot.model_validate(
                 {
                     "ageBand": age_band,
+                    "resetRevision": self._reset_revisions[normalized_subject],
                     "currentSessionSummary": self._summaries.get(normalized_subject),
                     "deliveredTurns": [
                         turn.model_dump(mode="json", by_alias=True)
@@ -312,12 +332,17 @@ class DevelopmentAuthoritativeMemoryStore:
         self,
         *,
         subject: str,
+        expected_reset_revision: int,
         turn: DeliveredConversationTurn,
         proposal: AvaMemoryProposal | None,
         memory_id: str | None,
         occurred_at: datetime | None = None,
     ) -> MemoryProposalDecision:
         normalized_subject = _validate_subject(subject)
+        validated_expected_reset_revision = _validate_reset_revision(
+            expected_reset_revision,
+            field_name="expected_reset_revision",
+        )
         normalized_occurred_at = _validate_aware_datetime(
             occurred_at or datetime.now(UTC),
             field_name="occurred_at",
@@ -333,6 +358,12 @@ class DevelopmentAuthoritativeMemoryStore:
         )
 
         async with self._lock:
+            current_reset_revision = self._reset_revisions[normalized_subject]
+            if current_reset_revision != validated_expected_reset_revision:
+                raise MemoryResetRevisionMismatchError(
+                    expected_reset_revision=validated_expected_reset_revision,
+                    current_reset_revision=current_reset_revision,
+                )
             if validated_turn.turn_id in self._committed_turn_ids[normalized_subject]:
                 raise ValueError(
                     f"delivered turn {validated_turn.turn_id!r} is already committed"
@@ -390,11 +421,22 @@ class DevelopmentAuthoritativeMemoryStore:
         self,
         *,
         subject: str,
+        expected_reset_revision: int,
         summary: str | None,
     ) -> None:
         normalized_subject = _validate_subject(subject)
+        validated_expected_reset_revision = _validate_reset_revision(
+            expected_reset_revision,
+            field_name="expected_reset_revision",
+        )
         validated = _validate_optional_summary(summary)
         async with self._lock:
+            current_reset_revision = self._reset_revisions[normalized_subject]
+            if current_reset_revision != validated_expected_reset_revision:
+                raise MemoryResetRevisionMismatchError(
+                    expected_reset_revision=validated_expected_reset_revision,
+                    current_reset_revision=current_reset_revision,
+                )
             if validated is None:
                 self._summaries.pop(normalized_subject, None)
             else:
@@ -615,8 +657,11 @@ def _validate_weekly_summary(summary: str) -> str:
     normalized = _normalize_whitespace(summary)
     if not normalized:
         raise ValueError("weekly record summary cannot be empty")
-    if len(normalized) > 240:
-        raise ValueError("weekly record summary cannot exceed 240 characters")
+    if len(normalized) > MAX_CHILD_TURN_SUMMARY_CHARACTERS:
+        raise ValueError(
+            "weekly record summary cannot exceed "
+            f"{MAX_CHILD_TURN_SUMMARY_CHARACTERS} characters"
+        )
     if _SENSITIVE_MEMORY_PATTERN.search(normalized):
         raise ValueError("weekly record summary contains prohibited sensitive data")
     if _HIDDEN_INFERENCE_PATTERN.search(
@@ -629,6 +674,12 @@ def _validate_weekly_summary(summary: str) -> str:
 def _validate_aware_datetime(value: datetime, *, field_name: str) -> datetime:
     if value.tzinfo is None:
         raise ValueError(f"{field_name} must be timezone-aware")
+    return value
+
+
+def _validate_reset_revision(value: int, *, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field_name} must be a non-negative integer")
     return value
 
 
@@ -662,6 +713,7 @@ def bounded_snapshot(
     return AuthoritativeMemorySnapshot.model_validate(
         {
             "ageBand": snapshot.age_band,
+            "resetRevision": snapshot.reset_revision,
             "currentSessionSummary": snapshot.current_session_summary,
             "deliveredTurns": [
                 turn.model_dump(mode="json", by_alias=True)

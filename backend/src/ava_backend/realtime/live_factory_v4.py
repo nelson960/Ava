@@ -79,6 +79,12 @@ class LiveRealtimeCoordinatorFactoryV4:
             vad_silence_duration_ms=(
                 self._settings.openai_realtime_vad_silence_duration_ms
             ),
+            truncation_post_instructions_tokens=(
+                self._settings.openai_realtime_truncation_post_instructions_tokens
+            ),
+            truncation_retention_ratio=(
+                self._settings.openai_realtime_truncation_retention_ratio
+            ),
         )
         specialist: SvgCanvasSpecialist = OpenAISvgCanvasSpecialist(
             self._settings,

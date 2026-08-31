@@ -12,7 +12,7 @@ from .common import NonEmptyText, RealtimeProtocolModel
 
 INTERACTIVE_CANVAS_TOOL_NAME = "request_interactive_canvas"
 CANCEL_INTERACTIVE_CANVAS_TOOL_NAME = "cancel_interactive_canvas"
-INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS = 500
+INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS = 1000
 CANVAS_MODEL_SAFE_REJECTION_REASON = "visualUnavailable"
 _CALL_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
@@ -42,8 +42,8 @@ class InteractiveCanvasRequest(RealtimeProtocolModel):
     ] = Field(
         description=(
             "Describe the visual's conversational purpose, essential objects, "
-            "relationships, flow, and labels. Do not provide coordinates, SVG, "
-            "styles, code, scene IDs, or revisions."
+            "relationships, flow, and labels. Do not repeat full context or "
+            "provide coordinates, SVG, styles, code, scene IDs, or revisions."
         )
     )
     interaction_mode: InteractiveCanvasMode = Field(
@@ -57,6 +57,8 @@ class InteractiveCanvasRequest(RealtimeProtocolModel):
 
 class InteractiveCanvasCancellationRequest(RealtimeProtocolModel):
     """Explicit semantic request to stop unpresented canvas work."""
+
+
 class InteractiveCanvasToolStatus(StrEnum):
     READY = "ready"
     REJECTED = "rejected"

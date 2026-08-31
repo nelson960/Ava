@@ -22,6 +22,8 @@ async def test_live_factory_resolves_subject_workspace_for_each_session() -> Non
             environment=AvaEnvironment.TEST,
             openai_api_key=SecretStr("test-openai-key"),
             realtime_delivery_mode=RealtimeDeliveryMode.CAPTION_PREVIEW,
+            openai_realtime_truncation_post_instructions_tokens=64_000,
+            openai_realtime_truncation_retention_ratio=0.75,
         ),
         memory=DevelopmentAuthoritativeMemoryStore(),
         documents=SvgCanvasDocumentStore(),
@@ -49,6 +51,8 @@ async def test_live_factory_resolves_subject_workspace_for_each_session() -> Non
     assert isinstance(first, DeterministicRealtimeSessionCoordinator)
     assert isinstance(second, DeterministicRealtimeSessionCoordinator)
     assert isinstance(isolated, DeterministicRealtimeSessionCoordinator)
+    assert first._realtime._truncation_post_instructions_tokens == 64_000
+    assert first._realtime._truncation_retention_ratio == 0.75
 
     first_workspace = first._canvas_jobs.state.workspace
     second_workspace = second._canvas_jobs.state.workspace

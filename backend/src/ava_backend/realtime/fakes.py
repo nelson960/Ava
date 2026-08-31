@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Awaitable, Iterable
 from dataclasses import dataclass
 
 from ..canvas.svg_workspace import RecordedSvgCanvasInteraction
@@ -154,9 +154,7 @@ class DeterministicRealtimePlanProvider:
         self.canvas_interaction_response_interactions: list[
             RecordedSvgCanvasInteraction
         ] = []
-        self.canvas_interaction_response_session_updates: list[
-            dict[str, object]
-        ] = []
+        self.canvas_interaction_response_session_updates: list[dict[str, object]] = []
         self.turn_stream_started = asyncio.Event()
         self._canvas_interaction_response_requested = asyncio.Event()
         self._interaction_response_readiness_changed = asyncio.Event()
@@ -228,6 +226,20 @@ class DeterministicRealtimePlanProvider:
         if not turn_id:
             raise ValueError("turn_id cannot be empty")
         return self._child_text
+
+    def wait_for_child_transcript(
+        self,
+        *,
+        turn_id: str,
+    ) -> Awaitable[str | None]:
+        if not turn_id:
+            raise ValueError("turn_id cannot be empty")
+
+        async def resolved() -> str | None:
+            await asyncio.sleep(0)
+            return self._child_text
+
+        return resolved()
 
     async def next_input_event(self) -> RealtimeProviderInputEvent:
         return await self._input_events.get()

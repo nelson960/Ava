@@ -5,6 +5,7 @@ from builtins import anext
 import json
 import logging
 from collections import deque
+from types import MethodType
 
 import httpx
 import pytest
@@ -264,6 +265,7 @@ def _harness():  # type: ignore[no-untyped-def]
         AuthoritativeMemorySnapshot.model_validate(
             {
                 "ageBand": AgeBand.MIDDLE_CHILDHOOD,
+                "resetRevision": 0,
                 "currentSessionSummary": None,
                 "deliveredTurns": [],
                 "stableMemories": [],
@@ -427,6 +429,14 @@ async def _collect_turn_events(
             turn_id=turn_id,
         )
     ]
+
+
+async def _advance_ready_callbacks(*, rounds: int = 4) -> None:
+    loop = asyncio.get_running_loop()
+    for _ in range(rounds):
+        checkpoint: asyncio.Future[None] = loop.create_future()
+        loop.call_soon(checkpoint.set_result, None)
+        await checkpoint
 
 
 @pytest.mark.asyncio
@@ -604,9 +614,7 @@ async def test_originating_and_barge_in_items_keep_distinct_turn_ownership() -> 
 
     assert admitted == ("item-barge-b",)
     assert channel.input_item_owner(item_id="item-barge-b") == "turn-b"
-    assert await channel.child_transcript_for_turn("turn-b") == (
-        "What about the moon?"
-    )
+    assert await channel.child_transcript_for_turn("turn-b") == ("What about the moon?")
     assert await channel.child_transcript_for_turn("turn-a") == "Tell me about stars."
     await channel.close()
 
@@ -737,15 +745,14 @@ async def test_duplicate_consumed_continuation_terminal_is_ignored_before_next_t
     assert channel.last_response_id == "resp_turn_b"
     assert channel._response_owner_by_id[CONTINUATION_RESPONSE_ID] == "turn-canvas-a"
     assert channel._response_owner_by_id["resp_turn_b"] == "turn-b"
-    assert channel._consumed_terminal_response_owner_by_id[
-        CONTINUATION_RESPONSE_ID
-    ] == "turn-canvas-a"
+    assert (
+        channel._consumed_terminal_response_owner_by_id[CONTINUATION_RESPONSE_ID]
+        == "turn-canvas-a"
+    )
     duplicate = next(
         record.ava_context
         for record in caplog.records
-        if record.getMessage().startswith(
-            "openai_realtime_duplicate_terminal_ignored"
-        )
+        if record.getMessage().startswith("openai_realtime_duplicate_terminal_ignored")
     )
     assert duplicate == {
         "component": "realtimeProvider",
@@ -816,6 +823,29 @@ def test_session_update_uses_text_output_and_one_optional_semantic_tool() -> Non
     assert session["audio"]["input"]["transcription"] == {"model": "gpt-transcribe"}
     assert turn_detection["create_response"] is True
     assert turn_detection["interrupt_response"] is True
+    assert session["parallel_tool_calls"] is False
+    assert session["reasoning"] == {"effort": "low"}
+    assert session["truncation"] == {
+        "type": "retention_ratio",
+        "retention_ratio": 0.8,
+        "token_limits": {"post_instructions": 80_000},
+    }
+
+
+def test_session_update_propagates_custom_realtime_truncation_configuration() -> None:
+    payload = _session_update(
+        _harness(),
+        "gpt-realtime-test",
+        800,
+        truncation_post_instructions_tokens=64_000,
+        truncation_retention_ratio=0.75,
+    )
+
+    assert payload["session"]["truncation"] == {
+        "type": "retention_ratio",
+        "retention_ratio": 0.75,
+        "token_limits": {"post_instructions": 64_000},
+    }
 
 
 @pytest.mark.asyncio
@@ -1097,9 +1127,7 @@ async def test_owned_transcription_terminal_wakes_deferred_memory_waiter() -> No
 
 
 @pytest.mark.asyncio
-async def test_owned_transcription_wait_after_receiver_terminal_does_not_hang() -> (
-    None
-):
+async def test_owned_transcription_wait_after_receiver_terminal_does_not_hang() -> None:
     socket = _ControlledClosingRealtimeSocket(
         [{"type": "input_audio_buffer.committed", "item_id": "item-terminal"}]
     )
@@ -1699,13 +1727,9 @@ async def test_canvas_interaction_response_owns_each_exact_semantic_context() ->
         await asyncio.gather(pending_event, return_exceptions=True)
         await iterator.aclose()
 
-    assert (
-        "<semantic_focus>semantic-focus-A</semantic_focus>" in semantic_inputs[0]
-    )
+    assert "<semantic_focus>semantic-focus-A</semantic_focus>" in semantic_inputs[0]
     assert "semantic-focus-B" not in semantic_inputs[0]
-    assert (
-        "<semantic_focus>semantic-focus-B</semantic_focus>" in semantic_inputs[1]
-    )
+    assert "<semantic_focus>semantic-focus-B</semantic_focus>" in semantic_inputs[1]
     assert "semantic-focus-A" not in semantic_inputs[1]
     assert 'mode="explore"' in semantic_inputs[0]
     assert 'mode="select"' in semantic_inputs[1]
@@ -1832,9 +1856,10 @@ async def test_canvas_interaction_trigger_is_single_shot() -> None:
         turn_id="turn-canvas-single-shot",
         interaction=_recorded_interaction(),
     )
-    assert len(
-        [sent for sent in socket.sent if sent.get("type") == "response.create"]
-    ) == 1
+    assert (
+        len([sent for sent in socket.sent if sent.get("type") == "response.create"])
+        == 1
+    )
 
     for event in _text_response_events(
         response_id="resp_canvas_single_shot",
@@ -1862,8 +1887,7 @@ async def test_canvas_interaction_response_cannot_call_canvas_tool() -> None:
 
     for event in _canvas_response_events(
         arguments=(
-            '{"operation":"new","brief":"Show a cell.",'
-            '"interactionMode":"none"}'
+            '{"operation":"new","brief":"Show a cell.","interactionMode":"none"}'
         ),
         preamble="",
     ):
@@ -1878,7 +1902,9 @@ async def test_canvas_interaction_response_cannot_call_canvas_tool() -> None:
 
 
 @pytest.mark.asyncio
-async def test_child_input_observed_first_suppresses_canvas_interaction_response() -> None:
+async def test_child_input_observed_first_suppresses_canvas_interaction_response() -> (
+    None
+):
     channel, socket = _channel([])
     iterator = channel.stream_turn(
         harness=_harness(),
@@ -1919,9 +1945,9 @@ async def test_already_owned_child_input_suppresses_interaction_response() -> No
     )
     await channel.start_receiver()
     await socket.wait_received(2)
-    assert await channel.admit_pending_input_items(
-        turn_id="turn-owned-child"
-    ) == ("item_owned_child",)
+    assert await channel.admit_pending_input_items(turn_id="turn-owned-child") == (
+        "item_owned_child",
+    )
     iterator = channel.stream_turn(
         harness=_harness(),
         turn_id="turn-owned-child",
@@ -1966,6 +1992,315 @@ async def test_active_normal_response_suppresses_canvas_interaction_response() -
     socket.push(response_events[2])
     with pytest.raises(StopAsyncIteration):
         await iterator.__anext__()
+
+
+@pytest.mark.asyncio
+async def test_readiness_predicate_consistency_across_all_gates() -> None:
+    channel, socket = _channel([])
+    turn_id = "turn-readiness-consistency"
+
+    # 1. Closed provider
+    channel_closed, _ = _channel([])
+    await channel_closed.close()
+    assert (
+        channel_closed._canvas_interaction_response_readiness(turn_id)
+        == "providerClosed"
+    )
+    assert not await channel_closed.request_canvas_interaction_response(
+        turn_id=turn_id,
+        interaction=_recorded_interaction(),
+    )
+
+    # 2. Turn mismatch
+    assert channel._canvas_interaction_response_readiness(turn_id) == "turnMismatch"
+    assert not await channel.request_canvas_interaction_response(
+        turn_id=turn_id,
+        interaction=_recorded_interaction(),
+    )
+
+    # 3. Not awaiting trigger (stream_turn not started)
+    channel._active_turn_id = turn_id
+    assert (
+        channel._canvas_interaction_response_readiness(turn_id) == "notAwaitingTrigger"
+    )
+    assert not await channel.request_canvas_interaction_response(
+        turn_id=turn_id,
+        interaction=_recorded_interaction(),
+    )
+
+    # 4. Ready state
+    channel._awaiting_response_trigger_turn_id = turn_id
+    assert channel._canvas_interaction_response_readiness(turn_id) is None
+    assert await channel.wait_until_canvas_interaction_response_ready(turn_id=turn_id)
+    assert await channel.request_canvas_interaction_response(
+        turn_id=turn_id,
+        interaction=_recorded_interaction(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_generic_admission_never_reconstructs_response_trigger_ownership() -> (
+    None
+):
+    turn_id = "turn-admission-ownership"
+    channel, _ = _channel([])
+    channel._active_turn_id = turn_id
+    channel._awaiting_response_trigger_turn_id = None
+    channel._input_item_turn_ids["item-prior"] = None
+
+    channel._admit_input_item(item_id="item-prior", turn_id="turn-prior")
+
+    assert channel._awaiting_response_trigger_turn_id is None
+    assert channel._canvas_interaction_response_readiness(turn_id) == (
+        "notAwaitingTrigger"
+    )
+
+    channel._response_owner_by_id["resp-prior"] = None
+    channel._admit_response(response_id="resp-prior", turn_id="turn-prior")
+
+    assert channel._awaiting_response_trigger_turn_id is None
+    assert channel._canvas_interaction_response_readiness(turn_id) == (
+        "notAwaitingTrigger"
+    )
+
+
+@pytest.mark.asyncio
+async def test_readiness_waiter_closes_lost_wakeup_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel, _ = _channel([])
+    turn_id = "turn-lost-wakeup"
+    channel._active_turn_id = turn_id
+    channel._awaiting_response_trigger_turn_id = turn_id
+    channel._input_item_turn_ids["item-prior"] = None
+    original = channel._canvas_interaction_response_readiness
+    calls = 0
+
+    def readiness_with_transition(
+        self: _OpenAIRealtimeEventChannel,
+        candidate_turn_id: str,
+    ) -> str | None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            self._input_item_turn_ids["item-prior"] = "turn-prior"
+            self._interaction_response_readiness_changed.set()
+            return "unresolvedInputOwner"
+        return original(candidate_turn_id)
+
+    monkeypatch.setattr(
+        channel,
+        "_canvas_interaction_response_readiness",
+        MethodType(readiness_with_transition, channel),
+    )
+
+    assert await channel.wait_until_canvas_interaction_response_ready(turn_id=turn_id)
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_close_and_cancel_wake_blocked_readiness_waiters() -> None:
+    close_channel, _ = _channel([])
+    close_channel._active_turn_id = "turn-close-waiter"
+    close_channel._awaiting_response_trigger_turn_id = "turn-close-waiter"
+    close_channel._active_response_id = "resp-blocking-close"
+    close_waiter = asyncio.create_task(
+        close_channel.wait_until_canvas_interaction_response_ready(
+            turn_id="turn-close-waiter"
+        )
+    )
+    await _advance_ready_callbacks()
+    await close_channel.close()
+    assert await close_waiter is False
+
+    cancel_channel, _ = _channel([])
+    cancel_channel._active_turn_id = "turn-other"
+    cancel_waiter = asyncio.create_task(
+        cancel_channel.wait_until_canvas_interaction_response_ready(
+            turn_id="turn-cancel-waiter"
+        )
+    )
+    await _advance_ready_callbacks()
+    await cancel_channel.cancel(turn_id="turn-cancel-waiter")
+    assert await cancel_waiter is False
+
+
+@pytest.mark.asyncio
+async def test_unresolved_input_owner_wakes_and_triggers_interaction() -> None:
+    channel, socket = _channel(
+        [
+            {
+                "type": "input_audio_buffer.speech_started",
+                "item_id": "item_unresolved_test",
+                "audio_start_ms": 100,
+            }
+        ]
+    )
+    await channel.start_receiver()
+    await socket.wait_received(2)
+    turn_id = "turn-unresolved-input"
+
+    iterator = channel.stream_turn(
+        harness=_harness(),
+        turn_id=turn_id,
+    ).__aiter__()
+    pending_event = asyncio.create_task(iterator.__anext__())
+    await socket.wait_sent(1)
+
+    waiter = asyncio.create_task(
+        channel.wait_until_canvas_interaction_response_ready(turn_id=turn_id)
+    )
+    await asyncio.sleep(0.01)
+    assert not waiter.done()
+
+    await channel.admit_pending_input_items(turn_id="turn-prior-voice")
+    assert await asyncio.wait_for(waiter, timeout=1.0) is True
+
+    assert await channel.request_canvas_interaction_response(
+        turn_id=turn_id,
+        interaction=_recorded_interaction(),
+    )
+    assert (
+        sum(
+            sent.get("type") == "response.create"
+            and sent.get("response", {}).get("tool_choice") == "none"
+            for sent in socket.sent
+        )
+        == 1
+    )
+
+    pending_event.cancel()
+    await asyncio.gather(pending_event, return_exceptions=True)
+    await iterator.aclose()
+
+
+@pytest.mark.asyncio
+async def test_unresolved_response_owner_wakes_and_triggers_interaction() -> None:
+    channel, socket = _channel([])
+    await channel.start_receiver()
+    turn_id = "turn-unresolved-resp"
+
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp_unresolved_123",
+                "status": "completed",
+                "output": [],
+            },
+        }
+    )
+    await socket.wait_received(1)
+    iterator = channel.stream_turn(
+        harness=_harness(),
+        turn_id=turn_id,
+    ).__aiter__()
+    pending_event = asyncio.create_task(iterator.__anext__())
+    await socket.wait_sent(1)
+    assert (
+        channel._canvas_interaction_response_readiness(turn_id)
+        == "unresolvedResponseOwner"
+    )
+
+    waiter = asyncio.create_task(
+        channel.wait_until_canvas_interaction_response_ready(turn_id=turn_id)
+    )
+    await asyncio.sleep(0.01)
+    assert not waiter.done()
+
+    channel._admit_response(response_id="resp_unresolved_123", turn_id="turn-prior")
+    assert await asyncio.wait_for(waiter, timeout=1.0) is True
+
+    assert await channel.request_canvas_interaction_response(
+        turn_id=turn_id,
+        interaction=_recorded_interaction(),
+    )
+    assert sum(sent.get("type") == "response.create" for sent in socket.sent) == 1
+
+    pending_event.cancel()
+    await asyncio.gather(pending_event, return_exceptions=True)
+    await iterator.aclose()
+
+
+@pytest.mark.asyncio
+async def test_active_response_wakes_and_triggers_when_settled() -> None:
+    channel, socket = _channel([])
+    turn_id = "turn-active-resp-settle"
+    iterator = channel.stream_turn(
+        harness=_harness(),
+        turn_id=turn_id,
+    ).__aiter__()
+    pending_event = asyncio.create_task(iterator.__anext__())
+    await socket.wait_received(1)
+
+    response_events = _text_response_events(
+        response_id="resp_settle_test",
+        text="Explaining something first.",
+    )
+    socket.push(response_events[0])
+    socket.push(response_events[1])
+    assert isinstance(await pending_event, RealtimeSpeechTextDelta)
+
+    waiter = asyncio.create_task(
+        channel.wait_until_canvas_interaction_response_ready(turn_id=turn_id)
+    )
+    await asyncio.sleep(0.01)
+    assert not waiter.done()
+
+    socket.push(response_events[2])
+    with pytest.raises(StopAsyncIteration):
+        await iterator.__anext__()
+    assert await waiter is False
+
+    next_turn_id = "turn-next-tap"
+    next_iterator = channel.stream_turn(
+        harness=_harness(),
+        turn_id=next_turn_id,
+    ).__aiter__()
+    next_pending_event = asyncio.create_task(next_iterator.__anext__())
+
+    waiter_next = asyncio.create_task(
+        channel.wait_until_canvas_interaction_response_ready(turn_id=next_turn_id)
+    )
+    assert await asyncio.wait_for(waiter_next, timeout=1.0) is True
+    assert await channel.request_canvas_interaction_response(
+        turn_id=next_turn_id,
+        interaction=_recorded_interaction(),
+    )
+    await socket.wait_sent(2)
+
+    next_pending_event.cancel()
+    await asyncio.gather(next_pending_event, return_exceptions=True)
+    await next_iterator.aclose()
+
+
+@pytest.mark.asyncio
+async def test_response_events_require_created_before_done() -> None:
+    invalid, _ = _channel(
+        [
+            {
+                "type": "response.done",
+                "response": {
+                    "id": "resp-before-created",
+                    "status": "completed",
+                    "output": [],
+                    "usage": _usage(1, 1),
+                },
+            }
+        ]
+    )
+    with pytest.raises(OpenAIRealtimeProtocolError, match="before response.created"):
+        await _collect_turn_events(invalid, turn_id="turn-invalid-order")
+
+    valid, _ = _channel(
+        _text_response_events(
+            response_id="resp-created-before-done",
+            text="The order is valid.",
+        )
+    )
+    assert await _collect_turn_events(valid, turn_id="turn-valid-order") == [
+        RealtimeSpeechTextDelta(delta="The order is valid.")
+    ]
 
 
 @pytest.mark.asyncio
@@ -2341,6 +2676,175 @@ async def test_cancelled_canvas_continuation_cannot_escape_into_next_turn(
 
 
 @pytest.mark.asyncio
+async def test_late_exact_cancel_error_after_cancelled_done_keeps_next_turn_healthy(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    channel, socket = _channel(
+        [
+            {
+                "type": "response.created",
+                "response": {"id": "resp-cancelled-a"},
+            },
+            {
+                "type": "response.output_text.delta",
+                "response_id": "resp-cancelled-a",
+                "delta": "A partial answer.",
+            },
+        ]
+    )
+    iterator = channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-cancelled-a",
+    ).__aiter__()
+    assert await iterator.__anext__() == RealtimeSpeechTextDelta(
+        delta="A partial answer."
+    )
+
+    sent_before_cancel = len(socket.sent)
+    cancel_task = asyncio.create_task(channel.cancel(turn_id="turn-cancelled-a"))
+    await socket.wait_sent(sent_before_cancel + 1)
+    cancel_event = next(
+        event for event in reversed(socket.sent) if event["type"] == "response.cancel"
+    )
+    cancel_event_id = cancel_event["event_id"]
+    assert isinstance(cancel_event_id, str)
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp-cancelled-a",
+                "status": "cancelled",
+                "output": [],
+                "usage": _usage(3, 0),
+            },
+        }
+    )
+    await cancel_task
+    await iterator.aclose()
+
+    assert not channel._outstanding_cancel_outcomes
+    assert list(channel._recently_resolved_cancel_outcomes) == [cancel_event_id]
+
+    socket.push(
+        {
+            "type": "error",
+            "error": {
+                "code": "response_cancel_not_active",
+                "event_id": cancel_event_id,
+                "message": "The cancelled response is no longer active.",
+            },
+        }
+    )
+    for event in _text_response_events(
+        response_id="resp-next-b",
+        text="The next turn remains healthy.",
+    ):
+        socket.push(event)
+
+    with caplog.at_level(logging.INFO, logger="ava_backend.openai_realtime"):
+        received = await _collect_turn_events(channel, turn_id="turn-next-b")
+
+    assert received == [RealtimeSpeechTextDelta(delta="The next turn remains healthy.")]
+    assert not channel._recently_resolved_cancel_outcomes
+    assert "openai_realtime_late_cancel_error_consumed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_unknown_cancel_not_active_event_id_remains_fatal() -> None:
+    channel, _ = _channel(
+        [
+            {
+                "type": "error",
+                "error": {
+                    "code": "response_cancel_not_active",
+                    "event_id": "cancel-never-owned",
+                    "message": "The requested response is not active.",
+                },
+            }
+        ]
+    )
+
+    with pytest.raises(
+        OpenAIRealtimeUnavailableError,
+        match="response_cancel_not_active",
+    ):
+        await _collect_turn_events(channel, turn_id="turn-unknown-cancel")
+
+
+@pytest.mark.asyncio
+async def test_exact_recent_cancel_match_consumes_only_its_protocol_record() -> None:
+    channel, _ = _channel([])
+    first = await channel._send_response_cancel(
+        turn_id="turn-recent-1",
+        response_id="resp-recent-1",
+    )
+    channel._resolve_outstanding_cancel_outcome(
+        turn_id="turn-recent-1",
+        response_id="resp-recent-1",
+        terminal_status="cancelled",
+    )
+    second = await channel._send_response_cancel(
+        turn_id="turn-recent-2",
+        response_id="resp-recent-2",
+    )
+    channel._resolve_outstanding_cancel_outcome(
+        turn_id="turn-recent-2",
+        response_id="resp-recent-2",
+        terminal_status="cancelled",
+    )
+
+    consumed = channel._consume_recently_resolved_cancel_outcome(
+        {
+            "error": {
+                "code": "response_cancel_not_active",
+                "event_id": first.cancel_event_id,
+            }
+        }
+    )
+
+    assert consumed is not None
+    assert consumed.cancel_event_id == first.cancel_event_id
+    assert list(channel._recently_resolved_cancel_outcomes) == [second.cancel_event_id]
+
+
+@pytest.mark.asyncio
+async def test_recent_cancel_outcome_ledger_is_bounded_and_eviction_is_fatal() -> None:
+    channel, socket = _channel([])
+    resolved_event_ids: list[str] = []
+    for index in range(33):
+        outcome = await channel._send_response_cancel(
+            turn_id=f"turn-resolved-{index}",
+            response_id=f"resp-resolved-{index}",
+        )
+        resolved_event_ids.append(outcome.cancel_event_id)
+        channel._resolve_outstanding_cancel_outcome(
+            turn_id=f"turn-resolved-{index}",
+            response_id=f"resp-resolved-{index}",
+            terminal_status="cancelled",
+        )
+
+    assert len(channel._recently_resolved_cancel_outcomes) == 32
+    assert resolved_event_ids[0] not in channel._recently_resolved_cancel_outcomes
+    assert list(channel._recently_resolved_cancel_outcomes) == resolved_event_ids[1:]
+
+    socket.push(
+        {
+            "type": "error",
+            "error": {
+                "code": "response_cancel_not_active",
+                "event_id": resolved_event_ids[0],
+                "message": "The requested response is not active.",
+            },
+        }
+    )
+    with pytest.raises(
+        OpenAIRealtimeUnavailableError,
+        match="response_cancel_not_active",
+    ):
+        await _collect_turn_events(channel, turn_id="turn-after-eviction")
+
+
+@pytest.mark.asyncio
 async def test_cancel_before_response_id_is_known_settles_idempotently() -> None:
     channel, socket = _channel(
         [
@@ -2389,9 +2893,7 @@ async def test_cancellation_during_pending_interaction_response_create_does_not_
     await asyncio.gather(pending_event, return_exceptions=True)
     await iterator.aclose()
 
-    cancellation = asyncio.create_task(
-        channel.cancel(turn_id="turn-interaction-a")
-    )
+    cancellation = asyncio.create_task(channel.cancel(turn_id="turn-interaction-a"))
     await socket.wait_sent(3)
     socket.push(
         {
@@ -2417,13 +2919,9 @@ async def test_cancellation_during_pending_interaction_response_create_does_not_
     received = await _collect_turn_events(channel, turn_id="turn-child-b")
 
     assert received == [
-        RealtimeSpeechTextDelta(
-            delta="This is the child's normal Turn B response."
-        )
+        RealtimeSpeechTextDelta(delta="This is the child's normal Turn B response.")
     ]
-    assert channel._response_owner_by_id["resp_interaction_a"] == (
-        "turn-interaction-a"
-    )
+    assert channel._response_owner_by_id["resp_interaction_a"] == ("turn-interaction-a")
     assert channel._response_owner_by_id["resp_child_b"] == "turn-child-b"
     assert [event["type"] for event in socket.sent].count("response.cancel") == 2
     assert channel.last_response_id == "resp_child_b"
@@ -2459,9 +2957,7 @@ async def test_child_vad_cancels_pending_interaction_before_next_child_response(
     pending_event.cancel()
     await asyncio.gather(pending_event, return_exceptions=True)
     await iterator.aclose()
-    cancellation = asyncio.create_task(
-        channel.cancel(turn_id="turn-interaction-vad-a")
-    )
+    cancellation = asyncio.create_task(channel.cancel(turn_id="turn-interaction-vad-a"))
     await socket.wait_sent(3)
     socket.push(
         {
@@ -2501,9 +2997,9 @@ async def test_child_vad_cancels_pending_interaction_before_next_child_response(
     await socket.wait_received(9)
     await cancellation
 
-    assert await channel.admit_pending_input_items(
-        turn_id="turn-child-vad-b"
-    ) == ("item-child-vad-b",)
+    assert await channel.admit_pending_input_items(turn_id="turn-child-vad-b") == (
+        "item-child-vad-b",
+    )
     received = await _collect_turn_events(
         channel,
         turn_id="turn-child-vad-b",
@@ -2517,12 +3013,8 @@ async def test_child_vad_cancels_pending_interaction_before_next_child_response(
     assert channel._response_owner_by_id["resp_interaction_vad_a"] == (
         "turn-interaction-vad-a"
     )
-    assert channel._response_owner_by_id["resp_child_vad_b"] == (
-        "turn-child-vad-b"
-    )
-    assert channel.input_item_owner(item_id="item-child-vad-b") == (
-        "turn-child-vad-b"
-    )
+    assert channel._response_owner_by_id["resp_child_vad_b"] == ("turn-child-vad-b")
+    assert channel.input_item_owner(item_id="item-child-vad-b") == ("turn-child-vad-b")
     assert channel.last_response_id == "resp_child_vad_b"
     assert not channel._outstanding_cancel_outcomes
 
@@ -2811,8 +3303,9 @@ async def test_cancel_not_active_with_unknown_event_id_is_provider_failure() -> 
         )
 
     assert len(channel._outstanding_cancel_outcomes) == 1
-    assert channel._outstanding_cancel_outcomes[0].cancel_event_id == (
-        cancel_event["event_id"]
+    assert (
+        channel._outstanding_cancel_outcomes[0].cancel_event_id
+        == (cancel_event["event_id"])
     )
 
 

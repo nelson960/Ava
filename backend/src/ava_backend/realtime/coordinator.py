@@ -44,11 +44,14 @@ from .events_v4 import (
 )
 from .harness import RealtimeHarness, build_realtime_harness
 from .memory import (
+    MAX_CHILD_TURN_SUMMARY_CHARACTERS,
     AuthoritativeMemoryStore,
     AuthoritativeMemorySnapshot,
     ChildTurnTextSource,
+    DeliveredCanvasInteraction,
     DeliveredConversationTurn,
     DeliveredTurnTerminal,
+    MemoryResetRevisionMismatchError,
     MemoryProposalDecision,
 )
 from .provider_session import (
@@ -116,6 +119,22 @@ class _TurnResult:
     child_turn_summary: str
 
 
+@dataclass(frozen=True, slots=True)
+class _CapturedMemoryCommit:
+    sequence: int
+    turn_id: str
+    occurred_at: datetime
+    expected_reset_revision: int
+    child_turn_summary: str | None
+    child_text: str | None
+    child_text_source: ChildTurnTextSource | None
+    canvas_interaction: DeliveredCanvasInteraction | None
+    delivered_text: str
+    delivered_sample_count: int
+    terminal: DeliveredTurnTerminal
+    transcript_waiter: Awaitable[str | None] | None
+
+
 class DeterministicRealtimeSessionCoordinator:
     """Protocol-v4 conversation using injected provider and memory seams.
 
@@ -145,9 +164,14 @@ class DeterministicRealtimeSessionCoordinator:
         stream_id_factory: IdentifierFactory | None = None,
         failure_id_factory: IdentifierFactory = new_failure_id,
         occurrence_time_factory: OccurrenceTimeFactory = _utc_now,
+        memory_commit_drain_timeout_seconds: float = 2.0,
     ) -> None:
         if not 2_048 <= max_audio_chunk_bytes <= 192_000:
             raise ValueError("max_audio_chunk_bytes must be between 2048 and 192000")
+        if not 0.01 <= memory_commit_drain_timeout_seconds <= 10:
+            raise ValueError(
+                "memory_commit_drain_timeout_seconds must be between 0.01 and 10"
+            )
 
         self._session_id = session_id
         self._turn_id = turn_id
@@ -169,6 +193,7 @@ class DeterministicRealtimeSessionCoordinator:
         self._stream_id_factory = stream_id_factory
         self._failure_id_factory = failure_id_factory
         self._occurrence_time_factory = occurrence_time_factory
+        self._memory_commit_drain_timeout_seconds = memory_commit_drain_timeout_seconds
         if persistent and (
             turn_id_factory is None
             or request_id_factory is None
@@ -186,6 +211,7 @@ class DeterministicRealtimeSessionCoordinator:
         )
         self._canvas_context_lock = asyncio.Lock()
         self._memory_snapshot: AuthoritativeMemorySnapshot | None = None
+        self._memory_reset_revision: int | None = None
         self._harness: RealtimeHarness | None = None
         self._negotiated_call: NegotiatedRealtimeCall | None = None
         self._sequence = 0
@@ -198,6 +224,7 @@ class DeterministicRealtimeSessionCoordinator:
         self._audio_metadata_sent = False
         self._playback_started = False
         self._last_rendered_sample_count = 0
+        self._playback_progress_changed = asyncio.Event()
         self._stopped_sample_count: int | None = None
         self._cancel_event: CancelTurnEventV4 | None = None
         self._cancellation_requested = asyncio.Event()
@@ -209,8 +236,9 @@ class DeterministicRealtimeSessionCoordinator:
         self._terminal_failure_code: str | None = None
         self._last_failure_id: str | None = None
         self._last_failure_component: str | None = None
-        self._pending_memory_refresh_warning: tuple[str, str] | None = None
         self._memory_commit_tasks: dict[str, asyncio.Task[None]] = {}
+        self._memory_commit_sequence = 0
+        self._latest_memory_commit_sequence = 0
         self._turn_occurred_at: datetime | None = None
         self._last_error: Exception | None = None
         self._active_planning_task: asyncio.Task[_TurnResult | None] | None = None
@@ -225,9 +253,9 @@ class DeterministicRealtimeSessionCoordinator:
         self._interruption_provider_audio_start_ms: int | None = None
         self._provider_speech_started_observed_at: float | None = None
         self._preemption_requested_at: float | None = None
-        self._latest_canvas_interaction_intent: (
-            RecordedSvgCanvasInteraction | None
-        ) = None
+        self._latest_canvas_interaction_intent: RecordedSvgCanvasInteraction | None = (
+            None
+        )
         self._canvas_interaction_response_task: asyncio.Task[None] | None = None
         self._canvas_interaction_response_wakeup = asyncio.Event()
         self._canvas_interaction_response_turn_id: str | None = None
@@ -281,6 +309,7 @@ class DeterministicRealtimeSessionCoordinator:
                 age_band=self._age_band,
             )
             self._memory_snapshot = snapshot
+            self._memory_reset_revision = snapshot.reset_revision
             LOGGER.info(
                 "realtime_stage session_id=%s request_id=%s stage=memory.load "
                 "elapsed_ms=%.2f",
@@ -434,6 +463,8 @@ class DeterministicRealtimeSessionCoordinator:
                 buffered_sample_count=event.buffered_sample_count,
             )
             self._last_rendered_sample_count = event.rendered_sample_count
+            self._playback_progress_changed.set()
+            should_enqueue = False
         elif isinstance(event, PlaybackStoppedEventV4):
             self._require_playback_started()
             self._validate_rendered_position(event.rendered_sample_count)
@@ -632,7 +663,7 @@ class DeterministicRealtimeSessionCoordinator:
             self._last_error = error
             delivered_samples = self._bounded_rendered_sample_count()
             delivered_text = ledger.delivered_text(delivered_samples)
-            await self._commit_failed_interaction_memory(
+            self._schedule_failed_interaction_memory(
                 delivered_sample_count=delivered_samples,
                 delivered_text=delivered_text,
             )
@@ -658,7 +689,7 @@ class DeterministicRealtimeSessionCoordinator:
             self._last_error = error
             delivered_samples = self._bounded_rendered_sample_count()
             delivered_text = ledger.delivered_text(delivered_samples)
-            await self._commit_failed_interaction_memory(
+            self._schedule_failed_interaction_memory(
                 delivered_sample_count=delivered_samples,
                 delivered_text=delivered_text,
             )
@@ -684,7 +715,7 @@ class DeterministicRealtimeSessionCoordinator:
             self._last_error = error
             delivered_samples = self._bounded_rendered_sample_count()
             delivered_text = ledger.delivered_text(delivered_samples)
-            await self._commit_failed_interaction_memory(
+            self._schedule_failed_interaction_memory(
                 delivered_sample_count=delivered_samples,
                 delivered_text=delivered_text,
             )
@@ -726,13 +757,6 @@ class DeterministicRealtimeSessionCoordinator:
             )
 
         yield self._phase_frame(SpeechPhase.LISTENING)
-        if self._pending_memory_refresh_warning is not None:
-            failure_id, message = self._pending_memory_refresh_warning
-            self._pending_memory_refresh_warning = None
-            yield self._memory_persistence_failed_frame(
-                message,
-                failure_id=failure_id,
-            )
         LOGGER.info(
             "realtime_turn_stage session_id=%s turn_id=%s stage=listening "
             "elapsed_ms=%.2f",
@@ -1153,13 +1177,22 @@ class DeterministicRealtimeSessionCoordinator:
             self._cancellation_requested.wait(),
             name="ava-turn-server-preemption",
         )
+        progress_task: asyncio.Task[bool] | None = asyncio.create_task(
+            self._playback_progress_changed.wait(),
+            name="ava-turn-playback-progress-state",
+        )
         waiting_for_client_cancellation = False
         try:
             while not self._terminal:
                 input_task = self._active_provider_input_task
                 wait_tasks = {
                     task
-                    for task in (control_task, input_task, preemption_task)
+                    for task in (
+                        control_task,
+                        input_task,
+                        preemption_task,
+                        progress_task,
+                    )
                     if task is not None
                 }
                 done, _ = await asyncio.wait(
@@ -1198,23 +1231,33 @@ class DeterministicRealtimeSessionCoordinator:
                     if control_task is not None and not control_task.done():
                         continue
 
-                assert control_task is not None
-                if not control_task.done():
-                    continue
-                try:
-                    control = control_task.result()
-                except QueueClosed:
-                    return
+                while control_task is not None and (
+                    control_task.done() or self._controls.item_count > 0
+                ):
+                    try:
+                        control = await control_task
+                    except QueueClosed:
+                        return
 
-                if isinstance(control, CancelTurnEventV4):
-                    async for frame in self._cancel_frames(plan=plan, ledger=ledger):
-                        yield frame
-                    return
-                if isinstance(control, PlaybackProgressEventV4):
+                    if isinstance(control, CancelTurnEventV4):
+                        async for frame in self._cancel_frames(
+                            plan=plan, ledger=ledger
+                        ):
+                            yield frame
+                        return
+                    control_task = asyncio.create_task(
+                        self._controls.get(),
+                        name="ava-turn-playback-control",
+                    )
+
+                if progress_task is not None and progress_task.done():
+                    progress_task.result()
+                    self._playback_progress_changed.clear()
                     if (
                         not waiting_for_client_cancellation
-                        and control.rendered_sample_count == self.received_sample_count
-                        and control.buffered_sample_count == 0
+                        and not self._cancellation_requested.is_set()
+                        and self._last_rendered_sample_count
+                        == self.received_sample_count
                     ):
                         async for frame in self._complete_frames(
                             plan=plan,
@@ -1222,16 +1265,20 @@ class DeterministicRealtimeSessionCoordinator:
                         ):
                             yield frame
                         return
-                control_task = asyncio.create_task(
-                    self._controls.get(),
-                    name="ava-turn-playback-control",
-                )
+                    progress_task = asyncio.create_task(
+                        self._playback_progress_changed.wait(),
+                        name="ava-turn-playback-progress-state",
+                    )
         finally:
-            for task in (control_task, preemption_task):
+            for task in (control_task, preemption_task, progress_task):
                 if task is not None and not task.done():
                     task.cancel()
             await asyncio.gather(
-                *(task for task in (control_task, preemption_task) if task is not None),
+                *(
+                    task
+                    for task in (control_task, preemption_task, progress_task)
+                    if task is not None
+                ),
                 return_exceptions=True,
             )
             await self._cancel_provider_input_observer()
@@ -1263,6 +1310,9 @@ class DeterministicRealtimeSessionCoordinator:
 
         self._previous_terminal_turn_id = self._turn_id
         self._previous_terminal_stream_id = self._stream_id
+        self._memory_commit_sequence += 1
+        self._latest_memory_commit_sequence = self._memory_commit_sequence
+        self._last_memory_decision = None
         self._turn_id = turn_id_factory()
         self._request_id = request_id_factory()
         self._stream_id = stream_id_factory()
@@ -1276,6 +1326,7 @@ class DeterministicRealtimeSessionCoordinator:
         self._audio_metadata_sent = False
         self._playback_started = False
         self._last_rendered_sample_count = 0
+        self._playback_progress_changed = asyncio.Event()
         self._stopped_sample_count = None
         self._cancel_event = None
         self._cancellation_requested = asyncio.Event()
@@ -1360,9 +1411,7 @@ class DeterministicRealtimeSessionCoordinator:
                     await self._refresh_canvas_context()
                     if not self._is_latest_canvas_interaction(interaction):
                         continue
-                    turn_id = await self._interaction_response_ready_turn(
-                        interaction
-                    )
+                    turn_id = await self._interaction_response_ready_turn(interaction)
                     if turn_id is None:
                         break
                     if not self._is_latest_canvas_interaction(interaction):
@@ -1376,16 +1425,20 @@ class DeterministicRealtimeSessionCoordinator:
                             "Realtime turn already owns a canvas interaction input"
                         )
                     self._turn_canvas_interaction_input = interaction
-                    triggered = await self._realtime.request_canvas_interaction_response(
-                        turn_id=turn_id,
-                        interaction=interaction,
+                    triggered = (
+                        await self._realtime.request_canvas_interaction_response(
+                            turn_id=turn_id,
+                            interaction=interaction,
+                        )
                     )
                     superseded = not self._is_latest_canvas_interaction(interaction)
                     if not triggered:
                         if self._turn_canvas_interaction_input == interaction:
                             self._turn_canvas_interaction_input = None
                         self._canvas_interaction_response_turn_id = None
-                        break
+                        if superseded:
+                            break
+                        continue
                     if superseded:
                         self._request_server_preemption(
                             reason="canvasInteractionSuperseded"
@@ -1454,9 +1507,13 @@ class DeterministicRealtimeSessionCoordinator:
                     continue
                 changed.cancel()
                 await asyncio.gather(changed, return_exceptions=True)
-                if readiness.result() and self._turn_id == turn_id and not self._terminal:
+                if (
+                    readiness.result()
+                    and self._turn_id == turn_id
+                    and not self._terminal
+                ):
                     return turn_id
-                return None
+                continue
             finally:
                 for task in (readiness, changed):
                     if not task.done():
@@ -1565,7 +1622,7 @@ class DeterministicRealtimeSessionCoordinator:
             segments = parser.emitted_segments
             if not segments:
                 return None
-            child_transcript = await self._realtime.child_transcript(
+            child_transcript = self._realtime.available_child_transcript(
                 turn_id=self._turn_id
             )
             if child_transcript is None:
@@ -1962,11 +2019,45 @@ class DeterministicRealtimeSessionCoordinator:
         if interaction_task is not None:
             await asyncio.gather(interaction_task, return_exceptions=True)
         await self._cancel_active_turn_work()
-        memory_tasks = tuple(self._memory_commit_tasks.values())
-        for task in memory_tasks:
-            task.cancel()
-        if memory_tasks:
-            await asyncio.gather(*memory_tasks, return_exceptions=True)
+        memory_tasks_by_turn = dict(self._memory_commit_tasks)
+        if memory_tasks_by_turn:
+            _, pending = await asyncio.wait(
+                tuple(memory_tasks_by_turn.values()),
+                timeout=self._memory_commit_drain_timeout_seconds,
+            )
+            if pending:
+                pending_turns = {
+                    task: turn_id
+                    for turn_id, task in memory_tasks_by_turn.items()
+                    if task in pending
+                }
+                for task, turn_id in pending_turns.items():
+                    failure_id = self._failure_id_factory()
+                    LOGGER.warning(
+                        "memory_commit_drain_timed_out failure_id=%s "
+                        "session_id=%s turn_id=%s component=%s "
+                        "reason_category=%s timeout_seconds=%.2f",
+                        failure_id,
+                        self._session_id,
+                        turn_id,
+                        SpeechFailureComponent.MEMORY_STORE,
+                        "shutdownDrainTimeout",
+                        self._memory_commit_drain_timeout_seconds,
+                        extra={
+                            "ava_context": {
+                                "failureId": failure_id,
+                                "component": str(SpeechFailureComponent.MEMORY_STORE),
+                                "sessionId": self._session_id,
+                                "turnId": turn_id,
+                                "reasonCategory": "shutdownDrainTimeout",
+                                "timeoutSeconds": (
+                                    self._memory_commit_drain_timeout_seconds
+                                ),
+                            }
+                        },
+                    )
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
         self._memory_commit_tasks.clear()
         if not self._terminal:
             await self._realtime.cancel(turn_id=self._turn_id)
@@ -2101,10 +2192,7 @@ class DeterministicRealtimeSessionCoordinator:
                                     )
                                 return
                             self._start_provider_input_observer()
-                            if (
-                                next_item not in done
-                                and cancellation not in done
-                            ):
+                            if next_item not in done and cancellation not in done:
                                 continue
                         break
                 except BaseException:
@@ -2144,35 +2232,13 @@ class DeterministicRealtimeSessionCoordinator:
     ) -> AsyncIterator[AvaServerOutboundFrameV4]:
         delivered_samples = self.received_sample_count
         delivered_text = ledger.delivered_text(delivered_samples)
-        try:
-            await self._commit_memory(
-                turn_id=self._turn_id,
-                plan=plan,
-                delivered_sample_count=delivered_samples,
-                delivered_text=delivered_text,
-                terminal=DeliveredTurnTerminal.COMPLETED,
-            )
-        except Exception as error:
-            self._last_error = error
-            failure_id = self._failure_id_factory()
-            LOGGER.exception(
-                "memory_commit_failed failure_id=%s session_id=%s turn_id=%s",
-                failure_id,
-                self._session_id,
-                self._turn_id,
-                extra={
-                    "ava_context": {
-                        "failureId": failure_id,
-                        "component": str(SpeechFailureComponent.MEMORY_STORE),
-                        "sessionId": self._session_id,
-                        "turnId": self._turn_id,
-                    }
-                },
-            )
-            yield self._memory_persistence_failed_frame(
-                "Delivered turn could not be persisted.",
-                failure_id=failure_id,
-            )
+        self._schedule_memory_commit(
+            turn_id=self._turn_id,
+            plan=plan,
+            delivered_sample_count=delivered_samples,
+            delivered_text=delivered_text,
+            terminal=DeliveredTurnTerminal.COMPLETED,
+        )
         yield self._terminal_frame(
             {
                 "event": "turnCompleted",
@@ -2204,36 +2270,13 @@ class DeterministicRealtimeSessionCoordinator:
         delivered_samples = self._bounded_rendered_sample_count()
         delivered_text = ledger.delivered_text(delivered_samples)
         if plan is not None or self._turn_canvas_interaction_input is not None:
-            try:
-                await self._commit_memory(
-                    turn_id=self._turn_id,
-                    plan=plan,
-                    delivered_sample_count=delivered_samples,
-                    delivered_text=delivered_text,
-                    terminal=DeliveredTurnTerminal.CANCELLED,
-                )
-            except Exception as error:
-                self._last_error = error
-                failure_id = self._failure_id_factory()
-                LOGGER.exception(
-                    "cancelled_memory_commit_failed failure_id=%s "
-                    "session_id=%s turn_id=%s",
-                    failure_id,
-                    self._session_id,
-                    self._turn_id,
-                    extra={
-                        "ava_context": {
-                            "failureId": failure_id,
-                            "component": str(SpeechFailureComponent.MEMORY_STORE),
-                            "sessionId": self._session_id,
-                            "turnId": self._turn_id,
-                        }
-                    },
-                )
-                yield self._memory_persistence_failed_frame(
-                    "Interrupted delivered turn could not be persisted.",
-                    failure_id=failure_id,
-                )
+            self._schedule_memory_commit(
+                turn_id=self._turn_id,
+                plan=plan,
+                delivered_sample_count=delivered_samples,
+                delivered_text=delivered_text,
+                terminal=DeliveredTurnTerminal.CANCELLED,
+            )
 
         yield self._terminal_frame(
             {
@@ -2244,7 +2287,7 @@ class DeterministicRealtimeSessionCoordinator:
             }
         )
 
-    async def _commit_memory(
+    def _schedule_memory_commit(
         self,
         *,
         turn_id: str,
@@ -2253,205 +2296,17 @@ class DeterministicRealtimeSessionCoordinator:
         delivered_text: str,
         terminal: DeliveredTurnTerminal,
     ) -> None:
+        if turn_id in self._memory_commit_tasks:
+            raise CoordinatorStateError(
+                "one turn cannot own multiple durable memory commit tasks"
+            )
         occurred_at = self._require_turn_occurred_at()
+        expected_reset_revision = self._require_memory_reset_revision()
         interaction = self._turn_canvas_interaction_input
+        canvas_interaction: DeliveredCanvasInteraction | None = None
         if interaction is not None:
-            await self._persist_delivered_canvas_interaction(
-                turn_id=turn_id,
-                interaction=interaction,
-                delivered_sample_count=delivered_sample_count,
-                delivered_text=delivered_text,
-                terminal=terminal,
-                occurred_at=occurred_at,
-            )
-            return
-        if plan is None:
-            return
-        if self._child_text is None or self._child_text_source is None:
-            child_transcript = await self._realtime.child_transcript(
-                turn_id=turn_id
-            )
-            if child_transcript is not None:
-                self._child_text = _bounded_child_transcript(child_transcript)
-                self._child_text_source = ChildTurnTextSource.TRANSCRIPT
-
-        if self._child_text is None or self._child_text_source is None:
-            wait_for_child_transcript = getattr(
-                self._realtime,
-                "wait_for_child_transcript",
-                None,
-            )
-            if callable(wait_for_child_transcript):
-                if turn_id in self._memory_commit_tasks:
-                    return
-                transcript_waiter = cast(
-                    Callable[..., Awaitable[str | None]],
-                    wait_for_child_transcript,
-                )(turn_id=turn_id)
-                self._memory_commit_tasks[turn_id] = asyncio.create_task(
-                    self._commit_memory_after_transcription(
-                        turn_id=turn_id,
-                        plan=plan,
-                        delivered_sample_count=delivered_sample_count,
-                        delivered_text=delivered_text,
-                        terminal=terminal,
-                        occurred_at=occurred_at,
-                        transcript_waiter=transcript_waiter,
-                    ),
-                    name=f"ava-memory-commit-{turn_id}",
-                )
-                return
-            LOGGER.info(
-                "memory_commit_skipped session_id=%s turn_id=%s "
-                "reason=child_transcript_unavailable",
-                self._session_id,
-                turn_id,
-            )
-            self._last_memory_decision = None
-            return
-        await self._persist_delivered_turn(
-            turn_id=turn_id,
-            plan=plan,
-            child_text=self._require_child_text(),
-            child_text_source=self._require_child_text_source(),
-            delivered_sample_count=delivered_sample_count,
-            delivered_text=delivered_text,
-            terminal=terminal,
-            occurred_at=occurred_at,
-        )
-
-    async def _commit_failed_interaction_memory(
-        self,
-        *,
-        delivered_sample_count: int,
-        delivered_text: str,
-    ) -> None:
-        if self._turn_canvas_interaction_input is None:
-            return
-        try:
-            await self._commit_memory(
-                turn_id=self._turn_id,
-                plan=None,
-                delivered_sample_count=delivered_sample_count,
-                delivered_text=delivered_text,
-                terminal=DeliveredTurnTerminal.FAILED,
-            )
-        except Exception:
-            LOGGER.exception(
-                "failed_interaction_memory_commit_failed session_id=%s turn_id=%s",
-                self._session_id,
-                self._turn_id,
-            )
-
-    async def _commit_memory_after_transcription(
-        self,
-        *,
-        turn_id: str,
-        plan: _TurnResult,
-        delivered_sample_count: int,
-        delivered_text: str,
-        terminal: DeliveredTurnTerminal,
-        occurred_at: datetime,
-        transcript_waiter: Awaitable[str | None],
-    ) -> None:
-        try:
-            child_transcript = await transcript_waiter
-            if child_transcript is None:
-                LOGGER.info(
-                    "memory_commit_skipped session_id=%s turn_id=%s "
-                    "reason=child_transcription_terminal_without_text",
-                    self._session_id,
-                    turn_id,
-                )
-                return
-            child_text = _bounded_child_transcript(child_transcript)
-            await self._persist_delivered_turn(
-                turn_id=turn_id,
-                plan=plan,
-                child_text=child_text,
-                child_text_source=ChildTurnTextSource.TRANSCRIPT,
-                delivered_sample_count=delivered_sample_count,
-                delivered_text=delivered_text,
-                terminal=terminal,
-                occurred_at=occurred_at,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            self._last_error = error
-            failure_id = self._failure_id_factory()
-            LOGGER.exception(
-                "deferred_memory_commit_failed failure_id=%s session_id=%s "
-                "turn_id=%s",
-                failure_id,
-                self._session_id,
-                turn_id,
-                extra={
-                    "ava_context": {
-                        "failureId": failure_id,
-                        "component": str(SpeechFailureComponent.MEMORY_STORE),
-                        "sessionId": self._session_id,
-                        "turnId": turn_id,
-                    }
-                },
-            )
-            self._pending_memory_refresh_warning = (
-                failure_id,
-                "Delivered turn could not be persisted.",
-            )
-        finally:
-            task = asyncio.current_task()
-            if self._memory_commit_tasks.get(turn_id) is task:
-                self._memory_commit_tasks.pop(turn_id, None)
-
-    async def _persist_delivered_turn(
-        self,
-        *,
-        turn_id: str,
-        plan: _TurnResult,
-        child_text: str,
-        child_text_source: ChildTurnTextSource,
-        delivered_sample_count: int,
-        delivered_text: str,
-        terminal: DeliveredTurnTerminal,
-        occurred_at: datetime,
-    ) -> None:
-        turn = DeliveredConversationTurn.model_validate(
-            {
-                "turnId": turn_id,
-                "childText": child_text,
-                "childTextSource": child_text_source,
-                "avaDeliveredText": delivered_text,
-                "deliveredSampleCount": delivered_sample_count,
-                "childTurnSummary": plan.child_turn_summary,
-                "terminal": terminal,
-            }
-        )
-        self._last_memory_decision = await self._memory.commit_delivered_turn(
-            subject=self._subject,
-            turn=turn,
-            proposal=None,
-            memory_id=None,
-            occurred_at=occurred_at,
-        )
-
-    async def _persist_delivered_canvas_interaction(
-        self,
-        *,
-        turn_id: str,
-        interaction: RecordedSvgCanvasInteraction,
-        delivered_sample_count: int,
-        delivered_text: str,
-        terminal: DeliveredTurnTerminal,
-        occurred_at: datetime,
-    ) -> None:
-        turn = DeliveredConversationTurn.model_validate(
-            {
-                "turnId": turn_id,
-                "inputKind": "canvasInteraction",
-                "childText": None,
-                "childTextSource": None,
-                "canvasInteraction": {
+            canvas_interaction = DeliveredCanvasInteraction.model_validate(
+                {
                     "sceneId": interaction.scene_id,
                     "sceneRevision": interaction.scene_revision,
                     "interactionRevision": interaction.interaction_revision,
@@ -2460,20 +2315,155 @@ class DeterministicRealtimeSessionCoordinator:
                     "targetId": interaction.target_id,
                     "accessibilityLabel": interaction.accessibility_label,
                     "stepIndex": interaction.step_index,
-                },
-                "avaDeliveredText": delivered_text,
-                "deliveredSampleCount": delivered_sample_count,
-                "childTurnSummary": "Canvas interaction.",
-                "terminal": terminal,
-            }
-        )
-        self._last_memory_decision = await self._memory.commit_delivered_turn(
-            subject=self._subject,
-            turn=turn,
-            proposal=None,
-            memory_id=None,
+                }
+            )
+        elif plan is None:
+            return
+
+        child_text = self._child_text
+        child_text_source = self._child_text_source
+        transcript_waiter: Awaitable[str | None] | None = None
+        if canvas_interaction is None and (
+            child_text is None or child_text_source is None
+        ):
+            child_transcript = self._realtime.available_child_transcript(
+                turn_id=turn_id
+            )
+            if child_transcript is not None:
+                child_text = _bounded_child_transcript(child_transcript)
+                child_text_source = ChildTurnTextSource.TRANSCRIPT
+            else:
+                wait_for_child_transcript = getattr(
+                    self._realtime,
+                    "wait_for_child_transcript",
+                    None,
+                )
+                if callable(wait_for_child_transcript):
+                    transcript_waiter = cast(
+                        Callable[..., Awaitable[str | None]],
+                        wait_for_child_transcript,
+                    )(turn_id=turn_id)
+
+        self._memory_commit_sequence += 1
+        sequence = self._memory_commit_sequence
+        self._latest_memory_commit_sequence = sequence
+        payload = _CapturedMemoryCommit(
+            sequence=sequence,
+            turn_id=turn_id,
             occurred_at=occurred_at,
+            expected_reset_revision=expected_reset_revision,
+            child_turn_summary=(plan.child_turn_summary if plan is not None else None),
+            child_text=child_text,
+            child_text_source=child_text_source,
+            canvas_interaction=canvas_interaction,
+            delivered_sample_count=delivered_sample_count,
+            delivered_text=delivered_text,
+            terminal=terminal,
+            transcript_waiter=transcript_waiter,
         )
+        self._memory_commit_tasks[turn_id] = asyncio.create_task(
+            self._run_memory_commit(payload=payload),
+            name=f"ava-memory-commit-{turn_id}",
+        )
+
+    def _schedule_failed_interaction_memory(
+        self,
+        *,
+        delivered_sample_count: int,
+        delivered_text: str,
+    ) -> None:
+        if self._turn_canvas_interaction_input is None:
+            return
+        self._schedule_memory_commit(
+            turn_id=self._turn_id,
+            plan=None,
+            delivered_sample_count=delivered_sample_count,
+            delivered_text=delivered_text,
+            terminal=DeliveredTurnTerminal.FAILED,
+        )
+
+    async def _run_memory_commit(
+        self,
+        *,
+        payload: _CapturedMemoryCommit,
+    ) -> None:
+        try:
+            child_text = payload.child_text
+            child_text_source = payload.child_text_source
+            if payload.canvas_interaction is None and (
+                child_text is None or child_text_source is None
+            ):
+                transcript_waiter = payload.transcript_waiter
+                if transcript_waiter is None:
+                    LOGGER.info(
+                        "memory_commit_skipped session_id=%s turn_id=%s "
+                        "reason=child_transcript_waiter_unavailable",
+                        self._session_id,
+                        payload.turn_id,
+                    )
+                    return
+                child_transcript = await transcript_waiter
+                if child_transcript is not None:
+                    child_text = _bounded_child_transcript(child_transcript)
+                    child_text_source = ChildTurnTextSource.TRANSCRIPT
+            if payload.canvas_interaction is None and (
+                child_text is None or child_text_source is None
+            ):
+                LOGGER.info(
+                    "memory_commit_skipped session_id=%s turn_id=%s "
+                    "reason=child_transcription_terminal_without_text",
+                    self._session_id,
+                    payload.turn_id,
+                )
+                return
+
+            turn = _delivered_turn_from_memory_payload(
+                payload,
+                child_text=child_text,
+                child_text_source=child_text_source,
+            )
+            decision = await self._memory.commit_delivered_turn(
+                subject=self._subject,
+                expected_reset_revision=payload.expected_reset_revision,
+                turn=turn,
+                proposal=None,
+                memory_id=None,
+                occurred_at=payload.occurred_at,
+            )
+            if payload.sequence == self._latest_memory_commit_sequence:
+                self._last_memory_decision = decision
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            failure_id = self._failure_id_factory()
+            reason_category = _memory_failure_reason_category(error)
+            log = (
+                LOGGER.warning
+                if isinstance(error, MemoryResetRevisionMismatchError)
+                else LOGGER.error
+            )
+            log(
+                "memory_commit_failed failure_id=%s session_id=%s turn_id=%s "
+                "component=%s reason_category=%s",
+                failure_id,
+                self._session_id,
+                payload.turn_id,
+                SpeechFailureComponent.MEMORY_STORE,
+                reason_category,
+                extra={
+                    "ava_context": {
+                        "failureId": failure_id,
+                        "component": str(SpeechFailureComponent.MEMORY_STORE),
+                        "sessionId": self._session_id,
+                        "turnId": payload.turn_id,
+                        "reasonCategory": reason_category,
+                    }
+                },
+            )
+        finally:
+            task = asyncio.current_task()
+            if self._memory_commit_tasks.get(payload.turn_id) is task:
+                self._memory_commit_tasks.pop(payload.turn_id, None)
 
     async def _schedule_interrupted_canvas_presentation(self) -> None:
         if self._closed:
@@ -2509,6 +2499,13 @@ class DeterministicRealtimeSessionCoordinator:
         if self._turn_occurred_at is None:
             raise CoordinatorStateError("turn occurrence time is unavailable")
         return self._turn_occurred_at
+
+    def _require_memory_reset_revision(self) -> int:
+        if self._memory_reset_revision is None:
+            raise CoordinatorStateError(
+                "memory reset revision is unavailable before session negotiation"
+            )
+        return self._memory_reset_revision
 
     def _turn_created_frame(self) -> AvaServerControlFrameV4:
         return self._control_frame(
@@ -2620,29 +2617,6 @@ class DeterministicRealtimeSessionCoordinator:
             raise AssertionError("audio chunk frame resolved to the wrong type")
         self._next_audio_chunk_index += 1
         return frame
-
-    def _memory_persistence_failed_frame(
-        self,
-        message: str,
-        *,
-        failure_id: str,
-    ) -> AvaServerControlFrameV4:
-        self._terminal_failure_code = str(SpeechFailureCode.MEMORY_UNAVAILABLE)
-        self._last_failure_id = failure_id
-        self._last_failure_component = str(SpeechFailureComponent.MEMORY_STORE)
-        return self._control_frame(
-            {
-                "event": "memoryPersistenceFailed",
-                "revision": self._revision,
-                "failure": {
-                    "failureId": failure_id,
-                    "component": SpeechFailureComponent.MEMORY_STORE,
-                    "code": "memoryUnavailable",
-                    "message": message,
-                    "retryable": True,
-                },
-            }
-        )
 
     def _failed_frame(
         self,
@@ -2840,6 +2814,83 @@ class DeterministicRealtimeSessionCoordinator:
         return min(candidate, self.received_sample_count)
 
 
+def _delivered_turn_from_memory_payload(
+    payload: _CapturedMemoryCommit,
+    *,
+    child_text: str | None,
+    child_text_source: ChildTurnTextSource | None,
+) -> DeliveredConversationTurn:
+    interaction = payload.canvas_interaction
+    if interaction is not None:
+        return DeliveredConversationTurn.model_validate(
+            {
+                "turnId": payload.turn_id,
+                "inputKind": "canvasInteraction",
+                "childText": None,
+                "childTextSource": None,
+                "canvasInteraction": interaction.model_dump(
+                    mode="json",
+                    by_alias=True,
+                ),
+                "avaDeliveredText": payload.delivered_text,
+                "deliveredSampleCount": payload.delivered_sample_count,
+                "childTurnSummary": _canvas_interaction_summary(interaction),
+                "terminal": payload.terminal,
+            }
+        )
+    if child_text is None or child_text_source is None:
+        raise CoordinatorStateError("speech memory payload lost child text")
+    if payload.child_turn_summary is None:
+        raise CoordinatorStateError("speech memory payload lost its bounded summary")
+    return DeliveredConversationTurn.model_validate(
+        {
+            "turnId": payload.turn_id,
+            "childText": child_text,
+            "childTextSource": child_text_source,
+            "avaDeliveredText": payload.delivered_text,
+            "deliveredSampleCount": payload.delivered_sample_count,
+            "childTurnSummary": payload.child_turn_summary,
+            "terminal": payload.terminal,
+        }
+    )
+
+
+def _canvas_interaction_summary(
+    interaction: RecordedSvgCanvasInteraction | DeliveredCanvasInteraction,
+) -> str:
+    mode = str(interaction.interaction_mode)
+    if mode == "explore":
+        prefix = "Explored “"
+    elif mode == "select":
+        prefix = "Selected “"
+    elif mode == "steps":
+        if interaction.step_index is None:
+            raise ValueError("steps interaction memory requires an exact step index")
+        prefix = f"Viewed step {interaction.step_index}: “"
+    else:
+        raise ValueError("static Canvas content cannot produce interaction memory")
+
+    suffix = "”."
+    label = " ".join(interaction.accessibility_label.split())
+    available = MAX_CHILD_TURN_SUMMARY_CHARACTERS - len(prefix) - len(suffix)
+    if len(label) > available:
+        label = f"{label[: available - 1].rstrip()}…"
+    summary = f"{prefix}{label}{suffix}"
+    if len(summary) > MAX_CHILD_TURN_SUMMARY_CHARACTERS:
+        raise AssertionError("Canvas interaction memory summary exceeded its boundary")
+    return summary
+
+
+def _memory_failure_reason_category(error: Exception) -> str:
+    if isinstance(error, MemoryResetRevisionMismatchError):
+        return "staleResetRevision"
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    if isinstance(error, (ValueError, CoordinatorStateError)):
+        return "validation"
+    return "storeFailure"
+
+
 async def _next_provider_event(
     iterator: AsyncIterator[RealtimeProviderTurnEvent],
 ) -> RealtimeProviderTurnEvent:
@@ -2868,7 +2919,7 @@ def _bounded_child_transcript(value: str) -> str:
 
 
 def _bounded_child_summary(value: str) -> str:
-    if len(value) <= 240:
+    if len(value) <= MAX_CHILD_TURN_SUMMARY_CHARACTERS:
         return value
     boundary = value.rfind(" ", 0, 238)
     if boundary <= 0:

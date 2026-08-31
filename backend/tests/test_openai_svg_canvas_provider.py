@@ -7,7 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from ava_backend.canvas.svg_document import SafeSvgDraftDocument
+from ava_backend.canvas.svg_document import (
+    SafeSvgDraftDocument,
+    SvgDocumentValidationError,
+    SvgDocumentValidator,
+)
 from ava_backend.canvas.svg_specialist import (
     SvgCanvasSpecialistGeneration,
     SvgCanvasVisibleDraft,
@@ -524,6 +528,75 @@ async def test_provider_permits_one_deterministic_repair(
     assert rejected_validation["affectedAttribute"] == "foo"
     assert rejected_validation["limitName"] == "allowedAttributes"
     assert invalid not in caplog.text
+
+
+async def test_forbidden_style_element_uses_one_structured_repair() -> None:
+    invalid = _svg().replace(
+        "<title>",
+        "<style>.cloud { fill: #dff5ff; }</style>\n<title>",
+    )
+    valid = _svg(label="Repaired without stylesheet")
+    client = _Client(
+        [
+            _response(invalid, request_id="resp_style_invalid"),
+            _response(valid, request_id="resp_style_repaired"),
+        ]
+    )
+    provider = OpenAISvgCanvasSpecialist(
+        Settings(environment=AvaEnvironment.TEST, openai_canvas_max_quality_repairs=1),
+        session_id="session_style_repair",
+        safety_identifier="ava_test_user_style_repair",
+        client=client,  # type: ignore[arg-type]
+    )
+
+    generation = await provider.generate(_request())
+
+    assert generation.document.svg_text == valid
+    assert len(client.responses.arguments) == 2
+    repair_input = client.responses.arguments[1]["input"][0]["content"][0]["text"]
+    assert "&quot;category&quot;:&quot;capability&quot;" in repair_input
+    assert "&quot;code&quot;:&quot;elementForbidden&quot;" in repair_input
+    assert "&quot;affectedElement&quot;:&quot;style&quot;" in repair_input
+    assert "&quot;observedValue&quot;:&quot;style&quot;" in repair_input
+    assert "&lt;style&gt;" in repair_input
+
+
+def test_forbidden_style_element_remains_invalid_for_final_authority() -> None:
+    invalid = _svg().replace(
+        "<title>",
+        "<style>.cloud { fill: #dff5ff; }</style>\n<title>",
+    )
+
+    with pytest.raises(SvgDocumentValidationError) as raised:
+        SvgDocumentValidator().validate(invalid)
+
+    assert raised.value.code == "elementForbidden"
+    assert raised.value.feedback.category.value == "capability"
+    assert raised.value.feedback.element_name == "style"
+
+
+async def test_failed_style_repair_does_not_start_a_second_repair() -> None:
+    invalid = _svg().replace(
+        "<title>",
+        "<style>.cloud { fill: #dff5ff; }</style>\n<title>",
+    )
+    client = _Client(
+        [
+            _response(invalid, request_id="resp_style_invalid_primary"),
+            _response(invalid, request_id="resp_style_invalid_repair"),
+        ]
+    )
+    provider = OpenAISvgCanvasSpecialist(
+        Settings(environment=AvaEnvironment.TEST, openai_canvas_max_quality_repairs=1),
+        session_id="session_style_repair_once",
+        safety_identifier="ava_test_user_style_repair_once",
+        client=client,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(SvgCanvasSpecialistInvalidError, match="elementForbidden"):
+        await provider.generate(_request())
+
+    assert len(client.responses.arguments) == 2
 
 
 async def test_repair_receives_its_own_bounded_lifecycle_budget() -> None:

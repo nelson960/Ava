@@ -1047,7 +1047,6 @@ _SECURITY_SENSITIVE_ELEMENTS = frozenset(
         "image",
         "script",
         "set",
-        "style",
     }
 )
 

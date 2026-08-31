@@ -18,10 +18,12 @@ from .memory import (
     ConversationResetReceipt,
     DeliveredConversationTurn,
     DeliveredInputKind,
+    MemoryResetRevisionMismatchError,
     MemoryProposalDecision,
     WeeklyConversationRecap,
     WeeklyConversationRecord,
     _validate_aware_datetime,
+    _validate_reset_revision,
     _validate_subject,
     _validate_weekly_summary,
     compact_session_summary,
@@ -135,7 +137,7 @@ class PostgresAuthoritativeMemoryStore:
                 )
                 state_cursor = await connection.execute(
                     """
-                    select current_session_summary
+                    select current_session_summary, reset_revision
                     from ava_private.memory_state
                     where subject = %s
                     """,
@@ -174,6 +176,7 @@ class PostgresAuthoritativeMemoryStore:
         return AuthoritativeMemorySnapshot.model_validate(
             {
                 "ageBand": age_band,
+                "resetRevision": (state["reset_revision"] if state is not None else 0),
                 "currentSessionSummary": (
                     state["current_session_summary"] if state is not None else None
                 ),
@@ -193,12 +196,11 @@ class PostgresAuthoritativeMemoryStore:
                                 "interactionMode": row["canvas_interaction_mode"],
                                 "bindingId": row["canvas_binding_id"],
                                 "targetId": row["canvas_target_id"],
-                                "accessibilityLabel": row[
-                                    "canvas_accessibility_label"
-                                ],
+                                "accessibilityLabel": row["canvas_accessibility_label"],
                                 "stepIndex": row["canvas_step_index"],
                             }
-                            if row["input_kind"] == DeliveredInputKind.CANVAS_INTERACTION
+                            if row["input_kind"]
+                            == DeliveredInputKind.CANVAS_INTERACTION
                             else None
                         ),
                         "avaDeliveredText": row["ava_delivered_text"],
@@ -225,12 +227,17 @@ class PostgresAuthoritativeMemoryStore:
         self,
         *,
         subject: str,
+        expected_reset_revision: int,
         turn: DeliveredConversationTurn,
         proposal: AvaMemoryProposal | None,
         memory_id: str | None,
         occurred_at: datetime | None = None,
     ) -> MemoryProposalDecision:
         normalized_subject = _validate_subject(subject)
+        validated_expected_reset_revision = _validate_reset_revision(
+            expected_reset_revision,
+            field_name="expected_reset_revision",
+        )
         normalized_occurred_at = _validate_aware_datetime(
             occurred_at or datetime.now(UTC),
             field_name="occurred_at",
@@ -250,7 +257,15 @@ class PostgresAuthoritativeMemoryStore:
             try:
                 async with connection.transaction():
                     await self._ensure_subject(connection, normalized_subject)
-                    await self._lock_subject(connection, normalized_subject)
+                    current_reset_revision = await self._lock_subject(
+                        connection,
+                        normalized_subject,
+                    )
+                    if current_reset_revision != validated_expected_reset_revision:
+                        raise MemoryResetRevisionMismatchError(
+                            expected_reset_revision=(validated_expected_reset_revision),
+                            current_reset_revision=current_reset_revision,
+                        )
                     await connection.execute(
                         """
                         insert into ava_private.turn_receipts (subject, turn_id)
@@ -334,13 +349,27 @@ class PostgresAuthoritativeMemoryStore:
         self,
         *,
         subject: str,
+        expected_reset_revision: int,
         summary: str | None,
     ) -> None:
         normalized_subject = _validate_subject(subject)
+        validated_expected_reset_revision = _validate_reset_revision(
+            expected_reset_revision,
+            field_name="expected_reset_revision",
+        )
         normalized_summary = _validate_optional_summary(summary)
         async with self._connection() as connection:
             async with connection.transaction():
                 await self._ensure_subject(connection, normalized_subject)
+                current_reset_revision = await self._lock_subject(
+                    connection,
+                    normalized_subject,
+                )
+                if current_reset_revision != validated_expected_reset_revision:
+                    raise MemoryResetRevisionMismatchError(
+                        expected_reset_revision=validated_expected_reset_revision,
+                        current_reset_revision=current_reset_revision,
+                    )
                 await connection.execute(
                     """
                     update ava_private.memory_state
@@ -516,20 +545,22 @@ class PostgresAuthoritativeMemoryStore:
     async def _lock_subject(
         connection: AsyncConnection[dict[str, object]],
         subject: str,
-    ) -> None:
+    ) -> int:
         cursor = await connection.execute(
             """
-            select subject
+            select reset_revision
             from ava_private.memory_state
             where subject = %s
             for update
             """,
             (subject,),
         )
-        if await cursor.fetchone() is None:
+        row = await cursor.fetchone()
+        if row is None:
             raise PostgresMemoryStoreError(
                 "PostgreSQL memory subject disappeared before locking"
             )
+        return cast(int, row["reset_revision"])
 
     @staticmethod
     async def _store_memory_decision(

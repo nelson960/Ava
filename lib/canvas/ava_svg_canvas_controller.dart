@@ -754,9 +754,7 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     }
     final interactionMode = active.document.manifest.interactionMode;
     final selectionChanged = _selectedBindingId != binding.bindingId;
-    if ((interactionMode == AvaSvgInteractionMode.explore ||
-            interactionMode == AvaSvgInteractionMode.select) &&
-        !selectionChanged) {
+    if (interactionMode == AvaSvgInteractionMode.select && !selectionChanged) {
       return;
     }
     _selectedBindingId = binding.bindingId;

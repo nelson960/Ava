@@ -40,7 +40,7 @@ def test_v3_personality_suite_covers_every_product_behavior_category() -> None:
     suite = load_personality_eval_suite(SUITE_PATH)
 
     assert suite.prompt_version == REALTIME_PROMPT_VERSION
-    assert len(suite.cases) == 30
+    assert len(suite.cases) == 34
     assert {case.category for case in suite.cases} == set(PersonalityEvaluationCategory)
     assert len({case.id for case in suite.cases}) == len(suite.cases)
     assert any(
@@ -48,6 +48,36 @@ def test_v3_personality_suite_covers_every_product_behavior_category() -> None:
     )
     assert any(
         case.expectations.memory == FeatureExpectation.REQUIRED for case in suite.cases
+    )
+
+
+def test_v4_8_suite_covers_continuity_directness_and_supported_canvas_mechanics() -> (
+    None
+):
+    suite = load_personality_eval_suite(SUITE_PATH)
+    cases = {case.id: case for case in suite.cases}
+
+    continuation = cases["canvas_tool_continuation_coherent"]
+    assert continuation.expectations.canvas == FeatureExpectation.REQUIRED
+    assert any(
+        "one conversational thought" in criterion
+        for criterion in continuation.expectations.human_review
+    )
+
+    direct = cases["explanation_direct_without_required_acknowledgment"]
+    assert "Great question" in direct.expectations.forbidden_phrases
+    assert any(
+        "direct answer" in criterion for criterion in direct.expectations.human_review
+    )
+
+    explore = cases["canvas_explore_supported_mechanics"]
+    steps = cases["canvas_steps_supported_mechanics"]
+    for case in (explore, steps):
+        assert case.expectations.canvas == FeatureExpectation.REQUIRED
+        assert {"zoom", "pan", "drag"}.issubset(case.expectations.forbidden_phrases)
+    assert any("tap" in criterion for criterion in explore.expectations.human_review)
+    assert any(
+        "Back/Next" in criterion for criterion in steps.expectations.human_review
     )
 
 

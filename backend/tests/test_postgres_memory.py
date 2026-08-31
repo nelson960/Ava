@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import os
 import asyncio
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -28,8 +28,11 @@ from ava_backend.realtime.fakes import (
     DeterministicRealtimePlanProvider,
     DeterministicStreamingSpeechSynthesizer,
 )
-from ava_backend.realtime.memory import DeliveredConversationTurn
-from ava_backend.realtime.memory import AvaMemoryProposal
+from ava_backend.realtime.memory import (
+    AvaMemoryProposal,
+    DeliveredConversationTurn,
+    MemoryResetRevisionMismatchError,
+)
 from ava_backend.realtime.plan import AvaTurnPlan
 from ava_backend.realtime.postgres_memory import PostgresAuthoritativeMemoryStore
 from ava_backend.realtime.speech_contract import SpeechPhase
@@ -61,6 +64,18 @@ class _NoCanvasSpecialist:
 
     async def close(self) -> None:
         return
+
+
+class _PausingFencePostgresStore(PostgresAuthoritativeMemoryStore):
+    def __init__(self, database_url: str) -> None:
+        super().__init__(database_url)
+        self.before_subject_lock = asyncio.Event()
+        self.allow_subject_lock = asyncio.Event()
+
+    async def _lock_subject(self, connection, subject: str) -> int:  # type: ignore[no-untyped-def]
+        self.before_subject_lock.set()
+        await self.allow_subject_lock.wait()
+        return await super()._lock_subject(connection, subject)
 
 
 def _turn(index: int) -> DeliveredConversationTurn:
@@ -123,6 +138,7 @@ async def test_postgres_v3_memory_round_trip_compaction_recap_and_reset() -> Non
                 memory_id = "memory-1"
             await store.commit_delivered_turn(
                 subject=subject,
+                expected_reset_revision=0,
                 turn=_turn(index),
                 proposal=proposal,
                 memory_id=memory_id,
@@ -168,6 +184,7 @@ async def test_postgres_typed_canvas_interaction_round_trip_and_reset() -> None:
     try:
         decision = await store.commit_delivered_turn(
             subject=subject,
+            expected_reset_revision=0,
             turn=interaction_turn,
             proposal=AvaMemoryProposal.model_validate(
                 {
@@ -420,6 +437,7 @@ async def test_postgres_serializes_concurrent_semantic_memory_proposals() -> Non
         async def commit(index: int):
             return await store.commit_delivered_turn(
                 subject=subject,
+                expected_reset_revision=0,
                 turn=_turn(index),
                 proposal=AvaMemoryProposal.model_validate(
                     {
@@ -443,4 +461,119 @@ async def test_postgres_serializes_concurrent_semantic_memory_proposals() -> Non
         assert len(snapshot.delivered_turns) == 2
         assert len(snapshot.stable_memories) == 1
     finally:
+        await store.close()
+
+
+async def test_postgres_reset_wins_against_in_flight_delivered_commit() -> None:
+    assert TEST_DATABASE_URL is not None
+    store = _PausingFencePostgresStore(TEST_DATABASE_URL)
+    subject = f"test:{uuid4()}"
+    connection = await AsyncConnection.connect(TEST_DATABASE_URL, autocommit=True)
+    commit: asyncio.Task[object] | None = None
+    await store.open()
+    try:
+        await connection.execute(
+            "insert into ava_private.memory_state (subject) values (%s)",
+            (subject,),
+        )
+        commit = asyncio.create_task(
+            store.commit_delivered_turn(
+                subject=subject,
+                expected_reset_revision=0,
+                turn=_turn(90),
+                proposal=None,
+                memory_id=None,
+            )
+        )
+        await store.before_subject_lock.wait()
+
+        receipt = await store.reset_conversation(subject=subject)
+        assert receipt.revision == 1
+        store.allow_subject_lock.set()
+
+        with pytest.raises(MemoryResetRevisionMismatchError):
+            await commit
+
+        snapshot = await store.load_snapshot(
+            subject=subject,
+            age_band=AgeBand.MIDDLE_CHILDHOOD,
+        )
+        assert snapshot.reset_revision == 1
+        assert snapshot.delivered_turns == []
+        counts_cursor = await connection.execute(
+            """
+            select
+              (select count(*) from ava_private.turn_receipts where subject = %s)
+                as receipt_count,
+              (select count(*) from ava_private.delivered_turns where subject = %s)
+                as turn_count,
+              (select count(*) from ava_private.weekly_records where subject = %s)
+                as weekly_count
+            """,
+            (subject, subject, subject),
+        )
+        counts = await counts_cursor.fetchone()
+        assert counts == (0, 0, 0)
+    finally:
+        store.allow_subject_lock.set()
+        if commit is not None:
+            await asyncio.gather(commit, return_exceptions=True)
+        await connection.execute(
+            "delete from ava_private.reset_log where subject = %s",
+            (subject,),
+        )
+        await connection.execute(
+            "delete from ava_private.memory_state where subject = %s",
+            (subject,),
+        )
+        await connection.close()
+        await store.close()
+
+
+async def test_postgres_reset_wins_against_in_flight_summary_write() -> None:
+    assert TEST_DATABASE_URL is not None
+    store = _PausingFencePostgresStore(TEST_DATABASE_URL)
+    subject = f"test:{uuid4()}"
+    connection = await AsyncConnection.connect(TEST_DATABASE_URL, autocommit=True)
+    write: asyncio.Task[None] | None = None
+    await store.open()
+    try:
+        await connection.execute(
+            "insert into ava_private.memory_state (subject) values (%s)",
+            (subject,),
+        )
+        write = asyncio.create_task(
+            store.set_session_summary(
+                subject=subject,
+                expected_reset_revision=0,
+                summary="A stale pre-reset summary.",
+            )
+        )
+        await store.before_subject_lock.wait()
+
+        receipt = await store.reset_conversation(subject=subject)
+        assert receipt.revision == 1
+        store.allow_subject_lock.set()
+
+        with pytest.raises(MemoryResetRevisionMismatchError):
+            await write
+        snapshot = await store.load_snapshot(
+            subject=subject,
+            age_band=AgeBand.MIDDLE_CHILDHOOD,
+        )
+        assert snapshot.reset_revision == 1
+        assert snapshot.current_session_summary is None
+    finally:
+        store.allow_subject_lock.set()
+        if write is not None:
+            await asyncio.gather(write, return_exceptions=True)
+        await connection.execute(
+            "delete from ava_private.reset_log where subject = %s",
+            (subject,),
+        )
+        await connection.execute(
+            "delete from ava_private.memory_state where subject = %s",
+            (subject,),
+        )
+        await connection.close()
         await store.close()

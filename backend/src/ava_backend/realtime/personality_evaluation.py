@@ -223,6 +223,7 @@ def memory_snapshot_for_case(
     return AuthoritativeMemorySnapshot.model_validate(
         {
             "ageBand": case.age_band,
+            "resetRevision": 0,
             "currentSessionSummary": case.context.current_session_summary,
             "deliveredTurns": [
                 {

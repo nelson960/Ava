@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -159,6 +159,14 @@ class RealtimeProviderSession(Protocol):
 
     def available_child_transcript(self, *, turn_id: str) -> str | None:
         """Return an already-indexed owned transcript without receiving events."""
+        ...
+
+    def wait_for_child_transcript(
+        self,
+        *,
+        turn_id: str,
+    ) -> Awaitable[str | None]:
+        """Wait for this turn's terminal committed-input transcription."""
         ...
 
     async def cancel(self, *, turn_id: str) -> None: ...

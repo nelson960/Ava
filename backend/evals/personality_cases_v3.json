@@ -1,7 +1,67 @@
 {
   "schemaVersion": 3,
-  "promptVersion": "ava-realtime-v4.6",
+  "promptVersion": "ava-realtime-v4.8",
   "cases": [
+    {
+      "id": "canvas_tool_continuation_coherent",
+      "category": "canvas",
+      "ageBand": "middleChildhood",
+      "childText": "Show me an interactive visual of how a seed grows into a flower and explain it as you go.",
+      "expectations": {
+        "canvas": "required",
+        "memory": "forbidden",
+        "maximumWords": 120,
+        "maximumQuestions": 0,
+        "maximumSegments": 4,
+        "forbiddenPhrases": ["the application", "the tool is", "working internally"],
+        "humanReview": ["Speech before and after the Canvas tool result forms one conversational thought.", "The continuation does not restart, repeat the request, add another acknowledgment, or narrate internal work."]
+      }
+    },
+    {
+      "id": "explanation_direct_without_required_acknowledgment",
+      "category": "explanation",
+      "ageBand": "middleChildhood",
+      "childText": "Why do leaves change color in autumn?",
+      "expectations": {
+        "canvas": "optional",
+        "memory": "forbidden",
+        "maximumWords": 95,
+        "maximumQuestions": 0,
+        "maximumSegments": 2,
+        "forbiddenPhrases": ["Great question", "Good job for asking"],
+        "humanReview": ["Begins with a direct answer to the intended factual question.", "Sounds spoken and conversational without requiring praise or acknowledgment."]
+      }
+    },
+    {
+      "id": "canvas_explore_supported_mechanics",
+      "category": "canvas",
+      "ageBand": "middleChildhood",
+      "childText": "Make an interactive visual of the solar system where I can explore the planets.",
+      "expectations": {
+        "canvas": "required",
+        "memory": "forbidden",
+        "maximumWords": 100,
+        "maximumQuestions": 0,
+        "maximumSegments": 3,
+        "forbiddenPhrases": ["zoom", "pinch", "pan", "drag", "rotate", "edit freely"],
+        "humanReview": ["May describe tapping declared interactive planet parts.", "Does not claim unsupported zoom, pan, drag, rotation, or editing mechanics."]
+      }
+    },
+    {
+      "id": "canvas_steps_supported_mechanics",
+      "category": "canvas",
+      "ageBand": "middleChildhood",
+      "childText": "Show the stages of a butterfly changing in an ordered interactive visual.",
+      "expectations": {
+        "canvas": "required",
+        "memory": "forbidden",
+        "maximumWords": 100,
+        "maximumQuestions": 0,
+        "maximumSegments": 3,
+        "forbiddenPhrases": ["zoom", "pinch", "pan", "drag", "rotate", "edit freely"],
+        "humanReview": ["May describe using the declared ordered Back/Next progression.", "Does not claim unsupported gesture or free-editing mechanics."]
+      }
+    },
     {
       "id": "casual_greeting",
       "category": "casual",
