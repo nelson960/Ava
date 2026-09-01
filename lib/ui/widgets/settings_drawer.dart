@@ -361,11 +361,7 @@ class _SettingsDrawerState extends ConsumerState<SettingsDrawer> {
   Future<void> _showWeeklyRecap() async {
     setState(() => _weeklyRecapLoading = true);
     try {
-      final now = DateTime.now();
-      final today = DateTime(now.year, now.month, now.day);
-      final monday = today.subtract(Duration(days: today.weekday - 1));
-      final recap =
-          await ref.read(avaMemoryControlProvider).loadWeeklyRecap(monday);
+      final recap = await ref.read(avaMemoryControlProvider).loadWeeklyRecap();
       if (!mounted) return;
       setState(() => _weeklyRecapLoading = false);
       await showModalBottomSheet<void>(
@@ -569,8 +565,7 @@ class _WeeklyRecapSheet extends StatelessWidget {
             ),
             const SizedBox(height: 4),
             Text(
-              '${localizations.formatCompactDate(recap.periodStart)} – '
-              '${localizations.formatCompactDate(recap.periodEnd.subtract(const Duration(days: 1)))}',
+              _formatWeeklyRecapRange(localizations, recap),
               style: const TextStyle(
                 color: _SettingsDrawerState._mutedInk,
                 fontSize: 13,
@@ -611,13 +606,33 @@ class _WeeklyRecapSheet extends StatelessWidget {
                           ),
                         ),
                         Expanded(
-                          child: Text(
-                            record.summary,
-                            style: const TextStyle(
-                              color: _SettingsDrawerState._ink,
-                              fontSize: 14,
-                              height: 1.4,
-                            ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                record.summary,
+                                style: const TextStyle(
+                                  color: _SettingsDrawerState._ink,
+                                  fontSize: 14,
+                                  height: 1.4,
+                                ),
+                              ),
+                              const SizedBox(height: 3),
+                              Text(
+                                _formatWeeklyRecapTimestamp(
+                                  localizations,
+                                  record.occurredAt,
+                                ),
+                                key: ValueKey(
+                                  'weekly-recap-time-${record.turnId}',
+                                ),
+                                style: const TextStyle(
+                                  color: _SettingsDrawerState._mutedInk,
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                            ],
                           ),
                         ),
                       ],
@@ -630,4 +645,28 @@ class _WeeklyRecapSheet extends StatelessWidget {
       ),
     );
   }
+}
+
+String _formatWeeklyRecapRange(
+  MaterialLocalizations localizations,
+  AvaWeeklyConversationRecap recap,
+) {
+  final start = recap.periodStart;
+  final end = recap.periodEnd.subtract(const Duration(days: 1));
+  final startLabel = localizations.formatShortMonthDay(start);
+  final endLabel = localizations.formatShortMonthDay(end);
+  if (start.year == end.year) {
+    return '$startLabel – $endLabel ${localizations.formatYear(end)}';
+  }
+  return '$startLabel ${localizations.formatYear(start)} – '
+      '$endLabel ${localizations.formatYear(end)}';
+}
+
+String _formatWeeklyRecapTimestamp(
+  MaterialLocalizations localizations,
+  DateTime occurredAt,
+) {
+  final local = occurredAt.toLocal();
+  return '${localizations.formatShortDate(local)} · '
+      '${localizations.formatTimeOfDay(TimeOfDay.fromDateTime(local))}';
 }

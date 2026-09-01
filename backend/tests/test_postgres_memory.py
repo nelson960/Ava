@@ -32,12 +32,15 @@ from ava_backend.realtime.memory import (
     AvaMemoryProposal,
     ConversationEpisode,
     DeliveredConversationTurn,
+    MAX_WEEKLY_RECORDS,
     MemoryResetRevisionMismatchError,
     RAW_RETENTION_HIGH_WATER,
     RAW_RETENTION_LOW_WATER,
+    current_local_week_utc_bounds,
 )
 from ava_backend.realtime.plan import AvaTurnPlan
 from ava_backend.realtime.postgres_memory import PostgresAuthoritativeMemoryStore
+from ava_backend.realtime.postgres_memory import PostgresMemoryStoreError
 from ava_backend.realtime.speech_contract import SpeechPhase
 from ava_backend.realtime.svg_canvas_jobs import SvgCanvasJobCoordinator
 from ava_backend.realtime.websocket_v4 import AvaServerControlFrameV4
@@ -130,6 +133,56 @@ def _interaction_turn(index: int) -> DeliveredConversationTurn:
     )
 
 
+async def test_postgres_v6_schema_removes_weekly_storage_without_replacement() -> None:
+    assert TEST_DATABASE_URL is not None
+    store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
+    await store.open()
+    connection = await AsyncConnection.connect(TEST_DATABASE_URL)
+    try:
+        cursor = await connection.execute(
+            """
+            select
+              (select version from ava_private.schema_migrations
+                where name = 'realtime_memory_v6'),
+              to_regclass('ava_private.weekly_records'),
+              exists (
+                select 1
+                from pg_catalog.pg_tables
+                where schemaname = 'ava_private'
+                  and tablename like '%recap%'
+              )
+            """
+        )
+        assert await cursor.fetchone() == (1, None, False)
+    finally:
+        await connection.close()
+        await store.close()
+
+
+async def test_postgres_startup_rejects_schema_without_v6_registration() -> None:
+    assert TEST_DATABASE_URL is not None
+    connection = await AsyncConnection.connect(TEST_DATABASE_URL, autocommit=True)
+    store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
+    try:
+        await connection.execute(
+            "delete from ava_private.schema_migrations where name = 'realtime_memory_v6'"
+        )
+        with pytest.raises(PostgresMemoryStoreError, match="v6"):
+            await store.open()
+    finally:
+        await store.close()
+        await connection.execute(
+            """
+            insert into ava_private.schema_migrations (name, version)
+            values ('realtime_memory_v6', 1)
+            on conflict (name) do update
+            set version = excluded.version,
+                applied_at = now()
+            """
+        )
+        await connection.close()
+
+
 async def test_postgres_memory_round_trip_does_not_compact_at_event_nine() -> None:
     assert TEST_DATABASE_URL is not None
     store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
@@ -187,7 +240,7 @@ async def test_postgres_memory_round_trip_does_not_compact_at_event_nine() -> No
         now = datetime.now(UTC)
         recap = await store.load_weekly_recap(
             subject=subject,
-            period_start=now.date() - timedelta(days=now.weekday()),
+            timezone_id="Asia/Kolkata",
             generated_at=now,
         )
         assert len(recap.records) == 9
@@ -201,6 +254,48 @@ async def test_postgres_memory_round_trip_does_not_compact_at_event_nine() -> No
         assert empty.delivered_turns == []
         assert empty.stable_memories == []
         assert empty.current_session_summary is None
+    finally:
+        await store.close()
+
+
+async def test_postgres_weekly_recap_projects_newest_64_delivered_turns() -> None:
+    assert TEST_DATABASE_URL is not None
+    store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
+    subject = f"test:{uuid4()}"
+    generated_at = datetime.now(UTC)
+    _, _, week_start, _ = current_local_week_utc_bounds(
+        timezone_id="Asia/Kolkata",
+        generated_at=generated_at,
+    )
+    await store.open()
+    try:
+        for index in range(1, 71):
+            await store.commit_delivered_turn(
+                subject=subject,
+                expected_reset_revision=0,
+                turn=_turn(index),
+                proposal=None,
+                memory_id=None,
+                occurred_at=week_start + timedelta(minutes=index),
+                timezone_id="Europe/London",
+            )
+
+        recap = await store.load_weekly_recap(
+            subject=subject,
+            timezone_id="Asia/Kolkata",
+            generated_at=generated_at,
+        )
+
+        assert len(recap.records) == MAX_WEEKLY_RECORDS
+        assert [record.turn_id for record in recap.records] == [
+            f"turn-{index}" for index in range(70, 6, -1)
+        ]
+        assert [record.summary for record in recap.records] == [
+            f"Talked about astronomy topic {index}." for index in range(70, 6, -1)
+        ]
+        assert [record.occurred_at for record in recap.records] == [
+            week_start + timedelta(minutes=index) for index in range(70, 6, -1)
+        ]
     finally:
         await store.close()
 
@@ -357,10 +452,6 @@ async def test_postgres_event_257_atomically_compacts_to_128_raw_events() -> Non
             assert [candidate.source_kind for candidate in overlapping] == ["rawEvent"]
             await connection.execute(
                 "delete from ava_private.delivered_turns where subject = %s and turn_id = 'turn-1'",
-                (subject,),
-            )
-            await connection.execute(
-                "delete from ava_private.weekly_records where subject = %s and turn_id = 'turn-1'",
                 (subject,),
             )
             await connection.execute(
@@ -996,14 +1087,12 @@ async def test_postgres_reset_wins_against_in_flight_delivered_commit() -> None:
               (select count(*) from ava_private.turn_receipts where subject = %s)
                 as receipt_count,
               (select count(*) from ava_private.delivered_turns where subject = %s)
-                as turn_count,
-              (select count(*) from ava_private.weekly_records where subject = %s)
-                as weekly_count
+                as turn_count
             """,
-            (subject, subject, subject),
+            (subject, subject),
         )
         counts = await counts_cursor.fetchone()
-        assert counts == (0, 0, 0)
+        assert counts == (0, 0)
     finally:
         store.allow_subject_lock.set()
         if commit is not None:

@@ -81,17 +81,9 @@ class AvaBackendConfiguration {
   Uri get realtimeSessionsV4Endpoint =>
       _requireBaseUri().resolve('v4/realtime/sessions');
 
-  Uri weeklyRecapEndpoint(DateTime periodStart) {
-    final date = DateTime(
-      periodStart.year,
-      periodStart.month,
-      periodStart.day,
-    );
-    final formatted = '${date.year.toString().padLeft(4, '0')}-'
-        '${date.month.toString().padLeft(2, '0')}-'
-        '${date.day.toString().padLeft(2, '0')}';
+  Uri weeklyRecapEndpoint(String timezoneId) {
     return _requireBaseUri().resolve('v3/memory/weekly-recap').replace(
-      queryParameters: {'period_start': formatted},
+      queryParameters: {'timezoneId': timezoneId},
     );
   }
 

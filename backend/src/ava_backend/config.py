@@ -169,7 +169,6 @@ class Settings(BaseSettings):
     memory_pool_min_size: int = Field(default=1, ge=0, le=32)
     memory_pool_max_size: int = Field(default=4, ge=1, le=32)
     memory_pool_timeout_seconds: float = Field(default=5, ge=1, le=30)
-    memory_weekly_retention_days: int = Field(default=56, ge=7, le=365)
     context_history_max_messages: int = Field(default=12, ge=0, le=16)
     context_history_max_characters: int = Field(default=8000, ge=0, le=32_000)
     safety_hash_secret: SecretStr | None = None

@@ -821,6 +821,19 @@ class SvgCanvasJobCoordinator:
             terminal_status=SvgCanvasExecutionStatus.CANCELLED,
         )
 
+    async def reset_conversation(self) -> tuple[str, ...]:
+        """Cancel and release every session-temporary Canvas artifact."""
+
+        try:
+            return await self._cancel_workspace_pending(
+                discard_reason=CanvasDocumentDiscardReason.SUPERSEDED,
+                rejection_message="canvas generation was cancelled by conversation reset",
+                terminal_status=SvgCanvasExecutionStatus.CANCELLED,
+                clear_workspace=True,
+            )
+        finally:
+            await self._documents.release_session(session_id=self._session_id)
+
     async def _cancel_workspace_pending(
         self,
         *,
@@ -828,6 +841,7 @@ class SvgCanvasJobCoordinator:
         rejection_message: str,
         terminal_status: SvgCanvasExecutionStatus,
         exclude_generation_id: str | None = None,
+        clear_workspace: bool = False,
     ) -> tuple[str, ...]:
         async with self._lock:
             jobs = [
@@ -850,6 +864,8 @@ class SvgCanvasJobCoordinator:
                 candidate = None
             if candidate is not None:
                 self._presentation_offsets.pop(candidate.generation_id, None)
+            if clear_workspace:
+                self._state.workspace.clear()
         return await self._finalize_pending_cancellation(
             jobs=jobs,
             candidate=candidate,

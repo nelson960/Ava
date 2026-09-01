@@ -6,9 +6,10 @@ import re
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from enum import StrEnum
 from typing import Annotated, Protocol
+from zoneinfo import ZoneInfo
 
 from pydantic import Field, StringConstraints, model_validator
 
@@ -28,6 +29,11 @@ MAX_WEEKLY_RECORDS = 64
 MAX_SESSION_SUMMARY_CHARACTERS = 1_200
 MAX_CHILD_TURN_SUMMARY_CHARACTERS = 240
 MINIMUM_STABLE_MEMORY_CONFIDENCE = 0.8
+
+if MAX_WEEKLY_RECORDS > RAW_RETENTION_LOW_WATER:
+    raise RuntimeError(
+        "weekly recap projection cannot exceed retained raw conversation events"
+    )
 
 
 class MemoryResetRevisionMismatchError(RuntimeError):
@@ -350,7 +356,7 @@ class AuthoritativeMemoryStore(Protocol):
         self,
         *,
         subject: str,
-        period_start: date,
+        timezone_id: str,
         generated_at: datetime,
     ) -> WeeklyConversationRecap: ...
 
@@ -386,9 +392,6 @@ class DevelopmentAuthoritativeMemoryStore:
             dict
         )
         self._summaries: dict[str, str] = {}
-        self._weekly_records: defaultdict[str, list[WeeklyConversationRecord]] = (
-            defaultdict(list)
-        )
         self._committed_turn_ids: defaultdict[str, set[str]] = defaultdict(set)
         self._reset_revisions: defaultdict[str, int] = defaultdict(int)
         self._max_memories_per_subject = max_memories_per_subject
@@ -455,7 +458,7 @@ class DevelopmentAuthoritativeMemoryStore:
         validated_turn = DeliveredConversationTurn.model_validate(
             turn.model_dump(mode="json", by_alias=True)
         )
-        weekly_summary = _validate_weekly_summary(validated_turn.child_turn_summary)
+        _validate_weekly_summary(validated_turn.child_turn_summary)
         decision = evaluate_delivered_turn_memory_proposal(
             turn=validated_turn,
             proposal=proposal,
@@ -521,19 +524,6 @@ class DevelopmentAuthoritativeMemoryStore:
                 reference_time=datetime.now(UTC),
             )
             self._committed_turn_ids[normalized_subject].add(validated_turn.turn_id)
-            weekly_records = self._weekly_records[normalized_subject]
-            weekly_records.append(
-                WeeklyConversationRecord.model_validate(
-                    {
-                        "turnId": validated_turn.turn_id,
-                        "summary": weekly_summary,
-                        "occurredAt": normalized_occurred_at,
-                    }
-                )
-            )
-            weekly_records.sort(key=lambda record: (record.occurred_at, record.turn_id))
-            if len(weekly_records) > MAX_WEEKLY_RECORDS:
-                del weekly_records[:-MAX_WEEKLY_RECORDS]
         return decision
 
     async def search_memory_candidates(
@@ -683,21 +673,29 @@ class DevelopmentAuthoritativeMemoryStore:
         self,
         *,
         subject: str,
-        period_start: date,
+        timezone_id: str,
         generated_at: datetime,
     ) -> WeeklyConversationRecap:
         normalized_subject = _validate_subject(subject)
-        normalized_generated_at = _validate_aware_datetime(
-            generated_at,
-            field_name="generated_at",
+        period_start, period_end, lower_bound_utc, upper_bound_utc = (
+            current_local_week_utc_bounds(
+                timezone_id=timezone_id,
+                generated_at=generated_at,
+            )
         )
-        period_end = period_start + timedelta(days=7)
+        normalized_generated_at = _validate_aware_datetime(
+            generated_at, field_name="generated_at"
+        )
         async with self._lock:
-            records = [
-                record
-                for record in self._weekly_records.get(normalized_subject, ())
-                if period_start <= record.occurred_at.date() < period_end
-            ]
+            events = sorted(
+                (
+                    event
+                    for event in self._turns.get(normalized_subject, ())
+                    if lower_bound_utc <= event.occurred_at < upper_bound_utc
+                ),
+                key=lambda event: (event.occurred_at, event.turn.turn_id),
+                reverse=True,
+            )[:MAX_WEEKLY_RECORDS]
             return WeeklyConversationRecap.model_validate(
                 {
                     "periodStart": period_start,
@@ -705,8 +703,14 @@ class DevelopmentAuthoritativeMemoryStore:
                     "generatedAt": normalized_generated_at,
                     "resetRevision": self._reset_revisions[normalized_subject],
                     "records": [
-                        record.model_dump(mode="json", by_alias=True)
-                        for record in records
+                        WeeklyConversationRecord.model_validate(
+                            {
+                                "turnId": event.turn.turn_id,
+                                "summary": event.turn.child_turn_summary,
+                                "occurredAt": event.occurred_at,
+                            }
+                        ).model_dump(mode="json", by_alias=True)
+                        for event in events
                     ],
                 }
             )
@@ -722,7 +726,6 @@ class DevelopmentAuthoritativeMemoryStore:
             self._episodes.pop(normalized_subject, None)
             self._memories.pop(normalized_subject, None)
             self._summaries.pop(normalized_subject, None)
-            self._weekly_records.pop(normalized_subject, None)
             self._committed_turn_ids.pop(normalized_subject, None)
             self._reset_revisions[normalized_subject] += 1
             return ConversationResetReceipt.model_validate(
@@ -731,6 +734,27 @@ class DevelopmentAuthoritativeMemoryStore:
                     "resetAt": datetime.now(UTC),
                 }
             )
+
+
+def current_local_week_utc_bounds(
+    *,
+    timezone_id: str,
+    generated_at: datetime,
+) -> tuple[date, date, datetime, datetime]:
+    """Return the current local Monday-to-Monday window as UTC instants."""
+
+    validated_timezone_id = validate_iana_timezone_id(timezone_id)
+    normalized_generated_at = _validate_aware_datetime(
+        generated_at,
+        field_name="generated_at",
+    )
+    zone = ZoneInfo(validated_timezone_id)
+    local_now = normalized_generated_at.astimezone(zone)
+    period_start = local_now.date() - timedelta(days=local_now.weekday())
+    period_end = period_start + timedelta(days=7)
+    lower_bound_utc = datetime.combine(period_start, time.min, zone).astimezone(UTC)
+    upper_bound_utc = datetime.combine(period_end, time.min, zone).astimezone(UTC)
+    return period_start, period_end, lower_bound_utc, upper_bound_utc
 
 
 def conversation_episode_id(source_turn_ids: Sequence[str]) -> str:

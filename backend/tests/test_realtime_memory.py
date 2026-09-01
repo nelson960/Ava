@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -10,12 +11,14 @@ from ava_backend.realtime.memory import (
     ConversationEpisode,
     DeliveredConversationTurn,
     DevelopmentAuthoritativeMemoryStore,
+    MAX_WEEKLY_RECORDS,
     MemoryResetRevisionMismatchError,
     RAW_RETENTION_HIGH_WATER,
     RAW_RETENTION_LOW_WATER,
     StoredDeliveredConversationEvent,
     build_conversation_episodes,
     conversation_episode_id,
+    current_local_week_utc_bounds,
     evaluate_memory_proposal,
 )
 from ava_backend.realtime.memory import AvaMemoryProposal
@@ -339,11 +342,10 @@ async def test_v3_weekly_recap_is_bounded_factual_and_resettable() -> None:
         proposal=None,
         memory_id=None,
     )
-    now = datetime.now(UTC)
-    period_start = now.date() - timedelta(days=now.weekday())
+    now = datetime(2026, 9, 2, 6, tzinfo=UTC)
     recap = await store.load_weekly_recap(
         subject="child:123",
-        period_start=period_start,
+        timezone_id="Asia/Kolkata",
         generated_at=now,
     )
     assert [record.summary for record in recap.records] == [
@@ -354,11 +356,153 @@ async def test_v3_weekly_recap_is_bounded_factual_and_resettable() -> None:
     await store.reset_conversation(subject="child:123")
     reset_recap = await store.load_weekly_recap(
         subject="child:123",
-        period_start=period_start,
+        timezone_id="Asia/Kolkata",
         generated_at=now,
     )
     assert reset_recap.records == []
     assert reset_recap.reset_revision == 1
+
+
+async def test_weekly_recap_is_newest_first_with_descending_turn_id_ties() -> None:
+    store = DevelopmentAuthoritativeMemoryStore()
+    subject = "child:weekly-order"
+    earlier = datetime(2026, 9, 1, 10, tzinfo=UTC)
+    tied = datetime(2026, 9, 1, 12, tzinfo=UTC)
+    for turn_id, occurred_at in (
+        ("turn-earlier", earlier),
+        ("turn-a", tied),
+        ("turn-b", tied),
+    ):
+        await store.commit_delivered_turn(
+            subject=subject,
+            expected_reset_revision=0,
+            turn=_turn(turn_id=turn_id).model_copy(
+                update={"child_turn_summary": f"Summary for {turn_id}."}
+            ),
+            proposal=None,
+            memory_id=None,
+            occurred_at=occurred_at,
+            timezone_id="Europe/London",
+        )
+
+    recap = await store.load_weekly_recap(
+        subject=subject,
+        timezone_id="Europe/London",
+        generated_at=datetime(2026, 9, 2, 12, tzinfo=UTC),
+    )
+
+    assert [record.turn_id for record in recap.records] == [
+        "turn-b",
+        "turn-a",
+        "turn-earlier",
+    ]
+
+
+async def test_weekly_recap_uses_current_kolkata_local_week_boundaries() -> None:
+    store = DevelopmentAuthoritativeMemoryStore()
+    subject = "child:weekly-kolkata"
+    zone = ZoneInfo("Asia/Kolkata")
+    instants = {
+        "turn-prior-sunday": datetime(2026, 8, 30, 23, 45, tzinfo=zone),
+        "turn-monday": datetime(2026, 8, 31, 0, 15, tzinfo=zone),
+        "turn-next-monday": datetime(2026, 9, 7, 0, 0, tzinfo=zone),
+    }
+    for turn_id, local_time in instants.items():
+        await store.commit_delivered_turn(
+            subject=subject,
+            expected_reset_revision=0,
+            turn=_turn(turn_id=turn_id),
+            proposal=None,
+            memory_id=None,
+            occurred_at=local_time.astimezone(UTC),
+            timezone_id="Europe/London",
+        )
+
+    recap = await store.load_weekly_recap(
+        subject=subject,
+        timezone_id="Asia/Kolkata",
+        generated_at=datetime(2026, 9, 2, 6, tzinfo=UTC),
+    )
+
+    assert recap.period_start == date(2026, 8, 31)
+    assert recap.period_end == date(2026, 9, 7)
+    assert [record.turn_id for record in recap.records] == ["turn-monday"]
+
+
+@pytest.mark.parametrize(
+    ("generated_at", "expected_lower", "expected_upper", "expected_hours"),
+    [
+        (
+            datetime(2026, 3, 4, 12, tzinfo=UTC),
+            datetime(2026, 3, 2, 5, tzinfo=UTC),
+            datetime(2026, 3, 9, 4, tzinfo=UTC),
+            167,
+        ),
+        (
+            datetime(2026, 10, 28, 12, tzinfo=UTC),
+            datetime(2026, 10, 26, 4, tzinfo=UTC),
+            datetime(2026, 11, 2, 5, tzinfo=UTC),
+            169,
+        ),
+    ],
+)
+def test_current_new_york_week_bounds_follow_local_dst_calendar_arithmetic(
+    generated_at: datetime,
+    expected_lower: datetime,
+    expected_upper: datetime,
+    expected_hours: int,
+) -> None:
+    period_start, period_end, lower, upper = current_local_week_utc_bounds(
+        timezone_id="America/New_York",
+        generated_at=generated_at,
+    )
+
+    assert period_start.weekday() == 0
+    assert period_end == period_start + timedelta(days=7)
+    assert lower == expected_lower
+    assert upper == expected_upper
+    assert (upper - lower).total_seconds() == expected_hours * 3600
+
+
+async def test_current_week_recap_survives_normal_300_turn_raw_compaction() -> None:
+    assert MAX_WEEKLY_RECORDS <= RAW_RETENTION_LOW_WATER
+    store = DevelopmentAuthoritativeMemoryStore()
+    subject = "child:weekly-compaction"
+    zone = ZoneInfo("Asia/Kolkata")
+    local_monday = datetime(2026, 8, 31, tzinfo=zone)
+    expected: dict[str, tuple[str, datetime]] = {}
+    for index in range(1, 301):
+        turn_id = f"turn-{index:03d}"
+        summary = f"Canonical recap summary {index}."
+        occurred_at = (local_monday + timedelta(minutes=index)).astimezone(UTC)
+        expected[turn_id] = (summary, occurred_at)
+        await store.commit_delivered_turn(
+            subject=subject,
+            expected_reset_revision=0,
+            turn=_turn(turn_id=turn_id).model_copy(
+                update={"child_turn_summary": summary}
+            ),
+            proposal=None,
+            memory_id=None,
+            occurred_at=occurred_at,
+            timezone_id="Asia/Kolkata",
+        )
+
+    assert len(store._turns[subject]) == 171
+    assert store._episodes[subject]
+    recap = await store.load_weekly_recap(
+        subject=subject,
+        timezone_id="Asia/Kolkata",
+        generated_at=datetime(2026, 9, 2, 6, tzinfo=UTC),
+    )
+
+    expected_ids = [f"turn-{index:03d}" for index in range(300, 236, -1)]
+    assert [record.turn_id for record in recap.records] == expected_ids
+    assert len(recap.records) == MAX_WEEKLY_RECORDS
+    assert [(record.summary, record.occurred_at) for record in recap.records] == [
+        expected[turn_id] for turn_id in expected_ids
+    ]
+    assert not hasattr(store, "_weekly_records")
 
 
 async def test_v3_rejects_sensitive_weekly_summary_without_partial_commit() -> None:

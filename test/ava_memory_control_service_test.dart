@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:ava/config/ava_backend_configuration.dart';
+import 'package:ava/services/ava_device_context_service.dart';
 import 'package:ava/services/ava_memory_control_service.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -32,14 +33,15 @@ void main() {
         'https://ava.example/api/',
       ),
       transport: transport,
+      deviceContext: const _DeviceContextFake('Asia/Kolkata'),
     );
 
-    final recap = await service.loadWeeklyRecap(DateTime(2026, 7, 27));
+    final recap = await service.loadWeeklyRecap();
 
     expect(transport.method, 'GET');
     expect(
       transport.endpoint.toString(),
-      'https://ava.example/api/v3/memory/weekly-recap?period_start=2026-07-27',
+      'https://ava.example/api/v3/memory/weekly-recap?timezoneId=Asia%2FKolkata',
     );
     expect(transport.headers?['x-ava-protocol-version'], '3');
     expect(recap.records.single.summary, 'Talked about the moon.');
@@ -59,6 +61,7 @@ void main() {
     final service = ProductionAvaMemoryControl(
       configuration: AvaBackendConfiguration.parse('https://ava.example/'),
       transport: transport,
+      deviceContext: const _DeviceContextFake('UTC'),
     );
 
     await expectLater(
@@ -85,13 +88,23 @@ void main() {
     final service = ProductionAvaMemoryControl(
       configuration: AvaBackendConfiguration.parse('https://ava.example/'),
       transport: transport,
+      deviceContext: const _DeviceContextFake('Europe/London'),
     );
 
     await expectLater(
-      service.loadWeeklyRecap(DateTime(2026, 7, 27)),
+      service.loadWeeklyRecap(),
       throwsFormatException,
     );
   });
+}
+
+final class _DeviceContextFake implements AvaDeviceContext {
+  const _DeviceContextFake(this.timezoneId);
+
+  final String timezoneId;
+
+  @override
+  Future<String> currentTimezoneId() async => timezoneId;
 }
 
 final class _MemoryTransport implements AvaMemoryControlTransport {

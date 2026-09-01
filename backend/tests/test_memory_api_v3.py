@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
-
 from httpx import ASGITransport, AsyncClient
 
 from ava_backend.app import create_app
@@ -57,13 +55,10 @@ async def test_weekly_recap_and_reset_use_authenticated_subject() -> None:
         proposal=None,
         memory_id=None,
     )
-    now = datetime.now(UTC)
-    monday = now.date().fromordinal(now.date().toordinal() - now.weekday())
-
     async with await _client(store) as client:
         recap = await client.get(
             "/v3/memory/weekly-recap",
-            params={"period_start": monday.isoformat()},
+            params={"timezoneId": "Asia/Kolkata"},
             headers={"X-Ava-Protocol-Version": "3"},
         )
         reset = await client.delete(
@@ -145,10 +140,29 @@ async def test_v3_memory_endpoints_fail_visibly_when_store_is_not_configured() -
     async with await _client(None) as client:
         response = await client.get(
             "/v3/memory/weekly-recap",
+            params={"timezoneId": "Asia/Kolkata"},
             headers={"X-Ava-Protocol-Version": "3"},
         )
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "memory_unavailable"
+
+
+async def test_weekly_recap_requires_a_valid_iana_timezone() -> None:
+    async with await _client(DevelopmentAuthoritativeMemoryStore()) as client:
+        missing = await client.get(
+            "/v3/memory/weekly-recap",
+            headers={"X-Ava-Protocol-Version": "3"},
+        )
+        malformed = await client.get(
+            "/v3/memory/weekly-recap",
+            params={"timezoneId": "IST"},
+            headers={"X-Ava-Protocol-Version": "3"},
+        )
+
+    assert missing.status_code == 422
+    assert missing.json()["error"]["code"] == "invalid_request"
+    assert malformed.status_code == 422
+    assert malformed.json()["error"]["code"] == "invalid_request"
 
 
 async def test_v3_memory_endpoints_require_protocol_header() -> None:

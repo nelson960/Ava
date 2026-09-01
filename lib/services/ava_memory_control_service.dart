@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import '../config/ava_backend_configuration.dart';
+import 'ava_device_context_service.dart';
 
 const _protocolVersion = '3';
 
@@ -44,7 +45,7 @@ final class AvaConversationResetReceipt {
 }
 
 abstract interface class AvaMemoryControl {
-  Future<AvaWeeklyConversationRecap> loadWeeklyRecap(DateTime periodStart);
+  Future<AvaWeeklyConversationRecap> loadWeeklyRecap();
 
   Future<AvaConversationResetReceipt> resetConversations();
 }
@@ -141,19 +142,21 @@ final class ProductionAvaMemoryControl implements AvaMemoryControl {
   const ProductionAvaMemoryControl({
     required AvaBackendConfiguration configuration,
     required AvaMemoryControlTransport transport,
+    required AvaDeviceContext deviceContext,
   })  : _configuration = configuration,
-        _transport = transport;
+        _transport = transport,
+        _deviceContext = deviceContext;
 
   final AvaBackendConfiguration _configuration;
   final AvaMemoryControlTransport _transport;
+  final AvaDeviceContext _deviceContext;
 
   @override
-  Future<AvaWeeklyConversationRecap> loadWeeklyRecap(
-    DateTime periodStart,
-  ) async {
+  Future<AvaWeeklyConversationRecap> loadWeeklyRecap() async {
+    final timezoneId = await _deviceContext.currentTimezoneId();
     final response = await _request(
       method: 'GET',
-      endpoint: _configuration.weeklyRecapEndpoint(periodStart),
+      endpoint: _configuration.weeklyRecapEndpoint(timezoneId),
     );
     final payload = _jsonObject(jsonDecode(response.body), 'weekly recap');
     _requireKeys(payload, const {

@@ -2110,8 +2110,12 @@ async def test_reset_supersedes_pending_context_before_response_ownership(
     pre_reset = coordinator._pending_harness
     assert pre_reset is not None
     pre_reset_build_id = pre_reset.context.build_id
+    canvas_reset_epoch = coordinator._canvas_jobs.state.workspace.reset_epoch
 
     await coordinator.memory_reset(reset_revision=1)
+    assert (
+        coordinator._canvas_jobs.state.workspace.reset_epoch == canvas_reset_epoch + 1
+    )
     post_reset = coordinator._pending_harness
     assert post_reset is not None
     post_reset_build_id = post_reset.context.build_id

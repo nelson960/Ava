@@ -2,11 +2,19 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
-from fastapi import FastAPI, Header, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    Header,
+    Query,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -137,7 +145,6 @@ def create_app(
             min_pool_size=resolved_settings.memory_pool_min_size,
             max_pool_size=resolved_settings.memory_pool_max_size,
             pool_timeout_seconds=resolved_settings.memory_pool_timeout_seconds,
-            weekly_retention_days=resolved_settings.memory_weekly_retention_days,
         )
     elif (
         resolved_authoritative_memory is None
@@ -392,7 +399,11 @@ def create_app(
     @app.get("/v3/memory/weekly-recap")
     async def get_weekly_recap(
         request: Request,
-        period_start: date | None = None,
+        timezone_id: str = Query(
+            alias="timezoneId",
+            min_length=1,
+            max_length=64,
+        ),
         protocol_header: str | None = Header(
             default=None,
             alias="X-Ava-Protocol-Version",
@@ -423,14 +434,18 @@ def create_app(
                 message="Ava's conversation memory is not configured.",
             )
         generated_at = datetime.now(UTC)
-        selected_start = period_start or (
-            generated_at.date() - timedelta(days=generated_at.weekday())
-        )
         try:
             recap = await store.load_weekly_recap(
                 subject=client.subject,
-                period_start=selected_start,
+                timezone_id=timezone_id,
                 generated_at=generated_at,
+            )
+        except ValueError:
+            return _error_response(
+                request,
+                status_code=422,
+                code=ErrorCode.INVALID_REQUEST,
+                message="timezoneId must be a known IANA timezone identifier.",
             )
         except PostgresMemoryStoreError:
             LOGGER.exception(

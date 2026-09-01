@@ -49,10 +49,15 @@ final avaMemoryControlTransportProvider =
   return transport;
 });
 
+final avaDeviceContextProvider = Provider<AvaDeviceContext>((ref) {
+  return const AvaDeviceContextService();
+});
+
 final avaMemoryControlProvider = Provider<AvaMemoryControl>((ref) {
   return ProductionAvaMemoryControl(
     configuration: ref.watch(avaBackendConfigurationProvider),
     transport: ref.watch(avaMemoryControlTransportProvider),
+    deviceContext: ref.watch(avaDeviceContextProvider),
   );
 });
 
@@ -68,7 +73,7 @@ final avaRealtimeBootstrapServiceProvider =
   return AvaRealtimeBootstrapService(
     configuration: ref.watch(avaBackendConfigurationProvider),
     transport: ref.watch(avaRealtimeBootstrapTransportProvider),
-    deviceContext: const AvaDeviceContextService(),
+    deviceContext: ref.watch(avaDeviceContextProvider),
   );
 });
 

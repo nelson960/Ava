@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import AsyncIterator, cast
 
 from psycopg import AsyncConnection, Error as PsycopgError, errors
@@ -37,6 +37,7 @@ from .memory import (
     _validate_subject,
     _validate_weekly_summary,
     build_conversation_episodes,
+    current_local_week_utc_bounds,
     evaluate_delivered_turn_memory_proposal,
     _validate_optional_summary,
 )
@@ -51,8 +52,8 @@ class PostgresAuthoritativeMemoryStore:
     """Portable PostgreSQL store used locally and by Supabase PostgreSQL.
 
     The schema lives outside ``public`` so Supabase PostgREST never exposes the
-    tables accidentally. All writes that affect a delivered turn, stable
-    memory, compaction, and weekly recap are committed in one transaction.
+    tables accidentally. Delivered events are the canonical source for the
+    read-time current-week recap projection.
     """
 
     def __init__(
@@ -62,7 +63,6 @@ class PostgresAuthoritativeMemoryStore:
         min_pool_size: int = 1,
         max_pool_size: int = 4,
         pool_timeout_seconds: float = 5,
-        weekly_retention_days: int = 56,
     ) -> None:
         normalized_url = database_url.strip()
         if not normalized_url:
@@ -71,8 +71,6 @@ class PostgresAuthoritativeMemoryStore:
             raise ValueError("PostgreSQL pool sizes must satisfy 0 <= min <= max <= 32")
         if not 1 <= pool_timeout_seconds <= 30:
             raise ValueError("PostgreSQL pool timeout must be between 1 and 30 seconds")
-        if not 7 <= weekly_retention_days <= 365:
-            raise ValueError("weekly retention must be between 7 and 365 days")
         self._pool = cast(
             AsyncConnectionPool[AsyncConnection[dict[str, object]]],
             AsyncConnectionPool(
@@ -85,7 +83,6 @@ class PostgresAuthoritativeMemoryStore:
             ),
         )
         self._pool_timeout_seconds = pool_timeout_seconds
-        self._weekly_retention_days = weekly_retention_days
         self._opened = False
 
     async def open(self) -> None:
@@ -103,19 +100,19 @@ class PostgresAuthoritativeMemoryStore:
                     """
                     select version
                     from ava_private.schema_migrations
-                    where name = 'realtime_memory_v5'
+                    where name = 'realtime_memory_v6'
                     """
                 )
                 row = await cursor.fetchone()
         except (PsycopgError, PoolTimeout) as error:
             await self._pool.close()
             raise PostgresMemoryStoreError(
-                "PostgreSQL memory is unavailable or its v5 migration is missing"
+                "PostgreSQL memory is unavailable or its v6 migration is missing"
             ) from error
         if row is None or cast(int, row["version"]) != 1:
             await self._pool.close()
             raise PostgresMemoryStoreError(
-                "PostgreSQL memory schema realtime_memory_v5 version 1 is required"
+                "PostgreSQL memory schema realtime_memory_v6 version 1 is required"
             )
         self._opened = True
 
@@ -262,7 +259,7 @@ class PostgresAuthoritativeMemoryStore:
         validated_turn = DeliveredConversationTurn.model_validate(
             turn.model_dump(mode="json", by_alias=True)
         )
-        weekly_summary = _validate_weekly_summary(validated_turn.child_turn_summary)
+        _validate_weekly_summary(validated_turn.child_turn_summary)
         decision = evaluate_delivered_turn_memory_proposal(
             turn=validated_turn,
             proposal=proposal,
@@ -330,19 +327,6 @@ class PostgresAuthoritativeMemoryStore:
                             interaction.target_id if interaction else None,
                             interaction.accessibility_label if interaction else None,
                             interaction.step_index if interaction else None,
-                        ),
-                    )
-                    await connection.execute(
-                        """
-                        insert into ava_private.weekly_records
-                          (subject, turn_id, summary, occurred_at)
-                        values (%s, %s, %s, %s)
-                        """,
-                        (
-                            normalized_subject,
-                            validated_turn.turn_id,
-                            weekly_summary,
-                            normalized_occurred_at,
                         ),
                     )
                     decision = await self._store_memory_decision(
@@ -609,15 +593,20 @@ class PostgresAuthoritativeMemoryStore:
         self,
         *,
         subject: str,
-        period_start: date,
+        timezone_id: str,
         generated_at: datetime,
     ) -> WeeklyConversationRecap:
         normalized_subject = _validate_subject(subject)
+        period_start, period_end, lower_bound_utc, upper_bound_utc = (
+            current_local_week_utc_bounds(
+                timezone_id=timezone_id,
+                generated_at=generated_at,
+            )
+        )
         normalized_generated_at = _validate_aware_datetime(
             generated_at,
             field_name="generated_at",
         )
-        period_end = period_start + timedelta(days=7)
         async with self._connection() as connection:
             async with connection.transaction():
                 await connection.execute(
@@ -634,18 +623,18 @@ class PostgresAuthoritativeMemoryStore:
                 state = await state_cursor.fetchone()
                 records_cursor = await connection.execute(
                     """
-                    select turn_id, summary, occurred_at
-                    from ava_private.weekly_records
+                    select turn_id, child_turn_summary as summary, occurred_at
+                    from ava_private.delivered_turns
                     where subject = %s
                       and occurred_at >= %s
                       and occurred_at < %s
-                    order by occurred_at asc, turn_id asc
+                    order by occurred_at desc, turn_id desc
                     limit %s
                     """,
                     (
                         normalized_subject,
-                        datetime.combine(period_start, datetime.min.time(), UTC),
-                        datetime.combine(period_end, datetime.min.time(), UTC),
+                        lower_bound_utc,
+                        upper_bound_utc,
                         MAX_WEEKLY_RECORDS,
                     ),
                 )
@@ -698,10 +687,6 @@ class PostgresAuthoritativeMemoryStore:
                 revision = revision_row["reset_revision"]
                 await connection.execute(
                     "delete from ava_private.stable_memories where subject = %s",
-                    (normalized_subject,),
-                )
-                await connection.execute(
-                    "delete from ava_private.weekly_records where subject = %s",
                     (normalized_subject,),
                 )
                 await connection.execute(
@@ -941,14 +926,6 @@ class PostgresAuthoritativeMemoryStore:
         *,
         subject: str,
     ) -> None:
-        threshold = datetime.now(UTC) - timedelta(days=self._weekly_retention_days)
-        await connection.execute(
-            """
-            delete from ava_private.weekly_records
-            where subject = %s and occurred_at < %s
-            """,
-            (subject, threshold),
-        )
         episode_threshold = datetime.now(UTC) - timedelta(days=EPISODE_RETENTION_DAYS)
         await connection.execute(
             """
@@ -987,17 +964,12 @@ class PostgresAuthoritativeMemoryStore:
                   and memory.source_turn_id = receipt.turn_id
               )
               and not exists (
-                select 1 from ava_private.weekly_records as weekly
-                where weekly.subject = receipt.subject
-                  and weekly.turn_id = receipt.turn_id
-              )
-              and not exists (
                 select 1 from ava_private.conversation_episodes as episode
                 where episode.subject = receipt.subject
                   and receipt.turn_id = any(episode.source_turn_ids)
               )
             """,
-            (subject, threshold),
+            (subject, episode_threshold),
         )
 
 

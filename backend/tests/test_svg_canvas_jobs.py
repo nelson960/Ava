@@ -1454,6 +1454,136 @@ async def test_active_renderer_failure_preserves_backend_committed_scene() -> No
     await coordinator.close()
 
 
+async def test_conversation_reset_is_idempotent_without_canvas_work() -> None:
+    workspace = SvgCanvasWorkspace()
+    documents = SvgCanvasDocumentStore()
+    coordinator = SvgCanvasJobCoordinator(
+        session_id="session-reset-empty",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+        specialist=_Specialist(),
+        state=SvgCanvasSessionState(workspace=workspace),
+        documents=documents,
+        event_sink=_Sink(),
+        generation_id_factory=lambda: "generation-reset-empty",
+    )
+    initial_epoch = workspace.reset_epoch
+
+    await coordinator.reset_conversation()
+    await coordinator.reset_conversation()
+
+    assert workspace.current is None
+    assert workspace.scenes == ()
+    assert workspace.reset_epoch == initial_epoch + 2
+    assert documents.document_count == 0
+    assert documents.draft_count == 0
+    await coordinator.close()
+
+
+async def test_conversation_reset_clears_visible_canvas_workspace() -> None:
+    workspace = SvgCanvasWorkspace()
+    state = SvgCanvasSessionState(workspace=workspace)
+    (
+        coordinator,
+        _specialist,
+        _sink,
+        _completions,
+        documents,
+        _stored,
+        _active,
+    ) = await _activated_coordinator(state=state)
+    initial_epoch = workspace.reset_epoch
+
+    await coordinator.reset_conversation()
+
+    assert state.active is None
+    assert workspace.scenes == ()
+    assert workspace.reset_epoch == initial_epoch + 1
+    assert documents.document_count == 0
+    assert documents.draft_count == 0
+    await coordinator.close()
+
+
+async def test_conversation_reset_cancels_pending_sol_without_stale_completion() -> (
+    None
+):
+    specialist = _CancellationResistantSpecialist()
+    workspace = SvgCanvasWorkspace()
+    state = SvgCanvasSessionState(workspace=workspace)
+    documents = SvgCanvasDocumentStore()
+    coordinator = SvgCanvasJobCoordinator(
+        session_id="session-reset-pending",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+        specialist=specialist,
+        state=state,
+        documents=documents,
+        event_sink=_Sink(),
+        generation_id_factory=lambda: "generation-reset-pending",
+    )
+    await coordinator.accept_tool_call(
+        source_turn_id="turn-reset-pending",
+        call=_call(),
+        complete_tool=lambda turn, call, result: _record_completion(
+            [], turn, call, result
+        ),
+    )
+    await specialist.started.wait()
+
+    reset = asyncio.create_task(coordinator.reset_conversation())
+    await specialist.task_cancelled.wait()
+    specialist.release.set()
+    await reset
+    await coordinator.wait_for_background_work()
+
+    assert specialist.cancelled == ["generation-reset-pending"]
+    assert state.candidate is None
+    assert workspace.current is None
+    assert workspace.scenes == ()
+    assert documents.document_count == 0
+    assert documents.draft_count == 0
+    await coordinator.close()
+
+
+async def test_conversation_reset_releases_unpresented_document_and_visible_draft() -> (
+    None
+):
+    specialist = _ProgressiveSpecialist()
+    workspace = SvgCanvasWorkspace()
+    state = SvgCanvasSessionState(workspace=workspace)
+    documents = SvgCanvasDocumentStore()
+    coordinator = SvgCanvasJobCoordinator(
+        session_id="session-reset-draft",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+        specialist=specialist,
+        state=state,
+        documents=documents,
+        event_sink=_Sink(),
+        generation_id_factory=lambda: "generation-reset-draft",
+    )
+    await coordinator.accept_tool_call(
+        source_turn_id="turn-reset-draft",
+        call=_call(),
+        complete_tool=lambda turn, call, result: _record_completion(
+            [], turn, call, result
+        ),
+    )
+    await specialist.draft_emitted.wait()
+    assert documents.draft_count == 1
+
+    specialist.release.set()
+    await coordinator.wait_for_background_work()
+    assert state.candidate is not None
+    assert documents.document_count == 1
+
+    await coordinator.reset_conversation()
+
+    assert state.candidate is None
+    assert workspace.current is None
+    assert workspace.scenes == ()
+    assert documents.document_count == 0
+    assert documents.draft_count == 0
+    await coordinator.close()
+
+
 async def test_active_renderer_failure_preserves_canvas_semantic_context() -> None:
     (
         coordinator,

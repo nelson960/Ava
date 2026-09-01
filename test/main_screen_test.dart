@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:ava/config/ava_backend_configuration.dart';
 import 'package:ava/models/ava_realtime_protocol.dart';
 import 'package:ava/models/ava_realtime_protocol_v4.dart';
+import 'package:ava/services/ava_device_context_service.dart';
 import 'package:ava/services/ava_realtime_bootstrap_service.dart';
 import 'package:ava/services/ava_realtime_session_v4.dart';
 import 'package:ava/services/ava_realtime_webrtc.dart';
@@ -64,6 +65,9 @@ void main() {
           avaRealtimeBootstrapTransportProvider.overrideWithValue(
             bootstrapTransport,
           ),
+          avaDeviceContextProvider.overrideWithValue(
+            const _DeviceContextFake(),
+          ),
           avaRealtimeMediaConnectorV4Provider.overrideWithValue(
             (bootstrap) async => DeterministicAvaRealtimeMediaSession(
               offerSdp: _testOfferSdp,
@@ -118,6 +122,13 @@ void main() {
     expect(tester.takeException(), isNull);
     expect(find.text('Thinking'), findsOneWidget);
   });
+}
+
+final class _DeviceContextFake implements AvaDeviceContext {
+  const _DeviceContextFake();
+
+  @override
+  Future<String> currentTimezoneId() async => 'Asia/Kolkata';
 }
 
 final class _CountingBootstrapTransport

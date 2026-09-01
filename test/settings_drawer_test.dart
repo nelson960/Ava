@@ -168,6 +168,46 @@ void main() {
     expect(find.textContaining('diagnos'), findsNothing);
   });
 
+  testWidgets(
+      'weekly recap renders newest first with localized range and local time',
+      (tester) async {
+    final database = AppDatabase.forTesting(NativeDatabase.memory());
+    addTearDown(database.close);
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          databaseProvider.overrideWithValue(database),
+          avaMemoryControlProvider.overrideWithValue(_FakeMemoryControl()),
+        ],
+        child: const MaterialApp(
+          home: Scaffold(body: SettingsDrawer()),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.ensureVisible(
+      find.byKey(const ValueKey('settings-weekly-recap')),
+    );
+    await tester.tap(find.byKey(const ValueKey('settings-weekly-recap')));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Aug 31 – Sep 6 2026'), findsOneWidget);
+    expect(
+      tester.getTopLeft(find.text('Talked about the moon.')).dy,
+      lessThan(tester.getTopLeft(find.text('Built a model airplane.')).dy),
+    );
+    final timestampFinder =
+        find.byKey(const ValueKey('weekly-recap-time-turn-new'));
+    final local = DateTime.parse('2026-09-01T10:00:00Z').toLocal();
+    final localizations = MaterialLocalizations.of(
+      tester.element(timestampFinder),
+    );
+    final expectedTimestamp = '${localizations.formatShortDate(local)} · '
+        '${localizations.formatTimeOfDay(TimeOfDay.fromDateTime(local))}';
+    expect(tester.widget<Text>(timestampFinder).data, expectedTimestamp);
+  });
+
   testWidgets('weekly recap scrolls on a short viewport without overflowing',
       (tester) async {
     tester.view.physicalSize = const Size(640, 600);
@@ -320,9 +360,8 @@ Future<AvaSvgCanvasSessionHost> _retainedCanvasHost() async {
 
 final class _FakeMemoryControl implements AvaMemoryControl {
   @override
-  Future<AvaWeeklyConversationRecap> loadWeeklyRecap(
-    DateTime periodStart,
-  ) async {
+  Future<AvaWeeklyConversationRecap> loadWeeklyRecap() async {
+    final periodStart = DateTime(2026, 8, 31);
     return AvaWeeklyConversationRecap(
       periodStart: periodStart,
       periodEnd: periodStart.add(const Duration(days: 7)),
@@ -330,9 +369,14 @@ final class _FakeMemoryControl implements AvaMemoryControl {
       resetRevision: 0,
       records: [
         AvaWeeklyConversationRecord(
-          turnId: 'turn-1',
+          turnId: 'turn-new',
           summary: 'Talked about the moon.',
-          occurredAt: DateTime.utc(2026, 8, 1),
+          occurredAt: DateTime.parse('2026-09-01T10:00:00Z'),
+        ),
+        AvaWeeklyConversationRecord(
+          turnId: 'turn-old',
+          summary: 'Built a model airplane.',
+          occurredAt: DateTime.parse('2026-08-31T10:00:00Z'),
         ),
       ],
     );
@@ -349,7 +393,7 @@ final class _FakeMemoryControl implements AvaMemoryControl {
 
 final class _FailingMemoryControl implements AvaMemoryControl {
   @override
-  Future<AvaWeeklyConversationRecap> loadWeeklyRecap(DateTime periodStart) {
+  Future<AvaWeeklyConversationRecap> loadWeeklyRecap() {
     throw UnimplementedError();
   }
 
@@ -365,9 +409,8 @@ final class _FailingMemoryControl implements AvaMemoryControl {
 
 final class _ManyRecordsMemoryControl implements AvaMemoryControl {
   @override
-  Future<AvaWeeklyConversationRecap> loadWeeklyRecap(
-    DateTime periodStart,
-  ) async {
+  Future<AvaWeeklyConversationRecap> loadWeeklyRecap() async {
+    final periodStart = DateTime(2026, 8, 31);
     return AvaWeeklyConversationRecap(
       periodStart: periodStart,
       periodEnd: periodStart.add(const Duration(days: 7)),

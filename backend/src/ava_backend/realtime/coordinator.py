@@ -345,6 +345,7 @@ class DeterministicRealtimeSessionCoordinator:
         if current is not None and reset_revision <= current:
             return
         self._memory_reset_revision = reset_revision
+        await self._canvas_jobs.reset_conversation()
         self._warm_refresh_revision += 1
         self._warm_memories = ()
         self._recent_live_echo_suppression_turn_ids.clear()
