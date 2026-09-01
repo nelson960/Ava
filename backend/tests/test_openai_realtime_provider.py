@@ -5,6 +5,7 @@ from builtins import anext
 import json
 import logging
 from collections import deque
+from datetime import UTC, datetime
 from types import MethodType
 
 import httpx
@@ -25,9 +26,14 @@ from ava_backend.providers.openai_realtime_provider import (
     _session_update,
 )
 from ava_backend.realtime.harness import build_realtime_harness
+from ava_backend.realtime.context_assembler import (
+    DynamicContextAssembler,
+    DynamicContextBuildReason,
+)
 from ava_backend.realtime.fakes import DETERMINISTIC_AUDIO_OFFER_SDP
 from ava_backend.realtime.memory import AuthoritativeMemorySnapshot
 from ava_backend.realtime.provider_session import (
+    RealtimeContextInstallationStatus,
     RealtimeNegotiationResponseError,
     RealtimeProviderResponseIncompleteError,
 )
@@ -35,12 +41,20 @@ from ava_backend.realtime.tool_contract import (
     CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
     CANVAS_MODEL_SAFE_REJECTION_REASON,
     INTERACTIVE_CANVAS_TOOL_NAME,
+    GET_CURRENT_TIME_TOOL_NAME,
+    SEARCH_MEMORY_TOOL_NAME,
+    GetCurrentTimeToolOutputV4,
     InteractiveCanvasToolOutput,
     InteractiveCanvasToolOutputV4,
     InteractiveCanvasCancellationToolOutputV4,
     RealtimeCancelCanvasToolCall,
     RealtimeCanvasToolCall,
     RealtimeRejectedCanvasToolCall,
+    RealtimeGetCurrentTimeToolCall,
+    RealtimeRejectedUtilityToolCall,
+    RealtimeSearchMemoryToolCall,
+    RejectedUtilityToolOutputV4,
+    SearchMemoryToolOutputV4,
     RealtimeSpeechTextDelta,
 )
 
@@ -216,6 +230,17 @@ class _FakeRealtimeSocket:
         self.closed = True
 
 
+class _FailingSessionUpdateSocket(_FakeRealtimeSocket):
+    def __init__(self, events: list[dict[str, object]]) -> None:
+        super().__init__(events)
+        self.fail_session_update = False
+
+    async def send(self, message: str) -> None:
+        if self.fail_session_update:
+            raise RuntimeError("controlled session update failure")
+        await super().send(message)
+
+
 class _DelayedRealtimeSocket(_FakeRealtimeSocket):
     def __init__(
         self,
@@ -260,16 +285,28 @@ class _ControlledClosingRealtimeSocket(_FakeRealtimeSocket):
         raise ConnectionClosedError(Close(1011, "controlled receiver close"), None)
 
 
-def _harness():  # type: ignore[no-untyped-def]
+def _harness(  # type: ignore[no-untyped-def]
+    *,
+    build_id: str = "ctx-1",
+    timezone_id: str = "UTC",
+):
+    snapshot = AuthoritativeMemorySnapshot.model_validate(
+        {
+            "ageBand": AgeBand.MIDDLE_CHILDHOOD,
+            "resetRevision": 0,
+            "currentSessionSummary": None,
+            "deliveredTurns": [],
+            "stableMemories": [],
+        }
+    )
     return build_realtime_harness(
-        AuthoritativeMemorySnapshot.model_validate(
-            {
-                "ageBand": AgeBand.MIDDLE_CHILDHOOD,
-                "resetRevision": 0,
-                "currentSessionSummary": None,
-                "deliveredTurns": [],
-                "stableMemories": [],
-            }
+        dynamic_context=DynamicContextAssembler().assemble(
+            build_id=build_id,
+            reason=DynamicContextBuildReason.SESSION_BOOTSTRAP,
+            age_band=snapshot.age_band,
+            timezone_id=timezone_id,
+            current_time_utc=datetime(2026, 8, 31, tzinfo=UTC),
+            bootstrap_turns=tuple(snapshot.delivered_turns),
         )
     )
 
@@ -331,51 +368,53 @@ def _canvas_response_events(
     arguments: str,
     function_name: str = INTERACTIVE_CANVAS_TOOL_NAME,
     preamble: str = "I’ll show that clearly. ",
+    response_id: str = RESPONSE_ID,
+    call_id: str = FUNCTION_CALL_ID,
 ) -> list[dict[str, object]]:
     midpoint = len(arguments) // 2
     return [
         {
             "type": "response.created",
-            "response": {"id": RESPONSE_ID},
+            "response": {"id": response_id},
         },
         {
             "type": "response.output_text.delta",
-            "response_id": RESPONSE_ID,
+            "response_id": response_id,
             "delta": preamble,
         },
         {
             "type": "response.output_item.added",
-            "response_id": RESPONSE_ID,
+            "response_id": response_id,
             "item": {
                 "type": "function_call",
                 "name": function_name,
-                "call_id": FUNCTION_CALL_ID,
+                "call_id": call_id,
                 "arguments": "",
             },
         },
         {
             "type": "response.function_call_arguments.delta",
-            "response_id": RESPONSE_ID,
-            "call_id": FUNCTION_CALL_ID,
+            "response_id": response_id,
+            "call_id": call_id,
             "delta": arguments[:midpoint],
         },
         {
             "type": "response.function_call_arguments.delta",
-            "response_id": RESPONSE_ID,
-            "call_id": FUNCTION_CALL_ID,
+            "response_id": response_id,
+            "call_id": call_id,
             "delta": arguments[midpoint:],
         },
         {
             "type": "response.function_call_arguments.done",
-            "response_id": RESPONSE_ID,
+            "response_id": response_id,
             "name": function_name,
-            "call_id": FUNCTION_CALL_ID,
+            "call_id": call_id,
             "arguments": arguments,
         },
         {
             "type": "response.done",
             "response": {
-                "id": RESPONSE_ID,
+                "id": response_id,
                 "status": "completed",
                 "output": [
                     {
@@ -386,7 +425,7 @@ def _canvas_response_events(
                     {
                         "type": "function_call",
                         "name": function_name,
-                        "call_id": FUNCTION_CALL_ID,
+                        "call_id": call_id,
                         "arguments": arguments,
                     },
                 ],
@@ -400,6 +439,7 @@ def _channel(
     events: list[dict[str, object]],
     *,
     max_output_tokens: int = 800,
+    provider_call_id: str | None = None,
 ) -> tuple[
     _OpenAIRealtimeEventChannel,
     _FakeRealtimeSocket,
@@ -412,6 +452,7 @@ def _channel(
         model="gpt-realtime-test",
         max_output_tokens=max_output_tokens,
         turn_timeout_seconds=5,
+        provider_call_id=provider_call_id,
     )
     _TEST_CHANNELS.add(channel)
     return channel, socket
@@ -421,11 +462,12 @@ async def _collect_turn_events(
     channel: _OpenAIRealtimeEventChannel,
     *,
     turn_id: str,
+    harness=None,  # type: ignore[no-untyped-def]
 ) -> list[object]:
     return [
         event
         async for event in channel.stream_turn(
-            harness=_harness(),
+            harness=harness or _harness(),
             turn_id=turn_id,
         )
     ]
@@ -809,7 +851,7 @@ async def test_transport_close_retains_close_code_reason_and_is_not_protocol_err
     await channel.close()
 
 
-def test_session_update_uses_text_output_and_one_optional_semantic_tool() -> None:
+def test_session_update_uses_text_output_and_bounded_semantic_tools() -> None:
     payload = _session_update(_harness(), "gpt-realtime-test", 800)
     session = payload["session"]
 
@@ -818,6 +860,8 @@ def test_session_update_uses_text_output_and_one_optional_semantic_tool() -> Non
     assert [tool["name"] for tool in session["tools"]] == [
         INTERACTIVE_CANVAS_TOOL_NAME,
         CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
+        SEARCH_MEMORY_TOOL_NAME,
+        GET_CURRENT_TIME_TOOL_NAME,
     ]
     turn_detection = session["audio"]["input"]["turn_detection"]
     assert session["audio"]["input"]["transcription"] == {"model": "gpt-transcribe"}
@@ -846,6 +890,76 @@ def test_session_update_propagates_custom_realtime_truncation_configuration() ->
         "retention_ratio": 0.75,
         "token_limits": {"post_instructions": 64_000},
     }
+
+
+@pytest.mark.asyncio
+async def test_logically_new_context_deduplicates_wire_update_and_becomes_active(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.openai_realtime")
+    channel, socket = _channel([], provider_call_id="rtc_context_provenance")
+    await channel.start_receiver()
+
+    first_status = await channel.prepare(harness=_harness(build_id="ctx-17"))
+    second_status = await channel.prepare(harness=_harness(build_id="ctx-18"))
+
+    assert first_status == RealtimeContextInstallationStatus.INSTALLED
+    assert second_status == RealtimeContextInstallationStatus.DEDUPLICATED
+    assert channel.active_context_build_id == "ctx-18"
+    assert [event["type"] for event in socket.sent].count("session.update") == 1
+
+    for event in _text_response_events(
+        response_id="resp_context_provenance",
+        text="A content sentinel that must not enter provenance telemetry.",
+    ):
+        socket.push(event)
+    received = await _collect_turn_events(
+        channel,
+        turn_id="turn-context-provenance",
+        harness=_harness(build_id="ctx-18"),
+    )
+    assert received
+
+    admission = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage().startswith("openai_realtime_response_owner_admitted")
+    )
+    assert admission["providerCallId"] == "rtc_context_provenance"
+    assert admission["responseId"] == "resp_context_provenance"
+    assert admission["responseOwnerTurnId"] == "turn-context-provenance"
+    assert admission["activeContextBuildId"] == "ctx-18"
+    assert "A content sentinel" not in next(
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("openai_realtime_response_owner_admitted")
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_context_install_keeps_previous_active_build_identity() -> None:
+    socket = _FailingSessionUpdateSocket(
+        [{"type": "session.updated", "session": {"id": "sess_test"}}]
+    )
+    channel = _OpenAIRealtimeEventChannel(
+        socket,
+        model="gpt-realtime-test",
+        max_output_tokens=800,
+        turn_timeout_seconds=5,
+        provider_call_id="rtc_failed_context",
+    )
+    _TEST_CHANNELS.add(channel)
+    await channel.start_receiver()
+    await channel.prepare(harness=_harness(build_id="ctx-21"))
+    assert channel.active_context_build_id == "ctx-21"
+
+    socket.fail_session_update = True
+    with pytest.raises(OpenAIRealtimeUnavailableError, match="send failed"):
+        await channel.prepare(
+            harness=_harness(build_id="ctx-22", timezone_id="Asia/Kolkata")
+        )
+
+    assert channel.active_context_build_id == "ctx-21"
 
 
 @pytest.mark.asyncio
@@ -1509,6 +1623,235 @@ async def test_canvas_call_gets_one_output_then_tool_disabled_continuation(
 
 
 @pytest.mark.asyncio
+async def test_search_memory_continuation_exposes_only_terminal_canvas_tools() -> None:
+    arguments = json.dumps({"query": "Saturn rings"}, separators=(",", ":"))
+    channel, socket = _channel(
+        [
+            *_canvas_response_events(
+                arguments=arguments,
+                function_name=SEARCH_MEMORY_TOOL_NAME,
+                preamble="",
+            ),
+            *_text_response_events(
+                response_id=CONTINUATION_RESPONSE_ID,
+                text="You once asked about Saturn's icy rings.",
+            ),
+        ]
+    )
+
+    received = []
+    async for event in channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-memory-tool",
+    ):
+        received.append(event)
+        if isinstance(event, RealtimeSearchMemoryToolCall):
+            await channel.complete_utility_tool(
+                turn_id="turn-memory-tool",
+                call_id=event.call_id,
+                output=SearchMemoryToolOutputV4(status="noMatches"),
+                harness=_harness(),
+            )
+
+    assert [type(event) for event in received] == [
+        RealtimeSearchMemoryToolCall,
+        RealtimeSpeechTextDelta,
+    ]
+    continuation = [
+        sent for sent in socket.sent if sent.get("type") == "response.create"
+    ][-1]["response"]
+    assert continuation["tool_choice"] == "auto"
+    assert continuation["parallel_tool_calls"] is False
+    assert [tool["name"] for tool in continuation["tools"]] == [
+        INTERACTIVE_CANVAS_TOOL_NAME,
+        CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_current_time_then_canvas_is_the_maximum_allowed_tool_chain() -> None:
+    canvas_arguments = json.dumps(
+        {
+            "operation": "new",
+            "brief": "Show a simple morning and evening clock comparison.",
+            "interactionMode": "none",
+        },
+        separators=(",", ":"),
+    )
+    channel, socket = _channel(
+        [
+            *_canvas_response_events(
+                arguments="{}",
+                function_name=GET_CURRENT_TIME_TOOL_NAME,
+                preamble="",
+            ),
+            *_canvas_response_events(
+                arguments=canvas_arguments,
+                response_id=CONTINUATION_RESPONSE_ID,
+                call_id="call_canvas_after_time",
+                preamble="",
+            ),
+            *_text_response_events(
+                response_id="resp_after_two_tools",
+                text="Here is that clock comparison.",
+            ),
+        ]
+    )
+
+    received = []
+    async for event in channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-time-canvas",
+    ):
+        received.append(event)
+        if isinstance(event, RealtimeGetCurrentTimeToolCall):
+            await channel.complete_utility_tool(
+                turn_id="turn-time-canvas",
+                call_id=event.call_id,
+                output=GetCurrentTimeToolOutputV4.model_validate(
+                    {
+                        "localIsoDateTime": "2026-08-31T12:00:00+05:30",
+                        "weekday": "Monday",
+                        "daypart": "afternoon",
+                        "timezoneId": "Asia/Kolkata",
+                    }
+                ),
+                harness=_harness(),
+            )
+        elif isinstance(event, RealtimeCanvasToolCall):
+            await channel.complete_canvas_tool(
+                turn_id="turn-time-canvas",
+                call_id=event.call_id,
+                output=InteractiveCanvasToolOutputV4.model_validate(
+                    {
+                        "status": "accepted",
+                        "generationId": "generation-time-canvas",
+                    }
+                ),
+            )
+
+    assert [type(event) for event in received] == [
+        RealtimeGetCurrentTimeToolCall,
+        RealtimeCanvasToolCall,
+        RealtimeSpeechTextDelta,
+    ]
+    continuations = [
+        sent["response"]
+        for sent in socket.sent
+        if sent.get("type") == "response.create"
+    ]
+    assert continuations[-2]["tool_choice"] == "auto"
+    assert continuations[-1]["tool_choice"] == "none"
+    assert "tools" not in continuations[-1]
+
+
+@pytest.mark.parametrize(
+    ("function_name", "arguments"),
+    [
+        (SEARCH_MEMORY_TOOL_NAME, '{"query":"another lookup"}'),
+        (GET_CURRENT_TIME_TOOL_NAME, "{}"),
+    ],
+)
+async def test_canvas_terminal_continuation_rejects_later_utility_calls(
+    function_name: str,
+    arguments: str,
+) -> None:
+    channel, _ = _channel(
+        [
+            *_canvas_response_events(
+                arguments=(
+                    '{"operation":"new","brief":"Show Saturn.",'
+                    '"interactionMode":"none"}'
+                ),
+                preamble="",
+            ),
+            *_canvas_response_events(
+                arguments=arguments,
+                function_name=function_name,
+                response_id=CONTINUATION_RESPONSE_ID,
+                call_id="call_disallowed_after_canvas",
+                preamble="",
+            ),
+        ]
+    )
+    iterator = channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-canvas-terminal",
+    ).__aiter__()
+
+    call = await iterator.__anext__()
+    assert isinstance(call, RealtimeCanvasToolCall)
+    await channel.complete_canvas_tool(
+        turn_id="turn-canvas-terminal",
+        call_id=call.call_id,
+        output=InteractiveCanvasToolOutputV4.model_validate(
+            {"status": "accepted", "generationId": "generation-terminal"}
+        ),
+    )
+    with pytest.raises(OpenAIRealtimeProtocolError, match="additional function call"):
+        await iterator.__anext__()
+    await iterator.aclose()
+
+
+@pytest.mark.asyncio
+async def test_repeated_or_cross_utility_gets_one_rejection_then_no_tools() -> None:
+    channel, socket = _channel(
+        [
+            *_canvas_response_events(
+                arguments=json.dumps({"query": "Saturn"}),
+                function_name=SEARCH_MEMORY_TOOL_NAME,
+                preamble="",
+            ),
+            *_canvas_response_events(
+                arguments="{}",
+                function_name=GET_CURRENT_TIME_TOOL_NAME,
+                response_id=CONTINUATION_RESPONSE_ID,
+                call_id="call_invalid_second_utility",
+                preamble="",
+            ),
+            *_text_response_events(
+                response_id="resp_after_rejected_utility",
+                text="I can answer from what is already available.",
+            ),
+        ]
+    )
+
+    received = []
+    async for event in channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-utility-rejected",
+    ):
+        received.append(event)
+        if isinstance(event, RealtimeSearchMemoryToolCall):
+            await channel.complete_utility_tool(
+                turn_id="turn-utility-rejected",
+                call_id=event.call_id,
+                output=SearchMemoryToolOutputV4(status="noMatches"),
+                harness=_harness(),
+            )
+        elif isinstance(event, RealtimeRejectedUtilityToolCall):
+            await channel.complete_utility_tool(
+                turn_id="turn-utility-rejected",
+                call_id=event.call_id,
+                output=RejectedUtilityToolOutputV4(reason=event.reason),
+                harness=_harness(),
+            )
+
+    assert [type(event) for event in received] == [
+        RealtimeSearchMemoryToolCall,
+        RealtimeRejectedUtilityToolCall,
+        RealtimeSpeechTextDelta,
+    ]
+    continuations = [
+        sent["response"]
+        for sent in socket.sent
+        if sent.get("type") == "response.create"
+    ]
+    assert continuations[-1]["tool_choice"] == "none"
+    assert "tools" not in continuations[-1]
+
+
+@pytest.mark.asyncio
 async def test_explicit_canvas_cancellation_call_gets_idempotent_tool_output() -> None:
     channel, socket = _channel(
         [
@@ -1872,7 +2215,21 @@ async def test_canvas_interaction_trigger_is_single_shot() -> None:
 
 
 @pytest.mark.asyncio
-async def test_canvas_interaction_response_cannot_call_canvas_tool() -> None:
+@pytest.mark.parametrize(
+    ("function_name", "arguments"),
+    [
+        (
+            INTERACTIVE_CANVAS_TOOL_NAME,
+            '{"operation":"new","brief":"Show a cell.","interactionMode":"none"}',
+        ),
+        (SEARCH_MEMORY_TOOL_NAME, '{"query":"cell history"}'),
+        (GET_CURRENT_TIME_TOOL_NAME, "{}"),
+    ],
+)
+async def test_canvas_interaction_response_cannot_call_any_semantic_tool(
+    function_name: str,
+    arguments: str,
+) -> None:
     channel, socket = _channel([])
     iterator = channel.stream_turn(
         harness=_harness(),
@@ -1886,9 +2243,8 @@ async def test_canvas_interaction_response_cannot_call_canvas_tool() -> None:
     )
 
     for event in _canvas_response_events(
-        arguments=(
-            '{"operation":"new","brief":"Show a cell.","interactionMode":"none"}'
-        ),
+        arguments=arguments,
+        function_name=function_name,
         preamble="",
     ):
         socket.push(event)

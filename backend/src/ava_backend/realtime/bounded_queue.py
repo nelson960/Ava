@@ -25,18 +25,16 @@ class BoundedAsyncQueue(Generic[T]):
     ) -> None:
         if max_items <= 0 or max_weight <= 0:
             raise ValueError("queue limits must be positive")
-        self._queue: asyncio.Queue[T | object] = asyncio.Queue(maxsize=max_items)
+        self._queue: asyncio.Queue[T] = asyncio.Queue(maxsize=max_items)
         self._max_weight = max_weight
         self._weigh = weigh
         self._weight = 0
         self._closed = False
-        self._sentinel = object()
+        self._closed_event = asyncio.Event()
 
     @property
     def item_count(self) -> int:
-        return self._queue.qsize() - (
-            1 if self._closed and not self._queue.empty() else 0
-        )
+        return self._queue.qsize()
 
     @property
     def weight(self) -> int:
@@ -58,22 +56,41 @@ class BoundedAsyncQueue(Generic[T]):
         self._weight += weight
 
     async def get(self) -> T:
-        item = await self._queue.get()
-        if item is self._sentinel:
-            self._queue.task_done()
-            raise QueueClosed("realtime queue is closed")
-        typed_item = item  # keep the narrowing explicit for type checkers
-        weight = self._weigh(typed_item)  # type: ignore[arg-type]
-        self._weight -= weight
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                if self._closed:
+                    raise QueueClosed("realtime queue is closed") from None
+            else:
+                return self._finish_get(item)
+
+            item_available = asyncio.create_task(self._queue.get())
+            queue_closed = asyncio.create_task(self._closed_event.wait())
+            try:
+                await asyncio.wait(
+                    {item_available, queue_closed},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if item_available.done():
+                    return self._finish_get(item_available.result())
+            finally:
+                for task in (item_available, queue_closed):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    item_available,
+                    queue_closed,
+                    return_exceptions=True,
+                )
+
+    def _finish_get(self, item: T) -> T:
+        self._weight -= self._weigh(item)
         self._queue.task_done()
-        return typed_item  # type: ignore[return-value]
+        return item
 
     def close(self) -> None:
         if self._closed:
             return
-        if self._queue.full():
-            raise QueueCapacityExceeded(
-                "cannot close a full realtime queue before it is drained"
-            )
         self._closed = True
-        self._queue.put_nowait(self._sentinel)
+        self._closed_event.set()

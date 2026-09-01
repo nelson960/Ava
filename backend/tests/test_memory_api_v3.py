@@ -165,8 +165,8 @@ async def test_readiness_checks_configured_authoritative_memory() -> None:
     payload = response.json()
     assert payload["status"] == "ready"
     assert payload["protocolVersion"] == 3
-    assert payload["promptVersion"] == "ava-realtime-v4.8"
-    assert payload["toolContractVersion"] == "ava-realtime-tools-v4.5"
+    assert payload["promptVersion"] == "ava-realtime-v4.9"
+    assert payload["toolContractVersion"] == "ava-realtime-tools-v4.6"
     assert payload["canvasSpecialistVersion"] == "ava-svg-canvas-vnext-2"
     assert payload["build"]["version"] == "0.1.0"
     assert payload["build"]["instanceId"].startswith("instance-")

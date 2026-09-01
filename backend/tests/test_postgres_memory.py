@@ -536,6 +536,67 @@ async def test_postgres_search_rejects_non_lexical_queries_before_sql(
         await store.close()
 
 
+async def test_postgres_episode_search_excerpt_contains_late_matching_line() -> None:
+    assert TEST_DATABASE_URL is not None
+    store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
+    subject = f"test:{uuid4()}"
+    now = datetime.now(UTC)
+    digest_lines = [
+        (
+            "Late cobalt nebula wisps were discussed with Ava."
+            if index == 25
+            else f"Earlier ordinary astronomy topic {index} " + "x" * 90
+        )
+        for index in range(1, 33)
+    ]
+    digest = "\n".join(digest_lines)
+    assert "cobalt" not in digest[:1_200]
+    connection = await AsyncConnection.connect(TEST_DATABASE_URL, autocommit=True)
+    await store.open()
+    try:
+        await connection.execute(
+            "insert into ava_private.memory_state (subject) values (%s)",
+            (subject,),
+        )
+        await connection.execute(
+            """
+            insert into ava_private.conversation_episodes (
+              subject, episode_id, started_at, ended_at, timezone_id,
+              digest, source_turn_ids, source_event_count, created_at
+            ) values (%s, 'episode-late-match', %s, %s, 'UTC', %s, %s, 32, %s)
+            """,
+            (
+                subject,
+                now - timedelta(hours=1),
+                now,
+                digest,
+                [f"turn-late-{index}" for index in range(1, 33)],
+                now,
+            ),
+        )
+
+        candidates = await store.search_memory_candidates(
+            subject=subject,
+            query="cobalt nebula",
+        )
+
+        assert len(candidates) == 1
+        assert candidates[0].source_kind == "episode"
+        assert "cobalt nebula" in candidates[0].reference_text.casefold()
+        assert len(candidates[0].reference_text) <= 1_200
+        assert candidates[0].source_turn_ids[-1] == "turn-late-32"
+        assert candidates[0].started_at == now - timedelta(hours=1)
+        assert candidates[0].ended_at == now
+        assert "<b>" not in candidates[0].reference_text
+    finally:
+        await connection.execute(
+            "delete from ava_private.memory_state where subject = %s",
+            (subject,),
+        )
+        await connection.close()
+        await store.close()
+
+
 async def test_postgres_episode_insert_failure_rolls_back_new_raw_event() -> None:
     assert TEST_DATABASE_URL is not None
     store = _FailingEpisodeInsertPostgresStore(TEST_DATABASE_URL)

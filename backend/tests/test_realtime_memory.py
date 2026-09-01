@@ -184,6 +184,59 @@ async def test_raw_retention_compacts_only_above_high_water_into_episodes() -> N
     assert snapshot.current_session_summary is None
 
 
+async def test_episode_search_returns_late_matching_semantic_line() -> None:
+    store = DevelopmentAuthoritativeMemoryStore()
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    source_events = tuple(
+        StoredDeliveredConversationEvent(
+            occurred_at=base + timedelta(minutes=index),
+            timezone_id="UTC",
+            turn=_turn(
+                turn_id=f"turn-excerpt-{index}",
+                child_text=(
+                    "The hidden late nebula has cobalt wisps."
+                    if index == 25
+                    else f"Earlier ordinary astronomy discussion {index} " + "x" * 90
+                ),
+                delivered_text=f"Ava astronomy response {index} " + "y" * 90,
+            ).model_copy(
+                update={
+                    "child_turn_summary": (
+                        "Discussed cobalt nebula wisps."
+                        if index == 25
+                        else f"Earlier topic {index}."
+                    )
+                }
+            ),
+        )
+        for index in range(1, 33)
+    )
+    episode = build_conversation_episodes(
+        subject="child:excerpt",
+        source_events=source_events,
+        created_at=base + timedelta(hours=1),
+    )[0]
+    assert len(episode.digest[:1_200]) == 1_200
+    assert "cobalt" not in episode.digest[:1_200]
+    store._episodes["child:excerpt"].append(episode)
+
+    candidates = await store.search_memory_candidates(
+        subject="child:excerpt",
+        query="cobalt nebula",
+    )
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.source_kind == "episode"
+    assert "cobalt nebula" in candidate.reference_text.casefold()
+    assert len(candidate.reference_text) <= 1_200
+    assert candidate.source_turn_ids == list(episode.source_turn_ids)
+    assert candidate.started_at == episode.started_at
+    assert candidate.ended_at == episode.ended_at
+    assert "turn=" not in candidate.reference_text
+    assert "timezone=" not in candidate.reference_text
+
+
 def test_episode_identity_is_deterministic_for_exact_ordered_source_batch() -> None:
     ordered = ("turn-1", "turn-2", "turn-3")
     assert conversation_episode_id(ordered) == conversation_episode_id(ordered)

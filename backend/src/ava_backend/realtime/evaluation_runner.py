@@ -10,6 +10,7 @@ from typing import Annotated, Mapping
 from pydantic import Field, StringConstraints, model_validator
 
 from .common import NonEmptyText, RealtimeProtocolModel
+from .context_assembler import DynamicContextAssembler, DynamicContextBuildReason
 from .harness import build_realtime_harness
 from .personality_evaluation import (
     PersonalityEvalCandidate,
@@ -121,8 +122,18 @@ def run_personality_evaluation(
     case_reports: list[PersonalityCaseReport] = []
     failure_counts: Counter[str] = Counter()
     harness_fingerprints: set[str] = set()
+    assembler = DynamicContextAssembler()
     for case in suite.cases:
-        harness = build_realtime_harness(memory_snapshot_for_case(case))
+        snapshot = memory_snapshot_for_case(case)
+        dynamic_context = assembler.assemble(
+            build_id="ctx-1",
+            reason=DynamicContextBuildReason.SESSION_BOOTSTRAP,
+            age_band=snapshot.age_band,
+            timezone_id="UTC",
+            current_time_utc=generated_at,
+            bootstrap_turns=tuple(snapshot.delivered_turns),
+        )
+        harness = build_realtime_harness(dynamic_context=dynamic_context)
         harness_fingerprints.add(_harness_fingerprint(harness))
         result = evaluate_personality_candidate(case, candidates[case.id])
         for failure in result.failures:
@@ -210,7 +221,7 @@ def _harness_fingerprint(harness: object) -> str:
         {
             "promptVersion": harness.prompt_version,
             "instructions": harness.instructions.split(
-                "<ava_runtime_context",
+                "<ava_dynamic_context",
                 maxsplit=1,
             )[0],
             "tools": list(harness.tools),

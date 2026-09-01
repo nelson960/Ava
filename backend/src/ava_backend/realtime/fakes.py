@@ -16,6 +16,7 @@ from .plan import AvaTurnPlan
 from .speech_contract import SpeechAlignment, SpeechPhrase
 from .provider_session import (
     NegotiatedRealtimeCall,
+    RealtimeContextInstallationStatus,
     RealtimeProviderInputEvent,
     RealtimeProviderTurnEvent,
     validate_sdp,
@@ -28,6 +29,7 @@ from .tool_contract import (
     RealtimeCancelCanvasToolCall,
     RealtimeCanvasToolCall,
     RealtimeRejectedCanvasToolCall,
+    RealtimeUtilityToolOutputV4,
     RealtimeSpeechTextDelta,
 )
 
@@ -150,6 +152,7 @@ class DeterministicRealtimePlanProvider:
                 | InteractiveCanvasCancellationToolOutputV4
             )
         ] = []
+        self.completed_utility_outputs: list[RealtimeUtilityToolOutputV4] = []
         self.canvas_interaction_response_turn_ids: list[str] = []
         self.canvas_interaction_response_interactions: list[
             RecordedSvgCanvasInteraction
@@ -158,7 +161,11 @@ class DeterministicRealtimePlanProvider:
         self.turn_stream_started = asyncio.Event()
         self._canvas_interaction_response_requested = asyncio.Event()
         self._interaction_response_readiness_changed = asyncio.Event()
+        self._readiness_transition_lock = asyncio.Lock()
         self._active_turn_id: str | None = None
+        self._active_response_turn_id: str | None = None
+        self._settled_turn_ids: set[str] = set()
+        self._installed_context_build_id: str | None = None
         self._pending_call_id: str | None = None
         self._input_events: asyncio.Queue[RealtimeProviderInputEvent] = asyncio.Queue()
         self._input_item_turn_ids: dict[str, str | None] = {}
@@ -191,30 +198,83 @@ class DeterministicRealtimePlanProvider:
             )
         )
         self._canvas_interaction_response_requested.clear()
+        self._settled_turn_ids.discard(turn_id)
         self._active_turn_id = turn_id
         self._interaction_response_readiness_changed.set()
 
         async def _owned_stream() -> AsyncIterator[RealtimeProviderTurnEvent]:
+            response_completed = False
             try:
                 async for event in self._stream():
+                    if self._active_response_turn_id is None:
+                        # Expose the same idle turn boundary production uses for
+                        # a pending session.update before response.created.
+                        idle_boundary: asyncio.Future[None] = (
+                            asyncio.get_running_loop().create_future()
+                        )
+                        asyncio.get_running_loop().call_soon(
+                            idle_boundary.set_result,
+                            None,
+                        )
+                        await idle_boundary
+                        async with self._readiness_transition_lock:
+                            self._active_response_turn_id = turn_id
+                            self._interaction_response_readiness_changed.set()
                     yield event
+                response_completed = True
             finally:
-                if self._active_turn_id == turn_id:
+                if response_completed and self._active_turn_id == turn_id:
+                    self._settled_turn_ids.add(turn_id)
                     self._active_turn_id = None
+                    self._active_response_turn_id = None
                     self._interaction_response_readiness_changed.set()
 
         return _owned_stream()
 
-    async def prepare(self, *, harness: RealtimeHarness) -> None:
+    @property
+    def active_context_build_id(self) -> str | None:
+        return self._installed_context_build_id
+
+    async def prepare(
+        self,
+        *,
+        harness: RealtimeHarness,
+    ) -> RealtimeContextInstallationStatus:
         if self.closed:
             raise RuntimeError("fake Realtime provider session is closed")
         update = harness.session_update()
+        deduplicated = (
+            bool(self.prepared_session_updates)
+            and self.prepared_session_updates[-1] == update
+        )
         if (
             not self.prepared_session_updates
             or self.prepared_session_updates[-1] != update
         ):
             self.prepared_session_updates.append(update)
         await asyncio.sleep(0)
+        self._installed_context_build_id = harness.context.build_id
+        return (
+            RealtimeContextInstallationStatus.DEDUPLICATED
+            if deduplicated
+            else RealtimeContextInstallationStatus.INSTALLED
+        )
+
+    async def prepare_if_idle(
+        self,
+        *,
+        harness: RealtimeHarness,
+        turn_id: str,
+    ) -> RealtimeContextInstallationStatus | None:
+        async with self._readiness_transition_lock:
+            if self._canvas_interaction_response_readiness(turn_id) is not None:
+                return None
+            previous_build_id = self._installed_context_build_id
+            status = await self.prepare(harness=harness)
+            if self._canvas_interaction_response_readiness(turn_id) is None:
+                return status
+            self._installed_context_build_id = previous_build_id
+            return None
 
     async def child_transcript(self, *, turn_id: str) -> str | None:
         if not turn_id:
@@ -259,6 +319,7 @@ class DeterministicRealtimePlanProvider:
         if owner_turn_id is not None and existing != owner_turn_id:
             raise ValueError("fake provider input item changed turn ownership")
         self._input_events.put_nowait(event)
+        self._interaction_response_readiness_changed.set()
 
     async def admit_pending_input_items(self, *, turn_id: str) -> tuple[str, ...]:
         if not turn_id:
@@ -306,6 +367,7 @@ class DeterministicRealtimePlanProvider:
                 if not self.completed_canvas_outputs:
                     raise RuntimeError("fake canvas tool call was not completed")
                 self._pending_call_id = None
+                self._interaction_response_readiness_changed.set()
 
     async def complete_canvas_tool(
         self,
@@ -325,6 +387,20 @@ class DeterministicRealtimePlanProvider:
         self.completed_canvas_outputs.append(output)
         await asyncio.sleep(0)
 
+    async def complete_utility_tool(
+        self,
+        *,
+        turn_id: str,
+        call_id: str,
+        output: RealtimeUtilityToolOutputV4,
+        harness: RealtimeHarness,
+    ) -> None:
+        del harness
+        if not turn_id or not call_id:
+            raise ValueError("utility completion requires turn and call identity")
+        self.completed_utility_outputs.append(output)
+        await asyncio.sleep(0)
+
     async def request_canvas_interaction_response(
         self,
         *,
@@ -333,10 +409,7 @@ class DeterministicRealtimePlanProvider:
     ) -> bool:
         if not turn_id:
             raise ValueError("turn_id cannot be empty")
-        if (
-            self._active_turn_id != turn_id
-            or self._canvas_interaction_response_requested.is_set()
-        ):
+        if self._canvas_interaction_response_readiness(turn_id) is not None:
             return False
         self.canvas_interaction_response_turn_ids.append(turn_id)
         self.canvas_interaction_response_interactions.append(interaction)
@@ -351,6 +424,25 @@ class DeterministicRealtimePlanProvider:
         self._interaction_response_readiness_changed.set()
         return True
 
+    def _canvas_interaction_response_readiness(self, turn_id: str) -> str | None:
+        if self.closed:
+            return "providerClosed"
+        if turn_id in self.cancelled_turn_ids or turn_id in self._settled_turn_ids:
+            return "turnSettledOrCancelled"
+        if self._active_turn_id != turn_id:
+            return "turnMismatch"
+        if any(owner is None for owner in self._input_item_turn_ids.values()):
+            return "unresolvedInputOwner"
+        if any(owner == turn_id for owner in self._input_item_turn_ids.values()):
+            return "turnAlreadyOwnsInput"
+        if self._active_response_turn_id is not None:
+            return "activeResponse"
+        if self._pending_call_id is not None:
+            return "pendingCanvasCall"
+        if self._canvas_interaction_response_requested.is_set():
+            return "responseAlreadyRequested"
+        return None
+
     async def wait_until_canvas_interaction_response_ready(
         self,
         *,
@@ -358,20 +450,19 @@ class DeterministicRealtimePlanProvider:
     ) -> bool:
         if not turn_id:
             raise ValueError("turn_id cannot be empty")
-        while not self.closed and turn_id not in self.cancelled_turn_ids:
-            if (
-                self._active_turn_id == turn_id
-                and not self._canvas_interaction_response_requested.is_set()
-            ):
+        while True:
+            readiness = self._canvas_interaction_response_readiness(turn_id)
+            if readiness is None:
                 return True
+            if readiness in {"providerClosed", "turnSettledOrCancelled"}:
+                return False
             self._interaction_response_readiness_changed.clear()
-            if (
-                self._active_turn_id == turn_id
-                and not self._canvas_interaction_response_requested.is_set()
-            ):
+            readiness = self._canvas_interaction_response_readiness(turn_id)
+            if readiness is None:
                 return True
+            if readiness in {"providerClosed", "turnSettledOrCancelled"}:
+                return False
             await self._interaction_response_readiness_changed.wait()
-        return False
 
     async def cancel(self, *, turn_id: str) -> None:
         if turn_id not in self.cancelled_turn_ids:

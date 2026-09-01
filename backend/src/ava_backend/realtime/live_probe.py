@@ -6,6 +6,7 @@ import hashlib
 import json
 import sys
 from dataclasses import asdict
+from datetime import UTC, datetime
 from uuid import uuid4
 
 from ..config import BackendConfigurationError, Settings
@@ -15,6 +16,7 @@ from ..providers.openai_realtime_provider import (
     OpenAIRealtimeOutputValidationError,
 )
 from .harness import build_realtime_harness
+from .context_assembler import DynamicContextAssembler, DynamicContextBuildReason
 from .memory import AuthoritativeMemorySnapshot
 
 
@@ -72,15 +74,23 @@ async def _run(arguments: argparse.Namespace) -> int:
         )
 
     age_band = AgeBand(arguments.age_band)
+    snapshot = AuthoritativeMemorySnapshot.model_validate(
+        {
+            "ageBand": age_band,
+            "resetRevision": 0,
+            "currentSessionSummary": None,
+            "deliveredTurns": [],
+            "stableMemories": [],
+        }
+    )
     harness = build_realtime_harness(
-        AuthoritativeMemorySnapshot.model_validate(
-            {
-                "ageBand": age_band,
-                "resetRevision": 0,
-                "currentSessionSummary": None,
-                "deliveredTurns": [],
-                "stableMemories": [],
-            }
+        dynamic_context=DynamicContextAssembler().assemble(
+            build_id="ctx-1",
+            reason=DynamicContextBuildReason.SESSION_BOOTSTRAP,
+            age_band=snapshot.age_band,
+            timezone_id="UTC",
+            current_time_utc=datetime.now(UTC),
+            bootstrap_turns=tuple(snapshot.delivered_turns),
         )
     )
     probe = OpenAIRealtimeLiveProbe(

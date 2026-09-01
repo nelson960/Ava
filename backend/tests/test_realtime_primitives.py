@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import random
 
 import pytest
@@ -105,6 +106,66 @@ async def test_bounded_queue_capacity_and_close_are_deterministic() -> None:
         queue.put_nowait(b"e")
     assert await queue.get() == b"ab"
     queue.close()
+    queue.close()
+    with pytest.raises(QueueClosed, match="cannot write"):
+        queue.put_nowait(b"e")
     assert await queue.get() == b"cd"
+    assert queue.item_count == 0
+    assert queue.weight == 0
     with pytest.raises(QueueClosed):
         await queue.get()
+
+
+@pytest.mark.asyncio
+async def test_bounded_queue_close_wakes_an_already_blocked_getter() -> None:
+    queue: BoundedAsyncQueue[bytes] = BoundedAsyncQueue(
+        max_items=2,
+        max_weight=4,
+        weigh=len,
+    )
+    getter_started = asyncio.Event()
+
+    async def get_blocked() -> bytes:
+        getter_started.set()
+        return await queue.get()
+
+    getter = asyncio.create_task(get_blocked())
+    await getter_started.wait()
+    checkpoint = asyncio.get_running_loop().create_future()
+    asyncio.get_running_loop().call_soon(checkpoint.set_result, None)
+    await checkpoint
+    assert not getter.done()
+
+    queue.close()
+
+    with pytest.raises(QueueClosed, match="closed"):
+        await asyncio.wait_for(getter, timeout=0.5)
+
+
+@pytest.mark.asyncio
+async def test_bounded_queue_full_close_drains_items_before_closed() -> None:
+    queue: BoundedAsyncQueue[bytes] = BoundedAsyncQueue(
+        max_items=2,
+        max_weight=4,
+        weigh=len,
+    )
+    queue.put_nowait(b"a")
+    queue.put_nowait(b"bcd")
+    assert queue.item_count == 2
+    assert queue.weight == 4
+
+    queue.close()
+    queue.close()
+
+    assert queue.item_count == 2
+    assert queue.weight == 4
+    assert await queue.get() == b"a"
+    assert queue.item_count == 1
+    assert queue.weight == 3
+    assert await queue.get() == b"bcd"
+    assert queue.item_count == 0
+    assert queue.weight == 0
+    with pytest.raises(QueueClosed, match="closed"):
+        await queue.get()
+    with pytest.raises(QueueClosed, match="cannot write"):
+        queue.put_nowait(b"x")

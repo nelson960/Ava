@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import UTC, datetime
 import json
 from pathlib import Path
 
 import pytest
 
+from ava_backend.realtime.context_assembler import (
+    DynamicContextAssembler,
+    DynamicContextBuildReason,
+)
 from ava_backend.realtime.harness import (
     REALTIME_PROMPT_VERSION,
     build_realtime_harness,
@@ -86,7 +91,16 @@ def test_every_eval_case_builds_a_strict_privacy_bounded_harness() -> None:
 
     for case in suite.cases:
         snapshot = memory_snapshot_for_case(case)
-        harness = build_realtime_harness(snapshot)
+        harness = build_realtime_harness(
+            dynamic_context=DynamicContextAssembler().assemble(
+                build_id="ctx-1",
+                reason=DynamicContextBuildReason.SESSION_BOOTSTRAP,
+                age_band=snapshot.age_band,
+                timezone_id="UTC",
+                current_time_utc=datetime(2026, 8, 31, tzinfo=UTC),
+                bootstrap_turns=tuple(snapshot.delivered_turns),
+            )
+        )
         assert harness.prompt_version == suite.prompt_version
         assert harness.tool_choice == "auto"
         assert "date_of_birth" not in harness.context.content

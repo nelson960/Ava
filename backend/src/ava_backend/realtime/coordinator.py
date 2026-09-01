@@ -3,16 +3,23 @@ from __future__ import annotations
 import asyncio
 import logging
 from builtins import anext
+from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from time import monotonic
 from typing import TypeAlias, TypeVar, cast
+from zoneinfo import ZoneInfo
 
 from ..canvas.svg_workspace import RecordedSvgCanvasInteraction
 from ..diagnostics import new_failure_id
 from ..protocol import AgeBand
 from .bounded_queue import BoundedAsyncQueue, QueueClosed
+from .context_assembler import (
+    DynamicContextAssembler,
+    DynamicContextBuildReason,
+    MemoryReference,
+)
 from .coordinator_v4 import ProtocolV4CanvasEventSink
 from .delivery import (
     DeliveredTextLedger,
@@ -50,12 +57,16 @@ from .memory import (
     ChildTurnTextSource,
     DeliveredCanvasInteraction,
     DeliveredConversationTurn,
+    DeliveredInputKind,
     DeliveredTurnTerminal,
     MemoryResetRevisionMismatchError,
     MemoryProposalDecision,
+    MemorySearchCandidate,
+    MemoryCandidateSourceKind,
 )
 from .provider_session import (
     NegotiatedRealtimeCall,
+    RealtimeContextInstallationStatus,
     RealtimeProviderInputEvent,
     RealtimeProviderProtocolError,
     RealtimeProviderResponseIncompleteError,
@@ -77,6 +88,15 @@ from .tool_contract import (
     InteractiveCanvasCancellationToolOutputV4,
     InteractiveCanvasToolOutputV4,
     InteractiveCanvasToolStatusV4,
+    GetCurrentTimeToolOutputV4,
+    RealtimeGetCurrentTimeToolCall,
+    RealtimeRejectedUtilityToolCall,
+    RealtimeSearchMemoryToolCall,
+    RealtimeUtilityToolKind,
+    RejectedUtilityToolOutputV4,
+    SearchMemoryReferenceV4,
+    SearchMemoryToolOutputV4,
+    SearchMemoryToolStatus,
     RealtimeCancelCanvasToolCall,
     RealtimeCanvasToolCall,
     RealtimeRejectedCanvasToolCall,
@@ -91,6 +111,7 @@ from .websocket_v4 import (
 )
 
 LOGGER = logging.getLogger("ava_backend.realtime_coordinator")
+RECENT_LIVE_ECHO_SUPPRESSION_TURNS = 8
 
 
 class CoordinatorStateError(RuntimeError):
@@ -112,6 +133,9 @@ class _PlanningState:
     canvas_call_id: str | None = None
     canvas_generation_id: str | None = None
     first_text_delta_at: float | None = None
+    tool_steps_used: int = 0
+    utility_tool_kind: RealtimeUtilityToolKind | None = None
+    canvas_terminal_used: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +159,7 @@ class _CapturedMemoryCommit:
     delivered_sample_count: int
     terminal: DeliveredTurnTerminal
     transcript_waiter: Awaitable[str | None] | None
+    warm_refresh_revision: int
 
 
 class DeterministicRealtimeSessionCoordinator:
@@ -168,6 +193,8 @@ class DeterministicRealtimeSessionCoordinator:
         failure_id_factory: IdentifierFactory = new_failure_id,
         occurrence_time_factory: OccurrenceTimeFactory = _utc_now,
         memory_commit_drain_timeout_seconds: float = 2.0,
+        context_assembler: DynamicContextAssembler | None = None,
+        current_time_factory: OccurrenceTimeFactory = _utc_now,
     ) -> None:
         if not 2_048 <= max_audio_chunk_bytes <= 192_000:
             raise ValueError("max_audio_chunk_bytes must be between 2048 and 192000")
@@ -198,6 +225,8 @@ class DeterministicRealtimeSessionCoordinator:
         self._failure_id_factory = failure_id_factory
         self._occurrence_time_factory = occurrence_time_factory
         self._memory_commit_drain_timeout_seconds = memory_commit_drain_timeout_seconds
+        self._context_assembler = context_assembler or DynamicContextAssembler()
+        self._current_time_factory = current_time_factory
         if persistent and (
             turn_id_factory is None
             or request_id_factory is None
@@ -217,6 +246,15 @@ class DeterministicRealtimeSessionCoordinator:
         self._memory_snapshot: AuthoritativeMemorySnapshot | None = None
         self._memory_reset_revision: int | None = None
         self._harness: RealtimeHarness | None = None
+        self._pending_harness: RealtimeHarness | None = None
+        self._pending_context_reason: DynamicContextBuildReason | None = None
+        self._context_installation_task: asyncio.Task[None] | None = None
+        self._warm_memories: tuple[MemoryReference, ...] = ()
+        self._warm_refresh_revision = 0
+        self._context_build_sequence = 0
+        self._recent_live_echo_suppression_turn_ids: deque[str] = deque(
+            maxlen=RECENT_LIVE_ECHO_SUPPRESSION_TURNS
+        )
         self._negotiated_call: NegotiatedRealtimeCall | None = None
         self._sequence = 0
         self._revision = 0
@@ -296,6 +334,28 @@ class DeterministicRealtimeSessionCoordinator:
             raise CoordinatorStateError("Realtime media has not been negotiated")
         return self._negotiated_call
 
+    async def memory_reset(self, *, reset_revision: int) -> None:
+        if (
+            isinstance(reset_revision, bool)
+            or not isinstance(reset_revision, int)
+            or reset_revision < 1
+        ):
+            raise ValueError("reset_revision must be a positive integer")
+        current = self._memory_reset_revision
+        if current is not None and reset_revision <= current:
+            return
+        self._memory_reset_revision = reset_revision
+        self._warm_refresh_revision += 1
+        self._warm_memories = ()
+        self._recent_live_echo_suppression_turn_ids.clear()
+        self._last_memory_decision = None
+        # Durable reset clears application memory projections. It does not mutate
+        # conversation items already resident in the provider's ephemeral call.
+        if self._harness is not None and not self._closed:
+            await self._refresh_canvas_context(
+                reason=DynamicContextBuildReason.MEMORY_COMPACTED
+            )
+
     async def negotiate(self, *, offer_sdp: str) -> NegotiatedRealtimeCall:
         if self._closed:
             raise CoordinatorStateError("cannot negotiate a closed coordinator")
@@ -322,9 +382,24 @@ class DeterministicRealtimeSessionCoordinator:
                 (monotonic() - memory_started) * 1000,
             )
             harness_started = monotonic()
-            harness = build_realtime_harness(
-                snapshot,
+            self._warm_memories = _stable_memory_references(snapshot)
+            bootstrap_current_time_utc = self._current_time_factory()
+            dynamic_context = self._context_assembler.assemble(
+                build_id=self._next_context_build_id(),
+                reason=DynamicContextBuildReason.SESSION_BOOTSTRAP,
+                age_band=self._age_band,
+                timezone_id=self._timezone_id,
+                current_time_utc=bootstrap_current_time_utc,
+                bootstrap_turns=tuple(snapshot.delivered_turns),
+                warm_memories=self._warm_memories,
                 canvas_context=self._current_canvas_context(),
+            )
+            harness = build_realtime_harness(
+                dynamic_context=dynamic_context,
+            )
+            self._log_dynamic_context_build(
+                DynamicContextBuildReason.SESSION_BOOTSTRAP,
+                harness,
             )
             LOGGER.info(
                 "realtime_stage session_id=%s request_id=%s stage=harness.build "
@@ -343,7 +418,23 @@ class DeterministicRealtimeSessionCoordinator:
                 (monotonic() - negotiation_started) * 1000,
             )
             prompt_started = monotonic()
-            await self._realtime.prepare(harness=harness)
+            try:
+                installation_status = await self._realtime.prepare(harness=harness)
+            except Exception as error:
+                self._log_context_installation(
+                    harness=harness,
+                    reason=DynamicContextBuildReason.SESSION_BOOTSTRAP,
+                    status="failed",
+                    provider_call_id=negotiated.provider_call_id,
+                    error_type=type(error).__name__,
+                )
+                raise
+            self._log_context_installation(
+                harness=harness,
+                reason=DynamicContextBuildReason.SESSION_BOOTSTRAP,
+                status=str(installation_status),
+                provider_call_id=negotiated.provider_call_id,
+            )
             LOGGER.info(
                 "realtime_stage session_id=%s request_id=%s stage=prompt.install "
                 "prompt_version=%s elapsed_ms=%.2f",
@@ -356,6 +447,15 @@ class DeterministicRealtimeSessionCoordinator:
             self._last_error = error
             raise
         self._harness = harness
+        bootstrap_speech_turn_ids = [
+            turn.turn_id
+            for turn in snapshot.delivered_turns
+            if turn.input_kind == DeliveredInputKind.SPEECH
+        ]
+        if dynamic_context.included_bootstrap_turns:
+            self._recent_live_echo_suppression_turn_ids.extend(
+                bootstrap_speech_turn_ids[-dynamic_context.included_bootstrap_turns :]
+            )
         self._negotiated_call = negotiated
         LOGGER.info(
             "realtime_session_prepared session_id=%s timezone_id=%s "
@@ -1350,6 +1450,7 @@ class DeterministicRealtimeSessionCoordinator:
         self._last_failure_id = None
         self._last_failure_component = None
         self._last_error = None
+        self._ensure_pending_context_installation(replace=True)
         if self._latest_canvas_interaction_intent is not None:
             self._canvas_interaction_response_wakeup.set()
         LOGGER.info(
@@ -1363,7 +1464,11 @@ class DeterministicRealtimeSessionCoordinator:
             (monotonic() - rearm_started) * 1000,
         )
 
-    async def _refresh_canvas_context(self) -> None:
+    async def _refresh_canvas_context(
+        self,
+        *,
+        reason: DynamicContextBuildReason = DynamicContextBuildReason.CANVAS_ACTIVATED,
+    ) -> None:
         """Install canonical semantic canvas context for the next response.
 
         This is a session update only. The validated-interaction caller may
@@ -1371,31 +1476,245 @@ class DeterministicRealtimeSessionCoordinator:
         """
 
         async with self._canvas_context_lock:
-            snapshot = self._memory_snapshot
-            if snapshot is None or self._harness is None:
+            if self._memory_snapshot is None or self._harness is None:
                 raise CoordinatorStateError(
                     "canvas context cannot refresh before session negotiation"
                 )
-            harness = build_realtime_harness(
-                snapshot,
-                canvas_context=self._current_canvas_context(),
+            harness = self._build_live_harness(reason=reason)
+            self._pending_harness = harness
+            self._pending_context_reason = reason
+            try:
+                installation_status = await self._realtime.prepare_if_idle(
+                    harness=harness,
+                    turn_id=self._turn_id,
+                )
+            except Exception as error:
+                self._log_context_installation(
+                    harness=harness,
+                    reason=reason,
+                    status="failed",
+                    error_type=type(error).__name__,
+                )
+                raise
+            if installation_status is not None:
+                self._harness = harness
+                self._pending_harness = None
+                self._pending_context_reason = None
+            else:
+                self._ensure_pending_context_installation()
+            self._log_context_installation(
+                harness=harness,
+                reason=reason,
+                status=(
+                    str(installation_status)
+                    if installation_status is not None
+                    else "deferred"
+                ),
             )
-            await self._realtime.prepare(harness=harness)
-            self._harness = harness
-            interaction = self._canvas_jobs.state.last_interaction
-            LOGGER.info(
-                "canvas_interaction_context_installed session_id=%s scene_id=%s "
-                "scene_revision=%s interaction_revision=%s binding_id=%s",
-                self._session_id,
-                interaction.scene_id if interaction is not None else None,
-                interaction.scene_revision if interaction is not None else None,
-                interaction.interaction_revision if interaction is not None else None,
-                interaction.binding_id if interaction is not None else None,
-            )
+
+    def _build_live_harness(
+        self,
+        *,
+        reason: DynamicContextBuildReason,
+    ) -> RealtimeHarness:
+        dynamic_context = self._context_assembler.assemble(
+            build_id=self._next_context_build_id(),
+            reason=reason,
+            age_band=self._age_band,
+            timezone_id=self._timezone_id,
+            current_time_utc=self._current_time_factory(),
+            bootstrap_turns=(),
+            warm_memories=self._warm_memories,
+            canvas_context=self._current_canvas_context(),
+        )
+        harness = build_realtime_harness(dynamic_context=dynamic_context)
+        self._log_dynamic_context_build(reason, harness)
+        return harness
+
+    def _log_dynamic_context_build(
+        self,
+        reason: DynamicContextBuildReason,
+        harness: RealtimeHarness,
+    ) -> None:
+        context = harness.context
+        LOGGER.info(
+            "realtime_dynamic_context_built session_id=%s reason=%s "
+            "context_build_id=%s final_utf8_bytes=%d estimated_tokens=%d "
+            "bootstrap_turn_count=%d warm_reference_count=%d "
+            "canvas_included=%s included_references=%d omitted_references=%d",
+            self._session_id,
+            reason,
+            context.build_id,
+            context.final_utf8_bytes,
+            context.estimated_dynamic_tokens,
+            context.included_bootstrap_turns,
+            context.included_memory_references,
+            context.canvas_included,
+            context.included_memory_references,
+            context.omitted_memory_references,
+            extra={
+                "ava_context": {
+                    "sessionId": self._session_id,
+                    "reason": str(reason),
+                    "contextBuildId": context.build_id,
+                    "finalUtf8Bytes": context.final_utf8_bytes,
+                    "estimatedTokens": context.estimated_dynamic_tokens,
+                    "bootstrapTurnCount": context.included_bootstrap_turns,
+                    "warmReferenceCount": context.included_memory_references,
+                    "canvasIncluded": context.canvas_included,
+                    "includedReferenceCount": context.included_memory_references,
+                    "omittedReferenceCount": context.omitted_memory_references,
+                }
+            },
+        )
+
+    def _next_context_build_id(self) -> str:
+        self._context_build_sequence += 1
+        return f"ctx-{self._context_build_sequence}"
+
+    def _log_context_installation(
+        self,
+        *,
+        harness: RealtimeHarness,
+        reason: DynamicContextBuildReason,
+        status: str,
+        provider_call_id: str | None = None,
+        error_type: str | None = None,
+    ) -> None:
+        resolved_provider_call_id = provider_call_id
+        if resolved_provider_call_id is None and self._negotiated_call is not None:
+            resolved_provider_call_id = self._negotiated_call.provider_call_id
+        interaction = self._canvas_jobs.state.last_interaction
+        LOGGER.info(
+            "realtime_context_installation session_id=%s reason=%s status=%s "
+            "context_build_id=%s provider_call_id=%s scene_id=%s "
+            "scene_revision=%s interaction_revision=%s binding_id=%s "
+            "error_type=%s",
+            self._session_id,
+            reason,
+            status,
+            harness.context.build_id,
+            resolved_provider_call_id,
+            interaction.scene_id if interaction is not None else None,
+            interaction.scene_revision if interaction is not None else None,
+            interaction.interaction_revision if interaction is not None else None,
+            interaction.binding_id if interaction is not None else None,
+            error_type,
+            extra={
+                "ava_context": {
+                    "sessionId": self._session_id,
+                    "reason": str(reason),
+                    "status": status,
+                    "contextBuildId": harness.context.build_id,
+                    "providerCallId": resolved_provider_call_id,
+                    "sceneId": interaction.scene_id if interaction else None,
+                    "sceneRevision": (
+                        interaction.scene_revision if interaction else None
+                    ),
+                    "interactionRevision": (
+                        interaction.interaction_revision if interaction else None
+                    ),
+                    "bindingId": interaction.binding_id if interaction else None,
+                    "errorType": error_type,
+                }
+            },
+        )
 
     def _current_canvas_context(self) -> str | None:
         context = self._canvas_jobs.render_realtime_context()
         return context or None
+
+    async def _install_pending_context_if_idle(
+        self,
+        *,
+        turn_id: str,
+    ) -> tuple[
+        bool,
+        RealtimeContextInstallationStatus | None,
+        RealtimeHarness | None,
+        DynamicContextBuildReason | None,
+    ]:
+        async with self._canvas_context_lock:
+            harness = self._pending_harness
+            reason = self._pending_context_reason
+            if harness is None:
+                return True, None, None, None
+            try:
+                installation_status = await self._realtime.prepare_if_idle(
+                    harness=harness,
+                    turn_id=turn_id,
+                )
+            except Exception as error:
+                self._log_context_installation(
+                    harness=harness,
+                    reason=reason or DynamicContextBuildReason.CANVAS_ACTIVATED,
+                    status="failed",
+                    error_type=type(error).__name__,
+                )
+                raise
+            if installation_status is not None:
+                self._harness = harness
+                self._pending_harness = None
+                self._pending_context_reason = None
+            return (
+                installation_status is not None,
+                installation_status,
+                harness,
+                reason,
+            )
+
+    def _ensure_pending_context_installation(self, *, replace: bool = False) -> None:
+        if self._closed or self._pending_harness is None:
+            return
+        existing = self._context_installation_task
+        if existing is not None and not existing.done():
+            if not replace:
+                return
+            existing.cancel()
+        turn_id = self._turn_id
+        task = asyncio.create_task(
+            self._run_pending_context_installation(turn_id=turn_id),
+            name=f"ava-context-install-{turn_id}",
+        )
+        self._context_installation_task = task
+
+    async def _run_pending_context_installation(self, *, turn_id: str) -> None:
+        task = asyncio.current_task()
+        try:
+            ready = await self._realtime.wait_until_canvas_interaction_response_ready(
+                turn_id=turn_id
+            )
+            if not ready or self._closed or self._turn_id != turn_id:
+                return
+            (
+                _,
+                installation_status,
+                harness,
+                reason,
+            ) = await self._install_pending_context_if_idle(turn_id=turn_id)
+            if harness is not None:
+                self._log_context_installation(
+                    harness=harness,
+                    reason=reason or DynamicContextBuildReason.CANVAS_ACTIVATED,
+                    status=(
+                        str(installation_status)
+                        if installation_status is not None
+                        else "deferred"
+                    ),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            LOGGER.warning(
+                "realtime_context_installation_failed session_id=%s turn_id=%s "
+                "error_type=%s",
+                self._session_id,
+                turn_id,
+                type(error).__name__,
+            )
+        finally:
+            if self._context_installation_task is task:
+                self._context_installation_task = None
 
     def _ensure_canvas_interaction_response_worker(self) -> None:
         task = self._canvas_interaction_response_task
@@ -1415,13 +1734,24 @@ class DeterministicRealtimeSessionCoordinator:
                 if interaction is None:
                     break
                 try:
-                    await self._refresh_canvas_context()
+                    await self._refresh_canvas_context(
+                        reason=(DynamicContextBuildReason.CANVAS_INTERACTION_COMMITTED)
+                    )
                     if not self._is_latest_canvas_interaction(interaction):
                         continue
                     turn_id = await self._interaction_response_ready_turn(interaction)
                     if turn_id is None:
                         break
                     if not self._is_latest_canvas_interaction(interaction):
+                        continue
+                    installed, _, _, _ = await self._install_pending_context_if_idle(
+                        turn_id=turn_id
+                    )
+                    if not installed:
+                        if self._is_latest_canvas_interaction(interaction):
+                            await self._realtime.wait_until_canvas_interaction_response_ready(
+                                turn_id=turn_id
+                            )
                         continue
                     self._canvas_interaction_response_turn_id = turn_id
                     if self._turn_id != turn_id or self._terminal:
@@ -1566,14 +1896,39 @@ class DeterministicRealtimeSessionCoordinator:
                     for segment in parser.feed(event.delta):
                         await updates.put(segment)
                     continue
+                if isinstance(event, RealtimeRejectedUtilityToolCall):
+                    for segment in parser.finish_response_chunk():
+                        await updates.put(segment)
+                    self._claim_rejected_utility(event, state=state)
+                    await self._realtime.complete_utility_tool(
+                        turn_id=self._turn_id,
+                        call_id=event.call_id,
+                        output=RejectedUtilityToolOutputV4(reason=event.reason),
+                        harness=self.harness,
+                    )
+                    continue
+                if isinstance(event, RealtimeSearchMemoryToolCall):
+                    for segment in parser.finish_response_chunk():
+                        await updates.put(segment)
+                    self._claim_utility(
+                        RealtimeUtilityToolKind.SEARCH_MEMORY,
+                        state=state,
+                    )
+                    await self._run_search_memory_tool(event)
+                    continue
+                if isinstance(event, RealtimeGetCurrentTimeToolCall):
+                    for segment in parser.finish_response_chunk():
+                        await updates.put(segment)
+                    self._claim_utility(
+                        RealtimeUtilityToolKind.GET_CURRENT_TIME,
+                        state=state,
+                    )
+                    await self._run_get_current_time_tool(event)
+                    continue
                 if isinstance(event, RealtimeRejectedCanvasToolCall):
                     for segment in parser.finish_response_chunk():
                         await updates.put(segment)
-                    if state.canvas_call_id is not None:
-                        raise StreamingTurnParseError(
-                            "Realtime requested more than one canvas in one turn"
-                        )
-                    state.canvas_call_id = event.call_id
+                    self._claim_canvas(event.call_id, state=state)
                     self._canvas_status = "rejected"
                     LOGGER.warning(
                         "canvas_tool_arguments_rejected session_id=%s "
@@ -1602,11 +1957,7 @@ class DeterministicRealtimeSessionCoordinator:
                 if isinstance(event, RealtimeCancelCanvasToolCall):
                     for segment in parser.finish_response_chunk():
                         await updates.put(segment)
-                    if state.canvas_call_id is not None:
-                        raise StreamingTurnParseError(
-                            "Realtime requested more than one canvas action in one turn"
-                        )
-                    state.canvas_call_id = event.call_id
+                    self._claim_canvas(event.call_id, state=state)
                     await self._run_canvas_cancellation_tool(event, state=state)
                     continue
                 if not isinstance(event, RealtimeCanvasToolCall):
@@ -1615,11 +1966,7 @@ class DeterministicRealtimeSessionCoordinator:
                     )
                 for segment in parser.finish_response_chunk():
                     await updates.put(segment)
-                if state.canvas_call_id is not None:
-                    raise StreamingTurnParseError(
-                        "Realtime requested more than one canvas in one turn"
-                    )
-                state.canvas_call_id = event.call_id
+                self._claim_canvas(event.call_id, state=state)
                 await self._run_canvas_tool(event, state=state)
 
             if self._cancel_event is not None:
@@ -1646,6 +1993,177 @@ class DeterministicRealtimeSessionCoordinator:
             )
         finally:
             updates.put_nowait(None)
+
+    def _claim_utility(
+        self,
+        tool_kind: RealtimeUtilityToolKind,
+        *,
+        state: _PlanningState,
+    ) -> None:
+        if (
+            state.tool_steps_used != 0
+            or state.utility_tool_kind is not None
+            or state.canvas_terminal_used
+        ):
+            raise StreamingTurnParseError(
+                "Realtime utility tool violated the bounded turn chain"
+            )
+        state.tool_steps_used = 1
+        state.utility_tool_kind = tool_kind
+
+    def _claim_rejected_utility(
+        self,
+        call: RealtimeRejectedUtilityToolCall,
+        *,
+        state: _PlanningState,
+    ) -> None:
+        if state.canvas_terminal_used or state.tool_steps_used >= 2:
+            raise StreamingTurnParseError(
+                "Realtime rejected utility exceeded the bounded turn chain"
+            )
+        state.tool_steps_used += 1
+        if state.utility_tool_kind is None:
+            state.utility_tool_kind = call.tool_kind
+
+    def _claim_canvas(self, call_id: str, *, state: _PlanningState) -> None:
+        if (
+            state.canvas_terminal_used
+            or state.canvas_call_id is not None
+            or state.tool_steps_used >= 2
+        ):
+            raise StreamingTurnParseError(
+                "Realtime requested a canvas outside the bounded turn chain"
+            )
+        if state.tool_steps_used == 1 and state.utility_tool_kind is None:
+            raise StreamingTurnParseError(
+                "Realtime canvas continuation lost utility ownership"
+            )
+        state.canvas_call_id = call_id
+        state.canvas_terminal_used = True
+        state.tool_steps_used += 1
+
+    async def _run_search_memory_tool(
+        self,
+        call: RealtimeSearchMemoryToolCall,
+    ) -> None:
+        output: SearchMemoryToolOutputV4
+        candidates: list[MemorySearchCandidate] = []
+        try:
+            lower, upper = _local_date_search_bounds(
+                from_date=call.request.from_date,
+                to_date=call.request.to_date,
+                timezone_id=self._timezone_id,
+            )
+            candidates = await self._memory.search_memory_candidates(
+                subject=self._subject,
+                query=call.request.query,
+                limit=5,
+                from_instant=lower,
+                to_instant=upper,
+            )
+        except ValueError:
+            output = SearchMemoryToolOutputV4(
+                status=SearchMemoryToolStatus.REJECTED,
+                reason="The historical-memory query or date range was invalid.",
+            )
+        except Exception as error:
+            LOGGER.warning(
+                "realtime_semantic_tool_failed session_id=%s turn_id=%s "
+                "tool_kind=%s step=1 error_type=%s",
+                self._session_id,
+                self._turn_id,
+                RealtimeUtilityToolKind.SEARCH_MEMORY,
+                type(error).__name__,
+            )
+            output = SearchMemoryToolOutputV4(
+                status=SearchMemoryToolStatus.UNAVAILABLE,
+                reason="Historical memory is temporarily unavailable.",
+            )
+        else:
+            references = [_search_tool_reference(candidate) for candidate in candidates]
+            output = SearchMemoryToolOutputV4(
+                status=(
+                    SearchMemoryToolStatus.AVAILABLE
+                    if references
+                    else SearchMemoryToolStatus.NO_MATCHES
+                ),
+                references=references,
+            )
+        await self._realtime.complete_utility_tool(
+            turn_id=self._turn_id,
+            call_id=call.call_id,
+            output=output,
+            harness=self.harness,
+        )
+        result_source_kinds = [str(candidate.source_kind) for candidate in candidates]
+        result_source_ids = [candidate.source_id for candidate in candidates]
+        LOGGER.info(
+            "realtime_semantic_tool_completed session_id=%s turn_id=%s "
+            "tool_call_id=%s tool_kind=%s step=1 query_char_count=%d "
+            "has_from_date=%s has_to_date=%s raw_candidate_count=%d "
+            "result_count=%d result_source_kinds=%s result_source_ids=%s status=%s",
+            self._session_id,
+            self._turn_id,
+            call.call_id,
+            RealtimeUtilityToolKind.SEARCH_MEMORY,
+            len(call.request.query),
+            call.request.from_date is not None,
+            call.request.to_date is not None,
+            len(candidates),
+            len(output.references),
+            result_source_kinds,
+            result_source_ids,
+            output.status,
+            extra={
+                "ava_context": {
+                    "sessionId": self._session_id,
+                    "turnId": self._turn_id,
+                    "toolCallId": call.call_id,
+                    "toolKind": str(RealtimeUtilityToolKind.SEARCH_MEMORY),
+                    "step": 1,
+                    "queryCharCount": len(call.request.query),
+                    "hasFromDate": call.request.from_date is not None,
+                    "hasToDate": call.request.to_date is not None,
+                    "rawCandidateCount": len(candidates),
+                    "resultCount": len(output.references),
+                    "resultSourceKinds": result_source_kinds,
+                    "resultSourceIds": result_source_ids,
+                    "status": str(output.status),
+                }
+            },
+        )
+
+    async def _run_get_current_time_tool(
+        self,
+        call: RealtimeGetCurrentTimeToolCall,
+    ) -> None:
+        now = self._current_time_factory()
+        if now.tzinfo is None:
+            raise CoordinatorStateError(
+                "current time factory returned a timezone-naive datetime"
+            )
+        local = now.astimezone(ZoneInfo(self._timezone_id))
+        output = GetCurrentTimeToolOutputV4.model_validate(
+            {
+                "localIsoDateTime": local.isoformat(),
+                "weekday": local.strftime("%A"),
+                "daypart": _clock_daypart(local.hour),
+                "timezoneId": self._timezone_id,
+            }
+        )
+        await self._realtime.complete_utility_tool(
+            turn_id=self._turn_id,
+            call_id=call.call_id,
+            output=output,
+            harness=self.harness,
+        )
+        LOGGER.info(
+            "realtime_semantic_tool_completed session_id=%s turn_id=%s "
+            "tool_kind=%s step=1 result_count=1",
+            self._session_id,
+            self._turn_id,
+            RealtimeUtilityToolKind.GET_CURRENT_TIME,
+        )
 
     async def _run_canvas_tool(
         self,
@@ -2018,6 +2536,18 @@ class DeterministicRealtimeSessionCoordinator:
         if self._closed:
             return
         self._closed = True
+        context_installation_task = self._context_installation_task
+        self._context_installation_task = None
+        if (
+            context_installation_task is not None
+            and not context_installation_task.done()
+        ):
+            context_installation_task.cancel()
+        if context_installation_task is not None:
+            await asyncio.gather(
+                context_installation_task,
+                return_exceptions=True,
+            )
         interaction_task = self._canvas_interaction_response_task
         self._canvas_interaction_response_task = None
         self._canvas_interaction_response_wakeup.set()
@@ -2066,6 +2596,7 @@ class DeterministicRealtimeSessionCoordinator:
                     task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
         self._memory_commit_tasks.clear()
+        self._recent_live_echo_suppression_turn_ids.clear()
         if not self._terminal:
             await self._realtime.cancel(turn_id=self._turn_id)
             await self._speech.cancel(turn_id=self._turn_id)
@@ -2354,6 +2885,8 @@ class DeterministicRealtimeSessionCoordinator:
         self._memory_commit_sequence += 1
         sequence = self._memory_commit_sequence
         self._latest_memory_commit_sequence = sequence
+        self._warm_refresh_revision += 1
+        warm_refresh_revision = self._warm_refresh_revision
         payload = _CapturedMemoryCommit(
             sequence=sequence,
             turn_id=turn_id,
@@ -2368,6 +2901,7 @@ class DeterministicRealtimeSessionCoordinator:
             delivered_text=delivered_text,
             terminal=terminal,
             transcript_waiter=transcript_waiter,
+            warm_refresh_revision=warm_refresh_revision,
         )
         self._memory_commit_tasks[turn_id] = asyncio.create_task(
             self._run_memory_commit(payload=payload),
@@ -2405,9 +2939,19 @@ class DeterministicRealtimeSessionCoordinator:
                 if transcript_waiter is None:
                     LOGGER.info(
                         "memory_commit_skipped session_id=%s turn_id=%s "
-                        "reason=child_transcript_waiter_unavailable",
+                        "reason=child_transcript_waiter_unavailable "
+                        "warm_refresh_revision=%d",
                         self._session_id,
                         payload.turn_id,
+                        payload.warm_refresh_revision,
+                        extra={
+                            "ava_context": {
+                                "sessionId": self._session_id,
+                                "turnId": payload.turn_id,
+                                "reason": "childTranscriptWaiterUnavailable",
+                                "warmRefreshRevision": (payload.warm_refresh_revision),
+                            }
+                        },
                     )
                     return
                 child_transcript = await transcript_waiter
@@ -2419,9 +2963,19 @@ class DeterministicRealtimeSessionCoordinator:
             ):
                 LOGGER.info(
                     "memory_commit_skipped session_id=%s turn_id=%s "
-                    "reason=child_transcription_terminal_without_text",
+                    "reason=child_transcription_terminal_without_text "
+                    "warm_refresh_revision=%d",
                     self._session_id,
                     payload.turn_id,
+                    payload.warm_refresh_revision,
+                    extra={
+                        "ava_context": {
+                            "sessionId": self._session_id,
+                            "turnId": payload.turn_id,
+                            "reason": "childTranscriptionTerminalWithoutText",
+                            "warmRefreshRevision": payload.warm_refresh_revision,
+                        }
+                    },
                 )
                 return
 
@@ -2430,6 +2984,7 @@ class DeterministicRealtimeSessionCoordinator:
                 child_text=child_text,
                 child_text_source=child_text_source,
             )
+            commit_started = monotonic()
             decision = await self._memory.commit_delivered_turn(
                 subject=self._subject,
                 expected_reset_revision=payload.expected_reset_revision,
@@ -2439,8 +2994,31 @@ class DeterministicRealtimeSessionCoordinator:
                 occurred_at=payload.occurred_at,
                 timezone_id=payload.timezone_id,
             )
+            if payload.expected_reset_revision != self._memory_reset_revision:
+                return
+            commit_duration_ms = max(0.0, (monotonic() - commit_started) * 1000)
+            LOGGER.info(
+                "memory_commit_completed session_id=%s turn_id=%s "
+                "reset_revision=%d input_kind=%s duration_ms=%.2f",
+                self._session_id,
+                payload.turn_id,
+                payload.expected_reset_revision,
+                turn.input_kind,
+                commit_duration_ms,
+                extra={
+                    "ava_context": {
+                        "sessionId": self._session_id,
+                        "turnId": payload.turn_id,
+                        "resetRevision": payload.expected_reset_revision,
+                        "inputKind": str(turn.input_kind),
+                        "durationMs": commit_duration_ms,
+                    }
+                },
+            )
+            self._recent_live_echo_suppression_turn_ids.append(payload.turn_id)
             if payload.sequence == self._latest_memory_commit_sequence:
                 self._last_memory_decision = decision
+            await self._refresh_warm_memory(payload=payload, turn=turn)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -2473,6 +3051,105 @@ class DeterministicRealtimeSessionCoordinator:
             task = asyncio.current_task()
             if self._memory_commit_tasks.get(payload.turn_id) is task:
                 self._memory_commit_tasks.pop(payload.turn_id, None)
+
+    async def _refresh_warm_memory(
+        self,
+        *,
+        payload: _CapturedMemoryCommit,
+        turn: DeliveredConversationTurn,
+    ) -> None:
+        revision = payload.warm_refresh_revision
+        LOGGER.info(
+            "memory_warm_refresh_started session_id=%s turn_id=%s revision=%d",
+            self._session_id,
+            payload.turn_id,
+            revision,
+        )
+        try:
+            candidates = await self._memory.search_memory_candidates(
+                subject=self._subject,
+                query=_warm_memory_query(turn),
+                limit=4,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            LOGGER.warning(
+                "memory_warm_refresh_failed session_id=%s turn_id=%s "
+                "revision=%d reason_category=%s",
+                self._session_id,
+                payload.turn_id,
+                revision,
+                _memory_failure_reason_category(error),
+            )
+            return
+        if (
+            payload.expected_reset_revision != self._memory_reset_revision
+            or revision != self._warm_refresh_revision
+        ):
+            return
+        recent_live_turn_ids = set(self._recent_live_echo_suppression_turn_ids)
+        surviving_candidates = [
+            candidate
+            for candidate in candidates
+            if not recent_live_turn_ids.intersection(candidate.source_turn_ids)
+        ]
+        selected_candidates = surviving_candidates[:4]
+        references = tuple(
+            MemoryReference.from_candidate(candidate)
+            for candidate in selected_candidates
+        )
+        self._warm_memories = references
+        raw_candidate_count = len(candidates)
+        recent_suppressed_count = raw_candidate_count - len(surviving_candidates)
+        selected_source_kinds = [
+            str(candidate.source_kind) for candidate in selected_candidates
+        ]
+        selected_source_ids = [candidate.source_id for candidate in selected_candidates]
+        LOGGER.info(
+            "memory_warm_refresh_completed session_id=%s turn_id=%s "
+            "revision=%d raw_candidate_count=%d recent_suppressed_count=%d "
+            "selected_count=%d selected_source_kinds=%s selected_source_ids=%s",
+            self._session_id,
+            payload.turn_id,
+            revision,
+            raw_candidate_count,
+            recent_suppressed_count,
+            len(selected_candidates),
+            selected_source_kinds,
+            selected_source_ids,
+            extra={
+                "ava_context": {
+                    "sessionId": self._session_id,
+                    "turnId": payload.turn_id,
+                    "sourceTurnId": payload.turn_id,
+                    "revision": revision,
+                    "rawCandidateCount": raw_candidate_count,
+                    "recentSuppressedCount": recent_suppressed_count,
+                    "selectedCount": len(selected_candidates),
+                    "selectedSourceKinds": selected_source_kinds,
+                    "selectedSourceIds": selected_source_ids,
+                }
+            },
+        )
+        reason = (
+            DynamicContextBuildReason.CANVAS_INTERACTION_COMMITTED
+            if turn.canvas_interaction is not None
+            else DynamicContextBuildReason.TURN_COMMITTED
+        )
+        try:
+            await self._refresh_canvas_context(reason=reason)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            LOGGER.warning(
+                "realtime_context_installation_failed session_id=%s turn_id=%s "
+                "reason=%s error_type=%s",
+                self._session_id,
+                payload.turn_id,
+                reason,
+                type(error).__name__,
+            )
 
     async def _schedule_interrupted_canvas_presentation(self) -> None:
         if self._closed:
@@ -2888,6 +3565,84 @@ def _canvas_interaction_summary(
     if len(summary) > MAX_CHILD_TURN_SUMMARY_CHARACTERS:
         raise AssertionError("Canvas interaction memory summary exceeded its boundary")
     return summary
+
+
+def _stable_memory_references(
+    snapshot: AuthoritativeMemorySnapshot,
+) -> tuple[MemoryReference, ...]:
+    return tuple(
+        MemoryReference.model_validate(
+            {
+                "sourceKind": MemoryCandidateSourceKind.STABLE_MEMORY,
+                "startedAt": None,
+                "endedAt": None,
+                "timezoneIds": [],
+                "text": memory.summary,
+                "sourceTurnIds": [memory.source_turn_id],
+            }
+        )
+        for memory in snapshot.stable_memories[-4:]
+    )
+
+
+def _warm_memory_query(turn: DeliveredConversationTurn) -> str:
+    fields = [turn.child_turn_summary]
+    if turn.child_text is not None:
+        fields.append(turn.child_text)
+    elif turn.canvas_interaction is not None:
+        fields.append(turn.canvas_interaction.accessibility_label)
+    normalized = " ".join(" ".join(fields).split())
+    if not normalized:
+        raise CoordinatorStateError("warm memory seed lost semantic turn material")
+    return normalized[:500]
+
+
+def _local_date_search_bounds(
+    *,
+    from_date: date | None,
+    to_date: date | None,
+    timezone_id: str,
+) -> tuple[datetime | None, datetime | None]:
+    if from_date is not None and to_date is not None and from_date > to_date:
+        raise ValueError("fromDate cannot be after toDate")
+    zone = ZoneInfo(validate_iana_timezone_id(timezone_id))
+    lower = (
+        datetime.combine(from_date, time.min, tzinfo=zone).astimezone(UTC)
+        if from_date is not None
+        else None
+    )
+    upper = (
+        datetime.combine(to_date + timedelta(days=1), time.min, tzinfo=zone).astimezone(
+            UTC
+        )
+        if to_date is not None
+        else None
+    )
+    return lower, upper
+
+
+def _search_tool_reference(
+    candidate: MemorySearchCandidate,
+) -> SearchMemoryReferenceV4:
+    return SearchMemoryReferenceV4.model_validate(
+        {
+            "sourceKind": candidate.source_kind,
+            "startedAt": candidate.started_at,
+            "endedAt": candidate.ended_at,
+            "timezoneIds": candidate.timezone_ids,
+            "text": candidate.reference_text,
+        }
+    )
+
+
+def _clock_daypart(hour: int) -> str:
+    if 5 <= hour < 12:
+        return "morning"
+    if 12 <= hour < 17:
+        return "afternoon"
+    if 17 <= hour < 21:
+        return "evening"
+    return "night"
 
 
 def _memory_failure_reason_category(error: Exception) -> str:

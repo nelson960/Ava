@@ -26,6 +26,7 @@ from ..realtime.harness import RealtimeHarness
 from ..realtime.provider_session import (
     MAX_SDP_BYTES,
     NegotiatedRealtimeCall,
+    RealtimeContextInstallationStatus,
     RealtimeProviderError,
     RealtimeProviderProtocolError,
     RealtimeProviderResponseIncompleteError,
@@ -38,16 +39,26 @@ from ..realtime.provider_session import (
 )
 from ..realtime.tool_contract import (
     CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
+    GET_CURRENT_TIME_TOOL_NAME,
     INTERACTIVE_CANVAS_TOOL_NAME,
+    SEARCH_MEMORY_TOOL_NAME,
+    GetCurrentTimeRequest,
     InteractiveCanvasCancellationRequest,
     InteractiveCanvasCancellationToolOutputV4,
     InteractiveCanvasRequest,
     InteractiveCanvasToolOutput,
     InteractiveCanvasToolOutputV4,
+    RealtimeGetCurrentTimeToolCall,
+    RealtimeRejectedUtilityToolCall,
+    RealtimeSearchMemoryToolCall,
+    RealtimeUtilityToolKind,
+    RealtimeUtilityToolOutputV4,
     RealtimeCancelCanvasToolCall,
     RealtimeCanvasToolCall,
     RealtimeRejectedCanvasToolCall,
     RealtimeSpeechTextDelta,
+    RejectedUtilityToolOutputV4,
+    SearchMemoryRequest,
 )
 from ..realtime.turn_parser import StreamingSpeechParser, StreamingTurnParseError
 
@@ -64,6 +75,11 @@ _SIDEBAND_SEQUENCE_FIELD = "__ava_sideband_sequence"
 _CANVAS_INTERACTION_RESPONSE_MAX_OUTPUT_TOKENS = 256
 _CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS = 512
 _MAX_CONSUMED_TERMINAL_RESPONSE_IDS = 64
+_CANVAS_TOOL_NAMES = frozenset(
+    {INTERACTIVE_CANVAS_TOOL_NAME, CANCEL_INTERACTIVE_CANVAS_TOOL_NAME}
+)
+_UTILITY_TOOL_NAMES = frozenset({SEARCH_MEMORY_TOOL_NAME, GET_CURRENT_TIME_TOOL_NAME})
+_SEMANTIC_TOOL_NAMES = _CANVAS_TOOL_NAMES | _UTILITY_TOOL_NAMES
 
 
 class OpenAIRealtimeProviderError(RealtimeProviderError):
@@ -269,8 +285,10 @@ class _OpenAIRealtimeEventChannel:
         truncation_retention_ratio: float = (
             DEFAULT_OPENAI_REALTIME_TRUNCATION_RETENTION_RATIO
         ),
+        provider_call_id: str | None = None,
     ) -> None:
         self._socket = socket
+        self._provider_call_id = provider_call_id
         self._model = model
         self._transcription_model = _required_name(
             transcription_model,
@@ -328,9 +346,12 @@ class _OpenAIRealtimeEventChannel:
         ] = OrderedDict()
         self._next_cancel_sequence = 1
         self._prepared_session_update: str | None = None
+        self._installed_context_build_id: str | None = None
         self._cancelled_turn_ids: set[str] = set()
         self._pending_canvas_call_id: str | None = None
         self._completed_canvas_call_ids: set[str] = set()
+        self._pending_utility_call_id: str | None = None
+        self._completed_utility_call_ids: set[str] = set()
         self.last_usage: OpenAIRealtimeUsage | None = None
         self.last_response_id: str | None = None
         self.last_first_delta_ms: float | None = None
@@ -624,7 +645,12 @@ class _OpenAIRealtimeEventChannel:
 
         response_completed = False
         try:
-            await self.prepare(harness=harness)
+            # Production negotiation installs the initial harness before the
+            # microphone is enabled. Later dynamic projections use the
+            # coordinator's readiness-gated installation path; a turn reader
+            # must never reinstall an older harness over that safe update.
+            if self._prepared_session_update is None:
+                await self.prepare(harness=harness)
 
             trigger_started = monotonic()
             if normalized_text is not None:
@@ -738,6 +764,64 @@ class _OpenAIRealtimeEventChannel:
         self._pending_canvas_call_id = None
         self._interaction_response_readiness_changed.set()
 
+    async def complete_utility_tool(
+        self,
+        *,
+        turn_id: str,
+        call_id: str,
+        output: RealtimeUtilityToolOutputV4,
+        harness: RealtimeHarness,
+    ) -> None:
+        if self._closed:
+            raise OpenAIRealtimeProtocolError(
+                "cannot complete a tool on a closed Realtime channel"
+            )
+        if turn_id != self._active_turn_id:
+            raise OpenAIRealtimeProtocolError(
+                "utility tool completion does not match the active turn"
+            )
+        if call_id in self._completed_utility_call_ids:
+            raise OpenAIRealtimeProtocolError("utility tool call was completed twice")
+        if call_id != self._pending_utility_call_id:
+            raise OpenAIRealtimeProtocolError(
+                "utility tool completion does not match the pending call"
+            )
+        await self._send_json(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": output.model_dump_json(by_alias=True, exclude_none=True),
+                },
+            }
+        )
+        rejected = isinstance(output, RejectedUtilityToolOutputV4)
+        response: dict[str, object] = {
+            "conversation": "auto",
+            "output_modalities": ["text"],
+            "tool_choice": "none" if rejected else "auto",
+            "parallel_tool_calls": False,
+            "max_output_tokens": min(
+                _CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS,
+                self._max_output_tokens,
+            ),
+        }
+        if not rejected:
+            response["tools"] = [
+                tool
+                for tool in harness.tools
+                if tool.get("name")
+                in {
+                    INTERACTIVE_CANVAS_TOOL_NAME,
+                    CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
+                }
+            ]
+        await self._send_json({"type": "response.create", "response": response})
+        self._completed_utility_call_ids.add(call_id)
+        self._pending_utility_call_id = None
+        self._interaction_response_readiness_changed.set()
+
     def _canvas_interaction_response_readiness(
         self,
         turn_id: str,
@@ -758,6 +842,8 @@ class _OpenAIRealtimeEventChannel:
             return "activeResponse"
         if self._pending_canvas_call_id is not None:
             return "pendingCanvasCall"
+        if self._pending_utility_call_id is not None:
+            return "pendingUtilityCall"
         if self._awaiting_response_trigger_turn_id != turn_id:
             return "notAwaitingTrigger"
         return None
@@ -847,7 +933,15 @@ class _OpenAIRealtimeEventChannel:
                 return False
             await self._interaction_response_readiness_changed.wait()
 
-    async def prepare(self, *, harness: RealtimeHarness) -> None:
+    @property
+    def active_context_build_id(self) -> str | None:
+        return self._installed_context_build_id
+
+    async def prepare(
+        self,
+        *,
+        harness: RealtimeHarness,
+    ) -> RealtimeContextInstallationStatus:
         """Prepare the sideband before Flutter is told to unmute the mic."""
 
         payload = _session_update(
@@ -871,7 +965,14 @@ class _OpenAIRealtimeEventChannel:
             sort_keys=True,
         )
         if serialized == self._prepared_session_update:
-            return
+            self._installed_context_build_id = harness.context.build_id
+            LOGGER.info(
+                "openai_realtime_prompt_deduplicated prompt_version=%s "
+                "tool_contract_version=%s",
+                harness.prompt_version,
+                harness.tool_contract_version,
+            )
+            return RealtimeContextInstallationStatus.DEDUPLICATED
         initial_prepare = self._prepared_session_update is None
         await self._send_json(payload)
         # The first update must be acknowledged before Flutter is allowed to
@@ -884,6 +985,7 @@ class _OpenAIRealtimeEventChannel:
         if initial_prepare:
             await self._wait_for_session_updated()
         self._prepared_session_update = serialized
+        self._installed_context_build_id = harness.context.build_id
         LOGGER.info(
             "openai_realtime_prompt_installed prompt_version=%s "
             "tool_contract_version=%s acknowledged=%s "
@@ -906,6 +1008,22 @@ class _OpenAIRealtimeEventChannel:
                 }
             },
         )
+        return RealtimeContextInstallationStatus.INSTALLED
+
+    async def prepare_if_idle(
+        self,
+        *,
+        harness: RealtimeHarness,
+        turn_id: str,
+    ) -> RealtimeContextInstallationStatus | None:
+        if self._canvas_interaction_response_readiness(turn_id) is not None:
+            return None
+        previous_build_id = self._installed_context_build_id
+        status = await self.prepare(harness=harness)
+        if self._canvas_interaction_response_readiness(turn_id) is None:
+            return status
+        self._installed_context_build_id = previous_build_id
+        return None
 
     async def cancel(self, *, turn_id: str) -> None:
         if not turn_id.strip():
@@ -915,6 +1033,31 @@ class _OpenAIRealtimeEventChannel:
         if self._awaiting_response_trigger_turn_id == turn_id:
             self._awaiting_response_trigger_turn_id = None
             self._interaction_response_readiness_changed.set()
+        cancelled_pending_utility = (
+            not self._closed
+            and self._active_turn_id == turn_id
+            and self._pending_utility_call_id is not None
+        )
+        if cancelled_pending_utility:
+            call_id = self._pending_utility_call_id
+            await self._send_json(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": RejectedUtilityToolOutputV4(
+                            reason="The child interrupted this utility request."
+                        ).model_dump_json(by_alias=True),
+                    },
+                }
+            )
+            self._pending_utility_call_id = None
+            self._active_response_id = None
+            self._active_turn_id = None
+            self._cancelled_turn_ids.add(turn_id)
+            self._interaction_response_readiness_changed.set()
+            return
         cancelled_pending_canvas = (
             not self._closed
             and self._active_turn_id == turn_id
@@ -1356,6 +1499,8 @@ class _OpenAIRealtimeEventChannel:
                 consumer_phase=consumer_phase,
                 active_turn_id=self._active_turn_id,
                 active_response_id=self._active_response_id,
+                provider_call_id=self._provider_call_id,
+                active_context_build_id=self._installed_context_build_id,
             )
             return
         if owner != turn_id:
@@ -1566,6 +1711,9 @@ class _OpenAIRealtimeEventChannel:
     ) -> AsyncIterator[RealtimeProviderTurnEvent]:
         continuation = False
         canvas_called = False
+        utility_called = False
+        tool_steps_used = 0
+        utility_chain_rejected = False
         accumulated_usage: OpenAIRealtimeUsage | None = None
 
         while True:
@@ -1753,18 +1901,23 @@ class _OpenAIRealtimeEventChannel:
                             "OpenAI canvas interaction response attempted a tool call"
                         )
                     function_item_count += 1
-                    if function_item_count > 1 or continuation or canvas_called:
+                    if function_item_count > 1 or canvas_called or tool_steps_used >= 2:
                         raise OpenAIRealtimeProtocolError(
                             "OpenAI emitted an unexpected additional function call"
                         )
                     function_name = _required_string(item, "name")
-                    if function_name not in {
-                        INTERACTIVE_CANVAS_TOOL_NAME,
-                        CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
-                    }:
+                    if function_name not in _SEMANTIC_TOOL_NAMES:
                         raise OpenAIRealtimeProtocolError(
                             "OpenAI selected an unavailable function"
                         )
+                    if utility_chain_rejected:
+                        raise OpenAIRealtimeProtocolError(
+                            "OpenAI selected a function after a rejected utility chain"
+                        )
+                    if utility_called and function_name not in _CANVAS_TOOL_NAMES:
+                        # Retain exact ownership so Ava can return one bounded
+                        # rejected function output and terminate tool capability.
+                        pass
                     call_id = _required_string(item, "call_id")
                     continue
 
@@ -1810,10 +1963,7 @@ class _OpenAIRealtimeEventChannel:
                     candidate_call_id = _required_string(event, "call_id")
                     candidate_response_id = _required_string(event, "response_id")
                     candidate_arguments = _required_string(event, "arguments")
-                    if candidate_name not in {
-                        INTERACTIVE_CANVAS_TOOL_NAME,
-                        CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
-                    }:
+                    if candidate_name not in _SEMANTIC_TOOL_NAMES:
                         raise OpenAIRealtimeProtocolError(
                             "OpenAI completed an unavailable function"
                         )
@@ -1885,18 +2035,15 @@ class _OpenAIRealtimeEventChannel:
                             raise OpenAIRealtimeProtocolError(
                                 "OpenAI canvas interaction response attempted a tool call"
                             )
-                        if continuation or canvas_called:
+                        if canvas_called or tool_steps_used >= 2:
                             raise OpenAIRealtimeProtocolError(
-                                "OpenAI continuation attempted another canvas call"
+                                "OpenAI continuation exceeded Ava's semantic tool chain"
                             )
                         item = function_items[0]
                         completed_name = _required_string(item, "name")
                         completed_call_id = _required_string(item, "call_id")
                         completed_arguments = _required_string(item, "arguments")
-                        if completed_name not in {
-                            INTERACTIVE_CANVAS_TOOL_NAME,
-                            CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
-                        }:
+                        if completed_name not in _SEMANTIC_TOOL_NAMES:
                             raise OpenAIRealtimeProtocolError(
                                 "OpenAI response completed an unavailable function"
                             )
@@ -1921,7 +2068,7 @@ class _OpenAIRealtimeEventChannel:
                                 "OpenAI response arguments differ from streamed arguments"
                             )
                         _log_response_diagnostic(
-                            "openai_realtime_canvas_function_response_consumed",
+                            "openai_realtime_function_response_consumed",
                             event=event,
                             response_id=completed_response_id,
                             response_owner_turn_id=self._response_owner_by_id.get(
@@ -1933,75 +2080,147 @@ class _OpenAIRealtimeEventChannel:
                             active_response_id=self._active_response_id,
                             call_id=completed_call_id,
                         )
-                        try:
-                            if completed_name == INTERACTIVE_CANVAS_TOOL_NAME:
-                                request = InteractiveCanvasRequest.model_validate_json(
-                                    completed_arguments
-                                )
-                            else:
-                                InteractiveCanvasCancellationRequest.model_validate_json(
-                                    completed_arguments
-                                )
-                        except ValidationError as error:
-                            validation_issues = _content_free_validation_issues(error)
-                            LOGGER.warning(
-                                "openai_canvas_arguments_rejected call_id=%s "
-                                "validation_issue_count=%d",
-                                completed_call_id,
-                                error.error_count(),
-                                extra={
-                                    "ava_context": {
-                                        "callId": completed_call_id,
-                                        "issueCount": error.error_count(),
-                                        "issues": validation_issues,
-                                    }
-                                },
-                            )
-                            self._pending_canvas_call_id = completed_call_id
-                            canvas_called = True
-                            self._mark_response_terminal_consumed(
-                                event,
-                                response_id=completed_response_id,
-                                turn_id=turn_id,
-                                consumer_phase="turnResponse",
-                            )
-                            yield RealtimeRejectedCanvasToolCall(
-                                call_id=completed_call_id,
-                                reason=(
-                                    "The canvas request exceeded Ava's bounded "
-                                    "tool contract."
-                                ),
-                            )
-                            if completed_call_id not in self._completed_canvas_call_ids:
-                                raise OpenAIRealtimeProtocolError(
-                                    "Ava did not return the rejected canvas "
-                                    "function output"
-                                )
-                            self._completed_canvas_call_ids.discard(completed_call_id)
-                            continuation = True
-                            break
-                        self._pending_canvas_call_id = completed_call_id
-                        canvas_called = True
                         self._mark_response_terminal_consumed(
                             event,
                             response_id=completed_response_id,
                             turn_id=turn_id,
                             consumer_phase="turnResponse",
                         )
-                        if completed_name == INTERACTIVE_CANVAS_TOOL_NAME:
-                            yield RealtimeCanvasToolCall(
-                                call_id=completed_call_id,
-                                request=request,
-                            )
+                        if completed_name in _CANVAS_TOOL_NAMES:
+                            self._pending_canvas_call_id = completed_call_id
+                            canvas_called = True
+                            tool_steps_used += 1
+                            try:
+                                if completed_name == INTERACTIVE_CANVAS_TOOL_NAME:
+                                    canvas_request = (
+                                        InteractiveCanvasRequest.model_validate_json(
+                                            completed_arguments
+                                        )
+                                    )
+                                else:
+                                    InteractiveCanvasCancellationRequest.model_validate_json(
+                                        completed_arguments
+                                    )
+                            except ValidationError as error:
+                                LOGGER.warning(
+                                    "openai_canvas_arguments_rejected call_id=%s "
+                                    "validation_issue_count=%d",
+                                    completed_call_id,
+                                    error.error_count(),
+                                    extra={
+                                        "ava_context": {
+                                            "callId": completed_call_id,
+                                            "issueCount": error.error_count(),
+                                            "issues": _content_free_validation_issues(
+                                                error
+                                            ),
+                                        }
+                                    },
+                                )
+                                yield RealtimeRejectedCanvasToolCall(
+                                    call_id=completed_call_id,
+                                    reason=(
+                                        "The canvas request exceeded Ava's bounded "
+                                        "tool contract."
+                                    ),
+                                )
+                            else:
+                                if completed_name == INTERACTIVE_CANVAS_TOOL_NAME:
+                                    yield RealtimeCanvasToolCall(
+                                        call_id=completed_call_id,
+                                        request=canvas_request,
+                                    )
+                                else:
+                                    yield RealtimeCancelCanvasToolCall(
+                                        call_id=completed_call_id
+                                    )
+                            if completed_call_id not in self._completed_canvas_call_ids:
+                                raise OpenAIRealtimeProtocolError(
+                                    "Ava did not return the canvas function output"
+                                )
+                            self._completed_canvas_call_ids.discard(completed_call_id)
                         else:
-                            yield RealtimeCancelCanvasToolCall(
-                                call_id=completed_call_id
-                            )
-                        if completed_call_id not in self._completed_canvas_call_ids:
-                            raise OpenAIRealtimeProtocolError(
-                                "Ava did not return the canvas function output"
-                            )
-                        self._completed_canvas_call_ids.discard(completed_call_id)
+                            utility_kind = RealtimeUtilityToolKind(completed_name)
+                            repeated_or_cross_utility = utility_called
+                            utility_rejected = repeated_or_cross_utility
+                            utility_request: SearchMemoryRequest | GetCurrentTimeRequest
+                            if not utility_rejected:
+                                try:
+                                    if completed_name == SEARCH_MEMORY_TOOL_NAME:
+                                        utility_request = (
+                                            SearchMemoryRequest.model_validate_json(
+                                                completed_arguments
+                                            )
+                                        )
+                                    else:
+                                        utility_request = (
+                                            GetCurrentTimeRequest.model_validate_json(
+                                                completed_arguments
+                                            )
+                                        )
+                                except ValidationError as error:
+                                    utility_rejected = True
+                                    LOGGER.warning(
+                                        "openai_utility_arguments_rejected "
+                                        "tool_kind=%s call_id=%s "
+                                        "validation_issue_count=%d",
+                                        utility_kind,
+                                        completed_call_id,
+                                        error.error_count(),
+                                        extra={
+                                            "ava_context": {
+                                                "toolKind": str(utility_kind),
+                                                "callId": completed_call_id,
+                                                "issueCount": error.error_count(),
+                                                "issues": (
+                                                    _content_free_validation_issues(
+                                                        error
+                                                    )
+                                                ),
+                                            }
+                                        },
+                                    )
+                            self._pending_utility_call_id = completed_call_id
+                            utility_called = True
+                            tool_steps_used += 1
+                            if utility_rejected:
+                                yield RealtimeRejectedUtilityToolCall(
+                                    call_id=completed_call_id,
+                                    tool_kind=utility_kind,
+                                    reason=(
+                                        "The utility request is unavailable in this "
+                                        "tool position or exceeded its bounded contract."
+                                    ),
+                                )
+                                utility_chain_rejected = True
+                            elif completed_name == SEARCH_MEMORY_TOOL_NAME:
+                                if not isinstance(utility_request, SearchMemoryRequest):
+                                    raise AssertionError(
+                                        "search memory request parsing changed"
+                                    )
+                                yield RealtimeSearchMemoryToolCall(
+                                    call_id=completed_call_id,
+                                    request=utility_request,
+                                )
+                            else:
+                                if not isinstance(
+                                    utility_request, GetCurrentTimeRequest
+                                ):
+                                    raise AssertionError(
+                                        "current time request parsing changed"
+                                    )
+                                yield RealtimeGetCurrentTimeToolCall(
+                                    call_id=completed_call_id,
+                                    request=utility_request,
+                                )
+                            if (
+                                completed_call_id
+                                not in self._completed_utility_call_ids
+                            ):
+                                raise OpenAIRealtimeProtocolError(
+                                    "Ava did not return the utility function output"
+                                )
+                            self._completed_utility_call_ids.discard(completed_call_id)
                         continuation = True
                         break
 
@@ -2454,6 +2673,7 @@ class OpenAIRealtimeProviderSession:
                     self._truncation_post_instructions_tokens
                 ),
                 truncation_retention_ratio=self._truncation_retention_ratio,
+                provider_call_id=call_id,
             )
             await channel.start_receiver()
         except Exception as error:
@@ -2521,8 +2741,27 @@ class OpenAIRealtimeProviderSession:
     async def admit_pending_input_items(self, *, turn_id: str) -> tuple[str, ...]:
         return await self._require_channel().admit_pending_input_items(turn_id=turn_id)
 
-    async def prepare(self, *, harness: RealtimeHarness) -> None:
-        await self._require_channel().prepare(harness=harness)
+    @property
+    def active_context_build_id(self) -> str | None:
+        return self._require_channel().active_context_build_id
+
+    async def prepare(
+        self,
+        *,
+        harness: RealtimeHarness,
+    ) -> RealtimeContextInstallationStatus:
+        return await self._require_channel().prepare(harness=harness)
+
+    async def prepare_if_idle(
+        self,
+        *,
+        harness: RealtimeHarness,
+        turn_id: str,
+    ) -> RealtimeContextInstallationStatus | None:
+        return await self._require_channel().prepare_if_idle(
+            harness=harness,
+            turn_id=turn_id,
+        )
 
     async def complete_canvas_tool(
         self,
@@ -2539,6 +2778,21 @@ class OpenAIRealtimeProviderSession:
             turn_id=turn_id,
             call_id=call_id,
             output=output,
+        )
+
+    async def complete_utility_tool(
+        self,
+        *,
+        turn_id: str,
+        call_id: str,
+        output: RealtimeUtilityToolOutputV4,
+        harness: RealtimeHarness,
+    ) -> None:
+        await self._require_channel().complete_utility_tool(
+            turn_id=turn_id,
+            call_id=call_id,
+            output=output,
+            harness=harness,
         )
 
     async def request_canvas_interaction_response(
@@ -3514,6 +3768,8 @@ def _log_response_diagnostic(
     active_turn_id: str | None = None,
     active_response_id: str | None = None,
     call_id: str | None = None,
+    provider_call_id: str | None = None,
+    active_context_build_id: str | None = None,
     status: str | None = None,
 ) -> None:
     if event is not None:
@@ -3533,13 +3789,18 @@ def _log_response_diagnostic(
     }
     if call_id is not None:
         context["callId"] = call_id
+    if provider_call_id is not None:
+        context["providerCallId"] = provider_call_id
+    if active_context_build_id is not None:
+        context["activeContextBuildId"] = active_context_build_id
     if status is not None:
         context["status"] = status
     LOGGER.log(
         level,
         "%s sideband_sequence=%s event_type=%s response_id=%s "
         "response_owner_turn_id=%s consumer_turn_id=%s consumer_phase=%s "
-        "active_turn_id=%s active_response_id=%s",
+        "active_turn_id=%s active_response_id=%s provider_call_id=%s "
+        "active_context_build_id=%s",
         message,
         sequence,
         event_type,
@@ -3549,6 +3810,8 @@ def _log_response_diagnostic(
         consumer_phase,
         active_turn_id,
         active_response_id,
+        provider_call_id,
+        active_context_build_id,
         extra={"ava_context": context},
     )
 

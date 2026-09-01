@@ -444,6 +444,25 @@ class RealtimeSessionRegistry:
         if record is not None:
             await record.coordinator.close()
 
+    async def notify_memory_reset(
+        self,
+        *,
+        subject: str,
+        reset_revision: int,
+    ) -> None:
+        async with self._lock:
+            coordinators = tuple(
+                record.coordinator
+                for record in self._records.values()
+                if record.subject == subject
+            )
+        await asyncio.gather(
+            *(
+                coordinator.memory_reset(reset_revision=reset_revision)
+                for coordinator in coordinators
+            )
+        )
+
     async def purge_expired(self) -> int:
         now = self._now()
         async with self._lock:

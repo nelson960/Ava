@@ -17,6 +17,7 @@ from ..providers.openai_svg_canvas_provider import OpenAISvgCanvasSpecialist
 from ..security import safety_identifier
 from .caption_preview import DevelopmentCaptionPreviewSynthesizer
 from .coordinator import DeterministicRealtimeSessionCoordinator
+from .context_assembler import DynamicContextAssembler
 from .coordinator_v4 import ProtocolV4CanvasEventSink
 from .delivery import StreamingSpeechSynthesizer
 from .memory import AuthoritativeMemoryStore
@@ -50,6 +51,7 @@ class LiveRealtimeCoordinatorFactoryV4:
         self._documents = documents
         self._canvas_workspaces = canvas_workspaces
         self._api_key = settings.require_openai_api_key()
+        self._context_assembler = DynamicContextAssembler()
 
     def create(
         self,
@@ -124,6 +126,7 @@ class LiveRealtimeCoordinatorFactoryV4:
             canvas_jobs=jobs,
             canvas_events=canvas_events,
             memory=self._memory,
+            context_assembler=self._context_assembler,
             persistent=True,
             turn_id_factory=lambda: f"turn-{uuid4().hex}",
             request_id_factory=lambda: f"request-{uuid4().hex}",

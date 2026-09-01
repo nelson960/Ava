@@ -498,6 +498,14 @@ def create_app(
                 message="Ava's conversation memory is temporarily unavailable.",
             )
         app.state.svg_canvas_workspaces.clear_subject(client.subject)
+        realtime_sessions: RealtimeSessionRegistry | None = (
+            app.state.realtime_v4_sessions
+        )
+        if realtime_sessions is not None:
+            await realtime_sessions.notify_memory_reset(
+                subject=client.subject,
+                reset_revision=receipt.revision,
+            )
         return JSONResponse(
             status_code=200,
             content=receipt.model_dump(mode="json", by_alias=True),

@@ -45,6 +45,7 @@ class _Coordinator:
     def __init__(self) -> None:
         self.closed = False
         self.received: list[AvaClientEventUnionV4] = []
+        self.memory_reset_revisions: list[int] = []
 
     @property
     def turn_id(self) -> str:
@@ -66,6 +67,9 @@ class _Coordinator:
 
     async def close(self) -> None:
         self.closed = True
+
+    async def memory_reset(self, *, reset_revision: int) -> None:
+        self.memory_reset_revisions.append(reset_revision)
 
 
 class _Factory:
@@ -361,6 +365,35 @@ async def test_v4_registry_tokens_expire_cannot_replay_and_close_owners() -> Non
         await registry.claim(session_id=second.session_id, token=second.token)
     assert await registry.purge_expired() == 1
     assert factory.coordinators[1].closed is True
+
+
+async def test_v4_registry_memory_reset_notifies_only_matching_subject() -> None:
+    factory = _Factory()
+    ids = iter(("session-reset-a", "session-reset-b", "session-reset-other"))
+    registry = RealtimeSessionRegistry(
+        coordinator_factory=factory,
+        token_codec=RealtimeSessionTokenCodec("m" * 32),
+        ttl=timedelta(seconds=120),
+        active_session_ttl=timedelta(minutes=30),
+        max_sessions=3,
+        session_id_factory=lambda: next(ids),
+    )
+    for subject in ("child:reset", "child:reset", "child:other"):
+        await registry.create(
+            request_id=f"request-{subject}-{len(factory.coordinators)}",
+            subject=subject,
+            age_band=AgeBand.MIDDLE_CHILDHOOD,
+            timezone_id="UTC",
+        )
+
+    await registry.notify_memory_reset(
+        subject="child:reset",
+        reset_revision=3,
+    )
+
+    assert factory.coordinators[0].memory_reset_revisions == [3]
+    assert factory.coordinators[1].memory_reset_revisions == [3]
+    assert factory.coordinators[2].memory_reset_revisions == []
 
 
 async def test_claimed_v4_session_keeps_canvas_authorization_until_release() -> None:

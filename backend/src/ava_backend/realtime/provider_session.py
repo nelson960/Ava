@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import AsyncIterator, Awaitable
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Protocol
 
 from ..canvas.svg_workspace import RecordedSvgCanvasInteraction
@@ -11,6 +12,7 @@ from .tool_contract import (
     InteractiveCanvasCancellationToolOutputV4,
     InteractiveCanvasToolOutput,
     InteractiveCanvasToolOutputV4,
+    RealtimeUtilityToolOutputV4,
     RealtimeTurnEvent,
 )
 
@@ -26,6 +28,11 @@ class RealtimeProviderInputEvent:
 
 MAX_SDP_BYTES = 256 * 1024
 _PROVIDER_CALL_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{7,127}$")
+
+
+class RealtimeContextInstallationStatus(StrEnum):
+    INSTALLED = "installed"
+    DEDUPLICATED = "deduplicated"
 
 
 class RealtimeProviderError(RuntimeError):
@@ -109,8 +116,24 @@ class RealtimeProviderSession(Protocol):
 
     async def negotiate(self, *, offer_sdp: str) -> NegotiatedRealtimeCall: ...
 
-    async def prepare(self, *, harness: RealtimeHarness) -> None:
+    @property
+    def active_context_build_id(self) -> str | None: ...
+
+    async def prepare(
+        self,
+        *,
+        harness: RealtimeHarness,
+    ) -> RealtimeContextInstallationStatus:
         """Install Ava's server-owned instructions and optional tools."""
+        ...
+
+    async def prepare_if_idle(
+        self,
+        *,
+        harness: RealtimeHarness,
+        turn_id: str,
+    ) -> RealtimeContextInstallationStatus | None:
+        """Install context only if the exact listening turn is still idle."""
         ...
 
     def turn_events(
@@ -136,6 +159,15 @@ class RealtimeProviderSession(Protocol):
             | InteractiveCanvasToolOutputV4
             | InteractiveCanvasCancellationToolOutputV4
         ),
+    ) -> None: ...
+
+    async def complete_utility_tool(
+        self,
+        *,
+        turn_id: str,
+        call_id: str,
+        output: RealtimeUtilityToolOutputV4,
+        harness: RealtimeHarness,
     ) -> None: ...
 
     async def request_canvas_interaction_response(

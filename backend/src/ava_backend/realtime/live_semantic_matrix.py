@@ -6,6 +6,7 @@ from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
+from datetime import UTC, datetime
 from typing import Annotated, Literal
 from uuid import uuid4
 
@@ -19,6 +20,7 @@ from ..providers.openai_realtime_provider import (
     OpenAIRealtimeProbeRequest,
 )
 from .common import NonEmptyText, RealtimeProtocolModel
+from .context_assembler import DynamicContextAssembler, DynamicContextBuildReason
 from .harness import REALTIME_PROMPT_VERSION, build_realtime_harness
 from .memory import AuthoritativeMemorySnapshot
 
@@ -74,15 +76,23 @@ async def _run(arguments: argparse.Namespace) -> int:
         raise BackendConfigurationError(
             "semantic matrix promptVersion does not match the active prompt"
         )
+    snapshot = AuthoritativeMemorySnapshot.model_validate(
+        {
+            "ageBand": AgeBand.MIDDLE_CHILDHOOD,
+            "resetRevision": 0,
+            "currentSessionSummary": None,
+            "deliveredTurns": [],
+            "stableMemories": [],
+        }
+    )
     harness = build_realtime_harness(
-        AuthoritativeMemorySnapshot.model_validate(
-            {
-                "ageBand": AgeBand.MIDDLE_CHILDHOOD,
-                "resetRevision": 0,
-                "currentSessionSummary": None,
-                "deliveredTurns": [],
-                "stableMemories": [],
-            }
+        dynamic_context=DynamicContextAssembler().assemble(
+            build_id="ctx-1",
+            reason=DynamicContextBuildReason.SESSION_BOOTSTRAP,
+            age_band=snapshot.age_band,
+            timezone_id="UTC",
+            current_time_utc=datetime.now(UTC),
+            bootstrap_turns=tuple(snapshot.delivered_turns),
         )
     )
     probe = OpenAIRealtimeLiveProbe(

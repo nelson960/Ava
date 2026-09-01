@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -12,6 +14,10 @@ from ava_backend.canvas.svg_specialist import (
     SvgCanvasSpecialistRequest,
 )
 from ava_backend.protocol import AgeBand
+from ava_backend.realtime.context_assembler import (
+    DynamicContextAssembler,
+    DynamicContextBuildReason,
+)
 from ava_backend.realtime.coordinator import DeterministicRealtimeSessionCoordinator
 from ava_backend.realtime.coordinator_v4 import (
     CanvasEventBackpressureError,
@@ -32,6 +38,7 @@ from ava_backend.realtime.fakes import (
     DeterministicRealtimePlanProvider,
     DeterministicStreamingSpeechSynthesizer,
 )
+from ava_backend.realtime.harness import build_realtime_harness
 from ava_backend.realtime.memory import DevelopmentAuthoritativeMemoryStore
 from ava_backend.realtime.plan import AvaTurnPlan
 from ava_backend.realtime.svg_canvas_jobs import SvgCanvasJobCoordinator
@@ -102,6 +109,39 @@ async def test_canvas_event_backpressure_fails_instead_of_blocking_lifecycle() -
         )
 
 
+async def test_fake_provider_settled_turn_terminates_deferred_readiness_wait() -> None:
+    plan = AvaTurnPlan.model_validate_json(
+        (FIXTURE_ROOT / "ava_turn_plan_conversation_v3.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    realtime = DeterministicRealtimePlanProvider(plan)
+
+    events = [
+        event
+        async for event in realtime.turn_events(
+            harness=build_realtime_harness(
+                dynamic_context=DynamicContextAssembler().assemble(
+                    build_id="ctx-1",
+                    reason=DynamicContextBuildReason.SESSION_BOOTSTRAP,
+                    age_band=AgeBand.MIDDLE_CHILDHOOD,
+                    timezone_id="UTC",
+                    current_time_utc=datetime(2026, 9, 1, tzinfo=UTC),
+                )
+            ),
+            turn_id="turn-settled-fake",
+        )
+    ]
+
+    assert events
+    assert not await asyncio.wait_for(
+        realtime.wait_until_canvas_interaction_response_ready(
+            turn_id="turn-settled-fake"
+        ),
+        timeout=0.5,
+    )
+
+
 async def test_v4_coordinator_runs_exact_svg_lifecycle_without_pcm_interleaving() -> (
     None
 ):
@@ -140,6 +180,10 @@ async def test_v4_coordinator_runs_exact_svg_lifecycle_without_pcm_interleaving(
         canvas_jobs=jobs,
         canvas_events=canvas_events,
         memory=DevelopmentAuthoritativeMemoryStore(),
+        persistent=True,
+        turn_id_factory=lambda: "turn-v4-adapter-2",
+        request_id_factory=lambda: "request-v4-adapter-2",
+        stream_id_factory=lambda: "stream-v4-adapter-2",
     )
     await coordinator.negotiate(offer_sdp=DETERMINISTIC_AUDIO_OFFER_SDP)
     await coordinator.receive(
@@ -158,107 +202,145 @@ async def test_v4_coordinator_runs_exact_svg_lifecycle_without_pcm_interleaving(
     next_client_sequence = 1
     speaking = False
     activated = False
-    async for frame in coordinator.frames():
-        frames.append(frame)
-        if not isinstance(frame, AvaServerControlFrameV4):
-            continue
-        event = frame.event
-        controls.append(event)
-        if isinstance(event, TurnPhaseChangedEventV4) and event.phase == "speaking":
-            speaking = True
-        if isinstance(event, CanvasDocumentAvailableEventV4):
-            await coordinator.receive(
-                _client(
-                    next_client_sequence,
-                    {
-                        "event": "canvasDocumentPrepared",
-                        "generationId": event.generation_id,
-                        "sceneId": event.scene_id,
-                        "sceneRevision": event.scene_revision,
-                        "svgSha256": event.svg_sha256,
-                        "manifestSha256": event.manifest_sha256,
-                        "rendererCapabilityVersion": (
-                            event.renderer_capability_version
-                        ),
-                        "validatorVersion": event.validator_version,
-                    },
+    first_turn_completed = False
+    rearmed = False
+    frame_stream = coordinator.frames()
+    try:
+        async for frame in frame_stream:
+            frames.append(frame)
+            if not isinstance(frame, AvaServerControlFrameV4):
+                continue
+            event = frame.event
+            controls.append(event)
+            if (
+                event.event == AvaServerEventTypeV4.TURN_CREATED
+                and event.turn_id == "turn-v4-adapter-2"
+            ):
+                rearmed = True
+            if isinstance(event, TurnPhaseChangedEventV4) and event.phase == "speaking":
+                speaking = True
+            if isinstance(event, CanvasDocumentAvailableEventV4):
+                await coordinator.receive(
+                    _client(
+                        next_client_sequence,
+                        {
+                            "event": "canvasDocumentPrepared",
+                            "generationId": event.generation_id,
+                            "sceneId": event.scene_id,
+                            "sceneRevision": event.scene_revision,
+                            "svgSha256": event.svg_sha256,
+                            "manifestSha256": event.manifest_sha256,
+                            "rendererCapabilityVersion": (
+                                event.renderer_capability_version
+                            ),
+                            "validatorVersion": event.validator_version,
+                        },
+                    )
                 )
-            )
-            next_client_sequence += 1
-        if isinstance(event, CanvasPresentationCueEventV4):
-            assert speaking
-            await coordinator.receive(
-                _client(
-                    next_client_sequence,
-                    {
-                        "event": "canvasPresented",
-                        "generationId": event.generation_id,
-                        "sceneId": event.scene_id,
-                        "sceneRevision": event.scene_revision,
-                        "svgSha256": event.svg_sha256,
-                        "manifestSha256": event.manifest_sha256,
-                        "firstRenderedSample": event.presentation_sample_offset,
-                    },
+                next_client_sequence += 1
+            if isinstance(event, CanvasPresentationCueEventV4):
+                assert speaking
+                await coordinator.receive(
+                    _client(
+                        next_client_sequence,
+                        {
+                            "event": "canvasPresented",
+                            "generationId": event.generation_id,
+                            "sceneId": event.scene_id,
+                            "sceneRevision": event.scene_revision,
+                            "svgSha256": event.svg_sha256,
+                            "manifestSha256": event.manifest_sha256,
+                            "firstRenderedSample": event.presentation_sample_offset,
+                        },
+                    )
                 )
-            )
-            next_client_sequence += 1
-        if isinstance(event, CanvasActivatedEventV4):
-            activated = True
-            await coordinator.receive(
-                _client(
-                    next_client_sequence,
-                    {
-                        "event": "playbackStarted",
-                        "turnId": "turn-v4-adapter",
-                        "streamId": "stream-v4-adapter",
-                        "renderedSampleCount": 0,
-                    },
+                next_client_sequence += 1
+            if isinstance(event, CanvasActivatedEventV4):
+                activated = True
+                await coordinator.receive(
+                    _client(
+                        next_client_sequence,
+                        {
+                            "event": "playbackStarted",
+                            "turnId": "turn-v4-adapter",
+                            "streamId": "stream-v4-adapter",
+                            "renderedSampleCount": 0,
+                        },
+                    )
                 )
-            )
-            next_client_sequence += 1
-            await coordinator.receive(
-                _client(
-                    next_client_sequence,
-                    {
-                        "event": "playbackProgress",
-                        "turnId": "turn-v4-adapter",
-                        "streamId": "stream-v4-adapter",
-                        "renderedSampleCount": coordinator.received_sample_count,
-                        "bufferedSampleCount": 0,
-                    },
+                next_client_sequence += 1
+                await coordinator.receive(
+                    _client(
+                        next_client_sequence,
+                        {
+                            "event": "playbackProgress",
+                            "turnId": "turn-v4-adapter",
+                            "streamId": "stream-v4-adapter",
+                            "renderedSampleCount": coordinator.received_sample_count,
+                            "bufferedSampleCount": 0,
+                        },
+                    )
                 )
-            )
-            next_client_sequence += 1
+                next_client_sequence += 1
+            if (
+                event.event == AvaServerEventTypeV4.TURN_COMPLETED
+                and event.turn_id == "turn-v4-adapter"
+            ):
+                first_turn_completed = True
+                assert len(realtime.prepared_session_updates) == 1
+                assert coordinator._pending_harness is not None
+            if (
+                rearmed
+                and len(realtime.prepared_session_updates) == 2
+                and coordinator._context_installation_task is None
+            ):
+                break
 
-    assert activated
-    assert [event.sequence for event in controls] == list(range(len(controls)))
-    assert controls[-1].event == AvaServerEventTypeV4.TURN_COMPLETED
-    assert len(svg_specialist.requests) == 1
-    assert isinstance(
-        realtime.completed_canvas_outputs[0], InteractiveCanvasToolOutputV4
-    )
-    assert state.active is not None
-    assert state.active.first_rendered_sample >= 0
-    assert state.active.document.svg_text == (
-        FIXTURE_ROOT / "ava_svg_document_v4.svg"
-    ).read_text(encoding="utf-8")
-    assert documents.document_count == 0
-    assert len(realtime.prepared_session_updates) == 3
-    pending_instructions = realtime.prepared_session_updates[1]["session"][
-        "instructions"
-    ]
-    assert isinstance(pending_instructions, str)
-    assert '<pending_visual state="ready"' in pending_instructions
-    assert '<pending_visual state="generating"' not in pending_instructions
-    assert "generation-v4-adapter" not in pending_instructions
+        assert first_turn_completed
+        assert rearmed
+        assert activated
+        assert len(realtime.prepared_session_updates) == 2
+        assert coordinator._pending_harness is None
+        assert coordinator._context_installation_task is None
 
-    for index, frame in enumerate(frames):
-        if isinstance(frame, AvaServerControlFrameV4) and isinstance(
-            frame.event, AudioChunkEventV4
-        ):
-            binary = frames[index + 1]
-            assert isinstance(binary, AvaServerPcmFrameV4)
-            assert binary.descriptor == frame.event
+        final_instructions = realtime.prepared_session_updates[-1]["session"][
+            "instructions"
+        ]
+        assert isinstance(final_instructions, str)
+        assert state.render_realtime_context() in final_instructions
 
-    await coordinator.close()
+        first_terminal_index = next(
+            index
+            for index, event in enumerate(controls)
+            if event.event == AvaServerEventTypeV4.TURN_COMPLETED
+            and event.turn_id == "turn-v4-adapter"
+        )
+        first_session_controls = controls[: first_terminal_index + 1]
+        assert [event.sequence for event in first_session_controls] == list(
+            range(len(first_session_controls))
+        )
+        assert first_session_controls[-1].event == AvaServerEventTypeV4.TURN_COMPLETED
+        assert len(svg_specialist.requests) == 1
+        assert isinstance(
+            realtime.completed_canvas_outputs[0], InteractiveCanvasToolOutputV4
+        )
+        assert state.active is not None
+        assert state.active.first_rendered_sample >= 0
+        assert state.active.document.svg_text == (
+            FIXTURE_ROOT / "ava_svg_document_v4.svg"
+        ).read_text(encoding="utf-8")
+        assert documents.document_count == 0
+
+        for index, frame in enumerate(frames):
+            if isinstance(frame, AvaServerControlFrameV4) and isinstance(
+                frame.event, AudioChunkEventV4
+            ):
+                binary = frames[index + 1]
+                assert isinstance(binary, AvaServerPcmFrameV4)
+                assert binary.descriptor == frame.event
+    finally:
+        await frame_stream.aclose()
+        await coordinator.close()
+
+    assert coordinator._context_installation_task is None
     assert documents.document_count == 0

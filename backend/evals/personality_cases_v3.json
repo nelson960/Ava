@@ -1,6 +1,6 @@
 {
   "schemaVersion": 3,
-  "promptVersion": "ava-realtime-v4.8",
+  "promptVersion": "ava-realtime-v4.9",
   "cases": [
     {
       "id": "canvas_tool_continuation_coherent",

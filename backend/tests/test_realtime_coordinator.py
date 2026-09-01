@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from builtins import anext
 from collections.abc import AsyncIterator, Awaitable, Callable
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -23,9 +25,15 @@ from ava_backend.canvas.svg_specialist import (
     SvgCanvasSpecialistRequest,
 )
 from ava_backend.protocol import AgeBand
+from ava_backend.realtime.context_assembler import (
+    DynamicContextBuildReason,
+    MemoryReference,
+)
 from ava_backend.realtime.coordinator import (
+    RECENT_LIVE_ECHO_SUPPRESSION_TURNS,
     CoordinatorStateError,
     DeterministicRealtimeSessionCoordinator,
+    _CapturedMemoryCommit,
     _canvas_interaction_summary,
 )
 from ava_backend.realtime.coordinator_v4 import ProtocolV4CanvasEventSink
@@ -58,13 +66,20 @@ from ava_backend.realtime.fakes import (
     DeterministicRealtimePlanProvider,
     DeterministicStreamingSpeechSynthesizer,
 )
+from ava_backend.realtime.harness import build_realtime_harness
 from ava_backend.realtime.memory import (
+    ChildTurnTextSource,
+    DeliveredConversationTurn,
+    DeliveredTurnTerminal,
     DevelopmentAuthoritativeMemoryStore,
+    MemoryProposalDecision,
+    MemorySearchCandidate,
     MemoryResetRevisionMismatchError,
 )
 from ava_backend.realtime.plan import AvaTurnPlan
 from ava_backend.realtime.provider_session import (
     NegotiatedRealtimeCall,
+    RealtimeContextInstallationStatus,
     RealtimeProviderInputEvent,
     RealtimeProviderProtocolError,
     RealtimeProviderResponseIncompleteError,
@@ -78,7 +93,11 @@ from ava_backend.realtime.speech_contract import (
 )
 from ava_backend.realtime.svg_canvas_jobs import SvgCanvasJobCoordinator
 from ava_backend.realtime.tool_contract import (
+    GetCurrentTimeRequest,
     InteractiveCanvasToolOutputV4,
+    RealtimeGetCurrentTimeToolCall,
+    RealtimeSearchMemoryToolCall,
+    SearchMemoryRequest,
     RealtimeCanvasToolCall,
     RealtimeSpeechTextDelta,
 )
@@ -237,7 +256,7 @@ class _BlockingInteractionContextProvider(DeterministicRealtimePlanProvider):
         if self.prepared_session_updates:
             self.context_refresh_started.set()
             await self.allow_context_refresh.wait()
-        await super().prepare(harness=harness)
+        return await super().prepare(harness=harness)
 
     async def request_canvas_interaction_response(
         self,
@@ -252,6 +271,35 @@ class _BlockingInteractionContextProvider(DeterministicRealtimePlanProvider):
         if triggered:
             self.interaction_response_requested.set()
         return triggered
+
+
+class _BlockingContextInstallProvider(DeterministicRealtimePlanProvider):
+    def __init__(self, plan: AvaTurnPlan) -> None:
+        super().__init__(plan)
+        self.context_refresh_started = asyncio.Event()
+        self.allow_context_refresh = asyncio.Event()
+
+    async def prepare(self, *, harness):  # type: ignore[no-untyped-def]
+        if self.prepared_session_updates:
+            self.context_refresh_started.set()
+            await self.allow_context_refresh.wait()
+        return await super().prepare(harness=harness)
+
+
+class _FailingContextInstallProvider(DeterministicRealtimePlanProvider):
+    def __init__(self, plan: AvaTurnPlan) -> None:
+        super().__init__(plan)
+        self.fail_idle_install = False
+
+    async def prepare_if_idle(
+        self,
+        *,
+        harness,
+        turn_id: str,
+    ):  # type: ignore[no-untyped-def]
+        if self.fail_idle_install:
+            raise RuntimeError("controlled context installation failure")
+        return await super().prepare_if_idle(harness=harness, turn_id=turn_id)
 
 
 class _TemporarilyUnreadyRealtimeProvider(DeterministicRealtimePlanProvider):
@@ -294,6 +342,42 @@ class _TemporarilyUnreadyRealtimeProvider(DeterministicRealtimePlanProvider):
             turn_id=turn_id,
             interaction=interaction,
         )
+
+
+class _UtilityRealtimeProvider(DeterministicRealtimePlanProvider):
+    def __init__(
+        self,
+        plan: AvaTurnPlan,
+        *,
+        tool_kind: str,
+        search_request: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(plan)
+        self.tool_kind = tool_kind
+        self.search_request = search_request
+
+    async def _stream(self) -> AsyncIterator[RealtimeProviderTurnEvent]:
+        self.turn_stream_started.set()
+        if self.tool_kind == "search_memory":
+            yield RealtimeSearchMemoryToolCall(
+                call_id="call_search_memory",
+                request=SearchMemoryRequest.model_validate(
+                    self.search_request
+                    or {
+                        "query": "a spring clock discussion",
+                        "fromDate": "2026-03-08",
+                        "toDate": "2026-03-08",
+                    }
+                ),
+            )
+        else:
+            yield RealtimeGetCurrentTimeToolCall(
+                call_id="call_get_current_time",
+                request=GetCurrentTimeRequest.model_validate({}),
+            )
+        if not self.completed_utility_outputs:
+            raise RuntimeError("fake utility tool call was not completed")
+        yield RealtimeSpeechTextDelta(delta="I found the grounded answer.")
 
 
 class _InteractionThenChildRealtimeProvider(DeterministicRealtimePlanProvider):
@@ -679,6 +763,7 @@ def _coordinator(
     canvas_specialist: SvgCanvasSpecialist | None = None,
     canvas_generation_id_factory: Callable[[], str] | None = None,
     memory_commit_drain_timeout_seconds: float = 2.0,
+    current_time_factory: Callable[[], datetime] | None = None,
 ) -> tuple[
     DeterministicRealtimeSessionCoordinator,
     DeterministicRealtimePlanProvider | object,
@@ -725,6 +810,7 @@ def _coordinator(
             occurrence_time_factory or (lambda: datetime.now(UTC))
         ),
         memory_commit_drain_timeout_seconds=memory_commit_drain_timeout_seconds,
+        current_time_factory=(current_time_factory or (lambda: datetime.now(UTC))),
     )
     return coordinator, resolved_realtime, speech, resolved_memory
 
@@ -1089,8 +1175,17 @@ class _MalformedRealtimeProvider:
             provider_call_id="rtc_malformed_provider",
         )
 
-    async def prepare(self, *, harness: object) -> None:
+    @property
+    def active_context_build_id(self) -> str | None:
+        return None
+
+    async def prepare(
+        self,
+        *,
+        harness: object,
+    ) -> RealtimeContextInstallationStatus:
         del harness
+        return RealtimeContextInstallationStatus.INSTALLED
 
     async def turn_events(
         self,
@@ -1209,6 +1304,244 @@ async def test_malformed_provider_text_fails_validation_before_tts() -> None:
     await coordinator.close()
 
 
+async def test_search_memory_tool_uses_coordinator_subject_and_dst_date_bounds(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.realtime_coordinator")
+    provider = _UtilityRealtimeProvider(
+        _plan(),
+        tool_kind="search_memory",
+        search_request={
+            "query": "SEARCH_QUERY_CONTENT_SENTINEL",
+            "fromDate": "2026-03-08",
+            "toDate": "2026-03-08",
+        },
+    )
+    memory = _RecordingSearchMemoryStore()
+    coordinator, _, _, _ = _coordinator(
+        realtime=provider,
+        memory=memory,
+        timezone_id="America/New_York",
+    )
+    await _ready(coordinator)
+
+    events = await _complete_delivered_turn(coordinator)
+
+    assert isinstance(events[-1], TurnCompletedEventV4)
+    explicit = memory.searches[0]
+    assert explicit["subject"] == "child:coordinator"
+    assert explicit["limit"] == 5
+    assert explicit["from_instant"] == datetime(2026, 3, 8, 5, 0, tzinfo=UTC)
+    assert explicit["to_instant"] == datetime(2026, 3, 9, 4, 0, tzinfo=UTC)
+    output = provider.completed_utility_outputs[0].model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    assert output["status"] == "available"
+    assert len(output["references"]) == 1
+    assert "sourceId" not in output["references"][0]
+    assert "sourceTurnIds" not in output["references"][0]
+    assert "relevance" not in output["references"][0]
+    telemetry = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage().startswith("realtime_semantic_tool_completed")
+        and record.ava_context.get("toolKind") == "search_memory"
+    )
+    assert telemetry == {
+        "sessionId": SESSION_ID,
+        "turnId": TURN_ID,
+        "toolCallId": "call_search_memory",
+        "toolKind": "search_memory",
+        "step": 1,
+        "queryCharCount": len("SEARCH_QUERY_CONTENT_SENTINEL"),
+        "hasFromDate": True,
+        "hasToDate": True,
+        "rawCandidateCount": 1,
+        "resultCount": 1,
+        "resultSourceKinds": ["episode"],
+        "resultSourceIds": ["episode-grounded-clock"],
+        "status": "available",
+    }
+    assert "SEARCH_QUERY_CONTENT_SENTINEL" not in caplog.text
+    await coordinator.close()
+
+
+async def test_get_current_time_tool_uses_validated_session_timezone() -> None:
+    provider = _UtilityRealtimeProvider(_plan(), tool_kind="get_current_time")
+    coordinator, _, _, _ = _coordinator(
+        realtime=provider,
+        timezone_id="Asia/Kolkata",
+        current_time_factory=lambda: datetime(2026, 8, 31, 6, 30, tzinfo=UTC),
+    )
+    await _ready(coordinator)
+
+    events = await _complete_delivered_turn(coordinator)
+
+    assert isinstance(events[-1], TurnCompletedEventV4)
+    output = provider.completed_utility_outputs[0].model_dump(
+        mode="json",
+        by_alias=True,
+    )
+    assert output == {
+        "localIsoDateTime": "2026-08-31T12:00:00+05:30",
+        "weekday": "Monday",
+        "daypart": "afternoon",
+        "timezoneId": "Asia/Kolkata",
+    }
+    await coordinator.close()
+
+
+async def test_get_current_time_uses_each_later_turns_execution_instant() -> None:
+    provider = _UtilityRealtimeProvider(_plan(), tool_kind="get_current_time")
+    clock = [datetime(2026, 8, 31, 6, 30, tzinfo=UTC)]
+    coordinator, _, _, _ = _coordinator(
+        realtime=provider,
+        persistent=True,
+        timezone_id="Asia/Kolkata",
+        current_time_factory=lambda: clock[0],
+    )
+    await _ready(coordinator)
+    frames = coordinator.frames()
+    next_client_sequence = 1
+    completed_turns = 0
+    try:
+        async for frame in frames:
+            if not isinstance(frame, AvaServerControlFrameV4):
+                continue
+            if isinstance(frame.event, AudioMetadataEventV4):
+                await coordinator.receive(
+                    _client(
+                        {
+                            "event": "playbackStarted",
+                            "sequence": next_client_sequence,
+                            "turnId": frame.event.turn_id,
+                            "streamId": frame.event.stream_id,
+                            "renderedSampleCount": 0,
+                        }
+                    )
+                )
+                next_client_sequence += 1
+            if (
+                isinstance(frame.event, TurnPhaseChangedEventV4)
+                and frame.event.phase == SpeechPhase.SPEAKING
+            ):
+                await coordinator.receive(
+                    _client(
+                        {
+                            "event": "playbackProgress",
+                            "sequence": next_client_sequence,
+                            "turnId": coordinator.turn_id,
+                            "streamId": coordinator._stream_id,
+                            "renderedSampleCount": coordinator.received_sample_count,
+                            "bufferedSampleCount": 0,
+                        }
+                    )
+                )
+                next_client_sequence += 1
+            if isinstance(frame.event, TurnCompletedEventV4):
+                completed_turns += 1
+                if completed_turns == 1:
+                    clock[0] += timedelta(minutes=45)
+                else:
+                    break
+
+        outputs = [
+            output.model_dump(mode="json", by_alias=True)
+            for output in provider.completed_utility_outputs
+        ]
+        assert [output["localIsoDateTime"] for output in outputs] == [
+            "2026-08-31T12:00:00+05:30",
+            "2026-08-31T12:45:00+05:30",
+        ]
+    finally:
+        await frames.aclose()
+        await coordinator.close()
+
+
+@pytest.mark.parametrize(
+    ("memory_kind", "search_request", "expected_status"),
+    [
+        (
+            "empty",
+            {"query": "history that does not exist"},
+            "noMatches",
+        ),
+        (
+            "failing",
+            {"query": "temporarily unavailable history"},
+            "unavailable",
+        ),
+        (
+            "empty",
+            {
+                "query": "reversed dates",
+                "fromDate": "2026-03-09",
+                "toDate": "2026-03-08",
+            },
+            "rejected",
+        ),
+        (
+            "empty",
+            {"query": "???"},
+            "rejected",
+        ),
+    ],
+)
+async def test_search_memory_empty_failure_and_reversed_dates_are_safe_tool_results(
+    memory_kind: str,
+    search_request: dict[str, object],
+    expected_status: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.realtime_coordinator")
+    memory = (
+        _FailingSearchMemoryStore()
+        if memory_kind == "failing"
+        else DevelopmentAuthoritativeMemoryStore()
+    )
+    provider = _UtilityRealtimeProvider(
+        _plan(),
+        tool_kind="search_memory",
+        search_request=search_request,
+    )
+    coordinator, _, _, _ = _coordinator(realtime=provider, memory=memory)
+    await _ready(coordinator)
+
+    events = await _complete_delivered_turn(coordinator)
+
+    assert isinstance(events[-1], TurnCompletedEventV4)
+    output = provider.completed_utility_outputs[0].model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    assert output["status"] == expected_status
+    assert output.get("references", []) == []
+    assert len(provider.completed_utility_outputs) == 1
+    if search_request["query"] == "???":
+        assert output == {
+            "status": "rejected",
+            "references": [],
+            "reason": "The historical-memory query or date range was invalid.",
+        }
+    telemetry = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage().startswith("realtime_semantic_tool_completed")
+        and record.ava_context.get("toolKind") == "search_memory"
+    )
+    assert telemetry["status"] == expected_status
+    assert telemetry["resultCount"] == 0
+    assert telemetry["rawCandidateCount"] == 0
+    assert telemetry["resultSourceKinds"] == []
+    assert telemetry["resultSourceIds"] == []
+    assert telemetry["queryCharCount"] == len(str(search_request["query"]))
+    assert str(search_request["query"]) not in caplog.text
+    await coordinator.close()
+
+
 class _FailingCommitMemoryStore(DevelopmentAuthoritativeMemoryStore):
     async def commit_delivered_turn(self, **kwargs: object):  # type: ignore[no-untyped-def]
         del kwargs
@@ -1236,6 +1569,105 @@ class _ObservedMemoryStore(DevelopmentAuthoritativeMemoryStore):
     async def wait_for_turn(self, turn_id: str) -> None:
         event = self.committed_by_turn.setdefault(turn_id, asyncio.Event())
         await event.wait()
+
+
+class _RecordingSearchMemoryStore(_ObservedMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.searches: list[dict[str, object]] = []
+
+    async def search_memory_candidates(self, **kwargs: object):  # type: ignore[no-untyped-def]
+        self.searches.append(dict(kwargs))
+        return [
+            MemorySearchCandidate.model_validate(
+                {
+                    "sourceId": "episode-grounded-clock",
+                    "sourceKind": "episode",
+                    "startedAt": "2026-03-08T06:00:00Z",
+                    "endedAt": "2026-03-08T06:05:00Z",
+                    "timezoneIds": ["America/New_York"],
+                    "referenceText": "The child previously discussed a spring clock.",
+                    "sourceTurnIds": ["turn-grounded-clock"],
+                    "relevance": 1.0,
+                }
+            )
+        ]
+
+
+class _FailingSearchMemoryStore(DevelopmentAuthoritativeMemoryStore):
+    async def search_memory_candidates(self, **kwargs: object):  # type: ignore[no-untyped-def]
+        del kwargs
+        raise RuntimeError("controlled historical-memory outage")
+
+
+class _SyntheticWarmMemoryStore(DevelopmentAuthoritativeMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.candidates: list[MemorySearchCandidate] = []
+        self.failed_turn_ids: set[str] = set()
+        self.searches: list[dict[str, object]] = []
+
+    async def commit_delivered_turn(self, **kwargs: object):  # type: ignore[no-untyped-def]
+        turn = kwargs["turn"]
+        if turn.turn_id in self.failed_turn_ids:  # type: ignore[union-attr]
+            raise RuntimeError("controlled durable commit failure")
+        return MemoryProposalDecision(
+            accepted=False,
+            reason="No stable-memory proposal was supplied.",
+            record=None,
+        )
+
+    async def search_memory_candidates(self, **kwargs: object):  # type: ignore[no-untyped-def]
+        self.searches.append(dict(kwargs))
+        return list(self.candidates)
+
+
+class _BlockingSearchMemoryStore(_ObservedMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.search_started = asyncio.Event()
+        self.allow_search = asyncio.Event()
+        self.search_cancelled = asyncio.Event()
+
+    async def search_memory_candidates(self, **kwargs: object):  # type: ignore[no-untyped-def]
+        del kwargs
+        self.search_started.set()
+        try:
+            await self.allow_search.wait()
+        except asyncio.CancelledError:
+            self.search_cancelled.set()
+            raise
+        return []
+
+
+class _SupersedingSearchMemoryStore(_ObservedMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.older_started = asyncio.Event()
+        self.allow_older = asyncio.Event()
+
+    async def search_memory_candidates(self, **kwargs: object):  # type: ignore[no-untyped-def]
+        query = str(kwargs["query"])
+        if "older" in query:
+            self.older_started.set()
+            await self.allow_older.wait()
+            marker = "older historical evidence"
+        else:
+            marker = "newer historical evidence"
+        return [
+            MemorySearchCandidate.model_validate(
+                {
+                    "sourceId": "episode-" + marker.split()[0],
+                    "sourceKind": "episode",
+                    "startedAt": "2026-01-01T00:00:00Z",
+                    "endedAt": "2026-01-01T00:05:00Z",
+                    "timezoneIds": ["UTC"],
+                    "referenceText": marker,
+                    "sourceTurnIds": ["turn-history-" + marker.split()[0]],
+                    "relevance": 1.0,
+                }
+            )
+        ]
 
 
 class _BlockingCommitMemoryStore(_ObservedMemoryStore):
@@ -1539,6 +1971,611 @@ async def test_blocked_memory_store_cannot_delay_persistent_rearm() -> None:
     await coordinator.close()
 
 
+async def test_blocked_warm_search_cannot_delay_terminal_or_rearm() -> None:
+    memory = _BlockingSearchMemoryStore()
+    coordinator, _, _, _ = _coordinator(memory=memory, persistent=True)
+    await _ready(coordinator)
+
+    rearm = asyncio.create_task(
+        _complete_first_persistent_turn_and_rearm(
+            coordinator,
+            first_client_sequence=1,
+        )
+    )
+    await memory.search_started.wait()
+    await asyncio.wait_for(rearm, timeout=1.0)
+
+    assert coordinator.turn_id == "turn-coordinator-2"
+    assert memory.committed_turn_ids == [TURN_ID]
+    memory.allow_search.set()
+    await coordinator.close()
+
+
+async def test_pending_context_installation_cannot_delay_persistent_rearm() -> None:
+    memory = _RecordingSearchMemoryStore()
+    provider = _BlockingContextInstallProvider(_plan())
+    coordinator, _, _, _ = _coordinator(
+        memory=memory,
+        realtime=provider,
+        persistent=True,
+    )
+    await _ready(coordinator)
+    frames = coordinator.frames()
+    try:
+        async for frame in frames:
+            if not isinstance(frame, AvaServerControlFrameV4):
+                continue
+            if isinstance(frame.event, AudioMetadataEventV4):
+                await coordinator.receive(
+                    _client(
+                        {
+                            "event": "playbackStarted",
+                            "sequence": 1,
+                            "turnId": TURN_ID,
+                            "streamId": STREAM_ID,
+                            "renderedSampleCount": 0,
+                        }
+                    )
+                )
+            if (
+                isinstance(frame.event, TurnPhaseChangedEventV4)
+                and frame.event.phase == SpeechPhase.SPEAKING
+            ):
+                await coordinator.receive(
+                    _client(
+                        {
+                            "event": "playbackProgress",
+                            "sequence": 2,
+                            "turnId": TURN_ID,
+                            "streamId": STREAM_ID,
+                            "renderedSampleCount": coordinator.received_sample_count,
+                            "bufferedSampleCount": 0,
+                        }
+                    )
+                )
+            if isinstance(frame.event, TurnCompletedEventV4):
+                break
+
+        await _advance_ready_callbacks()
+        assert coordinator._pending_harness is not None
+
+        next_frame = await asyncio.wait_for(anext(frames), timeout=1.0)
+        assert isinstance(next_frame, AvaServerControlFrameV4)
+        assert isinstance(next_frame.event, TurnCreatedEventV4)
+        assert next_frame.event.turn_id == "turn-coordinator-2"
+        assert not provider.context_refresh_started.is_set()
+    finally:
+        provider.allow_context_refresh.set()
+        await frames.aclose()
+        await coordinator.close()
+
+
+async def test_deferred_context_installation_preserves_one_build_identity(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.realtime_coordinator")
+    coordinator, provider, _, _ = _coordinator()
+    assert isinstance(provider, DeterministicRealtimePlanProvider)
+    await _ready(coordinator)
+    caplog.clear()
+    coordinator._warm_memories = (
+        MemoryReference.from_candidate(
+            _warm_candidate("deferred", source_turn_ids=["T-old-deferred"])
+        ),
+    )
+
+    await coordinator._refresh_canvas_context(
+        reason=DynamicContextBuildReason.TURN_COMMITTED
+    )
+    pending = coordinator._pending_harness
+    assert pending is not None
+    pending_build_id = pending.context.build_id
+    assert provider.active_context_build_id != pending_build_id
+
+    stream = provider.turn_events(
+        harness=coordinator.harness,
+        turn_id=TURN_ID,
+    )
+    await _advance_ready_callbacks()
+
+    assert coordinator._pending_harness is None
+    assert coordinator.harness.context.build_id == pending_build_id
+    assert provider.active_context_build_id == pending_build_id
+    records = [
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage().startswith("realtime_context_installation")
+        and record.ava_context["contextBuildId"] == pending_build_id
+    ]
+    assert [record["status"] for record in records] == ["deferred", "installed"]
+    assert {record["providerCallId"] for record in records} == {
+        "rtc_fake_ava_call_0001"
+    }
+    await stream.aclose()
+    await coordinator.close()
+
+
+async def test_reset_supersedes_pending_context_before_response_ownership(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.realtime_coordinator")
+    coordinator, provider, _, _ = _coordinator()
+    assert isinstance(provider, DeterministicRealtimePlanProvider)
+    await _ready(coordinator)
+    caplog.clear()
+
+    await coordinator._refresh_canvas_context(
+        reason=DynamicContextBuildReason.TURN_COMMITTED
+    )
+    pre_reset = coordinator._pending_harness
+    assert pre_reset is not None
+    pre_reset_build_id = pre_reset.context.build_id
+
+    await coordinator.memory_reset(reset_revision=1)
+    post_reset = coordinator._pending_harness
+    assert post_reset is not None
+    post_reset_build_id = post_reset.context.build_id
+    assert post_reset_build_id != pre_reset_build_id
+
+    stream = provider.turn_events(
+        harness=coordinator.harness,
+        turn_id=TURN_ID,
+    )
+    await _advance_ready_callbacks()
+    first_response_event = await anext(stream)
+
+    assert first_response_event is not None
+    assert coordinator.harness.context.build_id == post_reset_build_id
+    assert provider.active_context_build_id == post_reset_build_id
+    terminal_statuses = {
+        (record.ava_context["contextBuildId"], record.ava_context["status"])
+        for record in caplog.records
+        if record.getMessage().startswith("realtime_context_installation")
+        and record.ava_context["status"] in {"installed", "deduplicated"}
+    }
+    assert (post_reset_build_id, "deduplicated") in terminal_statuses
+    assert not any(build_id == pre_reset_build_id for build_id, _ in terminal_statuses)
+    await stream.aclose()
+    await coordinator.close()
+
+
+async def test_failed_context_install_logs_build_and_keeps_active_identity(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.realtime_coordinator")
+    provider = _FailingContextInstallProvider(_plan())
+    coordinator, _, _, _ = _coordinator(realtime=provider)
+    await _ready(coordinator)
+    active_build_id = provider.active_context_build_id
+    caplog.clear()
+    provider.fail_idle_install = True
+
+    with pytest.raises(
+        RuntimeError,
+        match="controlled context installation failure",
+    ):
+        await coordinator._refresh_canvas_context(
+            reason=DynamicContextBuildReason.TURN_COMMITTED
+        )
+
+    failed = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage().startswith("realtime_context_installation")
+        and record.ava_context["status"] == "failed"
+    )
+    assert failed["contextBuildId"] != active_build_id
+    assert failed["providerCallId"] == "rtc_fake_ava_call_0001"
+    assert failed["errorType"] == "RuntimeError"
+    assert provider.active_context_build_id == active_build_id
+    await coordinator.close()
+
+
+async def test_reset_invalidates_blocked_warm_search_before_installation() -> None:
+    memory = _BlockingSearchMemoryStore()
+    coordinator, provider, _, _ = _coordinator(memory=memory)
+    await _ready(coordinator)
+    initial_update_count = len(provider.prepared_session_updates)  # type: ignore[union-attr]
+
+    await _complete_delivered_turn(coordinator)
+    await memory.search_started.wait()
+    assert list(coordinator._recent_live_echo_suppression_turn_ids) == [TURN_ID]
+    receipt = await memory.reset_conversation(subject="child:coordinator")
+    await coordinator.memory_reset(reset_revision=receipt.revision)
+    memory.allow_search.set()
+    await _advance_ready_callbacks()
+
+    assert coordinator._warm_memories == ()
+    assert list(coordinator._recent_live_echo_suppression_turn_ids) == []
+    assert coordinator._memory_reset_revision == receipt.revision
+    assert len(provider.prepared_session_updates) == initial_update_count  # type: ignore[union-attr]
+    await coordinator.close()
+
+
+def _synthetic_turn_and_payload(
+    index: int,
+) -> tuple[DeliveredConversationTurn, _CapturedMemoryCommit]:
+    turn = DeliveredConversationTurn.model_validate(
+        {
+            "turnId": f"T{index}",
+            "childText": f"child topic {index}",
+            "childTextSource": "transcript",
+            "avaDeliveredText": f"Ava reply {index}.",
+            "deliveredSampleCount": 24_000,
+            "childTurnSummary": f"semantic summary {index}",
+            "terminal": "completed",
+        }
+    )
+    return turn, _CapturedMemoryCommit(
+        sequence=index,
+        turn_id=turn.turn_id,
+        occurred_at=datetime(2026, 8, 31, tzinfo=UTC),
+        timezone_id="UTC",
+        expected_reset_revision=0,
+        child_turn_summary=turn.child_turn_summary,
+        child_text=turn.child_text,
+        child_text_source=ChildTurnTextSource.TRANSCRIPT,
+        canvas_interaction=None,
+        delivered_text=turn.ava_delivered_text,
+        delivered_sample_count=turn.delivered_sample_count,
+        terminal=DeliveredTurnTerminal.COMPLETED,
+        transcript_waiter=None,
+        warm_refresh_revision=index,
+    )
+
+
+def _warm_candidate(
+    marker: str,
+    *,
+    source_turn_ids: list[str],
+    source_kind: str = "episode",
+    source_id: str | None = None,
+    reference_text: str | None = None,
+) -> MemorySearchCandidate:
+    return MemorySearchCandidate.model_validate(
+        {
+            "sourceId": source_id or f"episode-{marker}",
+            "sourceKind": source_kind,
+            "startedAt": "2026-01-01T00:00:00Z",
+            "endedAt": "2026-01-01T00:05:00Z",
+            "timezoneIds": ["UTC"],
+            "referenceText": reference_text or f"historical evidence {marker}",
+            "sourceTurnIds": source_turn_ids,
+            "relevance": 1.0,
+        }
+    )
+
+
+async def _commit_synthetic_turn(
+    coordinator: DeterministicRealtimeSessionCoordinator,
+    index: int,
+) -> tuple[DeliveredConversationTurn, _CapturedMemoryCommit]:
+    turn, payload = _synthetic_turn_and_payload(index)
+    coordinator._latest_memory_commit_sequence = index
+    coordinator._warm_refresh_revision = index
+    await coordinator._run_memory_commit(payload=payload)
+    return turn, payload
+
+
+async def test_context_build_telemetry_has_monotonic_identity_and_exact_counts(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.realtime_coordinator")
+    coordinator, _, _, _ = _coordinator()
+    await _ready(coordinator)
+    first = coordinator.harness
+    coordinator._warm_memories = (
+        MemoryReference.from_candidate(
+            _warm_candidate("build", source_turn_ids=["T-old"])
+        ),
+    )
+    second = coordinator._build_live_harness(
+        reason=DynamicContextBuildReason.TURN_COMMITTED
+    )
+    canvas_context = (
+        '<canvas_context trust="untrusted_model_generated_data">'
+        "CANVAS_ACCESSIBILITY_CONTENT_SENTINEL"
+        "</canvas_context>"
+    )
+    third = build_realtime_harness(
+        dynamic_context=coordinator._context_assembler.assemble(
+            build_id=coordinator._next_context_build_id(),
+            reason=DynamicContextBuildReason.CANVAS_ACTIVATED,
+            age_band=AgeBand.MIDDLE_CHILDHOOD,
+            timezone_id="UTC",
+            current_time_utc=datetime(2026, 9, 1, tzinfo=UTC),
+            canvas_context=canvas_context,
+        )
+    )
+    coordinator._log_dynamic_context_build(
+        DynamicContextBuildReason.CANVAS_ACTIVATED,
+        third,
+    )
+
+    records = [
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage().startswith("realtime_dynamic_context_built")
+    ]
+    assert [record["contextBuildId"] for record in records] == [
+        "ctx-1",
+        "ctx-2",
+        "ctx-3",
+    ]
+    assert records[0]["finalUtf8Bytes"] == len(first.context.content.encode("utf-8"))
+    assert records[1]["finalUtf8Bytes"] == len(second.context.content.encode("utf-8"))
+    assert records[0]["bootstrapTurnCount"] == 0
+    assert records[1]["warmReferenceCount"] == 1
+    assert records[1]["canvasIncluded"] is False
+    assert records[2]["finalUtf8Bytes"] == len(third.context.content.encode("utf-8"))
+    assert records[2]["canvasIncluded"] is True
+    assert "CANVAS_ACCESSIBILITY_CONTENT_SENTINEL" not in caplog.text
+    assert all(
+        "CANVAS_ACCESSIBILITY_CONTENT_SENTINEL" not in repr(record)
+        for record in records
+    )
+    await coordinator.close()
+
+
+async def test_commit_and_warm_refresh_log_content_free_provenance(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.realtime_coordinator")
+    memory = _SyntheticWarmMemoryStore()
+    memory.candidates = [
+        _warm_candidate(
+            "suppressed",
+            source_turn_ids=["T1"],
+            source_kind="rawEvent",
+            source_id="T1",
+            reference_text="MEMORY_CONTENT_SENTINEL_SUPPRESSED",
+        ),
+        _warm_candidate(
+            "episode",
+            source_turn_ids=["T-old-episode"],
+            source_id="episode-survivor",
+            reference_text="MEMORY_CONTENT_SENTINEL_EPISODE",
+        ),
+        _warm_candidate(
+            "stable",
+            source_turn_ids=["T-old-stable"],
+            source_kind="stableMemory",
+            source_id="memory-survivor",
+            reference_text="MEMORY_CONTENT_SENTINEL_STABLE",
+        ),
+    ]
+    coordinator, _, _, _ = _coordinator(memory=memory)
+    await _ready(coordinator)
+
+    _, payload = _synthetic_turn_and_payload(1)
+    coordinator._latest_memory_commit_sequence = 1
+    coordinator._warm_refresh_revision = 1
+    await coordinator._run_memory_commit(
+        payload=replace(
+            payload,
+            child_text="CHILD_TRANSCRIPT_CONTENT_SENTINEL",
+            child_turn_summary="CHILD_SUMMARY_CONTENT_SENTINEL",
+            delivered_text="AVA_DELIVERED_CONTENT_SENTINEL",
+        )
+    )
+
+    commit = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage().startswith("memory_commit_completed")
+    )
+    assert commit["sessionId"] == SESSION_ID
+    assert commit["turnId"] == "T1"
+    assert commit["resetRevision"] == 0
+    assert commit["inputKind"] == "speech"
+    assert commit["durationMs"] >= 0
+
+    warm = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage().startswith("memory_warm_refresh_completed")
+    )
+    assert warm["rawCandidateCount"] == 3
+    assert warm["recentSuppressedCount"] == 1
+    assert warm["selectedCount"] == 2
+    assert warm["selectedSourceKinds"] == ["episode", "stableMemory"]
+    assert warm["selectedSourceIds"] == ["episode-survivor", "memory-survivor"]
+    assert warm["sourceTurnId"] == "T1"
+    assert warm["revision"] == 1
+    for sentinel in (
+        "MEMORY_CONTENT_SENTINEL_SUPPRESSED",
+        "MEMORY_CONTENT_SENTINEL_EPISODE",
+        "MEMORY_CONTENT_SENTINEL_STABLE",
+        "CHILD_TRANSCRIPT_CONTENT_SENTINEL",
+        "CHILD_SUMMARY_CONTENT_SENTINEL",
+        "AVA_DELIVERED_CONTENT_SENTINEL",
+    ):
+        assert sentinel not in caplog.text
+        assert all(sentinel not in repr(record) for record in (commit, warm))
+    await coordinator.close()
+
+
+async def test_bootstrap_projected_turns_seed_recent_echo_suppression() -> None:
+    memory = DevelopmentAuthoritativeMemoryStore()
+    for index in range(1, 11):
+        turn, _ = _synthetic_turn_and_payload(index)
+        await memory.commit_delivered_turn(
+            subject="child:coordinator",
+            expected_reset_revision=0,
+            turn=turn,
+            proposal=None,
+            memory_id=None,
+            occurred_at=datetime(2026, 8, 31, tzinfo=UTC) + timedelta(minutes=index),
+            timezone_id="UTC",
+        )
+
+    coordinator, _, _, _ = _coordinator(memory=memory)
+    await _ready(coordinator)
+
+    assert list(coordinator._recent_live_echo_suppression_turn_ids) == [
+        f"T{index}" for index in range(3, 11)
+    ]
+    await coordinator.close()
+
+
+async def test_same_call_turns_roll_out_of_recent_echo_suppression_and_become_warm() -> (
+    None
+):
+    memory = _SyntheticWarmMemoryStore()
+    coordinator, provider, _, _ = _coordinator(memory=memory)
+    await _ready(coordinator)
+
+    latest_turn: DeliveredConversationTurn | None = None
+    latest_payload: _CapturedMemoryCommit | None = None
+    for index in range(1, 13):
+        latest_turn, latest_payload = await _commit_synthetic_turn(
+            coordinator,
+            index,
+        )
+
+    assert list(coordinator._recent_live_echo_suppression_turn_ids) == [
+        f"T{index}" for index in range(5, 13)
+    ]
+    assert memory.searches
+    assert "to_instant" not in memory.searches[-1]
+    assert latest_turn is not None
+    assert latest_payload is not None
+
+    memory.candidates = [
+        _warm_candidate("newest", source_turn_ids=["T12"]),
+        _warm_candidate("recent", source_turn_ids=["T8"]),
+        _warm_candidate("eligible", source_turn_ids=["T4"]),
+    ]
+    await coordinator._refresh_warm_memory(
+        payload=latest_payload,
+        turn=latest_turn,
+    )
+    assert [reference.text for reference in coordinator._warm_memories] == [
+        "historical evidence eligible"
+    ]
+
+    latest_turn, latest_payload = await _commit_synthetic_turn(coordinator, 13)
+    assert list(coordinator._recent_live_echo_suppression_turn_ids) == [
+        f"T{index}" for index in range(6, 14)
+    ]
+    memory.candidates = [_warm_candidate("rolled-out", source_turn_ids=["T5"])]
+    await coordinator._refresh_warm_memory(
+        payload=latest_payload,
+        turn=latest_turn,
+    )
+    assert [reference.text for reference in coordinator._warm_memories] == [
+        "historical evidence rolled-out"
+    ]
+    assert len(provider.negotiated_offers) == 1  # type: ignore[union-attr]
+    await coordinator.close()
+
+
+async def test_episode_candidate_is_excluded_on_any_recent_provenance_overlap() -> None:
+    memory = _SyntheticWarmMemoryStore()
+    coordinator, _, _, _ = _coordinator(memory=memory)
+    await _ready(coordinator)
+    latest_turn: DeliveredConversationTurn | None = None
+    latest_payload: _CapturedMemoryCommit | None = None
+    for index in range(1, 9):
+        latest_turn, latest_payload = await _commit_synthetic_turn(
+            coordinator,
+            index,
+        )
+    assert latest_turn is not None
+    assert latest_payload is not None
+
+    memory.candidates = [
+        _warm_candidate("overlap", source_turn_ids=["T0", "T4"]),
+        _warm_candidate("old", source_turn_ids=["T-old-a", "T-old-b"]),
+    ]
+    await coordinator._refresh_warm_memory(
+        payload=latest_payload,
+        turn=latest_turn,
+    )
+
+    assert [reference.text for reference in coordinator._warm_memories] == [
+        "historical evidence old"
+    ]
+    await coordinator.close()
+
+
+async def test_recent_echo_suppression_is_bounded_and_failed_commit_does_not_advance() -> (
+    None
+):
+    memory = _SyntheticWarmMemoryStore()
+    coordinator, _, _, _ = _coordinator(memory=memory)
+    await _ready(coordinator)
+
+    for index in range(1, 201):
+        await _commit_synthetic_turn(coordinator, index)
+
+    expected = [f"T{index}" for index in range(193, 201)]
+    assert RECENT_LIVE_ECHO_SUPPRESSION_TURNS == 8
+    assert list(coordinator._recent_live_echo_suppression_turn_ids) == expected
+    memory.failed_turn_ids.add("T201")
+    await _commit_synthetic_turn(coordinator, 201)
+    assert list(coordinator._recent_live_echo_suppression_turn_ids) == expected
+    await coordinator.close()
+    assert list(coordinator._recent_live_echo_suppression_turn_ids) == []
+
+
+async def test_newest_warm_refresh_supersedes_older_completion() -> None:
+    memory = _SupersedingSearchMemoryStore()
+    coordinator, _, _, _ = _coordinator(memory=memory)
+    await _ready(coordinator)
+
+    def turn_and_payload(
+        marker: str,
+        revision: int,
+    ) -> tuple[DeliveredConversationTurn, _CapturedMemoryCommit]:
+        turn = DeliveredConversationTurn.model_validate(
+            {
+                "turnId": f"turn-{marker}",
+                "childText": f"{marker} topic",
+                "childTextSource": "transcript",
+                "avaDeliveredText": "A grounded reply.",
+                "deliveredSampleCount": 24_000,
+                "childTurnSummary": f"{marker} semantic summary",
+                "terminal": "completed",
+            }
+        )
+        return turn, _CapturedMemoryCommit(
+            sequence=revision,
+            turn_id=turn.turn_id,
+            occurred_at=datetime(2026, 8, 31, tzinfo=UTC),
+            timezone_id="UTC",
+            expected_reset_revision=0,
+            child_turn_summary=turn.child_turn_summary,
+            child_text=turn.child_text,
+            child_text_source=ChildTurnTextSource.TRANSCRIPT,
+            canvas_interaction=None,
+            delivered_text=turn.ava_delivered_text,
+            delivered_sample_count=turn.delivered_sample_count,
+            terminal=DeliveredTurnTerminal.COMPLETED,
+            transcript_waiter=None,
+            warm_refresh_revision=revision,
+        )
+
+    older_turn, older_payload = turn_and_payload("older", 1)
+    newer_turn, newer_payload = turn_and_payload("newer", 2)
+    coordinator._warm_refresh_revision = 2
+    older = asyncio.create_task(
+        coordinator._refresh_warm_memory(payload=older_payload, turn=older_turn)
+    )
+    await memory.older_started.wait()
+    await coordinator._refresh_warm_memory(
+        payload=newer_payload,
+        turn=newer_turn,
+    )
+    memory.allow_older.set()
+    await older
+
+    assert [reference.text for reference in coordinator._warm_memories] == [
+        "newer historical evidence"
+    ]
+    await coordinator.close()
+
+
 async def test_close_drains_fast_pending_memory_commit() -> None:
     memory = _BlockingCommitMemoryStore()
     coordinator, _, _, _ = _coordinator(memory=memory)
@@ -1576,7 +2613,10 @@ async def test_close_cancels_hung_memory_commit_after_bounded_drain() -> None:
     assert snapshot.delivered_turns == []
 
 
-async def test_pre_reset_deferred_commit_cannot_resurrect_memory() -> None:
+async def test_pre_reset_deferred_commit_cannot_resurrect_memory(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.realtime_coordinator")
     plan = _plan()
     provider = _LateTranscriptRealtimeProvider(
         plan,
@@ -1603,6 +2643,42 @@ async def test_pre_reset_deferred_commit_cannot_resurrect_memory() -> None:
     assert snapshot.reset_revision == 1
     assert snapshot.delivered_turns == []
     assert snapshot.stable_memories == []
+    assert not any(
+        record.getMessage().startswith("memory_commit_completed")
+        for record in caplog.records
+    )
+    await coordinator.close()
+
+
+async def test_skipped_memory_commit_logs_allocated_warm_refresh_revision(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.realtime_coordinator")
+    coordinator, _, _, _ = _coordinator()
+    await _ready(coordinator)
+    _, payload = _synthetic_turn_and_payload(44)
+
+    await coordinator._run_memory_commit(
+        payload=replace(
+            payload,
+            child_text=None,
+            child_text_source=None,
+            transcript_waiter=None,
+            warm_refresh_revision=44,
+        )
+    )
+
+    skipped = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage().startswith("memory_commit_skipped")
+    )
+    assert skipped["turnId"] == "T44"
+    assert skipped["warmRefreshRevision"] == 44
+    assert not any(
+        record.getMessage().startswith("memory_commit_completed")
+        for record in caplog.records
+    )
     await coordinator.close()
 
 
@@ -1694,7 +2770,7 @@ async def test_committed_turn_is_loaded_into_fresh_session_harness() -> None:
     context = coordinator_b.harness.context.content
     assert child_text in context
     assert plan.speech in context
-    assert coordinator_b.harness.context.included_delivered_turns == 1
+    assert coordinator_b.harness.context.included_bootstrap_turns == 1
     await coordinator_b.close()
 
 
@@ -2359,16 +3435,20 @@ async def test_interaction_context_refresh_spanning_rearm_never_attaches_to_new_
     assert coordinator._turn_id == "turn-coordinator-2"
     blocking_jobs.release.set()
     await interaction
+    await _advance_ready_callbacks()
 
     assert state.last_interaction is not None
     assert state.last_interaction.binding_id == "explore_condensation"
     assert provider.canvas_interaction_response_turn_ids == []
     assert provider.canvas_interaction_response_interactions == []
-    instructions = provider.prepared_session_updates[-1]["session"]
-    assert isinstance(instructions, dict)
-    installed = instructions["instructions"]
+    assert coordinator._pending_harness is not None
+    pending = coordinator._pending_harness.instructions
+    assert '<last_interaction mode="explore">' in pending
+    installed_session = provider.prepared_session_updates[-1]["session"]
+    assert isinstance(installed_session, dict)
+    installed = installed_session["instructions"]
     assert isinstance(installed, str)
-    assert '<last_interaction mode="explore">' in installed
+    assert '<last_interaction mode="explore">' not in installed
     await coordinator.close()
 
 
@@ -2855,6 +3935,7 @@ async def test_late_turn_a_commit_preserves_cross_turn_memory_chronology() -> No
 async def test_memory_failure_does_not_delay_or_poison_speech(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.realtime_coordinator")
     plan = _plan()
     coordinator, _, _, _ = _coordinator(
         plan=plan,
@@ -2911,6 +3992,10 @@ async def test_memory_failure_does_not_delay_or_poison_speech(
     assert failure_record.ava_context["turnId"] == TURN_ID
     assert failure_record.ava_context["component"] == "memoryStore"
     assert failure_record.ava_context["reasonCategory"] == "storeFailure"
+    assert not any(
+        record.getMessage().startswith("memory_commit_completed")
+        for record in caplog.records
+    )
     assert "Tell me something gentle" not in caplog.text
     assert plan.speech not in caplog.text
     await coordinator.close()

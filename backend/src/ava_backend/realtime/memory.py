@@ -595,7 +595,10 @@ class DevelopmentAuthoritativeMemoryStore:
                         started_at=episode.started_at,
                         ended_at=episode.ended_at,
                         timezone_ids=(episode.timezone_id,),
-                        reference_text=episode.digest,
+                        reference_text=_matched_episode_excerpt(
+                            episode.digest,
+                            query_tokens,
+                        ),
                         source_turn_ids=episode.source_turn_ids,
                         relevance=relevance,
                     )
@@ -889,6 +892,35 @@ def _bounded_search_text(value: str, max_characters: int) -> str:
 def _lexical_relevance(text: str, query_tokens: Sequence[str]) -> float:
     folded = text.casefold()
     return float(sum(folded.count(token) for token in query_tokens))
+
+
+def _matched_episode_excerpt(
+    digest: str,
+    query_tokens: Sequence[str],
+    *,
+    max_characters: int = 1_200,
+) -> str:
+    """Return chronological matching digest lines, never a blind prefix."""
+
+    if not 1 <= max_characters <= 1_200:
+        raise ValueError("episode excerpt limit must be between 1 and 1200")
+    matched_lines = [
+        _normalize_whitespace(line)
+        for line in digest.splitlines()
+        if _normalize_whitespace(line) and _lexical_relevance(line, query_tokens) > 0
+    ]
+    if not matched_lines:
+        raise ValueError("matched episode did not contain matching semantic lines")
+    excerpt = ""
+    for line in matched_lines:
+        candidate = line if not excerpt else f"{excerpt}\n{line}"
+        if len(candidate) <= max_characters:
+            excerpt = candidate
+            continue
+        if not excerpt:
+            excerpt = _bounded_search_text(line, max_characters)
+        break
+    return excerpt
 
 
 def _find_provenance_range(

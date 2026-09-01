@@ -432,7 +432,26 @@ class PostgresAuthoritativeMemoryStore:
                     episode.started_at,
                     episode.ended_at,
                     array[episode.timezone_id]::text[] as timezone_ids,
-                    left(episode.digest, 1200) as reference_text,
+                    left(
+                      replace(
+                        replace(
+                          ts_headline(
+                            'simple',
+                            episode.digest,
+                            search_query.value,
+                            'StartSel=<ava-search-match>, '
+                            'StopSel=</ava-search-match>, MaxWords=48, '
+                            'MinWords=8, ShortWord=1, MaxFragments=4, '
+                            'FragmentDelimiter= … '
+                          ),
+                          '<ava-search-match>',
+                          ''
+                        ),
+                        '</ava-search-match>',
+                        ''
+                      ),
+                      1200
+                    ) as reference_text,
                     episode.source_turn_ids,
                     ts_rank_cd(
                       to_tsvector('simple', episode.digest),
