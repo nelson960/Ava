@@ -150,7 +150,11 @@ class OpenAISvgCanvasSpecialist:
         total_cached_tokens = 0
         total_cache_write_tokens = 0
         total_reasoning_tokens = 0
+        usage_response_count = 0
+        cache_write_usage_response_count = 0
         provider_request_id: str | None = None
+        attempt_count = 0
+        generation_status = "failed"
         failed_svg: str | None = None
         validation_feedback: SvgValidationFeedback | None = None
         next_draft_index = 1
@@ -181,6 +185,7 @@ class OpenAISvgCanvasSpecialist:
                 attempt_deadline = self._monotonic() + attempt_budget
                 if overall_deadline <= self._monotonic():
                     raise _CanvasGenerationDeadlineExceeded("overallSafety")
+                attempt_count = attempt + 1
                 try:
                     streamed = await self._request(
                         request,
@@ -231,12 +236,17 @@ class OpenAISvgCanvasSpecialist:
                 usage = _field(response, "usage")
                 details = _field(usage, "input_tokens_details")
                 output_details = _field(usage, "output_tokens_details")
+                if usage is not None:
+                    usage_response_count += 1
                 total_input_tokens += _integer_field(usage, "input_tokens")
                 total_output_tokens += _integer_field(usage, "output_tokens")
                 total_cached_tokens += _integer_field(details, "cached_tokens")
-                total_cache_write_tokens += _integer_field(
+                cache_write_tokens = _optional_integer_field(
                     details, "cache_write_tokens"
                 )
+                if cache_write_tokens is not None:
+                    cache_write_usage_response_count += 1
+                    total_cache_write_tokens += cache_write_tokens
                 total_reasoning_tokens += _integer_field(
                     output_details, "reasoning_tokens"
                 )
@@ -371,16 +381,12 @@ class OpenAISvgCanvasSpecialist:
                     elapsed_from=generation_started_at,
                     providerRequestId=provider_request_id,
                     attemptCount=attempt + 1,
-                    inputTokens=total_input_tokens,
-                    cachedInputTokens=total_cached_tokens,
-                    cacheWriteInputTokens=total_cache_write_tokens,
-                    outputTokens=total_output_tokens,
-                    reasoningTokens=total_reasoning_tokens,
                     svgByteLength=len(document.svg_bytes),
                     svgSha256=document.svg_sha256,
                     manifestByteLength=len(document.manifest_bytes),
                     manifestSha256=document.manifest_sha256,
                 )
+                generation_status = "succeeded"
                 return SvgCanvasSpecialistGeneration(
                     generation_id=request.generation_id,
                     document=document,
@@ -390,6 +396,7 @@ class OpenAISvgCanvasSpecialist:
                     cached_input_tokens=total_cached_tokens,
                 )
         except SvgCanvasSpecialistGenerationLimitError as error:
+            provider_request_id = error.provider_request_id or provider_request_id
             self._log(
                 "generationFailed",
                 request=request,
@@ -411,6 +418,7 @@ class OpenAISvgCanvasSpecialist:
                 f"SVG canvas specialist exceeded its {error.scope} deadline"
             ) from error
         except asyncio.CancelledError as error:
+            generation_status = "cancelled"
             self._log(
                 "generationFailed",
                 request=request,
@@ -431,6 +439,9 @@ class OpenAISvgCanvasSpecialist:
                 "SVG canvas specialist exceeded its deadline"
             ) from error
         except RateLimitError as error:
+            provider_request_id = (
+                getattr(error, "request_id", None) or provider_request_id
+            )
             self._log(
                 "generationFailed",
                 request=request,
@@ -453,6 +464,9 @@ class OpenAISvgCanvasSpecialist:
                 "SVG canvas specialist could not connect to OpenAI"
             ) from error
         except APIStatusError as error:
+            provider_request_id = (
+                getattr(error, "request_id", None) or provider_request_id
+            )
             self._log(
                 "generationFailed",
                 request=request,
@@ -467,6 +481,26 @@ class OpenAISvgCanvasSpecialist:
             ) from error
         finally:
             self._active.pop(request.generation_id, None)
+            self._log_usage(
+                request=request,
+                provider_request_id=provider_request_id,
+                attempt_count=attempt_count,
+                input_tokens=(total_input_tokens if usage_response_count else None),
+                cached_input_tokens=(
+                    total_cached_tokens if usage_response_count else None
+                ),
+                cache_write_input_tokens=(
+                    total_cache_write_tokens
+                    if usage_response_count > 0
+                    and cache_write_usage_response_count == usage_response_count
+                    else None
+                ),
+                output_tokens=(total_output_tokens if usage_response_count else None),
+                reasoning_tokens=(
+                    total_reasoning_tokens if usage_response_count else None
+                ),
+                status=generation_status,
+            )
 
         raise SvgCanvasSpecialistInvalidError(
             "SVG canvas specialist completed without a validated document"
@@ -864,6 +898,40 @@ class OpenAISvgCanvasSpecialist:
             extra={"ava_context": context},
         )
 
+    def _log_usage(
+        self,
+        *,
+        request: SvgCanvasSpecialistRequest,
+        provider_request_id: str | None,
+        attempt_count: int,
+        input_tokens: int | None,
+        cached_input_tokens: int | None,
+        cache_write_input_tokens: int | None,
+        output_tokens: int | None,
+        reasoning_tokens: int | None,
+        status: str,
+    ) -> None:
+        context: dict[str, object] = {
+            "provider": "openai",
+            "model": self._settings.openai_canvas_model,
+            "usageScope": "generation",
+            "sessionId": self._session_id,
+            "generationId": request.generation_id,
+            "providerRequestId": provider_request_id,
+            "attemptCount": attempt_count,
+            "inputTokens": input_tokens,
+            "cachedInputTokens": cached_input_tokens,
+            "outputTokens": output_tokens,
+            "reasoningTokens": reasoning_tokens,
+            "status": status,
+        }
+        if cache_write_input_tokens is not None:
+            context["cacheWriteInputTokens"] = cache_write_input_tokens
+        LOGGER.info(
+            "openai_canvas_usage",
+            extra={"ava_context": context},
+        )
+
 
 def _earliest_deadline(*deadlines: tuple[float, str]) -> tuple[float, str]:
     if not deadlines:  # pragma: no cover - internal call contract
@@ -943,6 +1011,11 @@ def _field(value: object, name: str) -> object | None:
 def _integer_field(value: object, name: str) -> int:
     candidate = _field(value, name)
     return candidate if isinstance(candidate, int) and candidate >= 0 else 0
+
+
+def _optional_integer_field(value: object, name: str) -> int | None:
+    candidate = _field(value, name)
+    return candidate if isinstance(candidate, int) and candidate >= 0 else None
 
 
 def _as_optional_string(value: object) -> str | None:

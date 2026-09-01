@@ -757,7 +757,8 @@ async def test_duplicate_consumed_continuation_terminal_is_ignored_before_next_t
                 response_id="resp_turn_b",
                 text="The new turn is healthy.",
             ),
-        ]
+        ],
+        provider_call_id="rtc_duplicate_terminal_usage",
     )
     iterator = channel.stream_turn(
         harness=_harness(),
@@ -803,6 +804,25 @@ async def test_duplicate_consumed_continuation_terminal_is_ignored_before_next_t
         "activeTurnId": "turn-b",
         "sidebandSequence": 12,
     }
+    usage_records = [
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage() == "openai_realtime_usage"
+    ]
+    assert [record["responseId"] for record in usage_records] == [
+        RESPONSE_ID,
+        CONTINUATION_RESPONSE_ID,
+        "resp_turn_b",
+    ]
+    assert [record["usageScope"] for record in usage_records] == [
+        "response",
+        "response",
+        "response",
+    ]
+    assert all(
+        record["providerCallId"] == "rtc_duplicate_terminal_usage"
+        for record in usage_records
+    )
     await channel.close()
 
 
@@ -1348,7 +1368,10 @@ async def test_transcription_delta_without_committed_owner_fails_loudly() -> Non
 
 
 @pytest.mark.asyncio
-async def test_cancel_preserves_transcription_progress_for_its_committed_item() -> None:
+async def test_cancel_preserves_transcription_progress_for_its_committed_item(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.openai_realtime")
     channel, socket = _channel(
         [
             {
@@ -1378,7 +1401,8 @@ async def test_cancel_preserves_transcription_progress_for_its_committed_item() 
                 response_id=CONTINUATION_RESPONSE_ID,
                 text="We can continue.",
             ),
-        ]
+        ],
+        provider_call_id="rtc_cancel_usage",
     )
     await channel.prepare(harness=_harness())
     channel._active_turn_id = "turn-cancelled"
@@ -1402,6 +1426,29 @@ async def test_cancel_preserves_transcription_progress_for_its_committed_item() 
     assert cancel_events[0]["response_id"] == RESPONSE_ID
     assert isinstance(cancel_events[0]["event_id"], str)
     assert cancel_events[0]["event_id"].startswith("ava_response_cancel_")
+    cancelled_usage = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage() == "openai_realtime_usage"
+        and record.ava_context["responseId"] == RESPONSE_ID
+    )
+    assert cancelled_usage == {
+        "provider": "openai",
+        "model": "gpt-realtime-test",
+        "usageScope": "response",
+        "providerCallId": "rtc_cancel_usage",
+        "responseId": RESPONSE_ID,
+        "turnId": "turn-cancelled",
+        "activeContextBuildId": "ctx-1",
+        "inputTokens": 3,
+        "cachedInputTokens": 2,
+        "inputTextTokens": 3,
+        "inputAudioTokens": 0,
+        "outputTokens": 0,
+        "outputTextTokens": 0,
+        "outputAudioTokens": 0,
+        "totalTokens": 3,
+    }
 
 
 @pytest.mark.asyncio
@@ -1553,25 +1600,30 @@ def test_live_matrix_request_is_strictly_bounded() -> None:
 @pytest.mark.parametrize("operation", ["new", "reviseFocused"])
 async def test_canvas_call_gets_one_output_then_tool_disabled_continuation(
     operation: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.openai_realtime")
+    brief_sentinel = "CANVAS_BRIEF_USAGE_CONTENT_SENTINEL"
+    speech_sentinel = "AVA_SPEECH_USAGE_CONTENT_SENTINEL"
+    continuation_sentinel = "AVA_CONTINUATION_USAGE_CONTENT_SENTINEL"
     arguments = json.dumps(
         {
             "operation": operation,
-            "brief": "Show a labeled water cycle with a clear loop.",
+            "brief": brief_sentinel,
             "interactionMode": "explore",
         },
         separators=(",", ":"),
     )
     events = [
-        *_canvas_response_events(arguments=arguments),
+        *_canvas_response_events(arguments=arguments, preamble=speech_sentinel),
         *_text_response_events(
             response_id=CONTINUATION_RESPONSE_ID,
-            text="Tap the cloud when you’re ready.",
+            text=continuation_sentinel,
             input_tokens=6,
             output_tokens=3,
         ),
     ]
-    channel, socket = _channel(events)
+    channel, socket = _channel(events, provider_call_id="rtc_usage_canvas")
 
     received = []
     async for event in channel.stream_turn(
@@ -1601,7 +1653,7 @@ async def test_canvas_call_gets_one_output_then_tool_disabled_continuation(
     call = received[1]
     assert isinstance(call, RealtimeCanvasToolCall)
     assert call.request.operation == operation
-    assert call.request.brief.startswith("Show a labeled water cycle")
+    assert call.request.brief == brief_sentinel
     function_outputs = [
         sent
         for sent in socket.sent
@@ -1620,6 +1672,50 @@ async def test_canvas_call_gets_one_output_then_tool_disabled_continuation(
     assert "input" not in continuation_requests[-1]["response"]
     assert channel.last_usage is not None
     assert channel.last_usage.total_tokens == 23
+    usage_records = [
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage() == "openai_realtime_usage"
+    ]
+    assert usage_records == [
+        {
+            "provider": "openai",
+            "model": "gpt-realtime-test",
+            "usageScope": "response",
+            "providerCallId": "rtc_usage_canvas",
+            "responseId": RESPONSE_ID,
+            "turnId": "turn-canvas",
+            "activeContextBuildId": "ctx-1",
+            "inputTokens": 10,
+            "cachedInputTokens": 2,
+            "inputTextTokens": 10,
+            "inputAudioTokens": 0,
+            "outputTokens": 4,
+            "outputTextTokens": 4,
+            "outputAudioTokens": 0,
+            "totalTokens": 14,
+        },
+        {
+            "provider": "openai",
+            "model": "gpt-realtime-test",
+            "usageScope": "response",
+            "providerCallId": "rtc_usage_canvas",
+            "responseId": CONTINUATION_RESPONSE_ID,
+            "turnId": "turn-canvas",
+            "activeContextBuildId": "ctx-1",
+            "inputTokens": 6,
+            "cachedInputTokens": 2,
+            "inputTextTokens": 6,
+            "inputAudioTokens": 0,
+            "outputTokens": 3,
+            "outputTextTokens": 3,
+            "outputAudioTokens": 0,
+            "totalTokens": 9,
+        },
+    ]
+    for sentinel in (brief_sentinel, speech_sentinel, continuation_sentinel):
+        assert sentinel not in caplog.text
+        assert all(sentinel not in repr(record) for record in usage_records)
 
 
 @pytest.mark.asyncio

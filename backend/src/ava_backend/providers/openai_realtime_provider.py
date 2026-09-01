@@ -1540,6 +1540,7 @@ class _OpenAIRealtimeEventChannel:
         response_id: str,
         turn_id: str,
         consumer_phase: str,
+        usage: OpenAIRealtimeUsage | None = None,
     ) -> None:
         owner = self._response_owner_by_id.get(response_id)
         if owner is None or owner != turn_id:
@@ -1550,6 +1551,7 @@ class _OpenAIRealtimeEventChannel:
             raise OpenAIRealtimeProtocolError(
                 "OpenAI terminal response was consumed more than once"
             )
+        reported_usage = usage or _parse_usage(event)
         self._consumed_terminal_response_owner_by_id[response_id] = owner
         _retain_latest(
             self._consumed_terminal_response_owner_by_id,
@@ -1564,6 +1566,28 @@ class _OpenAIRealtimeEventChannel:
             consumer_phase=consumer_phase,
             active_turn_id=self._active_turn_id,
             active_response_id=self._active_response_id,
+        )
+        LOGGER.info(
+            "openai_realtime_usage",
+            extra={
+                "ava_context": {
+                    "provider": "openai",
+                    "model": self._model,
+                    "usageScope": "response",
+                    "providerCallId": self._provider_call_id,
+                    "responseId": response_id,
+                    "turnId": owner,
+                    "activeContextBuildId": self._installed_context_build_id,
+                    "inputTokens": reported_usage.input_tokens,
+                    "cachedInputTokens": reported_usage.cached_input_tokens,
+                    "inputTextTokens": reported_usage.input_text_tokens,
+                    "inputAudioTokens": reported_usage.input_audio_tokens,
+                    "outputTokens": reported_usage.output_tokens,
+                    "outputTextTokens": reported_usage.output_text_tokens,
+                    "outputAudioTokens": reported_usage.output_audio_tokens,
+                    "totalTokens": reported_usage.total_tokens,
+                }
+            },
         )
 
     def _validate_input_transcription_progress(
@@ -2085,6 +2109,7 @@ class _OpenAIRealtimeEventChannel:
                             response_id=completed_response_id,
                             turn_id=turn_id,
                             consumer_phase="turnResponse",
+                            usage=usage,
                         )
                         if completed_name in _CANVAS_TOOL_NAMES:
                             self._pending_canvas_call_id = completed_call_id
@@ -2243,6 +2268,7 @@ class _OpenAIRealtimeEventChannel:
                         consumer_phase=(
                             "canvasContinuation" if continuation else "turnResponse"
                         ),
+                        usage=usage,
                     )
                     self.last_response_id = completed_response_id
                     self.last_usage = accumulated_usage

@@ -480,7 +480,7 @@ async def test_provider_permits_one_deterministic_repair(
         '<ellipse id="cloud"',
         '<ellipse id="cloud" foo="bar"',
     )
-    valid = _svg(label="Repaired cloud")
+    valid = _svg(label="CANVAS_GENERATION_USAGE_CONTENT_SENTINEL")
     client = _Client([_response(invalid), _response(valid, request_id="resp_456")])
     provider = OpenAISvgCanvasSpecialist(
         Settings(environment=AvaEnvironment.TEST, openai_canvas_max_quality_repairs=1),
@@ -528,6 +528,29 @@ async def test_provider_permits_one_deterministic_repair(
     assert rejected_validation["affectedAttribute"] == "foo"
     assert rejected_validation["limitName"] == "allowedAttributes"
     assert invalid not in caplog.text
+    usage_records = [
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage() == "openai_canvas_usage"
+    ]
+    assert usage_records == [
+        {
+            "provider": "openai",
+            "model": "gpt-5.6-sol",
+            "usageScope": "generation",
+            "sessionId": "session_test_1",
+            "generationId": "generation_1",
+            "providerRequestId": "resp_456",
+            "attemptCount": 2,
+            "inputTokens": 240,
+            "cachedInputTokens": 24,
+            "cacheWriteInputTokens": 6,
+            "outputTokens": 480,
+            "reasoningTokens": 14,
+            "status": "succeeded",
+        }
+    ]
+    assert "CANVAS_GENERATION_USAGE_CONTENT_SENTINEL" not in caplog.text
 
 
 async def test_forbidden_style_element_uses_one_structured_repair() -> None:
@@ -632,7 +655,9 @@ async def test_repair_receives_its_own_bounded_lifecycle_budget() -> None:
     assert blocked.is_set()
 
 
-async def test_provider_rejects_invalid_document_without_silent_cleanup() -> None:
+async def test_provider_rejects_invalid_document_without_silent_cleanup(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     invalid = _svg().replace("<ellipse", '<ellipse onload="alert(1)"')
     provider = OpenAISvgCanvasSpecialist(
         Settings(environment=AvaEnvironment.TEST, openai_canvas_max_quality_repairs=0),
@@ -641,8 +666,46 @@ async def test_provider_rejects_invalid_document_without_silent_cleanup() -> Non
         client=_Client([_response(invalid)]),  # type: ignore[arg-type]
     )
 
-    with pytest.raises(SvgCanvasSpecialistInvalidError, match="eventHandlerForbidden"):
+    with caplog.at_level(logging.INFO, logger="ava_backend.openai_svg_canvas"):
+        with pytest.raises(
+            SvgCanvasSpecialistInvalidError,
+            match="eventHandlerForbidden",
+        ):
+            await provider.generate(_request())
+
+    usage = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage() == "openai_canvas_usage"
+    )
+    assert usage["status"] == "failed"
+    assert usage["attemptCount"] == 1
+    assert usage["inputTokens"] == 120
+    assert usage["outputTokens"] == 240
+    assert invalid not in caplog.text
+
+
+async def test_canvas_usage_omits_unreported_cache_write_tokens(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    response = _response(_svg())
+    del response.usage.input_tokens_details.cache_write_tokens
+    provider = OpenAISvgCanvasSpecialist(
+        Settings(environment=AvaEnvironment.TEST, openai_canvas_max_quality_repairs=0),
+        session_id="session_usage_without_cache_write",
+        safety_identifier="ava_test_user_usage_without_cache_write",
+        client=_Client([response]),  # type: ignore[arg-type]
+    )
+
+    with caplog.at_level(logging.INFO, logger="ava_backend.openai_svg_canvas"):
         await provider.generate(_request())
+
+    usage = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage() == "openai_canvas_usage"
+    )
+    assert "cacheWriteInputTokens" not in usage
 
 
 async def test_current_svg_revision_context_preserves_whitespace() -> None:
@@ -743,7 +806,7 @@ async def test_streaming_observability_uses_only_terminal_exact_svg(
     telemetry = [
         record.ava_context
         for record in caplog.records
-        if hasattr(record, "ava_context")
+        if record.getMessage() == "svg_canvas_latency"
     ]
     assert [event["stage"] for event in telemetry] == [
         "attemptStarted",

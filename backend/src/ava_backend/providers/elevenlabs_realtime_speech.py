@@ -203,6 +203,10 @@ class ElevenLabsInputStreamingSynthesizer:
         yielded_audio = False
         saw_final = False
         phrase_submitted_at: float | None = None
+        input_characters: int | None = None
+        output_audio_bytes = 0
+        usage_status = "failed"
+        usage_error_type: str | None = None
         try:
             socket = await self._connector(
                 url,
@@ -217,6 +221,7 @@ class ElevenLabsInputStreamingSynthesizer:
                 if request_is_current:
                     self._active_socket = socket
             if not request_is_current:
+                usage_status = "cancelled"
                 await socket.close(
                     code=1000,
                     reason="Ava speech request no longer owns this turn",
@@ -248,6 +253,7 @@ class ElevenLabsInputStreamingSynthesizer:
                     separators=(",", ":"),
                 )
             )
+            input_characters = len(speech)
             phrase_submitted_at = monotonic()
             await socket.send('{"text":""}')
 
@@ -287,6 +293,7 @@ class ElevenLabsInputStreamingSynthesizer:
                     raise ElevenLabsInputStreamingError(
                         "ElevenLabs returned invalid PCM16 audio"
                     )
+                output_audio_bytes += len(pcm)
                 if not yielded_audio and phrase_submitted_at is not None:
                     elapsed_ms = max(
                         0.0,
@@ -336,10 +343,23 @@ class ElevenLabsInputStreamingSynthesizer:
                 raise ElevenLabsInputStreamingError(
                     "ElevenLabs alignment did not cover the complete phrase"
                 )
+            usage_status = "succeeded"
+        except asyncio.CancelledError:
+            usage_status = "cancelled"
+            usage_error_type = "CancelledError"
+            raise
+        except GeneratorExit:
+            usage_status = "cancelled"
+            usage_error_type = "GeneratorExit"
+            raise
         except TimeoutError as error:
+            usage_error_type = type(error).__name__
             raise ElevenLabsInputStreamingUnavailableError(
                 "ElevenLabs input stream timed out"
             ) from error
+        except Exception as error:
+            usage_error_type = type(error).__name__
+            raise
         finally:
             async with self._active_lock:
                 if self._active_turn_id == turn_id and self._active_socket is socket:
@@ -347,6 +367,44 @@ class ElevenLabsInputStreamingSynthesizer:
                     self._active_turn_id = None
             if socket is not None:
                 await socket.close(code=1000, reason="Ava phrase complete")
+            self._log_usage(
+                turn_id=turn_id,
+                stream_id=segment.id,
+                input_characters=input_characters,
+                output_audio_bytes=output_audio_bytes,
+                status=usage_status,
+                error_type=usage_error_type,
+            )
+
+    def _log_usage(
+        self,
+        *,
+        turn_id: str,
+        stream_id: str,
+        input_characters: int | None,
+        output_audio_bytes: int,
+        status: str,
+        error_type: str | None,
+    ) -> None:
+        output_audio_duration_ms = output_audio_bytes * 1000 / (2 * _SAMPLE_RATE_HZ)
+        LOGGER.info(
+            "elevenlabs_usage",
+            extra={
+                "ava_context": {
+                    "provider": "elevenlabs",
+                    "model": self._model_id,
+                    "usageScope": "phraseStream",
+                    "turnId": turn_id,
+                    "streamId": stream_id,
+                    "billingUnit": "character",
+                    "inputCharacters": input_characters,
+                    "outputAudioBytes": output_audio_bytes,
+                    "outputAudioDurationMs": output_audio_duration_ms,
+                    "status": status,
+                    "errorType": error_type,
+                }
+            },
+        )
 
     async def cancel(self, *, turn_id: str) -> None:
         if not turn_id.strip():

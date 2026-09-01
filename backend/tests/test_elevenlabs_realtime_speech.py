@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 from collections.abc import Mapping
 
 import pytest
@@ -86,7 +87,9 @@ class _Socket:
         self.close_reasons.append(reason)
 
 
-async def test_streams_phrase_pcm_and_exact_character_alignment() -> None:
+async def test_streams_phrase_pcm_and_exact_character_alignment(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     socket = _Socket(
         [
             _audio_message(
@@ -125,7 +128,13 @@ async def test_streams_phrase_pcm_and_exact_character_alignment() -> None:
         websocket_connector=connect,
         websocket_origin="wss://elevenlabs.test",
     )
-    items = [item async for item in provider.synthesize(_segment(), turn_id="turn-1")]
+    with caplog.at_level(
+        logging.INFO,
+        logger="ava_backend.elevenlabs_realtime_speech",
+    ):
+        items = [
+            item async for item in provider.synthesize(_segment(), turn_id="turn-1")
+        ]
 
     assert provider.model_id == "eleven_flash_v2_5"
     assert provider.voice_id == "voiceCandidateB123"
@@ -161,9 +170,30 @@ async def test_streams_phrase_pcm_and_exact_character_alignment() -> None:
     ]
     assert [len(item.pcm) for item in audio] == [96, 48]
     assert socket.closed
+    usage = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage() == "elevenlabs_usage"
+    )
+    assert usage == {
+        "provider": "elevenlabs",
+        "model": "eleven_flash_v2_5",
+        "usageScope": "phraseStream",
+        "turnId": "turn-1",
+        "streamId": "answer",
+        "billingUnit": "character",
+        "inputCharacters": 3,
+        "outputAudioBytes": 144,
+        "outputAudioDurationMs": 3.0,
+        "status": "succeeded",
+        "errorType": None,
+    }
+    assert "Hi." not in caplog.text
 
 
-async def test_rejects_alignment_that_changes_authored_phrase() -> None:
+async def test_rejects_alignment_that_changes_authored_phrase(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     socket = _Socket(
         [
             _audio_message(
@@ -188,9 +218,25 @@ async def test_rejects_alignment_that_changes_authored_phrase() -> None:
         websocket_connector=connect,
         websocket_origin="wss://elevenlabs.test",
     )
-    with pytest.raises(ElevenLabsInputStreamingError, match="authored phrase"):
-        _ = [item async for item in provider.synthesize(_segment(), turn_id="turn-1")]
+    with caplog.at_level(
+        logging.INFO,
+        logger="ava_backend.elevenlabs_realtime_speech",
+    ):
+        with pytest.raises(ElevenLabsInputStreamingError, match="authored phrase"):
+            _ = [
+                item async for item in provider.synthesize(_segment(), turn_id="turn-1")
+            ]
     assert socket.closed
+    usage = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage() == "elevenlabs_usage"
+    )
+    assert usage["status"] == "failed"
+    assert usage["errorType"] == "ElevenLabsInputStreamingError"
+    assert usage["inputCharacters"] == 3
+    assert usage["outputAudioBytes"] == 48
+    assert "Hi." not in caplog.text
 
 
 async def test_splits_large_alignment_into_transport_bounded_batches() -> None:
