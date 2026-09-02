@@ -6,6 +6,8 @@ import '../canvas/ava_svg_canvas_session_host.dart';
 import '../config/ava_backend_configuration.dart';
 import '../models/ava_realtime_protocol.dart';
 import '../services/ava_memory_control_service.dart';
+import '../services/ava_canvas_persistence_service.dart';
+import '../services/ava_canvas_restore_service.dart';
 import '../services/memory_service.dart';
 import '../services/pcm_speech_output_service.dart';
 import '../services/ava_realtime_presentation.dart';
@@ -28,13 +30,20 @@ final avaRealtimePresentationProvider =
 
 final avaSvgCanvasSessionHostProvider =
     ChangeNotifierProvider<AvaSvgCanvasSessionHost>((ref) {
-  return AvaSvgCanvasSessionHost();
+  return AvaSvgCanvasSessionHost(
+    persistence: ref.watch(avaCanvasPersistenceProvider),
+  );
 });
 
 final databaseProvider = Provider<AppDatabase>((ref) {
   final database = AppDatabase();
   ref.onDispose(database.close);
   return database;
+});
+
+final avaCanvasPersistenceProvider =
+    Provider<AvaCanvasPersistenceRepository>((ref) {
+  return AvaCanvasPersistenceRepository(ref.watch(databaseProvider));
 });
 
 final avaBackendConfigurationProvider =
@@ -77,6 +86,21 @@ final avaRealtimeBootstrapServiceProvider =
   );
 });
 
+final avaCanvasRestoreTransportProvider =
+    Provider<AvaCanvasRestoreTransport>((ref) {
+  final transport = IoAvaCanvasRestoreTransport();
+  ref.onDispose(transport.close);
+  return transport;
+});
+
+final avaCanvasRestoreServiceProvider =
+    Provider<AvaCanvasRestoreService>((ref) {
+  return AvaCanvasRestoreService(
+    configuration: ref.watch(avaBackendConfigurationProvider),
+    transport: ref.watch(avaCanvasRestoreTransportProvider),
+  );
+});
+
 final avaRealtimeSdpTransportProvider =
     Provider<AvaRealtimeSdpTransport>((ref) {
   final transport = IoAvaRealtimeSdpTransport();
@@ -109,6 +133,7 @@ final avaRealtimeRuntimeFactoryProvider =
   final configuration = ref.watch(avaBackendConfigurationProvider);
   final factory = AvaRealtimeRuntimeFactoryV4(
     bootstrapService: ref.watch(avaRealtimeBootstrapServiceProvider),
+    canvasRestoreService: ref.watch(avaCanvasRestoreServiceProvider),
     mediaConnector: ref.watch(avaRealtimeMediaConnectorV4Provider),
     transportConnector: ref.watch(avaRealtimeRawTransportConnectorV4Provider),
     documentLoaderFactory: (bootstrap, telemetry) => AvaSvgDocumentService(

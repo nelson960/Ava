@@ -245,6 +245,33 @@ final class AvaSvgCanvasController extends ChangeNotifier {
       _candidate?.phase == AvaSvgCanvasCandidatePhase.presentationRequested ||
       _candidate?.phase == AvaSvgCanvasCandidatePhase.awaitingActivation;
 
+  /// Re-establishes one already-validated retained scene on a fresh runtime.
+  /// This is local state hydration, not a candidate/presentation lifecycle.
+  void restoreRetainedActive(AvaValidatedSvgCanvasDocument document) {
+    _ensureOpen();
+    if (_active != null || hasPendingVisual) {
+      throw StateError('Retained Canvas restore requires a fresh controller.');
+    }
+    final descriptor = document.descriptor;
+    final retainedRevision = _retainedSceneRevision(descriptor.sceneId);
+    if (retainedRevision != null &&
+        retainedRevision != descriptor.sceneRevision) {
+      throw StateError(
+        'Retained Canvas restore disagrees with workspace revision.',
+      );
+    }
+    _active = AvaSvgCanvasActiveState(
+      document: document,
+      firstRenderedSample: 0,
+    );
+    _interactionRevision = 0;
+    _selectedBindingId = null;
+    _failedActiveRendererGenerationId = null;
+    _lastIssue = null;
+    _lastPendingOutcome = null;
+    notifyListeners();
+  }
+
   void receiveGenerationStarted(Map<String, Object?> event) {
     _ensureOpen();
     _requireExactKeys(

@@ -136,6 +136,20 @@ class SvgCanvasWorkspace:
         self._last_interaction = None
         return scene
 
+    def restore_focused(self, scene: ActiveSvgCanvasScene) -> ActiveSvgCanvasScene:
+        """Hydrate one independently validated scene before realtime negotiation."""
+
+        if self._scenes or self._current_scene_id is not None:
+            raise SvgCanvasWorkspaceError(
+                "canvas restore requires an empty ephemeral workspace"
+            )
+        if scene.revision < 1 or scene.revision > 10_001:
+            raise SvgCanvasWorkspaceError("restored canvas revision is invalid")
+        self._scenes.append(scene)
+        self._current_scene_id = scene.scene_id
+        self._last_interaction = None
+        return scene
+
     def start_execution(
         self,
         *,

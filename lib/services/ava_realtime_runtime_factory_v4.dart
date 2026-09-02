@@ -3,6 +3,7 @@ import '../canvas/ava_svg_canvas_session_host.dart';
 import '../models/ava_realtime_protocol.dart';
 import '../models/ava_realtime_protocol_v4.dart';
 import 'ava_realtime_bootstrap_service.dart';
+import 'ava_canvas_restore_service.dart';
 import 'ava_realtime_presentation.dart';
 import 'ava_realtime_runtime_factory.dart';
 import 'ava_realtime_session_v4.dart';
@@ -22,6 +23,7 @@ typedef AvaSvgDocumentLoaderFactory = AvaSvgDocumentLoader Function(
 final class AvaRealtimeRuntimeFactoryV4 implements AvaRealtimeRuntimeBuilder {
   AvaRealtimeRuntimeFactoryV4({
     required AvaRealtimeBootstrapService bootstrapService,
+    required AvaCanvasRestoreService canvasRestoreService,
     required AvaRealtimeMediaConnectorV4 mediaConnector,
     required AvaRealtimeRawTransportConnectorV4 transportConnector,
     required AvaSvgDocumentLoaderFactory documentLoaderFactory,
@@ -31,6 +33,7 @@ final class AvaRealtimeRuntimeFactoryV4 implements AvaRealtimeRuntimeBuilder {
     required String Function() cancelRequestIdFactory,
     AvaRealtimeTrace Function()? traceFactory,
   })  : _bootstrapService = bootstrapService,
+        _canvasRestoreService = canvasRestoreService,
         _mediaConnector = mediaConnector,
         _transportConnector = transportConnector,
         _documentLoaderFactory = documentLoaderFactory,
@@ -44,6 +47,7 @@ final class AvaRealtimeRuntimeFactoryV4 implements AvaRealtimeRuntimeBuilder {
                 ));
 
   final AvaRealtimeBootstrapService _bootstrapService;
+  final AvaCanvasRestoreService _canvasRestoreService;
   final AvaRealtimeMediaConnectorV4 _mediaConnector;
   final AvaRealtimeRawTransportConnectorV4 _transportConnector;
   final AvaSvgDocumentLoaderFactory _documentLoaderFactory;
@@ -65,6 +69,7 @@ final class AvaRealtimeRuntimeFactoryV4 implements AvaRealtimeRuntimeBuilder {
       throw RangeError.range(volume, 0, 1, 'volume');
     }
     final trace = _traceFactory()..mark('connection.requested');
+    await trace.measure('canvas.restore.local', () => _canvasHost.restoration);
     final canvasRenderProfile = _canvasHost.requireRenderProfile();
     final bootstrap = await trace.measure(
       'bootstrap.create',
@@ -74,6 +79,16 @@ final class AvaRealtimeRuntimeFactoryV4 implements AvaRealtimeRuntimeBuilder {
       ),
     );
     trace.attachSession(bootstrap.sessionId);
+    final restoredFocused = _canvasHost.presentedDocument;
+    if (restoredFocused != null) {
+      await trace.measure(
+        'canvas.restore.backend',
+        () => _canvasRestoreService.restoreFocused(
+          bootstrap: bootstrap,
+          document: restoredFocused,
+        ),
+      );
+    }
     void canvasTelemetry(AvaSvgCanvasTelemetryEvent event) {
       trace.mark(
         event.stage,

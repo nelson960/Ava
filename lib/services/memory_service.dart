@@ -43,11 +43,34 @@ class LearningProgressEvents extends Table {
   DateTimeColumn get occurredAt => dateTime()();
 }
 
+@DataClassName('StoredCanvasScene')
+class CanvasScenes extends Table {
+  TextColumn get sceneId => text().withLength(min: 1, max: 96)();
+  IntColumn get sceneRevision => integer()();
+  TextColumn get generationId => text().withLength(min: 1, max: 96)();
+  TextColumn get sourceTurnId => text().withLength(min: 1, max: 96)();
+  BlobColumn get svgBytes => blob()();
+  BlobColumn get manifestBytes => blob()();
+  TextColumn get svgSha256 => text().withLength(min: 64, max: 64)();
+  TextColumn get manifestSha256 => text().withLength(min: 64, max: 64)();
+  IntColumn get svgByteLength => integer()();
+  IntColumn get manifestByteLength => integer()();
+  TextColumn get rendererCapabilityVersion => text()();
+  TextColumn get validatorVersion => text()();
+  TextColumn get manifestVersion => text()();
+  IntColumn get workspaceOrder => integer()();
+  BoolColumn get isFocused => boolean()();
+
+  @override
+  Set<Column> get primaryKey => {sceneId};
+}
+
 @DriftDatabase(
   tables: [
     StudentProfiles,
     SessionHistory,
     LearningProgressEvents,
+    CanvasScenes,
   ],
 )
 class AppDatabase extends _$AppDatabase {
@@ -56,7 +79,7 @@ class AppDatabase extends _$AppDatabase {
   AppDatabase.forTesting(super.executor);
 
   @override
-  int get schemaVersion => 3;
+  int get schemaVersion => 4;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -74,6 +97,9 @@ class AppDatabase extends _$AppDatabase {
           }
           if (from < 3) {
             await migrator.createTable(learningProgressEvents);
+          }
+          if (from < 4) {
+            await migrator.createTable(canvasScenes);
           }
         },
       );

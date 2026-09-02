@@ -10,6 +10,7 @@ import 'package:ava/models/ava_realtime_protocol.dart';
 import 'package:ava/models/ava_realtime_protocol_v4.dart';
 import 'package:ava/models/ava_svg_canvas_protocol.dart';
 import 'package:ava/services/ava_realtime_bootstrap_service.dart';
+import 'package:ava/services/ava_canvas_restore_service.dart';
 import 'package:ava/services/ava_device_context_service.dart';
 import 'package:ava/services/ava_realtime_presentation.dart';
 import 'package:ava/services/ava_realtime_runtime_factory_v4.dart';
@@ -45,6 +46,7 @@ void main() {
         transport: bootstrapTransport,
         deviceContext: const _DeviceContextFake(),
       ),
+      canvasRestoreService: _restoreService(_CanvasRestoreTransport()),
       mediaConnector: (_) async => media,
       transportConnector: (_) async => raw,
       documentLoaderFactory: (bootstrap, telemetry) {
@@ -96,6 +98,53 @@ void main() {
     expect(media.closed, isTrue);
   });
 
+  test('local Canvas restoration completes before session bootstrap', () async {
+    final load = Completer<AvaRestoredCanvasWorkspace>();
+    final persistence = _DeferredCanvasPersistence(load.future);
+    final bootstrapTransport = _BootstrapTransport();
+    final media = DeterministicAvaRealtimeMediaSession(offerSdp: _offerSdp);
+    final raw = DeterministicAvaRealtimeRawTransportV4(const []);
+    final host = AvaSvgCanvasSessionHost(persistence: persistence);
+    host.updateRenderProfile(_profile);
+    final factory = AvaRealtimeRuntimeFactoryV4(
+      bootstrapService: AvaRealtimeBootstrapService(
+        configuration: AvaBackendConfiguration.parse(
+          'https://ava.example.test',
+        ),
+        transport: bootstrapTransport,
+        deviceContext: const _DeviceContextFake(),
+      ),
+      canvasRestoreService: _restoreService(_CanvasRestoreTransport()),
+      mediaConnector: (_) async => media,
+      transportConnector: (_) async => raw,
+      documentLoaderFactory: (_, __) => _Loader(),
+      canvasHost: host,
+      speechOutput: const _NoopPcmOutput(),
+      presentation: AvaRealtimePresentationController(),
+      cancelRequestIdFactory: () => 'cancel-v4-restore-barrier',
+    );
+    addTearDown(factory.close);
+    addTearDown(host.dispose);
+
+    final creating = factory.create(
+      ageBand: AvaRealtimeAgeBand.middleChildhood,
+      volume: 0.8,
+    );
+    await Future<void>.delayed(Duration.zero);
+
+    expect(bootstrapTransport.postCount, 0);
+    load.complete(
+      const AvaRestoredCanvasWorkspace(
+        documents: [],
+        focusedSceneId: null,
+      ),
+    );
+    final runtime = await creating;
+
+    expect(bootstrapTransport.postCount, 1);
+    await runtime.close();
+  });
+
   test('runtime_factory_uses_application_workspace_lookup', () async {
     final retained = _canvasDocument(
       generationId: 'generation-retained',
@@ -119,6 +168,7 @@ void main() {
     owner.dispose();
 
     final bootstrapTransport = _BootstrapTransport();
+    final restoreTransport = _CanvasRestoreTransport(retained);
     final media = DeterministicAvaRealtimeMediaSession(offerSdp: _offerSdp);
     final raw = DeterministicAvaRealtimeRawTransportV4(const []);
     final factory = AvaRealtimeRuntimeFactoryV4(
@@ -129,7 +179,11 @@ void main() {
         transport: bootstrapTransport,
         deviceContext: const _DeviceContextFake(),
       ),
-      mediaConnector: (_) async => media,
+      canvasRestoreService: _restoreService(restoreTransport),
+      mediaConnector: (_) async {
+        expect(restoreTransport.completedBeforeMediaConnect, isTrue);
+        return media;
+      },
       transportConnector: (_) async => raw,
       documentLoaderFactory: (_, __) => _Loader(revised),
       canvasHost: host,
@@ -143,6 +197,9 @@ void main() {
       ageBand: AvaRealtimeAgeBand.middleChildhood,
       volume: 0.8,
     );
+
+    expect(restoreTransport.putCount, 1);
+    expect(restoreTransport.completedBeforeMediaConnect, isTrue);
 
     await _activateCanvas(runtime.canvasController, revised);
 
@@ -167,6 +224,7 @@ void main() {
         transport: bootstrapTransport,
         deviceContext: const _DeviceContextFake(),
       ),
+      canvasRestoreService: _restoreService(_CanvasRestoreTransport()),
       mediaConnector: (_) async => media,
       transportConnector: (_) async => raw,
       documentLoaderFactory: (_, __) => _Loader(),
@@ -228,6 +286,66 @@ void main() {
     await runtime.close();
     await run;
   });
+}
+
+AvaCanvasRestoreService _restoreService(AvaCanvasRestoreTransport transport) =>
+    AvaCanvasRestoreService(
+      configuration: AvaBackendConfiguration.parse('https://ava.example.test'),
+      transport: transport,
+    );
+
+final class _CanvasRestoreTransport implements AvaCanvasRestoreTransport {
+  _CanvasRestoreTransport([this.expectedDocument]);
+
+  final AvaValidatedSvgCanvasDocument? expectedDocument;
+  int putCount = 0;
+  bool completedBeforeMediaConnect = false;
+
+  @override
+  Future<AvaCanvasRestoreResponse> putBytes({
+    required Uri endpoint,
+    required Map<String, String> headers,
+    required List<int> body,
+    required Duration timeout,
+  }) async {
+    putCount += 1;
+    expect(endpoint.path, endsWith('/canvas-restore'));
+    expect(headers['content-type'], 'application/octet-stream');
+    expect(body, isNotEmpty);
+    final expected = expectedDocument;
+    if (expected != null) {
+      final descriptor = expected.descriptor;
+      expect(body, orderedEquals(expected.svgBytes));
+      expect(headers['x-ava-scene-id'], descriptor.sceneId);
+      expect(headers['x-ava-scene-revision'], '${descriptor.sceneRevision}');
+      expect(headers['x-ava-svg-sha256'], descriptor.svgSha256);
+      expect(headers['x-ava-manifest-sha256'], descriptor.manifestSha256);
+    }
+    completedBeforeMediaConnect = true;
+    return const AvaCanvasRestoreResponse(
+      statusCode: HttpStatus.noContent,
+      protocolVersion: '4',
+      bytes: Stream.empty(),
+    );
+  }
+
+  @override
+  void close() {}
+}
+
+final class _DeferredCanvasPersistence implements AvaCanvasPersistence {
+  const _DeferredCanvasPersistence(this.workspace);
+
+  final Future<AvaRestoredCanvasWorkspace> workspace;
+
+  @override
+  Future<AvaRestoredCanvasWorkspace> loadWorkspace() => workspace;
+
+  @override
+  Future<void> persistActive(AvaValidatedSvgCanvasDocument document) async {}
+
+  @override
+  Future<void> reset() async {}
 }
 
 final class _DeviceContextFake implements AvaDeviceContext {

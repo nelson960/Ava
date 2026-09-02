@@ -11,6 +11,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 
 from ..canvas.render_profile import CanvasRenderProfile
+from ..canvas.svg_workspace import ActiveSvgCanvasScene
 from ..protocol import AgeBand
 from .events_v4 import (
     AVA_CLIENT_EVENT_ADAPTER_V4,
@@ -61,6 +62,8 @@ class RealtimeSessionCoordinatorV4(Protocol):
     async def close(self) -> None: ...
 
     async def memory_reset(self, *, reset_revision: int) -> None: ...
+
+    def restore_focused_canvas(self, scene: ActiveSvgCanvasScene) -> None: ...
 
     @property
     def turn_id(self) -> str: ...

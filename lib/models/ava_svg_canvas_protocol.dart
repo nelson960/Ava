@@ -410,24 +410,95 @@ final class AvaSvgCanvasDocumentDescriptorV4 {
     required this.sourceTurnId,
     required this.sceneId,
     required this.sceneRevision,
-    required this.svgPath,
-    required this.manifestPath,
+    required String svgPath,
+    required String manifestPath,
     required this.svgSha256,
     required this.manifestSha256,
     required this.svgByteLength,
     required this.manifestByteLength,
-  });
+  })  : _svgPath = svgPath,
+        _manifestPath = manifestPath;
+
+  factory AvaSvgCanvasDocumentDescriptorV4.restored({
+    required String generationId,
+    required String sourceTurnId,
+    required String sceneId,
+    required int sceneRevision,
+    required String svgSha256,
+    required String manifestSha256,
+    required int svgByteLength,
+    required int manifestByteLength,
+  }) {
+    final identity = {
+      'generationId': generationId,
+      'sourceTurnId': sourceTurnId,
+      'sceneId': sceneId,
+    };
+    for (final entry in identity.entries) {
+      if (!_identifier.hasMatch(entry.value)) {
+        throw FormatException(
+          'Restored Canvas ${entry.key} is not a protocol identifier.',
+        );
+      }
+    }
+    if (sceneRevision < 1 ||
+        sceneRevision > 10001 ||
+        !_sha256.hasMatch(svgSha256) ||
+        !_sha256.hasMatch(manifestSha256) ||
+        svgByteLength < 1 ||
+        svgByteLength > avaSvgMaximumDocumentBytes ||
+        manifestByteLength < 1 ||
+        manifestByteLength > avaSvgMaximumManifestBytes) {
+      throw const FormatException(
+        'Restored Canvas descriptor is outside the protocol bounds.',
+      );
+    }
+    return AvaSvgCanvasDocumentDescriptorV4._restored(
+      generationId: generationId,
+      sourceTurnId: sourceTurnId,
+      sceneId: sceneId,
+      sceneRevision: sceneRevision,
+      svgSha256: svgSha256,
+      manifestSha256: manifestSha256,
+      svgByteLength: svgByteLength,
+      manifestByteLength: manifestByteLength,
+    );
+  }
+
+  const AvaSvgCanvasDocumentDescriptorV4._restored({
+    required this.generationId,
+    required this.sourceTurnId,
+    required this.sceneId,
+    required this.sceneRevision,
+    required this.svgSha256,
+    required this.manifestSha256,
+    required this.svgByteLength,
+    required this.manifestByteLength,
+  })  : _svgPath = null,
+        _manifestPath = null;
 
   final String generationId;
   final String sourceTurnId;
   final String sceneId;
   final int sceneRevision;
-  final String svgPath;
-  final String manifestPath;
+  final String? _svgPath;
+  final String? _manifestPath;
   final String svgSha256;
   final String manifestSha256;
   final int svgByteLength;
   final int manifestByteLength;
+
+  bool get isLocallyRestored => _svgPath == null;
+
+  String get svgPath =>
+      _svgPath ??
+      (throw StateError('A locally restored Canvas has no backend SVG path.'));
+
+  String get manifestPath =>
+      _manifestPath ??
+      (throw StateError(
+        'A locally restored Canvas has no backend manifest path.',
+      ));
 
   factory AvaSvgCanvasDocumentDescriptorV4.fromJson(
     Map<String, Object?> json,
@@ -567,7 +638,11 @@ final class AvaValidatedSvgCanvasDocument {
     required Uint8List svgBytes,
     required Uint8List manifestBytes,
   }) {
-    if (svgBytes.length != descriptor.svgByteLength ||
+    if (svgBytes.isEmpty ||
+        svgBytes.length > avaSvgMaximumDocumentBytes ||
+        manifestBytes.isEmpty ||
+        manifestBytes.length > avaSvgMaximumManifestBytes ||
+        svgBytes.length != descriptor.svgByteLength ||
         manifestBytes.length != descriptor.manifestByteLength) {
       throw const FormatException(
         'Downloaded SVG document byte length does not match its descriptor.',

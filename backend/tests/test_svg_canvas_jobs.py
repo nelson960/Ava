@@ -1722,6 +1722,61 @@ async def test_replacement_session_revision_uses_exact_prior_svg() -> None:
     await replacement.close()
 
 
+async def test_restored_revision_four_supports_tap_and_revise_to_five() -> None:
+    workspace = SvgCanvasWorkspace()
+    restored = ActiveSvgCanvasScene(
+        generation_id="generation-restored-4",
+        source_turn_id="turn-restored-4",
+        scene_id="scene-restored",
+        revision=4,
+        document=_document(),
+        first_rendered_sample=0,
+    )
+    workspace.restore_focused(restored)
+    state = SvgCanvasSessionState(workspace=workspace)
+
+    recorded = state.record_interaction(
+        scene_id=restored.scene_id,
+        scene_revision=restored.revision,
+        interaction_revision=1,
+        svg_sha256=restored.document.svg_sha256,
+        manifest_sha256=restored.document.manifest_sha256,
+        binding_id="select-cloud",
+    )
+    assert recorded.binding_id == "select-cloud"
+    assert recorded.accessibility_label == "Rain cloud"
+
+    (
+        coordinator,
+        specialist,
+        _sink,
+        _completions,
+        _output,
+        _documents,
+    ) = await _accepted_coordinator(
+        ["generation-restored-5"],
+        state=state,
+        session_id="session-restored",
+        operation="reviseFocused",
+    )
+    try:
+        request = specialist.requests[-1]
+        assert request.current_scene_id == restored.scene_id
+        assert request.current_revision == 4
+        assert request.current_svg == restored.document.svg_text
+        assert request.current_svg_sha256 == restored.document.svg_sha256
+
+        specialist.release.set()
+        await coordinator.wait_for_background_work()
+        candidate = coordinator.state.candidate
+        assert candidate is not None
+        assert candidate.scene_id == restored.scene_id
+        assert candidate.base_revision == 4
+        assert candidate.revision == 5
+    finally:
+        await coordinator.close()
+
+
 async def test_different_subject_session_cannot_see_committed_workspace() -> None:
     workspaces = SvgCanvasWorkspaceStore()
     await _commit_shared_workspace_scene(workspaces, subject="child:X")

@@ -116,6 +116,38 @@ final class _DraftLoader implements AvaSvgDocumentLoader {
   void close() {}
 }
 
+final class _RestoredWorkspacePersistence implements AvaCanvasPersistence {
+  const _RestoredWorkspacePersistence(this.document);
+
+  final AvaValidatedSvgCanvasDocument document;
+
+  @override
+  Future<AvaRestoredCanvasWorkspace> loadWorkspace() async =>
+      AvaRestoredCanvasWorkspace(
+        documents: [document],
+        focusedSceneId: document.descriptor.sceneId,
+      );
+
+  @override
+  Future<void> persistActive(AvaValidatedSvgCanvasDocument document) async {}
+
+  @override
+  Future<void> reset() async {}
+}
+
+final class _FailingCanvasPersistence implements AvaCanvasPersistence {
+  @override
+  Future<AvaRestoredCanvasWorkspace> loadWorkspace() async =>
+      const AvaRestoredCanvasWorkspace(documents: [], focusedSceneId: null);
+
+  @override
+  Future<void> persistActive(AvaValidatedSvgCanvasDocument document) =>
+      Future<void>.error(StateError('deterministic persistence failure'));
+
+  @override
+  Future<void> reset() async {}
+}
+
 void main() {
   late List<Map<String, Object?>> serverEvents;
   late AvaValidatedSvgCanvasDocument document;
@@ -846,22 +878,25 @@ void main() {
     host.dispose();
   });
 
-  test('blank_new_runtime_does_not_erase_retained_canvas', () async {
+  test('fresh runtime hydrates retained canvas without lifecycle commands',
+      () async {
     final oldController = await _activate(document, serverEvents, []);
     final host = AvaSvgCanvasSessionHost()..attach(oldController);
     host.detach(oldController);
     oldController.dispose();
+    final commands = <AvaSvgCanvasClientCommand>[];
     final newController = AvaSvgCanvasController(
       documents: _Loader(Future.value(replacementDocument)),
-      commandSink: (_) {},
+      commandSink: commands.add,
     );
 
     host.attach(newController);
 
     expect(host.controller, same(newController));
-    expect(newController.active, isNull);
+    expect(newController.active?.document, same(document));
     expect(_documentForDisplay(host), same(document));
     expect(host.panelVisible, isTrue);
+    expect(commands, isEmpty);
     host.detach(newController);
     newController.dispose();
     host.dispose();
@@ -945,6 +980,34 @@ void main() {
     expect(displayedTransitions, [replacementDocument]);
     host.detach(newController);
     newController.dispose();
+    host.dispose();
+  });
+
+  test('persistence failure does not invalidate activated in-memory canvas',
+      () async {
+    final commands = <AvaSvgCanvasClientCommand>[];
+    final host = AvaSvgCanvasSessionHost(
+      persistence: _FailingCanvasPersistence(),
+    );
+    await host.restoration;
+    final controller = AvaSvgCanvasController(
+      documents: _Loader.documents([document]),
+      commandSink: commands.add,
+    );
+    host.attach(controller);
+
+    await _driveActivation(controller, document, serverEvents);
+    await Future<void>.delayed(Duration.zero);
+
+    expect(controller.active?.document, same(document));
+    expect(host.presentedDocument, same(document));
+    expect(host.workspaceDocuments, [document]);
+    expect(commands.map((command) => command.type), [
+      AvaSvgCanvasCommandType.canvasDocumentPrepared,
+      AvaSvgCanvasCommandType.canvasPresented,
+    ]);
+    host.detach(controller);
+    controller.dispose();
     host.dispose();
   });
 
@@ -1738,6 +1801,71 @@ void main() {
     view.onError('Detached renderer diagnostic.');
     await tester.pump();
     expect(commands, isEmpty);
+    host.dispose();
+  });
+
+  testWidgets('locally restored canvas uses active renderer without ACKs',
+      (tester) async {
+    final descriptor = document.descriptor;
+    final restored = AvaValidatedSvgCanvasDocument.verify(
+      descriptor: AvaSvgCanvasDocumentDescriptorV4.restored(
+        generationId: descriptor.generationId,
+        sourceTurnId: descriptor.sourceTurnId,
+        sceneId: descriptor.sceneId,
+        sceneRevision: descriptor.sceneRevision,
+        svgSha256: descriptor.svgSha256,
+        manifestSha256: descriptor.manifestSha256,
+        svgByteLength: descriptor.svgByteLength,
+        manifestByteLength: descriptor.manifestByteLength,
+      ),
+      svgBytes: document.svgBytes,
+      manifestBytes: document.manifestBytes,
+    );
+    final host = AvaSvgCanvasSessionHost(
+      persistence: _RestoredWorkspacePersistence(restored),
+    );
+    await host.restoration;
+    final commands = <AvaSvgCanvasClientCommand>[];
+    final controller = AvaSvgCanvasController(
+      documents: _Loader.documents([restored]),
+      commandSink: commands.add,
+      retainedSceneRevision: host.retainedSceneRevision,
+    );
+    host.attach(controller);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SizedBox(
+          width: 600,
+          height: 400,
+          child: AvaSvgCanvasPanel(host: host),
+        ),
+      ),
+    );
+
+    final view = tester.widget<AvaSvgCanvasView>(find.byType(AvaSvgCanvasView));
+    expect(view.activeDocument, same(restored));
+    expect(view.draft, isNull);
+    expect(view.candidate, isNull);
+    expect(view.presentCandidate, isFalse);
+    expect(view.interactionsEnabled, isTrue);
+    expect(controller.active?.document, same(restored));
+    expect(commands, isEmpty);
+
+    view.onBinding(restored.manifest.bindings['select-cloud']!);
+
+    expect(commands, hasLength(1));
+    expect(commands.single.type, AvaSvgCanvasCommandType.canvasInteraction);
+    expect(commands.single.fields, {
+      'sceneId': restored.descriptor.sceneId,
+      'sceneRevision': restored.descriptor.sceneRevision,
+      'interactionRevision': 1,
+      'svgSha256': restored.descriptor.svgSha256,
+      'manifestSha256': restored.descriptor.manifestSha256,
+      'bindingId': 'select-cloud',
+    });
+    host.detach(controller);
+    controller.dispose();
     host.dispose();
   });
 

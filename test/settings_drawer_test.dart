@@ -6,6 +6,7 @@ import 'package:ava/canvas/ava_svg_canvas_controller.dart';
 import 'package:ava/canvas/ava_svg_canvas_session_host.dart';
 import 'package:ava/models/ava_svg_canvas_protocol.dart';
 import 'package:ava/services/ava_memory_control_service.dart';
+import 'package:ava/services/ava_canvas_persistence_service.dart';
 import 'package:ava/services/memory_service.dart';
 import 'package:ava/services/ava_svg_document_service.dart';
 import 'package:ava/state/app_state.dart';
@@ -103,14 +104,18 @@ void main() {
       avaMessage: 'Hello Ari',
     );
     final canvasHost = await _retainedCanvasHost();
+    final canvasPersistence = AvaCanvasPersistenceRepository(database);
+    await canvasPersistence.persistActive(canvasHost.presentedDocument!);
     expect(canvasHost.sceneCount, 1);
     expect(canvasHost.controller, isNull);
+    expect(await database.select(database.canvasScenes).get(), hasLength(1));
 
     await tester.pumpWidget(
       ProviderScope(
         overrides: [
           databaseProvider.overrideWithValue(database),
           avaMemoryControlProvider.overrideWithValue(_FakeMemoryControl()),
+          avaCanvasPersistenceProvider.overrideWithValue(canvasPersistence),
           avaSvgCanvasSessionHostProvider.overrideWith((ref) => canvasHost),
         ],
         child: const MaterialApp(
@@ -141,6 +146,7 @@ void main() {
     expect(canvasHost.controller, isNull);
     expect(canvasHost.panelVisible, isFalse);
     expect(canvasHost.canReopen, isFalse);
+    expect(await database.select(database.canvasScenes).get(), isEmpty);
   });
 
   testWidgets('weekly recap shows bounded topic summaries', (tester) async {

@@ -13,6 +13,7 @@ from ava_backend.canvas.svg_specialist import (
     SvgCanvasSpecialistGeneration,
     SvgCanvasSpecialistRequest,
 )
+from ava_backend.canvas.svg_workspace import ActiveSvgCanvasScene
 from ava_backend.protocol import AgeBand
 from ava_backend.realtime.context_assembler import (
     DynamicContextAssembler,
@@ -140,6 +141,62 @@ async def test_fake_provider_settled_turn_terminates_deferred_readiness_wait() -
         ),
         timeout=0.5,
     )
+
+
+async def test_restored_focused_canvas_is_in_initial_provider_context() -> None:
+    plan = AvaTurnPlan.model_validate_json(
+        (FIXTURE_ROOT / "ava_turn_plan_conversation_v3.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    realtime = DeterministicRealtimePlanProvider(plan)
+    state = SvgCanvasSessionState()
+    documents = SvgCanvasDocumentStore()
+    canvas_events = ProtocolV4CanvasEventSink()
+    jobs = SvgCanvasJobCoordinator(
+        session_id="session-restored-context",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+        specialist=_SvgSpecialist(),
+        state=state,
+        documents=documents,
+        event_sink=canvas_events,
+        generation_id_factory=lambda: "generation-unused",
+    )
+    coordinator = DeterministicRealtimeSessionCoordinator(
+        session_id="session-restored-context",
+        turn_id="turn-restored-context",
+        request_id="request-restored-context",
+        stream_id="stream-restored-context",
+        subject="child:restored-context",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+        realtime=realtime,
+        speech=DeterministicStreamingSpeechSynthesizer(),
+        canvas_jobs=jobs,
+        canvas_events=canvas_events,
+        memory=DevelopmentAuthoritativeMemoryStore(),
+    )
+    document = SvgDocumentValidator().validate(
+        (FIXTURE_ROOT / "ava_svg_document_v4.svg").read_text(encoding="utf-8")
+    )
+    restored = ActiveSvgCanvasScene(
+        generation_id="generation-restored-context",
+        source_turn_id="turn-original-context",
+        scene_id="scene-restored-context",
+        revision=4,
+        document=document,
+        first_rendered_sample=0,
+    )
+    try:
+        coordinator.restore_focused_canvas(restored)
+        await coordinator.negotiate(offer_sdp=DETERMINISTIC_AUDIO_OFFER_SDP)
+
+        assert state.active is restored
+        assert len(realtime.prepared_session_updates) == 1
+        instructions = realtime.prepared_session_updates[0]["session"]["instructions"]
+        assert isinstance(instructions, str)
+        assert state.render_realtime_context() in instructions
+    finally:
+        await coordinator.close()
 
 
 async def test_v4_coordinator_runs_exact_svg_lifecycle_without_pcm_interleaving() -> (

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit, urlunsplit
@@ -32,8 +33,12 @@ from .canvas.svg_delivery import (
 from .canvas.svg_document import (
     SVG_MAX_MANIFEST_BYTES,
     SVG_MANIFEST_VERSION,
+    SVG_PROTOCOL_MAX_BYTES,
     SVG_RENDERER_CAPABILITY_VERSION,
     SVG_VALIDATOR_VERSION,
+    SvgDocumentValidationError,
+    SvgDocumentValidator,
+    SvgValidationLimits,
 )
 from .canvas.svg_specialist import SVG_CANVAS_SPECIALIST_PROMPT_VERSION
 from .canvas.svg_workspace import SvgCanvasWorkspaceStore
@@ -213,6 +218,11 @@ def create_app(
                 seconds=resolved_settings.realtime_max_session_seconds
             ),
             max_sessions=resolved_settings.realtime_max_sessions,
+            canvas_restore_validator=SvgDocumentValidator(
+                SvgValidationLimits(
+                    max_bytes=resolved_settings.canvas_max_svg_bytes,
+                )
+            ),
         )
         app.router.add_event_handler("shutdown", realtime_v4_sessions.close)
     app.state.realtime_v4_sessions = realtime_v4_sessions
@@ -527,6 +537,128 @@ def create_app(
             headers={
                 "Cache-Control": "no-store",
                 "X-Ava-Protocol-Version": "3",
+            },
+        )
+
+    @app.put(
+        "/v4/realtime/sessions/{session_id}/canvas-restore",
+        name="restore_realtime_canvas_v4",
+    )
+    async def restore_realtime_canvas_v4(
+        request: Request,
+        session_id: str,
+        canvas_token: str | None = Header(default=None, alias="X-Ava-Canvas-Token"),
+        protocol_header: str | None = Header(
+            default=None,
+            alias="X-Ava-Protocol-Version",
+        ),
+        generation_id: str | None = Header(default=None, alias="X-Ava-Generation-ID"),
+        source_turn_id: str | None = Header(default=None, alias="X-Ava-Source-Turn-ID"),
+        scene_id: str | None = Header(default=None, alias="X-Ava-Scene-ID"),
+        scene_revision: str | None = Header(default=None, alias="X-Ava-Scene-Revision"),
+        svg_sha256: str | None = Header(default=None, alias="X-Ava-SVG-SHA256"),
+        manifest_sha256: str | None = Header(
+            default=None, alias="X-Ava-Manifest-SHA256"
+        ),
+    ) -> Response:
+        if protocol_header != "4":
+            return _error_response(
+                request,
+                status_code=409,
+                code=ErrorCode.PROTOCOL_MISMATCH,
+                message="X-Ava-Protocol-Version must be exactly 4.",
+            )
+        if (
+            request.headers.get("content-type", "").split(";", maxsplit=1)[0].strip()
+            != "application/octet-stream"
+        ):
+            return _error_response(
+                request,
+                status_code=415,
+                code=ErrorCode.INVALID_REQUEST,
+                message="Canvas restore requires application/octet-stream.",
+            )
+        try:
+            client = await app.state.authenticator.authenticate(request)
+        except PermissionError:
+            return _error_response(
+                request,
+                status_code=401,
+                code=ErrorCode.UNAUTHORIZED,
+                message="A valid Ava client session is required.",
+            )
+        registry: RealtimeSessionRegistry | None = app.state.realtime_v4_sessions
+        if registry is None or canvas_token is None:
+            return _error_response(
+                request,
+                status_code=401 if canvas_token is None else 503,
+                code=(
+                    ErrorCode.UNAUTHORIZED
+                    if canvas_token is None
+                    else ErrorCode.PROVIDER_UNAVAILABLE
+                ),
+                message="Canvas restore authorization is unavailable.",
+            )
+        try:
+            validated_generation_id = _restore_identifier(generation_id, "generation")
+            validated_source_turn_id = _restore_identifier(
+                source_turn_id, "source turn"
+            )
+            validated_scene_id = _restore_identifier(scene_id, "scene")
+            validated_scene_revision = int(scene_revision or "")
+            if not 1 <= validated_scene_revision <= 10_001:
+                raise ValueError("scene revision is outside its bound")
+            validated_svg_sha256 = _restore_sha256(svg_sha256)
+            validated_manifest_sha256 = _restore_sha256(manifest_sha256)
+            svg_bytes = await _read_bounded_request_body(
+                request, SVG_PROTOCOL_MAX_BYTES
+            )
+            await registry.restore_focused_canvas(
+                session_id=session_id,
+                token=canvas_token,
+                subject=client.subject,
+                generation_id=validated_generation_id,
+                source_turn_id=validated_source_turn_id,
+                scene_id=validated_scene_id,
+                scene_revision=validated_scene_revision,
+                expected_svg_sha256=validated_svg_sha256,
+                expected_manifest_sha256=validated_manifest_sha256,
+                svg_bytes=svg_bytes,
+            )
+        except RealtimeSessionAuthenticationError:
+            return _error_response(
+                request,
+                status_code=401,
+                code=ErrorCode.UNAUTHORIZED,
+                message="The Canvas restore token or lifecycle is invalid.",
+            )
+        except (SvgDocumentValidationError, UnicodeDecodeError, ValueError):
+            return _error_response(
+                request,
+                status_code=422,
+                code=ErrorCode.INVALID_REQUEST,
+                message="The restored Canvas document is invalid.",
+            )
+        LOGGER.info(
+            "canvas_restore_completed session_id=%s scene_id=%s scene_revision=%s",
+            session_id,
+            validated_scene_id,
+            validated_scene_revision,
+            extra={
+                "ava_context": {
+                    "sessionId": session_id,
+                    "sceneId": validated_scene_id,
+                    "sceneRevision": validated_scene_revision,
+                    "svgSha256": validated_svg_sha256,
+                    "manifestSha256": validated_manifest_sha256,
+                }
+            },
+        )
+        return Response(
+            status_code=204,
+            headers={
+                "Cache-Control": "no-store",
+                "X-Ava-Protocol-Version": "4",
             },
         )
 
@@ -904,7 +1036,16 @@ def _install_http_boundary(app: FastAPI, settings: Settings) -> None:
                     code=ErrorCode.INVALID_REQUEST,
                     message="Content-Length must be a valid integer.",
                 )
-            if content_length > settings.request_max_bytes:
+            maximum_bytes = (
+                SVG_PROTOCOL_MAX_BYTES
+                if request.method == "PUT"
+                and re.fullmatch(
+                    r"/v4/realtime/sessions/[A-Za-z][A-Za-z0-9._:-]{0,63}/canvas-restore",
+                    request.url.path,
+                )
+                else settings.request_max_bytes
+            )
+            if content_length > maximum_bytes:
                 return _error_response(
                     request,
                     status_code=413,
@@ -1048,6 +1189,18 @@ async def _read_bounded_request_body(request: Request, maximum_bytes: int) -> by
     if not body:
         raise ValueError("request body cannot be empty")
     return bytes(body)
+
+
+def _restore_identifier(value: str | None, label: str) -> str:
+    if value is None or not re.fullmatch(r"[A-Za-z][A-Za-z0-9._:-]{0,95}", value):
+        raise ValueError(f"Canvas restore {label} ID is invalid")
+    return value
+
+
+def _restore_sha256(value: str | None) -> str:
+    if value is None or not re.fullmatch(r"[a-f0-9]{64}", value):
+        raise ValueError("Canvas restore SHA-256 is invalid")
+    return value
 
 
 def _bearer_token(value: str | None) -> str | None:

@@ -81,6 +81,10 @@ class AvaBackendConfiguration {
   Uri get realtimeSessionsV4Endpoint =>
       _requireBaseUri().resolve('v4/realtime/sessions');
 
+  Uri canvasRestoreEndpoint(String sessionId) => _requireBaseUri().resolve(
+        'v4/realtime/sessions/$sessionId/canvas-restore',
+      );
+
   Uri weeklyRecapEndpoint(String timezoneId) {
     return _requireBaseUri().resolve('v3/memory/weekly-recap').replace(
       queryParameters: {'timezoneId': timezoneId},

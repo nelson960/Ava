@@ -187,6 +187,22 @@ def test_clear_advances_reset_epoch_without_ordinary_commit_changes() -> None:
     assert workspace.reset_epoch == initial_epoch + 1
 
 
+def test_restore_hydrates_only_active_scene_without_fake_execution() -> None:
+    workspace = SvgCanvasWorkspace()
+    restored = _scene("restored", 4)
+
+    observed = workspace.restore_focused(restored)
+
+    assert observed is restored
+    assert workspace.current is restored
+    assert workspace.scenes == (restored,)
+    assert workspace.executions == ()
+    assert workspace.last_interaction is None
+
+    with pytest.raises(SvgCanvasWorkspaceError, match="empty"):
+        workspace.restore_focused(_scene("other", 1))
+
+
 def test_different_subjects_have_isolated_workspaces() -> None:
     store = SvgCanvasWorkspaceStore()
     workspace_x = store.workspace_for("child:X")

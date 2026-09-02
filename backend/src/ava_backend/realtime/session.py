@@ -17,6 +17,8 @@ from uuid import uuid4
 from pydantic import field_validator
 
 from ..canvas.render_profile import CanvasRenderProfile
+from ..canvas.svg_document import SvgDocumentValidator
+from ..canvas.svg_workspace import ActiveSvgCanvasScene
 from ..protocol import AgeBand
 from .common import RealtimeProtocolModel
 from .provider_session import NegotiatedRealtimeCall
@@ -76,6 +78,7 @@ class _RealtimeSessionRecord:
     negotiated_call_id: str | None = None
     claimed: bool = False
     active_deadline: datetime | None = None
+    canvas_restored: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +192,7 @@ class RealtimeSessionRegistry:
         ttl: timedelta,
         active_session_ttl: timedelta,
         max_sessions: int,
+        canvas_restore_validator: SvgDocumentValidator | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         session_id_factory: Callable[[], str] = lambda: f"session-{uuid4()}",
     ) -> None:
@@ -208,6 +212,9 @@ class RealtimeSessionRegistry:
         self._ttl = ttl
         self._active_session_ttl = active_session_ttl
         self._max_sessions = max_sessions
+        self._canvas_restore_validator = (
+            canvas_restore_validator or SvgDocumentValidator()
+        )
         self._now = now
         self._session_id_factory = session_id_factory
         self._records: dict[str, _RealtimeSessionRecord] = {}
@@ -345,6 +352,92 @@ class RealtimeSessionRegistry:
                 )
             current.negotiated_call_id = negotiated.provider_call_id
         return negotiated
+
+    async def restore_focused_canvas(
+        self,
+        *,
+        session_id: str,
+        token: str,
+        subject: str,
+        generation_id: str,
+        source_turn_id: str,
+        scene_id: str,
+        scene_revision: int,
+        expected_svg_sha256: str,
+        expected_manifest_sha256: str,
+        svg_bytes: bytes,
+    ) -> ActiveSvgCanvasScene:
+        """Revalidate and hydrate one focused local scene before SDP negotiation."""
+
+        now = self._now()
+        self._token_codec.verify(
+            token,
+            expected_session_id=session_id,
+            expected_scope="canvas",
+            now=now,
+        )
+        token_digest = hashlib.sha256(token.encode("utf-8")).digest()
+        async with self._lock:
+            self._require_canvas_restore_owner(
+                session_id=session_id,
+                subject=subject,
+                token_digest=token_digest,
+                now=now,
+            )
+
+        try:
+            svg_text = svg_bytes.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise ValueError("restored Canvas SVG must be strict UTF-8") from error
+        document = self._canvas_restore_validator.validate(svg_text)
+        if (
+            document.svg_sha256 != expected_svg_sha256
+            or document.manifest_sha256 != expected_manifest_sha256
+        ):
+            raise ValueError("restored Canvas hashes do not match validation output")
+        scene = ActiveSvgCanvasScene(
+            generation_id=generation_id,
+            source_turn_id=source_turn_id,
+            scene_id=scene_id,
+            revision=scene_revision,
+            document=document,
+            first_rendered_sample=0,
+        )
+        async with self._lock:
+            record = self._require_canvas_restore_owner(
+                session_id=session_id,
+                subject=subject,
+                token_digest=token_digest,
+                now=self._now(),
+            )
+            record.coordinator.restore_focused_canvas(scene)
+            record.canvas_restored = True
+        return scene
+
+    def _require_canvas_restore_owner(
+        self,
+        *,
+        session_id: str,
+        subject: str,
+        token_digest: bytes,
+        now: datetime,
+    ) -> _RealtimeSessionRecord:
+        record = self._records.get(session_id)
+        if record is None:
+            raise RealtimeSessionAuthenticationError(RealtimeSessionAuthFailure.UNKNOWN)
+        if record.expires_at <= now:
+            raise RealtimeSessionAuthenticationError(RealtimeSessionAuthFailure.EXPIRED)
+        if not hmac.compare_digest(
+            record.canvas_token_digest, token_digest
+        ) or not hmac.compare_digest(
+            record.subject.encode("utf-8"), subject.encode("utf-8")
+        ):
+            raise RealtimeSessionAuthenticationError(RealtimeSessionAuthFailure.INVALID)
+        if record.negotiation_started or record.negotiated_call_id is not None:
+            raise RealtimeSessionAuthenticationError(RealtimeSessionAuthFailure.CLAIMED)
+        if record.canvas_restored:
+            raise RealtimeSessionAuthenticationError(RealtimeSessionAuthFailure.CLAIMED)
+        return record
 
     async def claim(
         self,

@@ -11,11 +11,14 @@ import pytest
 from ava_backend.app import create_app
 from ava_backend.canvas.svg_delivery import SvgCanvasDocumentStore
 from ava_backend.canvas.svg_document import (
+    SVG_MANIFEST_VERSION,
+    SVG_PROTOCOL_MAX_BYTES,
     SvgDocumentValidator,
     SvgDraftSafetyValidator,
 )
 from ava_backend.canvas.render_profile import CanvasRenderProfile
 from ava_backend.canvas.svg_session import SvgCanvasSessionState
+from ava_backend.canvas.svg_workspace import ActiveSvgCanvasScene
 from ava_backend.canvas.svg_specialist import (
     SvgCanvasSpecialistGeneration,
     SvgCanvasVisibleDraft,
@@ -46,6 +49,7 @@ class _Coordinator:
         self.closed = False
         self.received: list[AvaClientEventUnionV4] = []
         self.memory_reset_revisions: list[int] = []
+        self.restored_scene: ActiveSvgCanvasScene | None = None
 
     @property
     def turn_id(self) -> str:
@@ -70,6 +74,10 @@ class _Coordinator:
 
     async def memory_reset(self, *, reset_revision: int) -> None:
         self.memory_reset_revisions.append(reset_revision)
+
+    def restore_focused_canvas(self, scene: ActiveSvgCanvasScene) -> None:
+        assert self.restored_scene is None
+        self.restored_scene = scene
 
 
 class _Factory:
@@ -283,6 +291,154 @@ def test_v4_bootstrap_and_independent_exact_document_fetch() -> None:
             },
         )
         assert wrong_scope.status_code == 401
+
+
+def test_focused_canvas_restore_revalidates_before_webrtc_negotiation() -> None:
+    factory = _Factory()
+    app = create_app(
+        Settings(
+            environment=AvaEnvironment.TEST,
+            realtime_session_token_secret=SecretStr("h" * 32),
+        ),
+        authoritative_memory=DevelopmentAuthoritativeMemoryStore(),
+        realtime_v4_coordinator_factory=factory,
+    )
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" '
+        'data-ava-interaction-mode="explore">'
+        "<title>Restored sun</title><desc>A tappable sun.</desc>"
+        '<circle id="sun" data-ava-binding="sun-binding" '
+        'data-ava-target="sun" aria-label="Sun" cx="50" cy="50" r="20"/>'
+        "</svg>"
+    )
+    validated = SvgDocumentValidator().validate(svg)
+    with TestClient(app, base_url="https://127.0.0.1") as client:
+        created = client.post(
+            "/v4/realtime/sessions",
+            headers={"X-Ava-Protocol-Version": "4"},
+            json={"protocolVersion": 4, "ageBand": "unknown", "timezoneId": "UTC"},
+        )
+        bootstrap = created.json()
+        restore_headers = {
+            "Content-Type": "application/octet-stream",
+            "X-Ava-Protocol-Version": "4",
+            "X-Ava-Canvas-Token": bootstrap["canvasToken"],
+            "X-Ava-Generation-ID": "generation-restored",
+            "X-Ava-Source-Turn-ID": "turn-restored",
+            "X-Ava-Scene-ID": "scene-restored",
+            "X-Ava-Scene-Revision": "4",
+            "X-Ava-SVG-SHA256": validated.svg_sha256,
+            "X-Ava-Manifest-SHA256": validated.manifest_sha256,
+        }
+        restored = client.put(
+            f"/v4/realtime/sessions/{bootstrap['sessionId']}/canvas-restore",
+            headers=restore_headers,
+            content=validated.svg_bytes,
+        )
+        assert restored.status_code == 204
+        scene = factory.coordinators[0].restored_scene
+        assert scene is not None
+        assert scene.revision == 4
+        assert scene.document.svg_bytes == validated.svg_bytes
+        assert scene.document.manifest_bytes == validated.manifest_bytes
+        assert scene.document.manifest_sha256 == validated.manifest_sha256
+        assert scene.document.manifest["manifestVersion"] == SVG_MANIFEST_VERSION
+        assert tuple(scene.document.bindings) == ("sun-binding",)
+
+        negotiated = client.post(
+            f"/v4/realtime/sessions/{bootstrap['sessionId']}/webrtc",
+            headers={
+                "Authorization": f"Bearer {bootstrap['webrtcToken']}",
+                "Content-Type": "application/sdp",
+                "X-Ava-Protocol-Version": "4",
+            },
+            content=DETERMINISTIC_AUDIO_OFFER_SDP,
+        )
+        assert negotiated.status_code == 200
+
+        replay = client.put(
+            f"/v4/realtime/sessions/{bootstrap['sessionId']}/canvas-restore",
+            headers=restore_headers,
+            content=validated.svg_bytes,
+        )
+        assert replay.status_code == 401
+
+
+def test_canvas_restore_rejects_tampered_svg_and_manifest_hash() -> None:
+    factory = _Factory()
+    app = create_app(
+        Settings(
+            environment=AvaEnvironment.TEST,
+            realtime_session_token_secret=SecretStr("j" * 32),
+        ),
+        authoritative_memory=DevelopmentAuthoritativeMemoryStore(),
+        realtime_v4_coordinator_factory=factory,
+    )
+    document = SvgDocumentValidator().validate(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10" '
+        'data-ava-interaction-mode="none"><title>A</title><desc>B</desc>'
+        '<circle cx="5" cy="5" r="2"/></svg>'
+    )
+    with TestClient(app, base_url="https://127.0.0.1") as client:
+        bootstrap = client.post(
+            "/v4/realtime/sessions",
+            headers={"X-Ava-Protocol-Version": "4"},
+            json={"protocolVersion": 4, "ageBand": "unknown", "timezoneId": "UTC"},
+        ).json()
+        response = client.put(
+            f"/v4/realtime/sessions/{bootstrap['sessionId']}/canvas-restore",
+            headers={
+                "Content-Type": "application/octet-stream",
+                "X-Ava-Protocol-Version": "4",
+                "X-Ava-Canvas-Token": bootstrap["canvasToken"],
+                "X-Ava-Generation-ID": "generation-tampered",
+                "X-Ava-Source-Turn-ID": "turn-tampered",
+                "X-Ava-Scene-ID": "scene-tampered",
+                "X-Ava-Scene-Revision": "1",
+                "X-Ava-SVG-SHA256": document.svg_sha256,
+                "X-Ava-Manifest-SHA256": "0" * 64,
+            },
+            content=document.svg_bytes + b" ",
+        )
+    assert response.status_code == 422
+    assert factory.coordinators[0].restored_scene is None
+
+
+def test_canvas_restore_has_route_specific_absolute_body_bound() -> None:
+    factory = _Factory()
+    app = create_app(
+        Settings(
+            environment=AvaEnvironment.TEST,
+            realtime_session_token_secret=SecretStr("k" * 32),
+            request_max_bytes=16 * 1024,
+        ),
+        authoritative_memory=DevelopmentAuthoritativeMemoryStore(),
+        realtime_v4_coordinator_factory=factory,
+    )
+    with TestClient(app, base_url="https://127.0.0.1") as client:
+        bootstrap = client.post(
+            "/v4/realtime/sessions",
+            headers={"X-Ava-Protocol-Version": "4"},
+            json={"protocolVersion": 4, "ageBand": "unknown", "timezoneId": "UTC"},
+        ).json()
+        response = client.put(
+            f"/v4/realtime/sessions/{bootstrap['sessionId']}/canvas-restore",
+            headers={
+                "Content-Type": "application/octet-stream",
+                "X-Ava-Protocol-Version": "4",
+                "X-Ava-Canvas-Token": bootstrap["canvasToken"],
+                "X-Ava-Generation-ID": "generation-oversized",
+                "X-Ava-Source-Turn-ID": "turn-oversized",
+                "X-Ava-Scene-ID": "scene-oversized",
+                "X-Ava-Scene-Revision": "1",
+                "X-Ava-SVG-SHA256": "0" * 64,
+                "X-Ava-Manifest-SHA256": "0" * 64,
+            },
+            content=b"x" * (SVG_PROTOCOL_MAX_BYTES + 1),
+        )
+
+    assert response.status_code == 413
+    assert factory.coordinators[0].restored_scene is None
 
 
 def test_v4_routes_are_unavailable_until_v4_factory_is_configured() -> None:

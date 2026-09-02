@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:developer' as developer;
 
 import 'package:flutter/foundation.dart';
 
@@ -11,6 +12,24 @@ typedef AvaCanvasRenderProfileUpdateSink = void Function(
   AvaCanvasRenderProfileV4 renderProfile,
 );
 
+final class AvaRestoredCanvasWorkspace {
+  const AvaRestoredCanvasWorkspace({
+    required this.documents,
+    required this.focusedSceneId,
+  });
+
+  final List<AvaValidatedSvgCanvasDocument> documents;
+  final String? focusedSceneId;
+}
+
+abstract interface class AvaCanvasPersistence {
+  Future<AvaRestoredCanvasWorkspace> loadWorkspace();
+
+  Future<void> persistActive(AvaValidatedSvgCanvasDocument document);
+
+  Future<void> reset();
+}
+
 /// Application-level owner of the presented SVG and the controller attached
 /// to the current realtime session.
 final class AvaSvgCanvasSessionHost extends ChangeNotifier {
@@ -18,7 +37,11 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
 
   AvaSvgCanvasSessionHost({
     Duration renderProfileDebounce = const Duration(milliseconds: 150),
-  }) : _renderProfileDebounce = renderProfileDebounce {
+    Duration persistenceRestoreTimeout = const Duration(seconds: 2),
+    AvaCanvasPersistence? persistence,
+  })  : _renderProfileDebounce = renderProfileDebounce,
+        _persistenceRestoreTimeout = persistenceRestoreTimeout,
+        _persistence = persistence {
     if (renderProfileDebounce.isNegative) {
       throw ArgumentError.value(
         renderProfileDebounce,
@@ -26,9 +49,21 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
         'cannot be negative',
       );
     }
+    if (persistenceRestoreTimeout <= Duration.zero) {
+      throw ArgumentError.value(
+        persistenceRestoreTimeout,
+        'persistenceRestoreTimeout',
+        'must be positive',
+      );
+    }
+    _restoration = _restorePersistedWorkspace();
   }
 
   final Duration _renderProfileDebounce;
+  final Duration _persistenceRestoreTimeout;
+  final AvaCanvasPersistence? _persistence;
+  late final Future<void> _restoration;
+  bool _restoreInvalidated = false;
   AvaSvgCanvasController? _controller;
   final List<AvaValidatedSvgCanvasDocument> _workspaceDocuments = [];
   AvaValidatedSvgCanvasDocument? _presentedDocument;
@@ -48,6 +83,7 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
   AvaValidatedSvgCanvasDocument? get presentedDocument => _presentedDocument;
   bool get panelDismissed => _panelDismissed;
   AvaCanvasRenderProfileV4? get renderProfile => _renderProfile;
+  Future<void> get restoration => _restoration;
 
   void updateRenderProfile(AvaCanvasRenderProfileV4 profile) {
     if (_sameRenderProfile(_renderProfile, profile)) return;
@@ -112,6 +148,12 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     if (previous != null) {
       _retainPresentedDocument(previous);
     }
+    final retainedActive = _presentedDocument;
+    if (controller.active == null &&
+        !controller.hasPendingVisual &&
+        retainedActive != null) {
+      controller.restoreRetainedActive(retainedActive);
+    }
     _retainPresentedDocument(controller);
     previous?.removeListener(_handleControllerChanged);
     _renderProfileTimer?.cancel();
@@ -172,6 +214,7 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
         'controller is detached.',
       );
     }
+    _restoreInvalidated = true;
     if (_workspaceDocuments.isEmpty &&
         _presentedDocument == null &&
         !_panelDismissed &&
@@ -247,6 +290,7 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
       }
       _workspaceDocuments.add(active);
       _presentedDocument = active;
+      _persistActive(active);
       return;
     }
 
@@ -267,6 +311,71 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     }
     _workspaceDocuments[index] = active;
     _presentedDocument = active;
+    _persistActive(active);
+  }
+
+  Future<void> _restorePersistedWorkspace() async {
+    final persistence = _persistence;
+    if (persistence == null) return;
+    try {
+      final restored =
+          await persistence.loadWorkspace().timeout(_persistenceRestoreTimeout);
+      if (_restoreInvalidated) return;
+      if (restored.documents.length > maximumSceneCount) {
+        throw StateError('Canvas persistence exceeded the workspace bound.');
+      }
+      final sceneIds = <String>{};
+      for (final document in restored.documents) {
+        if (!document.descriptor.isLocallyRestored ||
+            !sceneIds.add(document.descriptor.sceneId)) {
+          throw StateError(
+              'Canvas persistence returned invalid workspace state.');
+        }
+      }
+      final focusedSceneId = restored.focusedSceneId;
+      final focused = focusedSceneId == null
+          ? null
+          : restored.documents
+              .where(
+                (document) => document.descriptor.sceneId == focusedSceneId,
+              )
+              .firstOrNull;
+      if (focusedSceneId != null && focused == null) {
+        throw StateError('Canvas persistence returned an unknown focus.');
+      }
+      _workspaceDocuments
+        ..clear()
+        ..addAll(restored.documents);
+      _presentedDocument = focused;
+      notifyListeners();
+    } on Object catch (error, stackTrace) {
+      developer.log(
+        'canvas_restore_failed failureType=${error.runtimeType}',
+        name: 'ava.canvas.persistence',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      _workspaceDocuments.clear();
+      _presentedDocument = null;
+    }
+  }
+
+  void _persistActive(AvaValidatedSvgCanvasDocument document) {
+    final persistence = _persistence;
+    if (persistence == null || document.descriptor.isLocallyRestored) return;
+    unawaited(
+      persistence.persistActive(document).onError((error, stackTrace) {
+        final descriptor = document.descriptor;
+        developer.log(
+          'canvas_persist_failed sceneId=${descriptor.sceneId} '
+          'sceneRevision=${descriptor.sceneRevision} '
+          'failureType=${error.runtimeType}',
+          name: 'ava.canvas.persistence',
+          error: error,
+          stackTrace: stackTrace,
+        );
+      }),
+    );
   }
 
   bool _hasSameDocumentIdentity(
@@ -279,8 +388,6 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
         left.sourceTurnId == right.sourceTurnId &&
         left.sceneId == right.sceneId &&
         left.sceneRevision == right.sceneRevision &&
-        left.svgPath == right.svgPath &&
-        left.manifestPath == right.manifestPath &&
         left.svgSha256 == right.svgSha256 &&
         left.manifestSha256 == right.manifestSha256 &&
         left.svgByteLength == right.svgByteLength &&

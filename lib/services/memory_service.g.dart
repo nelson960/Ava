@@ -1208,6 +1208,790 @@ class LearningProgressEventsCompanion
   }
 }
 
+class $CanvasScenesTable extends CanvasScenes
+    with TableInfo<$CanvasScenesTable, StoredCanvasScene> {
+  @override
+  final GeneratedDatabase attachedDatabase;
+  final String? _alias;
+  $CanvasScenesTable(this.attachedDatabase, [this._alias]);
+  static const VerificationMeta _sceneIdMeta =
+      const VerificationMeta('sceneId');
+  @override
+  late final GeneratedColumn<String> sceneId = GeneratedColumn<String>(
+      'scene_id', aliasedName, false,
+      additionalChecks:
+          GeneratedColumn.checkTextLength(minTextLength: 1, maxTextLength: 96),
+      type: DriftSqlType.string,
+      requiredDuringInsert: true);
+  static const VerificationMeta _sceneRevisionMeta =
+      const VerificationMeta('sceneRevision');
+  @override
+  late final GeneratedColumn<int> sceneRevision = GeneratedColumn<int>(
+      'scene_revision', aliasedName, false,
+      type: DriftSqlType.int, requiredDuringInsert: true);
+  static const VerificationMeta _generationIdMeta =
+      const VerificationMeta('generationId');
+  @override
+  late final GeneratedColumn<String> generationId = GeneratedColumn<String>(
+      'generation_id', aliasedName, false,
+      additionalChecks:
+          GeneratedColumn.checkTextLength(minTextLength: 1, maxTextLength: 96),
+      type: DriftSqlType.string,
+      requiredDuringInsert: true);
+  static const VerificationMeta _sourceTurnIdMeta =
+      const VerificationMeta('sourceTurnId');
+  @override
+  late final GeneratedColumn<String> sourceTurnId = GeneratedColumn<String>(
+      'source_turn_id', aliasedName, false,
+      additionalChecks:
+          GeneratedColumn.checkTextLength(minTextLength: 1, maxTextLength: 96),
+      type: DriftSqlType.string,
+      requiredDuringInsert: true);
+  static const VerificationMeta _svgBytesMeta =
+      const VerificationMeta('svgBytes');
+  @override
+  late final GeneratedColumn<Uint8List> svgBytes = GeneratedColumn<Uint8List>(
+      'svg_bytes', aliasedName, false,
+      type: DriftSqlType.blob, requiredDuringInsert: true);
+  static const VerificationMeta _manifestBytesMeta =
+      const VerificationMeta('manifestBytes');
+  @override
+  late final GeneratedColumn<Uint8List> manifestBytes =
+      GeneratedColumn<Uint8List>('manifest_bytes', aliasedName, false,
+          type: DriftSqlType.blob, requiredDuringInsert: true);
+  static const VerificationMeta _svgSha256Meta =
+      const VerificationMeta('svgSha256');
+  @override
+  late final GeneratedColumn<String> svgSha256 = GeneratedColumn<String>(
+      'svg_sha256', aliasedName, false,
+      additionalChecks:
+          GeneratedColumn.checkTextLength(minTextLength: 64, maxTextLength: 64),
+      type: DriftSqlType.string,
+      requiredDuringInsert: true);
+  static const VerificationMeta _manifestSha256Meta =
+      const VerificationMeta('manifestSha256');
+  @override
+  late final GeneratedColumn<String> manifestSha256 = GeneratedColumn<String>(
+      'manifest_sha256', aliasedName, false,
+      additionalChecks:
+          GeneratedColumn.checkTextLength(minTextLength: 64, maxTextLength: 64),
+      type: DriftSqlType.string,
+      requiredDuringInsert: true);
+  static const VerificationMeta _svgByteLengthMeta =
+      const VerificationMeta('svgByteLength');
+  @override
+  late final GeneratedColumn<int> svgByteLength = GeneratedColumn<int>(
+      'svg_byte_length', aliasedName, false,
+      type: DriftSqlType.int, requiredDuringInsert: true);
+  static const VerificationMeta _manifestByteLengthMeta =
+      const VerificationMeta('manifestByteLength');
+  @override
+  late final GeneratedColumn<int> manifestByteLength = GeneratedColumn<int>(
+      'manifest_byte_length', aliasedName, false,
+      type: DriftSqlType.int, requiredDuringInsert: true);
+  static const VerificationMeta _rendererCapabilityVersionMeta =
+      const VerificationMeta('rendererCapabilityVersion');
+  @override
+  late final GeneratedColumn<String> rendererCapabilityVersion =
+      GeneratedColumn<String>('renderer_capability_version', aliasedName, false,
+          type: DriftSqlType.string, requiredDuringInsert: true);
+  static const VerificationMeta _validatorVersionMeta =
+      const VerificationMeta('validatorVersion');
+  @override
+  late final GeneratedColumn<String> validatorVersion = GeneratedColumn<String>(
+      'validator_version', aliasedName, false,
+      type: DriftSqlType.string, requiredDuringInsert: true);
+  static const VerificationMeta _manifestVersionMeta =
+      const VerificationMeta('manifestVersion');
+  @override
+  late final GeneratedColumn<String> manifestVersion = GeneratedColumn<String>(
+      'manifest_version', aliasedName, false,
+      type: DriftSqlType.string, requiredDuringInsert: true);
+  static const VerificationMeta _workspaceOrderMeta =
+      const VerificationMeta('workspaceOrder');
+  @override
+  late final GeneratedColumn<int> workspaceOrder = GeneratedColumn<int>(
+      'workspace_order', aliasedName, false,
+      type: DriftSqlType.int, requiredDuringInsert: true);
+  static const VerificationMeta _isFocusedMeta =
+      const VerificationMeta('isFocused');
+  @override
+  late final GeneratedColumn<bool> isFocused = GeneratedColumn<bool>(
+      'is_focused', aliasedName, false,
+      type: DriftSqlType.bool,
+      requiredDuringInsert: true,
+      defaultConstraints:
+          GeneratedColumn.constraintIsAlways('CHECK ("is_focused" IN (0, 1))'));
+  @override
+  List<GeneratedColumn> get $columns => [
+        sceneId,
+        sceneRevision,
+        generationId,
+        sourceTurnId,
+        svgBytes,
+        manifestBytes,
+        svgSha256,
+        manifestSha256,
+        svgByteLength,
+        manifestByteLength,
+        rendererCapabilityVersion,
+        validatorVersion,
+        manifestVersion,
+        workspaceOrder,
+        isFocused
+      ];
+  @override
+  String get aliasedName => _alias ?? actualTableName;
+  @override
+  String get actualTableName => $name;
+  static const String $name = 'canvas_scenes';
+  @override
+  VerificationContext validateIntegrity(Insertable<StoredCanvasScene> instance,
+      {bool isInserting = false}) {
+    final context = VerificationContext();
+    final data = instance.toColumns(true);
+    if (data.containsKey('scene_id')) {
+      context.handle(_sceneIdMeta,
+          sceneId.isAcceptableOrUnknown(data['scene_id']!, _sceneIdMeta));
+    } else if (isInserting) {
+      context.missing(_sceneIdMeta);
+    }
+    if (data.containsKey('scene_revision')) {
+      context.handle(
+          _sceneRevisionMeta,
+          sceneRevision.isAcceptableOrUnknown(
+              data['scene_revision']!, _sceneRevisionMeta));
+    } else if (isInserting) {
+      context.missing(_sceneRevisionMeta);
+    }
+    if (data.containsKey('generation_id')) {
+      context.handle(
+          _generationIdMeta,
+          generationId.isAcceptableOrUnknown(
+              data['generation_id']!, _generationIdMeta));
+    } else if (isInserting) {
+      context.missing(_generationIdMeta);
+    }
+    if (data.containsKey('source_turn_id')) {
+      context.handle(
+          _sourceTurnIdMeta,
+          sourceTurnId.isAcceptableOrUnknown(
+              data['source_turn_id']!, _sourceTurnIdMeta));
+    } else if (isInserting) {
+      context.missing(_sourceTurnIdMeta);
+    }
+    if (data.containsKey('svg_bytes')) {
+      context.handle(_svgBytesMeta,
+          svgBytes.isAcceptableOrUnknown(data['svg_bytes']!, _svgBytesMeta));
+    } else if (isInserting) {
+      context.missing(_svgBytesMeta);
+    }
+    if (data.containsKey('manifest_bytes')) {
+      context.handle(
+          _manifestBytesMeta,
+          manifestBytes.isAcceptableOrUnknown(
+              data['manifest_bytes']!, _manifestBytesMeta));
+    } else if (isInserting) {
+      context.missing(_manifestBytesMeta);
+    }
+    if (data.containsKey('svg_sha256')) {
+      context.handle(_svgSha256Meta,
+          svgSha256.isAcceptableOrUnknown(data['svg_sha256']!, _svgSha256Meta));
+    } else if (isInserting) {
+      context.missing(_svgSha256Meta);
+    }
+    if (data.containsKey('manifest_sha256')) {
+      context.handle(
+          _manifestSha256Meta,
+          manifestSha256.isAcceptableOrUnknown(
+              data['manifest_sha256']!, _manifestSha256Meta));
+    } else if (isInserting) {
+      context.missing(_manifestSha256Meta);
+    }
+    if (data.containsKey('svg_byte_length')) {
+      context.handle(
+          _svgByteLengthMeta,
+          svgByteLength.isAcceptableOrUnknown(
+              data['svg_byte_length']!, _svgByteLengthMeta));
+    } else if (isInserting) {
+      context.missing(_svgByteLengthMeta);
+    }
+    if (data.containsKey('manifest_byte_length')) {
+      context.handle(
+          _manifestByteLengthMeta,
+          manifestByteLength.isAcceptableOrUnknown(
+              data['manifest_byte_length']!, _manifestByteLengthMeta));
+    } else if (isInserting) {
+      context.missing(_manifestByteLengthMeta);
+    }
+    if (data.containsKey('renderer_capability_version')) {
+      context.handle(
+          _rendererCapabilityVersionMeta,
+          rendererCapabilityVersion.isAcceptableOrUnknown(
+              data['renderer_capability_version']!,
+              _rendererCapabilityVersionMeta));
+    } else if (isInserting) {
+      context.missing(_rendererCapabilityVersionMeta);
+    }
+    if (data.containsKey('validator_version')) {
+      context.handle(
+          _validatorVersionMeta,
+          validatorVersion.isAcceptableOrUnknown(
+              data['validator_version']!, _validatorVersionMeta));
+    } else if (isInserting) {
+      context.missing(_validatorVersionMeta);
+    }
+    if (data.containsKey('manifest_version')) {
+      context.handle(
+          _manifestVersionMeta,
+          manifestVersion.isAcceptableOrUnknown(
+              data['manifest_version']!, _manifestVersionMeta));
+    } else if (isInserting) {
+      context.missing(_manifestVersionMeta);
+    }
+    if (data.containsKey('workspace_order')) {
+      context.handle(
+          _workspaceOrderMeta,
+          workspaceOrder.isAcceptableOrUnknown(
+              data['workspace_order']!, _workspaceOrderMeta));
+    } else if (isInserting) {
+      context.missing(_workspaceOrderMeta);
+    }
+    if (data.containsKey('is_focused')) {
+      context.handle(_isFocusedMeta,
+          isFocused.isAcceptableOrUnknown(data['is_focused']!, _isFocusedMeta));
+    } else if (isInserting) {
+      context.missing(_isFocusedMeta);
+    }
+    return context;
+  }
+
+  @override
+  Set<GeneratedColumn> get $primaryKey => {sceneId};
+  @override
+  StoredCanvasScene map(Map<String, dynamic> data, {String? tablePrefix}) {
+    final effectivePrefix = tablePrefix != null ? '$tablePrefix.' : '';
+    return StoredCanvasScene(
+      sceneId: attachedDatabase.typeMapping
+          .read(DriftSqlType.string, data['${effectivePrefix}scene_id'])!,
+      sceneRevision: attachedDatabase.typeMapping
+          .read(DriftSqlType.int, data['${effectivePrefix}scene_revision'])!,
+      generationId: attachedDatabase.typeMapping
+          .read(DriftSqlType.string, data['${effectivePrefix}generation_id'])!,
+      sourceTurnId: attachedDatabase.typeMapping
+          .read(DriftSqlType.string, data['${effectivePrefix}source_turn_id'])!,
+      svgBytes: attachedDatabase.typeMapping
+          .read(DriftSqlType.blob, data['${effectivePrefix}svg_bytes'])!,
+      manifestBytes: attachedDatabase.typeMapping
+          .read(DriftSqlType.blob, data['${effectivePrefix}manifest_bytes'])!,
+      svgSha256: attachedDatabase.typeMapping
+          .read(DriftSqlType.string, data['${effectivePrefix}svg_sha256'])!,
+      manifestSha256: attachedDatabase.typeMapping.read(
+          DriftSqlType.string, data['${effectivePrefix}manifest_sha256'])!,
+      svgByteLength: attachedDatabase.typeMapping
+          .read(DriftSqlType.int, data['${effectivePrefix}svg_byte_length'])!,
+      manifestByteLength: attachedDatabase.typeMapping.read(
+          DriftSqlType.int, data['${effectivePrefix}manifest_byte_length'])!,
+      rendererCapabilityVersion: attachedDatabase.typeMapping.read(
+          DriftSqlType.string,
+          data['${effectivePrefix}renderer_capability_version'])!,
+      validatorVersion: attachedDatabase.typeMapping.read(
+          DriftSqlType.string, data['${effectivePrefix}validator_version'])!,
+      manifestVersion: attachedDatabase.typeMapping.read(
+          DriftSqlType.string, data['${effectivePrefix}manifest_version'])!,
+      workspaceOrder: attachedDatabase.typeMapping
+          .read(DriftSqlType.int, data['${effectivePrefix}workspace_order'])!,
+      isFocused: attachedDatabase.typeMapping
+          .read(DriftSqlType.bool, data['${effectivePrefix}is_focused'])!,
+    );
+  }
+
+  @override
+  $CanvasScenesTable createAlias(String alias) {
+    return $CanvasScenesTable(attachedDatabase, alias);
+  }
+}
+
+class StoredCanvasScene extends DataClass
+    implements Insertable<StoredCanvasScene> {
+  final String sceneId;
+  final int sceneRevision;
+  final String generationId;
+  final String sourceTurnId;
+  final Uint8List svgBytes;
+  final Uint8List manifestBytes;
+  final String svgSha256;
+  final String manifestSha256;
+  final int svgByteLength;
+  final int manifestByteLength;
+  final String rendererCapabilityVersion;
+  final String validatorVersion;
+  final String manifestVersion;
+  final int workspaceOrder;
+  final bool isFocused;
+  const StoredCanvasScene(
+      {required this.sceneId,
+      required this.sceneRevision,
+      required this.generationId,
+      required this.sourceTurnId,
+      required this.svgBytes,
+      required this.manifestBytes,
+      required this.svgSha256,
+      required this.manifestSha256,
+      required this.svgByteLength,
+      required this.manifestByteLength,
+      required this.rendererCapabilityVersion,
+      required this.validatorVersion,
+      required this.manifestVersion,
+      required this.workspaceOrder,
+      required this.isFocused});
+  @override
+  Map<String, Expression> toColumns(bool nullToAbsent) {
+    final map = <String, Expression>{};
+    map['scene_id'] = Variable<String>(sceneId);
+    map['scene_revision'] = Variable<int>(sceneRevision);
+    map['generation_id'] = Variable<String>(generationId);
+    map['source_turn_id'] = Variable<String>(sourceTurnId);
+    map['svg_bytes'] = Variable<Uint8List>(svgBytes);
+    map['manifest_bytes'] = Variable<Uint8List>(manifestBytes);
+    map['svg_sha256'] = Variable<String>(svgSha256);
+    map['manifest_sha256'] = Variable<String>(manifestSha256);
+    map['svg_byte_length'] = Variable<int>(svgByteLength);
+    map['manifest_byte_length'] = Variable<int>(manifestByteLength);
+    map['renderer_capability_version'] =
+        Variable<String>(rendererCapabilityVersion);
+    map['validator_version'] = Variable<String>(validatorVersion);
+    map['manifest_version'] = Variable<String>(manifestVersion);
+    map['workspace_order'] = Variable<int>(workspaceOrder);
+    map['is_focused'] = Variable<bool>(isFocused);
+    return map;
+  }
+
+  CanvasScenesCompanion toCompanion(bool nullToAbsent) {
+    return CanvasScenesCompanion(
+      sceneId: Value(sceneId),
+      sceneRevision: Value(sceneRevision),
+      generationId: Value(generationId),
+      sourceTurnId: Value(sourceTurnId),
+      svgBytes: Value(svgBytes),
+      manifestBytes: Value(manifestBytes),
+      svgSha256: Value(svgSha256),
+      manifestSha256: Value(manifestSha256),
+      svgByteLength: Value(svgByteLength),
+      manifestByteLength: Value(manifestByteLength),
+      rendererCapabilityVersion: Value(rendererCapabilityVersion),
+      validatorVersion: Value(validatorVersion),
+      manifestVersion: Value(manifestVersion),
+      workspaceOrder: Value(workspaceOrder),
+      isFocused: Value(isFocused),
+    );
+  }
+
+  factory StoredCanvasScene.fromJson(Map<String, dynamic> json,
+      {ValueSerializer? serializer}) {
+    serializer ??= driftRuntimeOptions.defaultSerializer;
+    return StoredCanvasScene(
+      sceneId: serializer.fromJson<String>(json['sceneId']),
+      sceneRevision: serializer.fromJson<int>(json['sceneRevision']),
+      generationId: serializer.fromJson<String>(json['generationId']),
+      sourceTurnId: serializer.fromJson<String>(json['sourceTurnId']),
+      svgBytes: serializer.fromJson<Uint8List>(json['svgBytes']),
+      manifestBytes: serializer.fromJson<Uint8List>(json['manifestBytes']),
+      svgSha256: serializer.fromJson<String>(json['svgSha256']),
+      manifestSha256: serializer.fromJson<String>(json['manifestSha256']),
+      svgByteLength: serializer.fromJson<int>(json['svgByteLength']),
+      manifestByteLength: serializer.fromJson<int>(json['manifestByteLength']),
+      rendererCapabilityVersion:
+          serializer.fromJson<String>(json['rendererCapabilityVersion']),
+      validatorVersion: serializer.fromJson<String>(json['validatorVersion']),
+      manifestVersion: serializer.fromJson<String>(json['manifestVersion']),
+      workspaceOrder: serializer.fromJson<int>(json['workspaceOrder']),
+      isFocused: serializer.fromJson<bool>(json['isFocused']),
+    );
+  }
+  @override
+  Map<String, dynamic> toJson({ValueSerializer? serializer}) {
+    serializer ??= driftRuntimeOptions.defaultSerializer;
+    return <String, dynamic>{
+      'sceneId': serializer.toJson<String>(sceneId),
+      'sceneRevision': serializer.toJson<int>(sceneRevision),
+      'generationId': serializer.toJson<String>(generationId),
+      'sourceTurnId': serializer.toJson<String>(sourceTurnId),
+      'svgBytes': serializer.toJson<Uint8List>(svgBytes),
+      'manifestBytes': serializer.toJson<Uint8List>(manifestBytes),
+      'svgSha256': serializer.toJson<String>(svgSha256),
+      'manifestSha256': serializer.toJson<String>(manifestSha256),
+      'svgByteLength': serializer.toJson<int>(svgByteLength),
+      'manifestByteLength': serializer.toJson<int>(manifestByteLength),
+      'rendererCapabilityVersion':
+          serializer.toJson<String>(rendererCapabilityVersion),
+      'validatorVersion': serializer.toJson<String>(validatorVersion),
+      'manifestVersion': serializer.toJson<String>(manifestVersion),
+      'workspaceOrder': serializer.toJson<int>(workspaceOrder),
+      'isFocused': serializer.toJson<bool>(isFocused),
+    };
+  }
+
+  StoredCanvasScene copyWith(
+          {String? sceneId,
+          int? sceneRevision,
+          String? generationId,
+          String? sourceTurnId,
+          Uint8List? svgBytes,
+          Uint8List? manifestBytes,
+          String? svgSha256,
+          String? manifestSha256,
+          int? svgByteLength,
+          int? manifestByteLength,
+          String? rendererCapabilityVersion,
+          String? validatorVersion,
+          String? manifestVersion,
+          int? workspaceOrder,
+          bool? isFocused}) =>
+      StoredCanvasScene(
+        sceneId: sceneId ?? this.sceneId,
+        sceneRevision: sceneRevision ?? this.sceneRevision,
+        generationId: generationId ?? this.generationId,
+        sourceTurnId: sourceTurnId ?? this.sourceTurnId,
+        svgBytes: svgBytes ?? this.svgBytes,
+        manifestBytes: manifestBytes ?? this.manifestBytes,
+        svgSha256: svgSha256 ?? this.svgSha256,
+        manifestSha256: manifestSha256 ?? this.manifestSha256,
+        svgByteLength: svgByteLength ?? this.svgByteLength,
+        manifestByteLength: manifestByteLength ?? this.manifestByteLength,
+        rendererCapabilityVersion:
+            rendererCapabilityVersion ?? this.rendererCapabilityVersion,
+        validatorVersion: validatorVersion ?? this.validatorVersion,
+        manifestVersion: manifestVersion ?? this.manifestVersion,
+        workspaceOrder: workspaceOrder ?? this.workspaceOrder,
+        isFocused: isFocused ?? this.isFocused,
+      );
+  StoredCanvasScene copyWithCompanion(CanvasScenesCompanion data) {
+    return StoredCanvasScene(
+      sceneId: data.sceneId.present ? data.sceneId.value : this.sceneId,
+      sceneRevision: data.sceneRevision.present
+          ? data.sceneRevision.value
+          : this.sceneRevision,
+      generationId: data.generationId.present
+          ? data.generationId.value
+          : this.generationId,
+      sourceTurnId: data.sourceTurnId.present
+          ? data.sourceTurnId.value
+          : this.sourceTurnId,
+      svgBytes: data.svgBytes.present ? data.svgBytes.value : this.svgBytes,
+      manifestBytes: data.manifestBytes.present
+          ? data.manifestBytes.value
+          : this.manifestBytes,
+      svgSha256: data.svgSha256.present ? data.svgSha256.value : this.svgSha256,
+      manifestSha256: data.manifestSha256.present
+          ? data.manifestSha256.value
+          : this.manifestSha256,
+      svgByteLength: data.svgByteLength.present
+          ? data.svgByteLength.value
+          : this.svgByteLength,
+      manifestByteLength: data.manifestByteLength.present
+          ? data.manifestByteLength.value
+          : this.manifestByteLength,
+      rendererCapabilityVersion: data.rendererCapabilityVersion.present
+          ? data.rendererCapabilityVersion.value
+          : this.rendererCapabilityVersion,
+      validatorVersion: data.validatorVersion.present
+          ? data.validatorVersion.value
+          : this.validatorVersion,
+      manifestVersion: data.manifestVersion.present
+          ? data.manifestVersion.value
+          : this.manifestVersion,
+      workspaceOrder: data.workspaceOrder.present
+          ? data.workspaceOrder.value
+          : this.workspaceOrder,
+      isFocused: data.isFocused.present ? data.isFocused.value : this.isFocused,
+    );
+  }
+
+  @override
+  String toString() {
+    return (StringBuffer('StoredCanvasScene(')
+          ..write('sceneId: $sceneId, ')
+          ..write('sceneRevision: $sceneRevision, ')
+          ..write('generationId: $generationId, ')
+          ..write('sourceTurnId: $sourceTurnId, ')
+          ..write('svgBytes: $svgBytes, ')
+          ..write('manifestBytes: $manifestBytes, ')
+          ..write('svgSha256: $svgSha256, ')
+          ..write('manifestSha256: $manifestSha256, ')
+          ..write('svgByteLength: $svgByteLength, ')
+          ..write('manifestByteLength: $manifestByteLength, ')
+          ..write('rendererCapabilityVersion: $rendererCapabilityVersion, ')
+          ..write('validatorVersion: $validatorVersion, ')
+          ..write('manifestVersion: $manifestVersion, ')
+          ..write('workspaceOrder: $workspaceOrder, ')
+          ..write('isFocused: $isFocused')
+          ..write(')'))
+        .toString();
+  }
+
+  @override
+  int get hashCode => Object.hash(
+      sceneId,
+      sceneRevision,
+      generationId,
+      sourceTurnId,
+      $driftBlobEquality.hash(svgBytes),
+      $driftBlobEquality.hash(manifestBytes),
+      svgSha256,
+      manifestSha256,
+      svgByteLength,
+      manifestByteLength,
+      rendererCapabilityVersion,
+      validatorVersion,
+      manifestVersion,
+      workspaceOrder,
+      isFocused);
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      (other is StoredCanvasScene &&
+          other.sceneId == this.sceneId &&
+          other.sceneRevision == this.sceneRevision &&
+          other.generationId == this.generationId &&
+          other.sourceTurnId == this.sourceTurnId &&
+          $driftBlobEquality.equals(other.svgBytes, this.svgBytes) &&
+          $driftBlobEquality.equals(other.manifestBytes, this.manifestBytes) &&
+          other.svgSha256 == this.svgSha256 &&
+          other.manifestSha256 == this.manifestSha256 &&
+          other.svgByteLength == this.svgByteLength &&
+          other.manifestByteLength == this.manifestByteLength &&
+          other.rendererCapabilityVersion == this.rendererCapabilityVersion &&
+          other.validatorVersion == this.validatorVersion &&
+          other.manifestVersion == this.manifestVersion &&
+          other.workspaceOrder == this.workspaceOrder &&
+          other.isFocused == this.isFocused);
+}
+
+class CanvasScenesCompanion extends UpdateCompanion<StoredCanvasScene> {
+  final Value<String> sceneId;
+  final Value<int> sceneRevision;
+  final Value<String> generationId;
+  final Value<String> sourceTurnId;
+  final Value<Uint8List> svgBytes;
+  final Value<Uint8List> manifestBytes;
+  final Value<String> svgSha256;
+  final Value<String> manifestSha256;
+  final Value<int> svgByteLength;
+  final Value<int> manifestByteLength;
+  final Value<String> rendererCapabilityVersion;
+  final Value<String> validatorVersion;
+  final Value<String> manifestVersion;
+  final Value<int> workspaceOrder;
+  final Value<bool> isFocused;
+  final Value<int> rowid;
+  const CanvasScenesCompanion({
+    this.sceneId = const Value.absent(),
+    this.sceneRevision = const Value.absent(),
+    this.generationId = const Value.absent(),
+    this.sourceTurnId = const Value.absent(),
+    this.svgBytes = const Value.absent(),
+    this.manifestBytes = const Value.absent(),
+    this.svgSha256 = const Value.absent(),
+    this.manifestSha256 = const Value.absent(),
+    this.svgByteLength = const Value.absent(),
+    this.manifestByteLength = const Value.absent(),
+    this.rendererCapabilityVersion = const Value.absent(),
+    this.validatorVersion = const Value.absent(),
+    this.manifestVersion = const Value.absent(),
+    this.workspaceOrder = const Value.absent(),
+    this.isFocused = const Value.absent(),
+    this.rowid = const Value.absent(),
+  });
+  CanvasScenesCompanion.insert({
+    required String sceneId,
+    required int sceneRevision,
+    required String generationId,
+    required String sourceTurnId,
+    required Uint8List svgBytes,
+    required Uint8List manifestBytes,
+    required String svgSha256,
+    required String manifestSha256,
+    required int svgByteLength,
+    required int manifestByteLength,
+    required String rendererCapabilityVersion,
+    required String validatorVersion,
+    required String manifestVersion,
+    required int workspaceOrder,
+    required bool isFocused,
+    this.rowid = const Value.absent(),
+  })  : sceneId = Value(sceneId),
+        sceneRevision = Value(sceneRevision),
+        generationId = Value(generationId),
+        sourceTurnId = Value(sourceTurnId),
+        svgBytes = Value(svgBytes),
+        manifestBytes = Value(manifestBytes),
+        svgSha256 = Value(svgSha256),
+        manifestSha256 = Value(manifestSha256),
+        svgByteLength = Value(svgByteLength),
+        manifestByteLength = Value(manifestByteLength),
+        rendererCapabilityVersion = Value(rendererCapabilityVersion),
+        validatorVersion = Value(validatorVersion),
+        manifestVersion = Value(manifestVersion),
+        workspaceOrder = Value(workspaceOrder),
+        isFocused = Value(isFocused);
+  static Insertable<StoredCanvasScene> custom({
+    Expression<String>? sceneId,
+    Expression<int>? sceneRevision,
+    Expression<String>? generationId,
+    Expression<String>? sourceTurnId,
+    Expression<Uint8List>? svgBytes,
+    Expression<Uint8List>? manifestBytes,
+    Expression<String>? svgSha256,
+    Expression<String>? manifestSha256,
+    Expression<int>? svgByteLength,
+    Expression<int>? manifestByteLength,
+    Expression<String>? rendererCapabilityVersion,
+    Expression<String>? validatorVersion,
+    Expression<String>? manifestVersion,
+    Expression<int>? workspaceOrder,
+    Expression<bool>? isFocused,
+    Expression<int>? rowid,
+  }) {
+    return RawValuesInsertable({
+      if (sceneId != null) 'scene_id': sceneId,
+      if (sceneRevision != null) 'scene_revision': sceneRevision,
+      if (generationId != null) 'generation_id': generationId,
+      if (sourceTurnId != null) 'source_turn_id': sourceTurnId,
+      if (svgBytes != null) 'svg_bytes': svgBytes,
+      if (manifestBytes != null) 'manifest_bytes': manifestBytes,
+      if (svgSha256 != null) 'svg_sha256': svgSha256,
+      if (manifestSha256 != null) 'manifest_sha256': manifestSha256,
+      if (svgByteLength != null) 'svg_byte_length': svgByteLength,
+      if (manifestByteLength != null)
+        'manifest_byte_length': manifestByteLength,
+      if (rendererCapabilityVersion != null)
+        'renderer_capability_version': rendererCapabilityVersion,
+      if (validatorVersion != null) 'validator_version': validatorVersion,
+      if (manifestVersion != null) 'manifest_version': manifestVersion,
+      if (workspaceOrder != null) 'workspace_order': workspaceOrder,
+      if (isFocused != null) 'is_focused': isFocused,
+      if (rowid != null) 'rowid': rowid,
+    });
+  }
+
+  CanvasScenesCompanion copyWith(
+      {Value<String>? sceneId,
+      Value<int>? sceneRevision,
+      Value<String>? generationId,
+      Value<String>? sourceTurnId,
+      Value<Uint8List>? svgBytes,
+      Value<Uint8List>? manifestBytes,
+      Value<String>? svgSha256,
+      Value<String>? manifestSha256,
+      Value<int>? svgByteLength,
+      Value<int>? manifestByteLength,
+      Value<String>? rendererCapabilityVersion,
+      Value<String>? validatorVersion,
+      Value<String>? manifestVersion,
+      Value<int>? workspaceOrder,
+      Value<bool>? isFocused,
+      Value<int>? rowid}) {
+    return CanvasScenesCompanion(
+      sceneId: sceneId ?? this.sceneId,
+      sceneRevision: sceneRevision ?? this.sceneRevision,
+      generationId: generationId ?? this.generationId,
+      sourceTurnId: sourceTurnId ?? this.sourceTurnId,
+      svgBytes: svgBytes ?? this.svgBytes,
+      manifestBytes: manifestBytes ?? this.manifestBytes,
+      svgSha256: svgSha256 ?? this.svgSha256,
+      manifestSha256: manifestSha256 ?? this.manifestSha256,
+      svgByteLength: svgByteLength ?? this.svgByteLength,
+      manifestByteLength: manifestByteLength ?? this.manifestByteLength,
+      rendererCapabilityVersion:
+          rendererCapabilityVersion ?? this.rendererCapabilityVersion,
+      validatorVersion: validatorVersion ?? this.validatorVersion,
+      manifestVersion: manifestVersion ?? this.manifestVersion,
+      workspaceOrder: workspaceOrder ?? this.workspaceOrder,
+      isFocused: isFocused ?? this.isFocused,
+      rowid: rowid ?? this.rowid,
+    );
+  }
+
+  @override
+  Map<String, Expression> toColumns(bool nullToAbsent) {
+    final map = <String, Expression>{};
+    if (sceneId.present) {
+      map['scene_id'] = Variable<String>(sceneId.value);
+    }
+    if (sceneRevision.present) {
+      map['scene_revision'] = Variable<int>(sceneRevision.value);
+    }
+    if (generationId.present) {
+      map['generation_id'] = Variable<String>(generationId.value);
+    }
+    if (sourceTurnId.present) {
+      map['source_turn_id'] = Variable<String>(sourceTurnId.value);
+    }
+    if (svgBytes.present) {
+      map['svg_bytes'] = Variable<Uint8List>(svgBytes.value);
+    }
+    if (manifestBytes.present) {
+      map['manifest_bytes'] = Variable<Uint8List>(manifestBytes.value);
+    }
+    if (svgSha256.present) {
+      map['svg_sha256'] = Variable<String>(svgSha256.value);
+    }
+    if (manifestSha256.present) {
+      map['manifest_sha256'] = Variable<String>(manifestSha256.value);
+    }
+    if (svgByteLength.present) {
+      map['svg_byte_length'] = Variable<int>(svgByteLength.value);
+    }
+    if (manifestByteLength.present) {
+      map['manifest_byte_length'] = Variable<int>(manifestByteLength.value);
+    }
+    if (rendererCapabilityVersion.present) {
+      map['renderer_capability_version'] =
+          Variable<String>(rendererCapabilityVersion.value);
+    }
+    if (validatorVersion.present) {
+      map['validator_version'] = Variable<String>(validatorVersion.value);
+    }
+    if (manifestVersion.present) {
+      map['manifest_version'] = Variable<String>(manifestVersion.value);
+    }
+    if (workspaceOrder.present) {
+      map['workspace_order'] = Variable<int>(workspaceOrder.value);
+    }
+    if (isFocused.present) {
+      map['is_focused'] = Variable<bool>(isFocused.value);
+    }
+    if (rowid.present) {
+      map['rowid'] = Variable<int>(rowid.value);
+    }
+    return map;
+  }
+
+  @override
+  String toString() {
+    return (StringBuffer('CanvasScenesCompanion(')
+          ..write('sceneId: $sceneId, ')
+          ..write('sceneRevision: $sceneRevision, ')
+          ..write('generationId: $generationId, ')
+          ..write('sourceTurnId: $sourceTurnId, ')
+          ..write('svgBytes: $svgBytes, ')
+          ..write('manifestBytes: $manifestBytes, ')
+          ..write('svgSha256: $svgSha256, ')
+          ..write('manifestSha256: $manifestSha256, ')
+          ..write('svgByteLength: $svgByteLength, ')
+          ..write('manifestByteLength: $manifestByteLength, ')
+          ..write('rendererCapabilityVersion: $rendererCapabilityVersion, ')
+          ..write('validatorVersion: $validatorVersion, ')
+          ..write('manifestVersion: $manifestVersion, ')
+          ..write('workspaceOrder: $workspaceOrder, ')
+          ..write('isFocused: $isFocused, ')
+          ..write('rowid: $rowid')
+          ..write(')'))
+        .toString();
+  }
+}
+
 abstract class _$AppDatabase extends GeneratedDatabase {
   _$AppDatabase(QueryExecutor e) : super(e);
   $AppDatabaseManager get managers => $AppDatabaseManager(this);
@@ -1216,12 +2000,13 @@ abstract class _$AppDatabase extends GeneratedDatabase {
   late final $SessionHistoryTable sessionHistory = $SessionHistoryTable(this);
   late final $LearningProgressEventsTable learningProgressEvents =
       $LearningProgressEventsTable(this);
+  late final $CanvasScenesTable canvasScenes = $CanvasScenesTable(this);
   @override
   Iterable<TableInfo<Table, Object?>> get allTables =>
       allSchemaEntities.whereType<TableInfo<Table, Object?>>();
   @override
   List<DatabaseSchemaEntity> get allSchemaEntities =>
-      [studentProfiles, sessionHistory, learningProgressEvents];
+      [studentProfiles, sessionHistory, learningProgressEvents, canvasScenes];
 }
 
 typedef $$StudentProfilesTableCreateCompanionBuilder = StudentProfilesCompanion
@@ -1834,6 +2619,346 @@ typedef $$LearningProgressEventsTableProcessedTableManager
         ),
         StoredLearningProgressEvent,
         PrefetchHooks Function()>;
+typedef $$CanvasScenesTableCreateCompanionBuilder = CanvasScenesCompanion
+    Function({
+  required String sceneId,
+  required int sceneRevision,
+  required String generationId,
+  required String sourceTurnId,
+  required Uint8List svgBytes,
+  required Uint8List manifestBytes,
+  required String svgSha256,
+  required String manifestSha256,
+  required int svgByteLength,
+  required int manifestByteLength,
+  required String rendererCapabilityVersion,
+  required String validatorVersion,
+  required String manifestVersion,
+  required int workspaceOrder,
+  required bool isFocused,
+  Value<int> rowid,
+});
+typedef $$CanvasScenesTableUpdateCompanionBuilder = CanvasScenesCompanion
+    Function({
+  Value<String> sceneId,
+  Value<int> sceneRevision,
+  Value<String> generationId,
+  Value<String> sourceTurnId,
+  Value<Uint8List> svgBytes,
+  Value<Uint8List> manifestBytes,
+  Value<String> svgSha256,
+  Value<String> manifestSha256,
+  Value<int> svgByteLength,
+  Value<int> manifestByteLength,
+  Value<String> rendererCapabilityVersion,
+  Value<String> validatorVersion,
+  Value<String> manifestVersion,
+  Value<int> workspaceOrder,
+  Value<bool> isFocused,
+  Value<int> rowid,
+});
+
+class $$CanvasScenesTableFilterComposer
+    extends Composer<_$AppDatabase, $CanvasScenesTable> {
+  $$CanvasScenesTableFilterComposer({
+    required super.$db,
+    required super.$table,
+    super.joinBuilder,
+    super.$addJoinBuilderToRootComposer,
+    super.$removeJoinBuilderFromRootComposer,
+  });
+  ColumnFilters<String> get sceneId => $composableBuilder(
+      column: $table.sceneId, builder: (column) => ColumnFilters(column));
+
+  ColumnFilters<int> get sceneRevision => $composableBuilder(
+      column: $table.sceneRevision, builder: (column) => ColumnFilters(column));
+
+  ColumnFilters<String> get generationId => $composableBuilder(
+      column: $table.generationId, builder: (column) => ColumnFilters(column));
+
+  ColumnFilters<String> get sourceTurnId => $composableBuilder(
+      column: $table.sourceTurnId, builder: (column) => ColumnFilters(column));
+
+  ColumnFilters<Uint8List> get svgBytes => $composableBuilder(
+      column: $table.svgBytes, builder: (column) => ColumnFilters(column));
+
+  ColumnFilters<Uint8List> get manifestBytes => $composableBuilder(
+      column: $table.manifestBytes, builder: (column) => ColumnFilters(column));
+
+  ColumnFilters<String> get svgSha256 => $composableBuilder(
+      column: $table.svgSha256, builder: (column) => ColumnFilters(column));
+
+  ColumnFilters<String> get manifestSha256 => $composableBuilder(
+      column: $table.manifestSha256,
+      builder: (column) => ColumnFilters(column));
+
+  ColumnFilters<int> get svgByteLength => $composableBuilder(
+      column: $table.svgByteLength, builder: (column) => ColumnFilters(column));
+
+  ColumnFilters<int> get manifestByteLength => $composableBuilder(
+      column: $table.manifestByteLength,
+      builder: (column) => ColumnFilters(column));
+
+  ColumnFilters<String> get rendererCapabilityVersion => $composableBuilder(
+      column: $table.rendererCapabilityVersion,
+      builder: (column) => ColumnFilters(column));
+
+  ColumnFilters<String> get validatorVersion => $composableBuilder(
+      column: $table.validatorVersion,
+      builder: (column) => ColumnFilters(column));
+
+  ColumnFilters<String> get manifestVersion => $composableBuilder(
+      column: $table.manifestVersion,
+      builder: (column) => ColumnFilters(column));
+
+  ColumnFilters<int> get workspaceOrder => $composableBuilder(
+      column: $table.workspaceOrder,
+      builder: (column) => ColumnFilters(column));
+
+  ColumnFilters<bool> get isFocused => $composableBuilder(
+      column: $table.isFocused, builder: (column) => ColumnFilters(column));
+}
+
+class $$CanvasScenesTableOrderingComposer
+    extends Composer<_$AppDatabase, $CanvasScenesTable> {
+  $$CanvasScenesTableOrderingComposer({
+    required super.$db,
+    required super.$table,
+    super.joinBuilder,
+    super.$addJoinBuilderToRootComposer,
+    super.$removeJoinBuilderFromRootComposer,
+  });
+  ColumnOrderings<String> get sceneId => $composableBuilder(
+      column: $table.sceneId, builder: (column) => ColumnOrderings(column));
+
+  ColumnOrderings<int> get sceneRevision => $composableBuilder(
+      column: $table.sceneRevision,
+      builder: (column) => ColumnOrderings(column));
+
+  ColumnOrderings<String> get generationId => $composableBuilder(
+      column: $table.generationId,
+      builder: (column) => ColumnOrderings(column));
+
+  ColumnOrderings<String> get sourceTurnId => $composableBuilder(
+      column: $table.sourceTurnId,
+      builder: (column) => ColumnOrderings(column));
+
+  ColumnOrderings<Uint8List> get svgBytes => $composableBuilder(
+      column: $table.svgBytes, builder: (column) => ColumnOrderings(column));
+
+  ColumnOrderings<Uint8List> get manifestBytes => $composableBuilder(
+      column: $table.manifestBytes,
+      builder: (column) => ColumnOrderings(column));
+
+  ColumnOrderings<String> get svgSha256 => $composableBuilder(
+      column: $table.svgSha256, builder: (column) => ColumnOrderings(column));
+
+  ColumnOrderings<String> get manifestSha256 => $composableBuilder(
+      column: $table.manifestSha256,
+      builder: (column) => ColumnOrderings(column));
+
+  ColumnOrderings<int> get svgByteLength => $composableBuilder(
+      column: $table.svgByteLength,
+      builder: (column) => ColumnOrderings(column));
+
+  ColumnOrderings<int> get manifestByteLength => $composableBuilder(
+      column: $table.manifestByteLength,
+      builder: (column) => ColumnOrderings(column));
+
+  ColumnOrderings<String> get rendererCapabilityVersion => $composableBuilder(
+      column: $table.rendererCapabilityVersion,
+      builder: (column) => ColumnOrderings(column));
+
+  ColumnOrderings<String> get validatorVersion => $composableBuilder(
+      column: $table.validatorVersion,
+      builder: (column) => ColumnOrderings(column));
+
+  ColumnOrderings<String> get manifestVersion => $composableBuilder(
+      column: $table.manifestVersion,
+      builder: (column) => ColumnOrderings(column));
+
+  ColumnOrderings<int> get workspaceOrder => $composableBuilder(
+      column: $table.workspaceOrder,
+      builder: (column) => ColumnOrderings(column));
+
+  ColumnOrderings<bool> get isFocused => $composableBuilder(
+      column: $table.isFocused, builder: (column) => ColumnOrderings(column));
+}
+
+class $$CanvasScenesTableAnnotationComposer
+    extends Composer<_$AppDatabase, $CanvasScenesTable> {
+  $$CanvasScenesTableAnnotationComposer({
+    required super.$db,
+    required super.$table,
+    super.joinBuilder,
+    super.$addJoinBuilderToRootComposer,
+    super.$removeJoinBuilderFromRootComposer,
+  });
+  GeneratedColumn<String> get sceneId =>
+      $composableBuilder(column: $table.sceneId, builder: (column) => column);
+
+  GeneratedColumn<int> get sceneRevision => $composableBuilder(
+      column: $table.sceneRevision, builder: (column) => column);
+
+  GeneratedColumn<String> get generationId => $composableBuilder(
+      column: $table.generationId, builder: (column) => column);
+
+  GeneratedColumn<String> get sourceTurnId => $composableBuilder(
+      column: $table.sourceTurnId, builder: (column) => column);
+
+  GeneratedColumn<Uint8List> get svgBytes =>
+      $composableBuilder(column: $table.svgBytes, builder: (column) => column);
+
+  GeneratedColumn<Uint8List> get manifestBytes => $composableBuilder(
+      column: $table.manifestBytes, builder: (column) => column);
+
+  GeneratedColumn<String> get svgSha256 =>
+      $composableBuilder(column: $table.svgSha256, builder: (column) => column);
+
+  GeneratedColumn<String> get manifestSha256 => $composableBuilder(
+      column: $table.manifestSha256, builder: (column) => column);
+
+  GeneratedColumn<int> get svgByteLength => $composableBuilder(
+      column: $table.svgByteLength, builder: (column) => column);
+
+  GeneratedColumn<int> get manifestByteLength => $composableBuilder(
+      column: $table.manifestByteLength, builder: (column) => column);
+
+  GeneratedColumn<String> get rendererCapabilityVersion => $composableBuilder(
+      column: $table.rendererCapabilityVersion, builder: (column) => column);
+
+  GeneratedColumn<String> get validatorVersion => $composableBuilder(
+      column: $table.validatorVersion, builder: (column) => column);
+
+  GeneratedColumn<String> get manifestVersion => $composableBuilder(
+      column: $table.manifestVersion, builder: (column) => column);
+
+  GeneratedColumn<int> get workspaceOrder => $composableBuilder(
+      column: $table.workspaceOrder, builder: (column) => column);
+
+  GeneratedColumn<bool> get isFocused =>
+      $composableBuilder(column: $table.isFocused, builder: (column) => column);
+}
+
+class $$CanvasScenesTableTableManager extends RootTableManager<
+    _$AppDatabase,
+    $CanvasScenesTable,
+    StoredCanvasScene,
+    $$CanvasScenesTableFilterComposer,
+    $$CanvasScenesTableOrderingComposer,
+    $$CanvasScenesTableAnnotationComposer,
+    $$CanvasScenesTableCreateCompanionBuilder,
+    $$CanvasScenesTableUpdateCompanionBuilder,
+    (
+      StoredCanvasScene,
+      BaseReferences<_$AppDatabase, $CanvasScenesTable, StoredCanvasScene>
+    ),
+    StoredCanvasScene,
+    PrefetchHooks Function()> {
+  $$CanvasScenesTableTableManager(_$AppDatabase db, $CanvasScenesTable table)
+      : super(TableManagerState(
+          db: db,
+          table: table,
+          createFilteringComposer: () =>
+              $$CanvasScenesTableFilterComposer($db: db, $table: table),
+          createOrderingComposer: () =>
+              $$CanvasScenesTableOrderingComposer($db: db, $table: table),
+          createComputedFieldComposer: () =>
+              $$CanvasScenesTableAnnotationComposer($db: db, $table: table),
+          updateCompanionCallback: ({
+            Value<String> sceneId = const Value.absent(),
+            Value<int> sceneRevision = const Value.absent(),
+            Value<String> generationId = const Value.absent(),
+            Value<String> sourceTurnId = const Value.absent(),
+            Value<Uint8List> svgBytes = const Value.absent(),
+            Value<Uint8List> manifestBytes = const Value.absent(),
+            Value<String> svgSha256 = const Value.absent(),
+            Value<String> manifestSha256 = const Value.absent(),
+            Value<int> svgByteLength = const Value.absent(),
+            Value<int> manifestByteLength = const Value.absent(),
+            Value<String> rendererCapabilityVersion = const Value.absent(),
+            Value<String> validatorVersion = const Value.absent(),
+            Value<String> manifestVersion = const Value.absent(),
+            Value<int> workspaceOrder = const Value.absent(),
+            Value<bool> isFocused = const Value.absent(),
+            Value<int> rowid = const Value.absent(),
+          }) =>
+              CanvasScenesCompanion(
+            sceneId: sceneId,
+            sceneRevision: sceneRevision,
+            generationId: generationId,
+            sourceTurnId: sourceTurnId,
+            svgBytes: svgBytes,
+            manifestBytes: manifestBytes,
+            svgSha256: svgSha256,
+            manifestSha256: manifestSha256,
+            svgByteLength: svgByteLength,
+            manifestByteLength: manifestByteLength,
+            rendererCapabilityVersion: rendererCapabilityVersion,
+            validatorVersion: validatorVersion,
+            manifestVersion: manifestVersion,
+            workspaceOrder: workspaceOrder,
+            isFocused: isFocused,
+            rowid: rowid,
+          ),
+          createCompanionCallback: ({
+            required String sceneId,
+            required int sceneRevision,
+            required String generationId,
+            required String sourceTurnId,
+            required Uint8List svgBytes,
+            required Uint8List manifestBytes,
+            required String svgSha256,
+            required String manifestSha256,
+            required int svgByteLength,
+            required int manifestByteLength,
+            required String rendererCapabilityVersion,
+            required String validatorVersion,
+            required String manifestVersion,
+            required int workspaceOrder,
+            required bool isFocused,
+            Value<int> rowid = const Value.absent(),
+          }) =>
+              CanvasScenesCompanion.insert(
+            sceneId: sceneId,
+            sceneRevision: sceneRevision,
+            generationId: generationId,
+            sourceTurnId: sourceTurnId,
+            svgBytes: svgBytes,
+            manifestBytes: manifestBytes,
+            svgSha256: svgSha256,
+            manifestSha256: manifestSha256,
+            svgByteLength: svgByteLength,
+            manifestByteLength: manifestByteLength,
+            rendererCapabilityVersion: rendererCapabilityVersion,
+            validatorVersion: validatorVersion,
+            manifestVersion: manifestVersion,
+            workspaceOrder: workspaceOrder,
+            isFocused: isFocused,
+            rowid: rowid,
+          ),
+          withReferenceMapper: (p0) => p0
+              .map((e) => (e.readTable(table), BaseReferences(db, table, e)))
+              .toList(),
+          prefetchHooksCallback: null,
+        ));
+}
+
+typedef $$CanvasScenesTableProcessedTableManager = ProcessedTableManager<
+    _$AppDatabase,
+    $CanvasScenesTable,
+    StoredCanvasScene,
+    $$CanvasScenesTableFilterComposer,
+    $$CanvasScenesTableOrderingComposer,
+    $$CanvasScenesTableAnnotationComposer,
+    $$CanvasScenesTableCreateCompanionBuilder,
+    $$CanvasScenesTableUpdateCompanionBuilder,
+    (
+      StoredCanvasScene,
+      BaseReferences<_$AppDatabase, $CanvasScenesTable, StoredCanvasScene>
+    ),
+    StoredCanvasScene,
+    PrefetchHooks Function()>;
 
 class $AppDatabaseManager {
   final _$AppDatabase _db;
@@ -1845,4 +2970,6 @@ class $AppDatabaseManager {
   $$LearningProgressEventsTableTableManager get learningProgressEvents =>
       $$LearningProgressEventsTableTableManager(
           _db, _db.learningProgressEvents);
+  $$CanvasScenesTableTableManager get canvasScenes =>
+      $$CanvasScenesTableTableManager(_db, _db.canvasScenes);
 }

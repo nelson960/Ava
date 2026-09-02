@@ -11,7 +11,7 @@ from time import monotonic
 from typing import TypeAlias, TypeVar, cast
 from zoneinfo import ZoneInfo
 
-from ..canvas.svg_workspace import RecordedSvgCanvasInteraction
+from ..canvas.svg_workspace import ActiveSvgCanvasScene, RecordedSvgCanvasInteraction
 from ..diagnostics import new_failure_id
 from ..protocol import AgeBand
 from .bounded_queue import BoundedAsyncQueue, QueueClosed
@@ -333,6 +333,13 @@ class DeterministicRealtimeSessionCoordinator:
         if self._negotiated_call is None:
             raise CoordinatorStateError("Realtime media has not been negotiated")
         return self._negotiated_call
+
+    def restore_focused_canvas(self, scene: ActiveSvgCanvasScene) -> None:
+        if self._closed or self._started or self._negotiated_call is not None:
+            raise CoordinatorStateError(
+                "Canvas restore must complete before realtime negotiation"
+            )
+        self._canvas_jobs.state.workspace.restore_focused(scene)
 
     async def memory_reset(self, *, reset_revision: int) -> None:
         if (

@@ -1,6 +1,8 @@
 import 'package:ava/models/ava_realtime_protocol.dart';
+import 'package:ava/services/memory_service.dart';
 import 'package:ava/state/app_state.dart';
 import 'package:ava/state/ava_session_state.dart';
+import 'package:drift/native.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -25,8 +27,11 @@ void main() {
 
   test('microphone intent is acknowledged before preparation completes',
       () async {
+    final database = AppDatabase.forTesting(NativeDatabase.memory());
+    addTearDown(database.close);
     final container = ProviderContainer(
       overrides: [
+        databaseProvider.overrideWithValue(database),
         avaRealtimeAgeBandProvider.overrideWithValue(
           AvaRealtimeAgeBand.middleChildhood,
         ),
@@ -52,7 +57,11 @@ void main() {
 
   test('presentation changes do not replace the realtime session controller',
       () {
-    final container = ProviderContainer();
+    final database = AppDatabase.forTesting(NativeDatabase.memory());
+    addTearDown(database.close);
+    final container = ProviderContainer(
+      overrides: [databaseProvider.overrideWithValue(database)],
+    );
     addTearDown(container.dispose);
 
     final controller = container.read(avaSessionProvider.notifier);
