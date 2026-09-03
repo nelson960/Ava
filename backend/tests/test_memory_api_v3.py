@@ -4,6 +4,7 @@ from httpx import ASGITransport, AsyncClient
 
 from ava_backend.app import create_app
 from ava_backend.canvas.svg_document import SvgDocumentValidator
+from ava_backend.canvas.svg_specialist import SVG_CANVAS_SPECIALIST_PROMPT_VERSION
 from ava_backend.canvas.svg_workspace import (
     ActiveSvgCanvasScene,
     SvgCanvasWorkspaceStore,
@@ -181,7 +182,7 @@ async def test_readiness_checks_configured_authoritative_memory() -> None:
     assert payload["protocolVersion"] == 3
     assert payload["promptVersion"] == "ava-realtime-v4.9"
     assert payload["toolContractVersion"] == "ava-realtime-tools-v4.6"
-    assert payload["canvasSpecialistVersion"] == "ava-svg-canvas-vnext-2"
+    assert payload["canvasSpecialistVersion"] == SVG_CANVAS_SPECIALIST_PROMPT_VERSION
     assert payload["build"]["version"] == "0.1.0"
     assert payload["build"]["instanceId"].startswith("instance-")
     assert payload["build"]["sourceRevision"].startswith("sha256:")

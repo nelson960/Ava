@@ -82,8 +82,8 @@ class Settings(BaseSettings):
         gt=0,
         lt=1,
     )
-    openai_canvas_model: Literal["gpt-5.6-sol"] = "gpt-5.6-sol"
-    openai_canvas_reasoning_effort: Literal["none", "low"] = "none"
+    openai_canvas_model: Literal["gpt-5.6-sol", "gpt-5.6-terra"] = "gpt-5.6-terra"
+    openai_canvas_reasoning_effort: Literal["none", "low", "medium"] = "medium"
     openai_canvas_timeout_seconds: float = Field(
         default=90,
         ge=3,

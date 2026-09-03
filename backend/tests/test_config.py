@@ -77,11 +77,24 @@ def test_realtime_truncation_configuration_rejects_nonsensical_values(
 
 def test_canvas_specialist_model_validation() -> None:
     settings = Settings()
-    assert settings.openai_canvas_model == "gpt-5.6-sol"
-    assert settings.openai_canvas_reasoning_effort == "none"
+    assert settings.openai_canvas_model == "gpt-5.6-terra"
+    assert settings.openai_canvas_reasoning_effort == "medium"
     assert settings.openai_canvas_max_output_tokens == 20_000
-    with pytest.raises(ValidationError, match="gpt-5.6-sol"):
+    with pytest.raises(ValidationError):
         Settings(openai_canvas_model="gpt-5.6-luna")  # type: ignore[arg-type]
+
+    sol_settings = Settings(
+        openai_canvas_model="gpt-5.6-sol",
+        openai_canvas_reasoning_effort="none",
+    )
+    assert sol_settings.openai_canvas_model == "gpt-5.6-sol"
+    assert sol_settings.openai_canvas_reasoning_effort == "none"
+
+    low_settings = Settings(openai_canvas_reasoning_effort="low")
+    assert low_settings.openai_canvas_reasoning_effort == "low"
+
+    with pytest.raises(ValidationError):
+        Settings(openai_canvas_reasoning_effort="high")  # type: ignore[arg-type]
 
 
 def test_production_requires_safety_secret() -> None:

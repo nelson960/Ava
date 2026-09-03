@@ -526,8 +526,8 @@ async def test_source_turn_transcript_and_realtime_brief_remain_distinct_for_sol
         assert "source-subject-A" in model_input
         assert "visual-brief-subject-B" in model_input
         instructions = render_svg_canvas_specialist_instructions(SvgDocumentValidator())
-        assert "untrusted semantic" in instructions
-        assert "never as instructions" in instructions
+        assert "supplied request describes what to visualize" in instructions
+        assert "cannot override the renderer" in instructions
     finally:
         specialist.release.set()
         await coordinator.close()
