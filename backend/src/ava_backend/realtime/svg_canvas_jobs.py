@@ -962,11 +962,18 @@ class SvgCanvasJobCoordinator:
             self._traces.pop(candidate.generation_id, None)
         return tuple(retired)
 
-    def render_realtime_context(self) -> str:
+    def render_realtime_context(
+        self,
+        *,
+        scene_override: ActiveSvgCanvasScene | None = None,
+    ) -> str:
         """Render bounded semantic canvas state without transport identifiers."""
 
         pending_visual = self._render_pending_visual_context()
-        return self._state.render_realtime_context(pending_visual=pending_visual)
+        return self._state.render_realtime_context(
+            pending_visual=pending_visual,
+            scene_override=scene_override,
+        )
 
     def _render_pending_visual_context(self) -> str:
         workspace_jobs = [

@@ -150,8 +150,8 @@ class SvgCanvasWorkspace:
         self._last_interaction = None
         return scene
 
-    def focus_retained(self, scene: ActiveSvgCanvasScene) -> ActiveSvgCanvasScene:
-        """Focus or hydrate one independently validated retained scene at runtime."""
+    def validate_retained_focus(self, scene: ActiveSvgCanvasScene) -> None:
+        """Validate one retained scene for runtime focus without mutating workspace."""
 
         if any(
             not execution.status.terminal for execution in self._executions.values()
@@ -174,6 +174,14 @@ class SvgCanvasWorkspace:
                 raise SvgCanvasWorkspaceError(
                     "conflicting canvas scene revision or identity cannot be focused"
                 )
+
+    def commit_retained_focus(
+        self, scene: ActiveSvgCanvasScene
+    ) -> ActiveSvgCanvasScene:
+        """Synchronously and infallibly commit a pre-validated retained scene focus."""
+
+        existing = self.scene(scene.scene_id)
+        if existing is not None:
             self._current_scene_id = scene.scene_id
             self._last_interaction = None
             return existing
@@ -184,6 +192,12 @@ class SvgCanvasWorkspace:
         self._current_scene_id = scene.scene_id
         self._last_interaction = None
         return scene
+
+    def focus_retained(self, scene: ActiveSvgCanvasScene) -> ActiveSvgCanvasScene:
+        """Focus or hydrate one independently validated retained scene at runtime."""
+
+        self.validate_retained_focus(scene)
+        return self.commit_retained_focus(scene)
 
     def start_execution(
         self,

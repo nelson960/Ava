@@ -1,14 +1,15 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui';
 
 import 'package:ava/canvas/ava_svg_canvas_controller.dart';
 import 'package:ava/canvas/ava_svg_canvas_session_host.dart';
 import 'package:ava/models/ava_svg_canvas_protocol.dart';
 import 'package:ava/services/ava_canvas_save_service.dart';
-import 'package:ava/services/ava_canvas_share_service.dart';
 import 'package:ava/services/ava_svg_document_service.dart';
 import 'package:ava/ui/dashboard/ava_svg_canvas_panel.dart';
 import 'package:ava/ui/dashboard/ava_svg_canvas_view.dart';
+import 'package:ava/ui/design/ava_design.dart';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -50,14 +51,6 @@ void main() {
   setUpAll(() {
     TestWidgetsFlutterBinding.ensureInitialized();
     InAppWebViewPlatform.instance = _TestInAppWebViewPlatform();
-  });
-
-  tearDownAll(() {
-    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-        .setMockMethodCallHandler(
-      const MethodChannel('plugins.flutter.io/share_plus'),
-      null,
-    );
   });
 
   test('startup restore leaves panel closed but semantically focused', () async {
@@ -235,38 +228,6 @@ void main() {
     host.dispose();
   });
 
-  test('share service sanitizes filename, writes exact bytes, and cleans up',
-      () async {
-    final doc = _document(scene: 1, revision: 1);
-    final originalBytes = doc.svgBytes;
-
-    // 11. Share service sanitizes title
-    final sanitized = IoAvaCanvasShareService.sanitizeFilename(
-      'Cloud / Storm: <Dangerous> & Café ☁️!',
-    );
-    expect(sanitized, startsWith('ava-Cloud_Storm_Dangerous_Caf'));
-    expect(sanitized, endsWith('.svg'));
-
-    String? sharedFilePath;
-    final shareService = IoAvaCanvasShareService(
-      tempDirectoryProvider: () async =>
-          Directory.systemTemp.createTempSync('ava_test_share'),
-      shareInvoker: (files, {sharePositionOrigin}) async {
-        expect(files.length, 1);
-        sharedFilePath = files.first.path;
-        final sharedBytes = await File(sharedFilePath!).readAsBytes();
-        // 12. exact UTF-8 bytes sent
-        expect(sharedBytes, originalBytes);
-      },
-    );
-
-    await shareService.shareSvg(document: doc);
-
-    // 13. temp file cleanup
-    expect(sharedFilePath, isNotNull);
-    expect(File(sharedFilePath!).existsSync(), isFalse);
-  });
-
   testWidgets('AvaSvgCanvasPanel compact navbar shows title, counter, download, and nav',
       (tester) async {
     final doc1 = _document(scene: 1, revision: 1, manifestJson: _manifestJson1);
@@ -318,10 +279,11 @@ void main() {
       findsOneWidget,
     );
 
-    IconButton buttonWithTooltip(String tooltip) => tester.widget<IconButton>(
+    AvaCanvasNavbarButton buttonWithTooltip(String tooltip) =>
+        tester.widget<AvaCanvasNavbarButton>(
           find.ancestor(
             of: find.byTooltip(tooltip),
-            matching: find.byType(IconButton),
+            matching: find.byType(AvaCanvasNavbarButton),
           ),
         );
 
@@ -369,7 +331,7 @@ void main() {
 
     final prevFinder = find.ancestor(
       of: find.byTooltip('Previous drawing'),
-      matching: find.byType(IconButton),
+      matching: find.byType(AvaCanvasNavbarButton),
     );
     final prevRenderSize = tester.getSize(prevFinder);
     expect(prevRenderSize.width, greaterThanOrEqualTo(44.0));
@@ -377,11 +339,41 @@ void main() {
 
     final closeFinder = find.ancestor(
       of: find.byTooltip('Close drawing'),
-      matching: find.byType(IconButton),
+      matching: find.byType(AvaCanvasNavbarButton),
     );
     final closeRenderSize = tester.getSize(closeFinder);
     expect(closeRenderSize.width, greaterThanOrEqualTo(44.0));
     expect(closeRenderSize.height, greaterThanOrEqualTo(44.0));
+
+    // Visual hover/pressed overlay area: 32x32 diameter, not oversized relative to icon,
+    // and visually centered at navbar center y = 16.5
+    final prevVisualFinder = find.byKey(
+      const ValueKey('navbar_button_visual_Previous drawing'),
+    );
+    final prevVisualSize = tester.getSize(prevVisualFinder);
+    expect(prevVisualSize.width, equals(32.0));
+    expect(prevVisualSize.height, equals(32.0));
+    expect(prevVisualSize.width, lessThan(prevRenderSize.width));
+    final prevVisualCenter = tester.getCenter(prevVisualFinder);
+    expect(prevVisualCenter.dy, equals(16.5));
+
+    // Hover over previous button produces small centered 32px circular overlay
+    final gesture = await tester.createGesture(kind: PointerDeviceKind.mouse);
+    await gesture.addPointer(location: Offset.zero);
+    addTearDown(gesture.removePointer);
+
+    await gesture.moveTo(tester.getCenter(prevFinder));
+    await tester.pumpAndSettle();
+
+    final hoveredContainer =
+        tester.widget<AnimatedContainer>(prevVisualFinder);
+    final hoveredDecoration =
+        hoveredContainer.decoration as ShapeDecoration;
+    expect(hoveredDecoration.shape, isA<CircleBorder>());
+    expect(hoveredDecoration.color, AvaColors.ink.withValues(alpha: 0.07));
+
+    await gesture.moveTo(Offset.zero);
+    await tester.pumpAndSettle();
 
     expect(prevButton.onPressed, isNotNull);
     expect(nextButton.onPressed, isNull);
@@ -442,10 +434,11 @@ void main() {
     expect(find.text('Café cloud 2 ☁️'), findsOneWidget);
     expect(find.text('2 / 2'), findsOneWidget);
 
-    IconButton buttonWithTooltip(String tooltip) => tester.widget<IconButton>(
+    AvaCanvasNavbarButton buttonWithTooltip(String tooltip) =>
+        tester.widget<AvaCanvasNavbarButton>(
           find.ancestor(
             of: find.byTooltip(tooltip),
-            matching: find.byType(IconButton),
+            matching: find.byType(AvaCanvasNavbarButton),
           ),
         );
 

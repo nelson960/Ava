@@ -6,7 +6,6 @@ import 'package:file_picker/file_picker.dart';
 import 'package:path/path.dart' as p;
 
 import '../models/ava_svg_canvas_protocol.dart';
-import 'ava_canvas_share_service.dart';
 
 abstract interface class AvaCanvasSaveService {
   Future<bool> saveSvg({
@@ -51,12 +50,21 @@ final class IoAvaCanvasSaveService implements AvaCanvasSaveService {
     );
   }
 
+  static String sanitizeFilename(String title) {
+    final cleaned = title
+        .replaceAll(RegExp(r'[^\w\s\-]'), '')
+        .trim()
+        .replaceAll(RegExp(r'\s+'), '_');
+    final bounded = cleaned.length > 64 ? cleaned.substring(0, 64) : cleaned;
+    return bounded.isEmpty ? 'ava-drawing.svg' : 'ava-$bounded.svg';
+  }
+
   @override
   Future<bool> saveSvg({
     required AvaValidatedSvgCanvasDocument document,
   }) async {
     try {
-      var filename = IoAvaCanvasShareService.sanitizeFilename(
+      var filename = sanitizeFilename(
         document.manifest.title,
       );
       if (!filename.toLowerCase().endsWith('.svg')) {

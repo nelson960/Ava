@@ -434,8 +434,13 @@ class SvgCanvasSessionState:
         except SvgCanvasWorkspaceError as error:
             self._fail(SvgCanvasStateErrorCode.CANONICAL_SCENE_CHANGED, str(error))
 
-    def render_realtime_context(self, *, pending_visual: str = "") -> str:
-        active = self.active
+    def render_realtime_context(
+        self,
+        *,
+        pending_visual: str = "",
+        scene_override: ActiveSvgCanvasScene | None = None,
+    ) -> str:
+        active = scene_override if scene_override is not None else self.active
         if active is None and not pending_visual:
             return ""
         prefix = '<canvas_context trust="untrusted_model_generated_data">'
@@ -446,7 +451,7 @@ class SvgCanvasSessionState:
             ):
                 raise ValueError("pending canvas context exceeds its bounded limit")
             return f"{prefix}{pending_visual}{suffix}"
-        interaction = self.last_interaction
+        interaction = None if scene_override is not None else self.last_interaction
         interaction_xml = ""
         if interaction is not None:
             step_attribute = (

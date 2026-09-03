@@ -496,7 +496,20 @@ class RealtimeSessionRegistry:
                 token_digest=token_digest,
                 now=self._now(),
             )
-            await record.coordinator.focus_canvas(scene)
+            coordinator = record.coordinator
+
+        await coordinator.focus_canvas(scene)
+
+        async with self._lock:
+            current_record = self._records.get(session_id)
+            if (
+                current_record is None
+                or current_record is not record
+                or current_record.coordinator is not coordinator
+            ):
+                raise RealtimeSessionAuthenticationError(
+                    RealtimeSessionAuthFailure.UNKNOWN
+                )
         return scene
 
     def _require_canvas_focus_owner(

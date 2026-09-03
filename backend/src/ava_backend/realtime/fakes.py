@@ -269,12 +269,7 @@ class DeterministicRealtimePlanProvider:
         async with self._readiness_transition_lock:
             if self._canvas_interaction_response_readiness(turn_id) is not None:
                 return None
-            previous_build_id = self._installed_context_build_id
-            status = await self.prepare(harness=harness)
-            if self._canvas_interaction_response_readiness(turn_id) is None:
-                return status
-            self._installed_context_build_id = previous_build_id
-            return None
+            return await self.prepare(harness=harness)
 
     async def child_transcript(self, *, turn_id: str) -> str | None:
         if not turn_id:

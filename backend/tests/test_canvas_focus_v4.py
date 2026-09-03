@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -614,9 +615,17 @@ class _RealtimeFocusPlanProvider(DeterministicRealtimePlanProvider):
     ) -> Any:
         return await self.prepare(harness=harness)
 
+    async def wait_until_canvas_interaction_response_ready(
+        self,
+        *,
+        turn_id: str,
+    ) -> bool:
+        return True
+
 
 async def _create_real_coordinator(
     session_id: str = "session-real-coord",
+    realtime_provider: _RealtimeFocusPlanProvider | None = None,
 ) -> tuple[
     DeterministicRealtimeSessionCoordinator,
     _RealtimeFocusPlanProvider,
@@ -630,7 +639,7 @@ async def _create_real_coordinator(
             encoding="utf-8"
         )
     )
-    realtime = _RealtimeFocusPlanProvider(plan)
+    realtime = realtime_provider or _RealtimeFocusPlanProvider(plan)
     state = SvgCanvasSessionState()
     documents = SvgCanvasDocumentStore()
     canvas_events = ProtocolV4CanvasEventSink()
@@ -953,3 +962,603 @@ async def test_claimed_canvas_focus_succeeds_after_bootstrap_ttl_and_fails_after
         )
     assert exc_focus.value.failure == RealtimeSessionAuthFailure.EXPIRED
 
+
+@pytest.mark.asyncio
+async def test_focus_canvas_fails_atomically_when_provider_installation_throws() -> None:
+    plan = AvaTurnPlan.model_validate_json(
+        (FIXTURE_ROOT / "ava_turn_plan_conversation_v3.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    class _FailingRealtimeProvider(_RealtimeFocusPlanProvider):
+        def __init__(self, plan: Any) -> None:
+            super().__init__(plan)
+            self.fail_prepare = False
+
+        async def prepare_if_idle(self, *, harness: Any, turn_id: str) -> Any:
+            if self.fail_prepare:
+                raise RuntimeError("Deterministic Realtime context installation failure")
+            return await super().prepare_if_idle(harness=harness, turn_id=turn_id)
+
+    provider = _FailingRealtimeProvider(plan)
+    coordinator, _realtime, canvas_events, memory, _specialist, jobs = (
+        await _create_real_coordinator(realtime_provider=provider)
+    )
+    try:
+        validator = SvgDocumentValidator(SvgValidationLimits())
+        doc_a = validator.validate(VALID_SVG)
+        scene_a = ActiveSvgCanvasScene(
+            generation_id="gen-a",
+            source_turn_id="turn-a",
+            scene_id="scene-a",
+            revision=1,
+            document=doc_a,
+            first_rendered_sample=0,
+        )
+        doc_b = validator.validate(VALID_SVG_2)
+        scene_b = ActiveSvgCanvasScene(
+            generation_id="gen-b",
+            source_turn_id="turn-b",
+            scene_id="scene-b",
+            revision=1,
+            document=doc_b,
+            first_rendered_sample=0,
+        )
+
+        # Initial backend focus: Scene A
+        await coordinator.focus_canvas(scene_a)
+        assert jobs.state.workspace.focused_scene_id == "scene-a"
+        assert jobs.state.active == scene_a
+
+        # Now make Realtime context installation throw on Scene B
+        provider.fail_prepare = True
+
+        with pytest.raises(RuntimeError, match="Deterministic Realtime context installation failure"):
+            await coordinator.focus_canvas(scene_b)
+
+        # Expected:
+        # - coordinator.focus_canvas(B) fails;
+        # - workspace.focused_scene_id remains A;
+        # - workspace.active/current remains A;
+        # - no fake canvasActivated;
+        # - no canvasPresented;
+        # - no memory commit;
+        # - no fake turn;
+        # - B is NOT semantically committed.
+        assert jobs.state.workspace.focused_scene_id == "scene-a"
+        assert jobs.state.active == scene_a
+        assert jobs.state.workspace.current == scene_a
+        assert jobs.state.workspace.scene("scene-b") is None
+        assert canvas_events._events.empty()
+        assert coordinator._turn_id == "turn-real-coord"
+        assert len(memory._committed_turn_ids[coordinator._subject]) == 0
+    finally:
+        await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_focus_canvas_retries_and_commits_only_after_installation_confirmed() -> None:
+    plan = AvaTurnPlan.model_validate_json(
+        (FIXTURE_ROOT / "ava_turn_plan_conversation_v3.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    class _DeferredThenReadyProvider(_RealtimeFocusPlanProvider):
+        def __init__(self, plan: Any) -> None:
+            super().__init__(plan)
+            self.attempts = 0
+            self.workspace_ref: SvgCanvasWorkspace | None = None
+            self.workspace_focus_on_first_attempt: str | None = None
+
+        async def prepare_if_idle(self, *, harness: Any, turn_id: str) -> Any:
+            self.attempts += 1
+            if self.attempts == 1:
+                if self.workspace_ref is not None:
+                    self.workspace_focus_on_first_attempt = self.workspace_ref.focused_scene_id
+                return None
+            return await super().prepare_if_idle(harness=harness, turn_id=turn_id)
+
+    provider = _DeferredThenReadyProvider(plan)
+    coordinator, _realtime, _canvas_events, _memory, _specialist, jobs = (
+        await _create_real_coordinator(realtime_provider=provider)
+    )
+    provider.workspace_ref = jobs.state.workspace
+    try:
+        validator = SvgDocumentValidator(SvgValidationLimits())
+        doc_a = validator.validate(VALID_SVG)
+        scene_a = ActiveSvgCanvasScene(
+            generation_id="gen-a",
+            source_turn_id="turn-a",
+            scene_id="scene-a",
+            revision=1,
+            document=doc_a,
+            first_rendered_sample=0,
+        )
+        doc_b = validator.validate(VALID_SVG_2)
+        scene_b = ActiveSvgCanvasScene(
+            generation_id="gen-b",
+            source_turn_id="turn-b",
+            scene_id="scene-b",
+            revision=1,
+            document=doc_b,
+            first_rendered_sample=0,
+        )
+
+        # Initial backend focus: Scene A (attempts count reset)
+        await coordinator.focus_canvas(scene_a)
+        assert jobs.state.workspace.focused_scene_id == "scene-a"
+        provider.attempts = 0  # reset for scene B focus
+
+        # Focus B: first prepare_if_idle returns None, then retry succeeds
+        await coordinator.focus_canvas(scene_b)
+
+        # Assertions before installation confirmation:
+        # workspace focus was == "scene-a"
+        assert provider.workspace_focus_on_first_attempt == "scene-a"
+        assert provider.attempts >= 2
+
+        # Assertions after successful confirmation:
+        # workspace focus == "scene-b"
+        assert jobs.state.workspace.focused_scene_id == "scene-b"
+        assert jobs.state.active == scene_b
+    finally:
+        await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_focus_canvas_does_not_hold_registry_lock_during_coordinator_await() -> None:
+    current_time = datetime(2026, 8, 25, 12, 0, 0, tzinfo=UTC)
+    block_focus = asyncio.Event()
+    focus_entered = asyncio.Event()
+
+    class _BlockingCoordinator(_StubCoordinator):
+        async def focus_canvas(self, scene: ActiveSvgCanvasScene) -> None:
+            focus_entered.set()
+            await block_focus.wait()
+            self.focused_scene = scene
+
+    class _BlockingFactory:
+        def __init__(self) -> None:
+            self.coordinators: list[_StubCoordinator] = []
+
+        def create(self, **kwargs: Any) -> _StubCoordinator:
+            coord = _BlockingCoordinator(kwargs["session_id"])
+            self.coordinators.append(coord)
+            return coord
+
+    factory = _BlockingFactory()
+    codec = RealtimeSessionTokenCodec("k" * 32)
+    registry = RealtimeSessionRegistry(
+        coordinator_factory=factory,  # type: ignore[arg-type]
+        token_codec=codec,
+        ttl=timedelta(seconds=120),
+        active_session_ttl=timedelta(seconds=3600),
+        max_sessions=10,
+        now=lambda: current_time,
+    )
+    validator = SvgDocumentValidator(SvgValidationLimits())
+    validated = validator.validate(VALID_SVG)
+
+    # Session A
+    session_a = await registry.create(
+        request_id="req-a",
+        subject="child:owner-a",
+        age_band=AgeBand.UNKNOWN,
+        timezone_id="UTC",
+    )
+    await registry.negotiate(
+        session_id=session_a.session_id,
+        token=session_a.webrtc_token,
+        subject="child:owner-a",
+        offer_sdp=DETERMINISTIC_AUDIO_OFFER_SDP,
+    )
+    await registry.claim(
+        session_id=session_a.session_id,
+        token=session_a.token,
+    )
+
+    # Session B
+    session_b = await registry.create(
+        request_id="req-b",
+        subject="child:owner-b",
+        age_band=AgeBand.UNKNOWN,
+        timezone_id="UTC",
+    )
+    await registry.negotiate(
+        session_id=session_b.session_id,
+        token=session_b.webrtc_token,
+        subject="child:owner-b",
+        offer_sdp=DETERMINISTIC_AUDIO_OFFER_SDP,
+    )
+    await registry.claim(
+        session_id=session_b.session_id,
+        token=session_b.token,
+    )
+
+    # Start focus on Session A in background task
+    task_a = asyncio.create_task(
+        registry.focus_canvas(
+            session_id=session_a.session_id,
+            token=session_a.canvas_token,
+            subject="child:owner-a",
+            generation_id="gen-focus-a",
+            source_turn_id="turn-focus-a",
+            scene_id="scene-focus-a",
+            scene_revision=1,
+            expected_svg_sha256=validated.svg_sha256,
+            expected_manifest_sha256=validated.manifest_sha256,
+            svg_bytes=validated.svg_bytes,
+        )
+    )
+
+    # Wait until Session A enters coordinator.focus_canvas
+    await asyncio.wait_for(focus_entered.wait(), timeout=2.0)
+
+    # WITHOUT releasing block_focus, perform an operation on Session B that acquires registry lock
+    try:
+        await asyncio.wait_for(
+            registry.authorize_canvas_document(
+                session_id=session_b.session_id,
+                token=session_b.canvas_token,
+                subject="child:owner-b",
+            ),
+            timeout=1.0,
+        )
+    finally:
+        block_focus.set()
+        await task_a
+
+
+@pytest.mark.asyncio
+async def test_registry_focus_canvas_fails_if_session_released_during_coordinator_focus() -> None:
+    current_time = datetime(2026, 8, 25, 12, 0, 0, tzinfo=UTC)
+    block_focus = asyncio.Event()
+    focus_entered = asyncio.Event()
+
+    class _BlockingCoordinator(_StubCoordinator):
+        async def focus_canvas(self, scene: ActiveSvgCanvasScene) -> None:
+            focus_entered.set()
+            await block_focus.wait()
+            self.focused_scene = scene
+
+    class _BlockingFactory:
+        def __init__(self) -> None:
+            self.coordinators: list[_StubCoordinator] = []
+
+        def create(self, **kwargs: Any) -> _StubCoordinator:
+            coord = _BlockingCoordinator(kwargs["session_id"])
+            self.coordinators.append(coord)
+            return coord
+
+    factory = _BlockingFactory()
+    codec = RealtimeSessionTokenCodec("k" * 32)
+    registry = RealtimeSessionRegistry(
+        coordinator_factory=factory,  # type: ignore[arg-type]
+        token_codec=codec,
+        ttl=timedelta(seconds=120),
+        active_session_ttl=timedelta(seconds=3600),
+        max_sessions=10,
+        now=lambda: current_time,
+    )
+    validator = SvgDocumentValidator(SvgValidationLimits())
+    validated = validator.validate(VALID_SVG)
+
+    session_a = await registry.create(
+        request_id="req-a",
+        subject="child:owner-a",
+        age_band=AgeBand.UNKNOWN,
+        timezone_id="UTC",
+    )
+    await registry.negotiate(
+        session_id=session_a.session_id,
+        token=session_a.webrtc_token,
+        subject="child:owner-a",
+        offer_sdp=DETERMINISTIC_AUDIO_OFFER_SDP,
+    )
+    await registry.claim(
+        session_id=session_a.session_id,
+        token=session_a.token,
+    )
+
+    task_a = asyncio.create_task(
+        registry.focus_canvas(
+            session_id=session_a.session_id,
+            token=session_a.canvas_token,
+            subject="child:owner-a",
+            generation_id="gen-focus-a",
+            source_turn_id="turn-focus-a",
+            scene_id="scene-focus-a",
+            scene_revision=1,
+            expected_svg_sha256=validated.svg_sha256,
+            expected_manifest_sha256=validated.manifest_sha256,
+            svg_bytes=validated.svg_bytes,
+        )
+    )
+
+    await asyncio.wait_for(focus_entered.wait(), timeout=2.0)
+
+    # Release session A while coordinator is outside the lock
+    await registry.release(session_a.session_id)
+
+    block_focus.set()
+    with pytest.raises(RealtimeSessionAuthenticationError) as exc_info:
+        await task_a
+    assert exc_info.value.failure == RealtimeSessionAuthFailure.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_post_install_infallible_commit_cannot_produce_split_brain() -> None:
+    """Prove no failure window exists between provider confirmation and canonical commit."""
+    (
+        coordinator,
+        _realtime,
+        _canvas_events,
+        _memory,
+        _specialist,
+        jobs,
+    ) = await _create_real_coordinator()
+    try:
+        validator = SvgDocumentValidator(SvgValidationLimits())
+        doc_a = validator.validate(VALID_SVG)
+        scene_a = ActiveSvgCanvasScene(
+            generation_id="gen-a",
+            source_turn_id="turn-a",
+            scene_id="scene-a",
+            revision=1,
+            document=doc_a,
+            first_rendered_sample=0,
+        )
+        doc_b = validator.validate(VALID_SVG_2)
+        scene_b = ActiveSvgCanvasScene(
+            generation_id="gen-b",
+            source_turn_id="turn-b",
+            scene_id="scene-b",
+            revision=1,
+            document=doc_b,
+            first_rendered_sample=0,
+        )
+
+        await coordinator.focus_canvas(scene_a)
+        assert jobs.state.workspace.focused_scene_id == "scene-a"
+
+        # Now focus B: provider installation succeeds
+        await coordinator.focus_canvas(scene_b)
+
+        # Invariant: Once provider has B, workspace MUST have B and live harness MUST have B
+        assert jobs.state.workspace.focused_scene_id == "scene-b"
+        assert jobs.state.active == scene_b
+        assert jobs.state.workspace.current == scene_b
+        assert coordinator.harness is not None
+        assert "Café cloud ☁️" not in coordinator.harness.instructions
+    finally:
+        await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_memory_reset_serialized_with_canvas_focus() -> None:
+    """Prove memory_reset and focus_canvas are serialized by canvas_context_lock."""
+    plan = AvaTurnPlan.model_validate_json(
+        (FIXTURE_ROOT / "ava_turn_plan_conversation_v3.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    prepare_started = asyncio.Event()
+    unblock_prepare = asyncio.Event()
+
+    class _ControllableProvider(_RealtimeFocusPlanProvider):
+        async def prepare_if_idle(self, *, harness: Any, turn_id: str) -> Any:
+            prepare_started.set()
+            await unblock_prepare.wait()
+            return await super().prepare_if_idle(harness=harness, turn_id=turn_id)
+
+    provider = _ControllableProvider(plan)
+    (
+        coordinator,
+        _realtime,
+        _canvas_events,
+        _memory,
+        _specialist,
+        jobs,
+    ) = await _create_real_coordinator(realtime_provider=provider)
+    try:
+        validator = SvgDocumentValidator(SvgValidationLimits())
+        doc_a = validator.validate(VALID_SVG)
+        scene_a = ActiveSvgCanvasScene(
+            generation_id="gen-a",
+            source_turn_id="turn-a",
+            scene_id="scene-a",
+            revision=1,
+            document=doc_a,
+            first_rendered_sample=0,
+        )
+        doc_b = validator.validate(VALID_SVG_2)
+        scene_b = ActiveSvgCanvasScene(
+            generation_id="gen-b",
+            source_turn_id="turn-b",
+            scene_id="scene-b",
+            revision=1,
+            document=doc_b,
+            first_rendered_sample=0,
+        )
+
+        unblock_prepare.set()
+        await coordinator.focus_canvas(scene_a)
+        assert jobs.state.workspace.focused_scene_id == "scene-a"
+
+        # Now start focus B with controllable prepare
+        unblock_prepare.clear()
+        focus_task = asyncio.create_task(coordinator.focus_canvas(scene_b))
+        await prepare_started.wait()
+
+        # While focus_canvas is inside canvas_context_lock awaiting prepare_if_idle,
+        # trigger memory_reset concurrently
+        reset_task = asyncio.create_task(coordinator.memory_reset(reset_revision=2))
+
+        # Yield to event loop to allow reset_task to try to acquire the lock
+        await asyncio.sleep(0.01)
+
+        # Unblock prepare_if_idle: focus commits B, then memory_reset runs
+        unblock_prepare.set()
+        await focus_task
+        await reset_task
+
+        # Both operations completed cleanly without split-brain:
+        # focus_canvas committed B, then memory_reset ran its authoritative reset,
+        # clearing workspace artifacts and updating dynamic context.
+        # Invariant: workspace is NOT left pointing to Scene A.
+        assert jobs.state.workspace.scene("scene-a") is None
+        assert jobs.state.workspace.focused_scene_id is None
+        assert coordinator.harness is not None
+        assert "Café cloud ☁️" not in coordinator.harness.instructions
+    finally:
+        await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_focus_canvas_does_not_fail_if_deadline_passes_during_coordinator_work() -> None:
+    current_time = datetime(2026, 8, 25, 12, 0, 0, tzinfo=UTC)
+
+    class _SlowCoordinator(_StubCoordinator):
+        def __init__(self, session_id: str, clock_advance_fn: Any) -> None:
+            super().__init__(session_id)
+            self._advance = clock_advance_fn
+
+        async def focus_canvas(self, scene: ActiveSvgCanvasScene) -> None:
+            # Advance time past active_deadline while coordinator is working
+            self._advance(timedelta(seconds=4000))
+            self.focused_scene = scene
+
+    class _SlowFactory:
+        def __init__(self, clock_advance_fn: Any) -> None:
+            self._advance = clock_advance_fn
+            self.coordinators: list[_StubCoordinator] = []
+
+        def create(self, **kwargs: Any) -> _StubCoordinator:
+            coord = _SlowCoordinator(kwargs["session_id"], self._advance)
+            self.coordinators.append(coord)
+            return coord
+
+    def _advance_time(delta: timedelta) -> None:
+        nonlocal current_time
+        current_time += delta
+
+    factory = _SlowFactory(_advance_time)
+    codec = RealtimeSessionTokenCodec("k" * 32)
+    registry = RealtimeSessionRegistry(
+        coordinator_factory=factory,  # type: ignore[arg-type]
+        token_codec=codec,
+        ttl=timedelta(seconds=120),
+        active_session_ttl=timedelta(seconds=3600),
+        max_sessions=10,
+        now=lambda: current_time,
+    )
+    validator = SvgDocumentValidator(SvgValidationLimits())
+    validated = validator.validate(VALID_SVG)
+
+    session_a = await registry.create(
+        request_id="req-a",
+        subject="child:owner-a",
+        age_band=AgeBand.UNKNOWN,
+        timezone_id="UTC",
+    )
+    await registry.negotiate(
+        session_id=session_a.session_id,
+        token=session_a.webrtc_token,
+        subject="child:owner-a",
+        offer_sdp=DETERMINISTIC_AUDIO_OFFER_SDP,
+    )
+    await registry.claim(
+        session_id=session_a.session_id,
+        token=session_a.token,
+    )
+
+    # Focus was authorized when requested; deadline passed while coordinator was committing.
+    # Registry must NOT convert this committed focus on a live session into an HTTP failure!
+    focused = await registry.focus_canvas(
+        session_id=session_a.session_id,
+        token=session_a.canvas_token,
+        subject="child:owner-a",
+        generation_id="gen-focus-a",
+        source_turn_id="turn-focus-a",
+        scene_id="scene-focus-a",
+        scene_revision=1,
+        expected_svg_sha256=validated.svg_sha256,
+        expected_manifest_sha256=validated.manifest_sha256,
+        svg_bytes=validated.svg_bytes,
+    )
+    assert focused.scene_id == "scene-focus-a"
+    assert factory.coordinators[0].focused_scene is not None
+
+
+@pytest.mark.asyncio
+async def test_focus_canvas_converges_to_b_when_readiness_changes_after_provider_send() -> None:
+    """Prove that if provider send succeeds, coordinator converges canonical workspace to B."""
+    plan = AvaTurnPlan.model_validate_json(
+        (FIXTURE_ROOT / "ava_turn_plan_conversation_v3.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    class _ReadinessRacingProvider(_RealtimeFocusPlanProvider):
+        def __init__(self, plan: Any) -> None:
+            super().__init__(plan)
+            self.send_count = 0
+
+        async def prepare(self, *, harness: Any) -> Any:
+            self.send_count += 1
+            # Simulate state change during/immediately after send (e.g. readiness changes to unready)
+            self._active_response_id = "resp_racing"
+            return await super().prepare(harness=harness)
+
+    provider = _ReadinessRacingProvider(plan)
+    (
+        coordinator,
+        _realtime,
+        _canvas_events,
+        _memory,
+        _specialist,
+        jobs,
+    ) = await _create_real_coordinator(realtime_provider=provider)
+    try:
+        validator = SvgDocumentValidator(SvgValidationLimits())
+        doc_a = validator.validate(VALID_SVG)
+        scene_a = ActiveSvgCanvasScene(
+            generation_id="gen-a",
+            source_turn_id="turn-a",
+            scene_id="scene-a",
+            revision=1,
+            document=doc_a,
+            first_rendered_sample=0,
+        )
+        doc_b = validator.validate(VALID_SVG_2)
+        scene_b = ActiveSvgCanvasScene(
+            generation_id="gen-b",
+            source_turn_id="turn-b",
+            scene_id="scene-b",
+            revision=1,
+            document=doc_b,
+            first_rendered_sample=0,
+        )
+
+        # Baseline: initial focus A
+        provider._active_response_id = None
+        await coordinator.focus_canvas(scene_a)
+        assert jobs.state.workspace.focused_scene_id == "scene-a"
+
+        # Now focus B: provider.prepare sends B and mutates readiness during send
+        provider._active_response_id = None
+        await coordinator.focus_canvas(scene_b)
+
+        # Provider send succeeded
+        assert provider.send_count >= 2
+        # Invariant: canonical workspace MUST converge to Scene B, not stay on A
+        assert jobs.state.workspace.focused_scene_id == "scene-b"
+        assert jobs.state.active == scene_b
+        assert jobs.state.workspace.current == scene_b
+        assert coordinator.harness is not None
+        assert "Café cloud ☁️" not in coordinator.harness.instructions
+    finally:
+        await coordinator.close()

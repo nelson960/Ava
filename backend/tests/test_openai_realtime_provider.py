@@ -2085,10 +2085,7 @@ async def test_accepted_canvas_continuation_supplies_drawing_instructions() -> N
         sent for sent in socket.sent if sent.get("type") == "response.create"
     ][-1]["response"]
     assert continuation["tool_choice"] == "none"
-    assert "instructions" in continuation
-    instructions = continuation["instructions"]
-    assert "actively being drawn" in instructions
-    assert "Never say you cannot draw" in instructions
+    assert "instructions" not in continuation
 
 
 @pytest.mark.asyncio
@@ -3936,3 +3933,116 @@ async def test_response_cancelled_by_turn_detected_completes_cleanly() -> None:
     assert channel.last_response_id == RESPONSE_ID
     assert channel.last_usage is not None
     assert channel.last_usage.total_tokens == 7
+
+
+@pytest.mark.asyncio
+async def test_accepted_canvas_tool_completion_contains_no_response_instructions() -> None:
+    channel, socket = _channel(
+        [
+            *_canvas_response_events(
+                arguments='{"operation":"new","brief":"Draw a star.","interactionMode":"none"}',
+                preamble="",
+            ),
+        ]
+    )
+    iterator = channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-canvas-p2",
+    ).__aiter__()
+
+    call = await iterator.__anext__()
+    assert isinstance(call, RealtimeCanvasToolCall)
+    await channel.complete_canvas_tool(
+        turn_id="turn-canvas-p2",
+        call_id=call.call_id,
+        output=InteractiveCanvasToolOutputV4.model_validate(
+            {"status": "accepted", "generationId": "generation-p2"}
+        ),
+    )
+    await iterator.aclose()
+
+    response_create_events = [
+        msg for msg in socket.sent if msg.get("type") == "response.create"
+    ]
+    assert len(response_create_events) == 1
+    response_payload = response_create_events[0]["response"]
+    assert isinstance(response_payload, dict)
+    assert response_payload["conversation"] == "auto"
+    assert response_payload["output_modalities"] == ["text"]
+    assert response_payload["tool_choice"] == "none"
+    assert "max_output_tokens" in response_payload
+    # P2: response-level instructions MUST NOT be present
+    assert "instructions" not in response_payload
+
+    # Harness prompt layer must still retain the drawing behavior
+    harness = _harness()
+    prompt_text = harness.instructions
+    assert "Ava has real visual drawing" in prompt_text
+    assert "never claim that she cannot draw" in prompt_text
+
+
+@pytest.mark.asyncio
+async def test_prepare_if_idle_not_ready_before_send() -> None:
+    """prepare_if_idle returns None before sending if channel is not idle/ready."""
+    channel, socket = _channel([])
+    await channel.prepare(harness=_harness())
+    initial_sent_count = len(socket.sent)
+
+    # Channel has no active turn awaiting trigger, so readiness is not ready
+    new_harness = _harness(build_id="ctx-2")
+    status = await channel.prepare_if_idle(harness=new_harness, turn_id="turn-inactive")
+
+    assert status is None
+    # No new session.update emitted
+    assert len(socket.sent) == initial_sent_count
+
+
+@pytest.mark.asyncio
+async def test_prepare_if_idle_readiness_changes_after_send() -> None:
+    """prepare_if_idle must return non-None once update is sent, even if readiness changes."""
+    class _MutatingSocket(_FakeRealtimeSocket):
+        def __init__(self, events: list[dict[str, object]]) -> None:
+            super().__init__(events)
+            self.channel_ref: _OpenAIRealtimeEventChannel | None = None
+
+        async def send(self, message: str) -> None:
+            parsed = json.loads(message)
+            if parsed.get("type") == "session.update" and self.channel_ref is not None:
+                if self.channel_ref._prepared_session_update is not None:
+                    # Mutate readiness to not-ready (e.g. response becomes active)
+                    self.channel_ref._active_response_id = "resp_racing"
+            await super().send(message)
+
+    socket = _MutatingSocket([{"type": "session.updated", "session": {"id": "sess_test"}}])
+    channel = _OpenAIRealtimeEventChannel(
+        socket,
+        model="gpt-realtime-test",
+        max_output_tokens=800,
+        turn_timeout_seconds=5,
+    )
+    socket.channel_ref = channel
+    _TEST_CHANNELS.add(channel)
+
+    # Initial prepare
+    await channel.prepare(harness=_harness())
+    initial_sent_count = len(socket.sent)
+
+    # Set up channel so turn-active is initially idle/ready
+    turn_id = "turn-active"
+    channel._active_turn_id = turn_id
+    channel._awaiting_response_trigger_turn_id = turn_id
+
+    # Precondition: channel readiness is initially None (ready)
+    assert channel._canvas_interaction_response_readiness(turn_id) is None
+
+    new_harness = _harness(build_id="ctx-2", timezone_id="America/New_York")
+    status = await channel.prepare_if_idle(harness=new_harness, turn_id=turn_id)
+
+    # session.update was sent onto the wire
+    assert len(socket.sent) == initial_sent_count + 1
+    session_update_msg = socket.sent[-1]
+    assert session_update_msg.get("type") == "session.update"
+
+    # Point of no return: once sent, prepare_if_idle must NOT return None
+    assert status == RealtimeContextInstallationStatus.INSTALLED
+    assert channel._installed_context_build_id == new_harness.context.build_id

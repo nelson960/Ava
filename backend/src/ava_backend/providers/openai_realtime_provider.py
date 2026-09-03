@@ -737,22 +737,6 @@ class _OpenAIRealtimeEventChannel:
                 },
             }
         )
-        status = getattr(output, "status", None)
-        status_value = (
-            str(status.value)
-            if status is not None and hasattr(status, "value")
-            else (str(status) if status is not None else "")
-        )
-        continuation_instructions = (
-            "The visual drawing request was accepted and is actively being drawn on "
-            "the screen right now. Briefly and naturally let the child know you are "
-            "making or drawing it (e.g., 'I'm drawing that now' or 'Let me make that "
-            "for you'). Never say you cannot draw or display visuals. Never describe a "
-            "substitute text or ASCII diagram. Never claim the drawing is complete before "
-            "actual presentation."
-            if status_value == "accepted"
-            else None
-        )
         response_payload: dict[str, object] = {
             "conversation": "auto",
             "output_modalities": ["text"],
@@ -762,8 +746,6 @@ class _OpenAIRealtimeEventChannel:
                 self._max_output_tokens,
             ),
         }
-        if continuation_instructions is not None:
-            response_payload["instructions"] = continuation_instructions
 
         await self._send_json(
             {
@@ -1038,12 +1020,7 @@ class _OpenAIRealtimeEventChannel:
     ) -> RealtimeContextInstallationStatus | None:
         if self._canvas_interaction_response_readiness(turn_id) is not None:
             return None
-        previous_build_id = self._installed_context_build_id
-        status = await self.prepare(harness=harness)
-        if self._canvas_interaction_response_readiness(turn_id) is None:
-            return status
-        self._installed_context_build_id = previous_build_id
-        return None
+        return await self.prepare(harness=harness)
 
     async def cancel(self, *, turn_id: str) -> None:
         if not turn_id.strip():

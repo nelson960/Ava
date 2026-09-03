@@ -7,7 +7,6 @@ import 'package:flutter/material.dart';
 import '../../canvas/ava_svg_canvas_controller.dart';
 import '../../canvas/ava_svg_canvas_session_host.dart';
 import '../../services/ava_canvas_save_service.dart';
-import '../../services/ava_canvas_share_service.dart';
 import '../design/ava_design.dart';
 import 'ava_svg_canvas_view.dart';
 
@@ -15,12 +14,10 @@ final class AvaSvgCanvasPanel extends StatelessWidget {
   const AvaSvgCanvasPanel({
     super.key,
     required this.host,
-    this.shareService = const IoAvaCanvasShareService(),
     this.saveService = const IoAvaCanvasSaveService(),
   });
 
   final AvaSvgCanvasSessionHost host;
-  final AvaCanvasShareService shareService;
   final AvaCanvasSaveService saveService;
 
   @override
@@ -216,88 +213,56 @@ final class AvaSvgCanvasPanel extends StatelessWidget {
             padding: const EdgeInsets.symmetric(horizontal: 6),
             child: Row(
               children: [
-                Semantics(
-                  button: true,
-                  label: 'Previous drawing',
-                  child: IconButton(
-                    tooltip: 'Previous drawing',
-                    padding: const EdgeInsets.only(bottom: 11),
-                    constraints: const BoxConstraints(
-                      minWidth: 44,
-                      minHeight: 44,
-                    ),
-                    onPressed: host.canSelectPrevious
-                        ? () => unawaited(host.selectPreviousScene())
-                        : null,
-                    icon: const Icon(CupertinoIcons.chevron_left, size: 18),
-                    color: AvaColors.ink.withValues(
-                      alpha: host.canSelectPrevious ? 0.72 : 0.28,
-                    ),
+                AvaCanvasNavbarButton(
+                  tooltip: 'Previous drawing',
+                  semanticsLabel: 'Previous drawing',
+                  onPressed: host.canSelectPrevious
+                      ? () => unawaited(host.selectPreviousScene())
+                      : null,
+                  icon: const Icon(CupertinoIcons.chevron_left, size: 18),
+                  color: AvaColors.ink.withValues(
+                    alpha: host.canSelectPrevious ? 0.72 : 0.28,
                   ),
                 ),
                 const Spacer(),
-                Semantics(
-                  button: true,
-                  label: 'Next drawing',
-                  child: IconButton(
-                    tooltip: 'Next drawing',
-                    padding: const EdgeInsets.only(bottom: 11),
-                    constraints: const BoxConstraints(
-                      minWidth: 44,
-                      minHeight: 44,
-                    ),
-                    onPressed: host.canSelectNext
-                        ? () => unawaited(host.selectNextScene())
-                        : null,
-                    icon: const Icon(CupertinoIcons.chevron_right, size: 18),
-                    color: AvaColors.ink.withValues(
-                      alpha: host.canSelectNext ? 0.72 : 0.28,
-                    ),
+                AvaCanvasNavbarButton(
+                  tooltip: 'Next drawing',
+                  semanticsLabel: 'Next drawing',
+                  onPressed: host.canSelectNext
+                      ? () => unawaited(host.selectNextScene())
+                      : null,
+                  icon: const Icon(CupertinoIcons.chevron_right, size: 18),
+                  color: AvaColors.ink.withValues(
+                    alpha: host.canSelectNext ? 0.72 : 0.28,
                   ),
                 ),
-                Semantics(
-                  button: true,
-                  label: 'Save drawing',
-                  child: IconButton(
-                    tooltip: 'Save drawing',
-                    padding: const EdgeInsets.only(bottom: 11),
-                    constraints: const BoxConstraints(
-                      minWidth: 44,
-                      minHeight: 44,
-                    ),
-                    onPressed: canSave
-                        ? () {
-                            developer.log('canvas_save_requested',
-                                name: 'ava.canvas.save');
-                            unawaited(saveService.saveSvg(document: active));
-                          }
-                        : null,
-                    icon: const Icon(
-                      CupertinoIcons.arrow_down_doc,
-                      size: 18,
-                    ),
-                    color: AvaColors.ink.withValues(
-                      alpha: canSave ? 0.72 : 0.28,
-                    ),
+                AvaCanvasNavbarButton(
+                  tooltip: 'Save drawing',
+                  semanticsLabel: 'Save drawing',
+                  onPressed: canSave
+                      ? () {
+                          developer.log('canvas_save_requested',
+                              name: 'ava.canvas.save');
+                          unawaited(saveService.saveSvg(document: active));
+                        }
+                      : null,
+                  icon: const Icon(
+                    CupertinoIcons.arrow_down_doc,
+                    size: 18,
+                  ),
+                  color: AvaColors.ink.withValues(
+                    alpha: canSave ? 0.72 : 0.28,
                   ),
                 ),
-                Semantics(
-                  button: true,
-                  label: 'Close drawing',
-                  child: IconButton(
-                    tooltip: 'Close drawing',
-                    padding: const EdgeInsets.only(bottom: 11),
-                    constraints: const BoxConstraints(
-                      minWidth: 44,
-                      minHeight: 44,
-                    ),
-                    onPressed: host.dismissPanel,
-                    icon: const Icon(
-                      CupertinoIcons.xmark_circle_fill,
-                      size: 18,
-                    ),
-                    color: AvaColors.ink.withValues(alpha: 0.72),
+                AvaCanvasNavbarButton(
+                  tooltip: 'Close drawing',
+                  semanticsLabel: 'Close drawing',
+                  onPressed: host.dismissPanel,
+                  icon: const Icon(
+                    CupertinoIcons.xmark_circle_fill,
+                    size: 18,
                   ),
+                  color: AvaColors.ink.withValues(alpha: 0.72),
                 ),
               ],
             ),
@@ -344,5 +309,130 @@ final class _TransientCanvasSurface extends StatelessWidget {
         ),
       ),
     );
+  }
+}
+
+final class AvaCanvasNavbarButton extends StatefulWidget {
+  const AvaCanvasNavbarButton({
+    super.key,
+    required this.tooltip,
+    required this.semanticsLabel,
+    required this.icon,
+    required this.onPressed,
+    this.color,
+    this.constraints = const BoxConstraints(minWidth: 44, minHeight: 44),
+    this.visualSize = 32.0,
+  });
+
+  final String tooltip;
+  final String semanticsLabel;
+  final Widget icon;
+  final VoidCallback? onPressed;
+  final Color? color;
+  final BoxConstraints? constraints;
+  final double visualSize;
+
+  @override
+  State<AvaCanvasNavbarButton> createState() => _AvaCanvasNavbarButtonState();
+}
+
+class _AvaCanvasNavbarButtonState extends State<AvaCanvasNavbarButton> {
+  bool _isHovered = false;
+  bool _isPressed = false;
+  bool _isFocused = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = widget.onPressed != null;
+    final baseColor = widget.color ?? AvaColors.ink;
+    final effectiveColor =
+        enabled ? baseColor : baseColor.withValues(alpha: 0.28);
+
+    Color overlayColor;
+    if (!enabled) {
+      overlayColor = Colors.transparent;
+    } else if (_isPressed) {
+      overlayColor = AvaColors.ink.withValues(alpha: 0.12);
+    } else if (_isHovered) {
+      overlayColor = AvaColors.ink.withValues(alpha: 0.07);
+    } else if (_isFocused) {
+      overlayColor = AvaColors.ink.withValues(alpha: 0.08);
+    } else {
+      overlayColor = Colors.transparent;
+    }
+
+    final topOffset = (33.0 - widget.visualSize) / 2.0;
+    final leftOffset = (44.0 - widget.visualSize) / 2.0;
+
+    return Semantics(
+      button: true,
+      enabled: enabled,
+      label: widget.semanticsLabel,
+      child: Tooltip(
+        message: widget.tooltip,
+        child: FocusableActionDetector(
+          enabled: enabled,
+          onShowFocusHighlight: (v) => setState(() => _isFocused = v),
+          actions: {
+            ActivateIntent: CallbackAction<ActivateIntent>(
+              onInvoke: (_) => widget.onPressed?.call(),
+            ),
+          },
+          mouseCursor:
+              enabled ? SystemMouseCursors.click : SystemMouseCursors.basic,
+          child: MouseRegion(
+            cursor:
+                enabled ? SystemMouseCursors.click : SystemMouseCursors.basic,
+            onEnter: enabled ? (_) => setState(() => _isHovered = true) : null,
+            onExit: enabled ? (_) => setState(() => _isHovered = false) : null,
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+            onTapDown:
+                enabled ? (_) => setState(() => _isPressed = true) : null,
+            onTapUp:
+                enabled ? (_) => setState(() => _isPressed = false) : null,
+            onTapCancel:
+                enabled ? () => setState(() => _isPressed = false) : null,
+            onTap: widget.onPressed,
+            child: ConstrainedBox(
+              constraints: widget.constraints ??
+                  const BoxConstraints(minWidth: 44, minHeight: 44),
+              child: SizedBox(
+                width: 44,
+                height: 44,
+                child: Stack(
+                  alignment: Alignment.topCenter,
+                  children: [
+                    Positioned(
+                      top: topOffset,
+                      left: leftOffset,
+                      width: widget.visualSize,
+                      height: widget.visualSize,
+                      child: AnimatedContainer(
+                        key: ValueKey('navbar_button_visual_${widget.tooltip}'),
+                        duration: const Duration(milliseconds: 100),
+                        decoration: ShapeDecoration(
+                          shape: const CircleBorder(),
+                          color: overlayColor,
+                        ),
+                        alignment: Alignment.center,
+                        child: IconTheme(
+                          data: IconThemeData(
+                            color: effectiveColor,
+                            size: 18,
+                          ),
+                          child: widget.icon,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
   }
 }

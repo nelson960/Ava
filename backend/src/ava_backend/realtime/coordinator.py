@@ -346,11 +346,66 @@ class DeterministicRealtimeSessionCoordinator:
             raise CoordinatorStateError(
                 "cannot change canvas focus on a closed coordinator"
             )
-        self._canvas_jobs.state.workspace.focus_retained(scene)
-        if self._harness is not None and not self._closed:
-            await self._refresh_canvas_context(
-                reason=DynamicContextBuildReason.CANVAS_FOCUSED
-            )
+        self._canvas_jobs.state.workspace.validate_retained_focus(scene)
+        if self._harness is None:
+            self._canvas_jobs.state.workspace.commit_retained_focus(scene)
+            return
+
+        while True:
+            if self._closed:
+                raise CoordinatorStateError(
+                    "cannot change canvas focus on a closed coordinator"
+                )
+            self._canvas_jobs.state.workspace.validate_retained_focus(scene)
+
+            turn_id = self._turn_id
+            async with self._canvas_context_lock:
+                if self._closed:
+                    raise CoordinatorStateError(
+                        "cannot change canvas focus on a closed coordinator"
+                    )
+                self._canvas_jobs.state.workspace.validate_retained_focus(scene)
+
+                staged_harness = self._build_live_harness(
+                    reason=DynamicContextBuildReason.CANVAS_FOCUSED,
+                    scene_override=scene,
+                )
+                installation_status = await self._realtime.prepare_if_idle(
+                    harness=staged_harness,
+                    turn_id=turn_id,
+                )
+                if installation_status is not None:
+                    self._canvas_jobs.state.workspace.commit_retained_focus(scene)
+                    self._harness = staged_harness
+                    self._pending_harness = None
+                    self._pending_context_reason = None
+                    if (
+                        self._context_installation_task is not None
+                        and not self._context_installation_task.done()
+                    ):
+                        self._context_installation_task.cancel()
+                    self._log_context_installation(
+                        harness=staged_harness,
+                        reason=DynamicContextBuildReason.CANVAS_FOCUSED,
+                        status=str(installation_status),
+                    )
+                    return
+
+            try:
+                ready = await asyncio.wait_for(
+                    self._realtime.wait_until_canvas_interaction_response_ready(
+                        turn_id=turn_id,
+                    ),
+                    timeout=5.0,
+                )
+            except TimeoutError:
+                raise CoordinatorStateError(
+                    "Realtime channel timed out waiting for canvas focus readiness"
+                )
+            if not ready:
+                raise CoordinatorStateError(
+                    "Realtime channel unready for canvas focus context installation"
+                )
 
     async def memory_reset(self, *, reset_revision: int) -> None:
         if (
@@ -359,21 +414,20 @@ class DeterministicRealtimeSessionCoordinator:
             or reset_revision < 1
         ):
             raise ValueError("reset_revision must be a positive integer")
-        current = self._memory_reset_revision
-        if current is not None and reset_revision <= current:
-            return
-        self._memory_reset_revision = reset_revision
-        await self._canvas_jobs.reset_conversation()
-        self._warm_refresh_revision += 1
-        self._warm_memories = ()
-        self._recent_live_echo_suppression_turn_ids.clear()
-        self._last_memory_decision = None
-        # Durable reset clears application memory projections. It does not mutate
-        # conversation items already resident in the provider's ephemeral call.
-        if self._harness is not None and not self._closed:
-            await self._refresh_canvas_context(
-                reason=DynamicContextBuildReason.MEMORY_COMPACTED
-            )
+        async with self._canvas_context_lock:
+            current = self._memory_reset_revision
+            if current is not None and reset_revision <= current:
+                return
+            self._memory_reset_revision = reset_revision
+            await self._canvas_jobs.reset_conversation()
+            self._warm_refresh_revision += 1
+            self._warm_memories = ()
+            self._recent_live_echo_suppression_turn_ids.clear()
+            self._last_memory_decision = None
+            if self._harness is not None and not self._closed:
+                await self._refresh_canvas_context_locked(
+                    reason=DynamicContextBuildReason.MEMORY_COMPACTED
+                )
 
     async def negotiate(self, *, offer_sdp: str) -> NegotiatedRealtimeCall:
         if self._closed:
@@ -1483,6 +1537,47 @@ class DeterministicRealtimeSessionCoordinator:
             (monotonic() - rearm_started) * 1000,
         )
 
+    async def _refresh_canvas_context_locked(
+        self,
+        *,
+        reason: DynamicContextBuildReason,
+    ) -> None:
+        if self._memory_snapshot is None or self._harness is None:
+            raise CoordinatorStateError(
+                "canvas context cannot refresh before session negotiation"
+            )
+        harness = self._build_live_harness(reason=reason)
+        self._pending_harness = harness
+        self._pending_context_reason = reason
+        try:
+            installation_status = await self._realtime.prepare_if_idle(
+                harness=harness,
+                turn_id=self._turn_id,
+            )
+        except Exception as error:
+            self._log_context_installation(
+                harness=harness,
+                reason=reason,
+                status="failed",
+                error_type=type(error).__name__,
+            )
+            raise
+        if installation_status is not None:
+            self._harness = harness
+            self._pending_harness = None
+            self._pending_context_reason = None
+        else:
+            self._ensure_pending_context_installation()
+        self._log_context_installation(
+            harness=harness,
+            reason=reason,
+            status=(
+                str(installation_status)
+                if installation_status is not None
+                else "deferred"
+            ),
+        )
+
     async def _refresh_canvas_context(
         self,
         *,
@@ -1495,46 +1590,13 @@ class DeterministicRealtimeSessionCoordinator:
         """
 
         async with self._canvas_context_lock:
-            if self._memory_snapshot is None or self._harness is None:
-                raise CoordinatorStateError(
-                    "canvas context cannot refresh before session negotiation"
-                )
-            harness = self._build_live_harness(reason=reason)
-            self._pending_harness = harness
-            self._pending_context_reason = reason
-            try:
-                installation_status = await self._realtime.prepare_if_idle(
-                    harness=harness,
-                    turn_id=self._turn_id,
-                )
-            except Exception as error:
-                self._log_context_installation(
-                    harness=harness,
-                    reason=reason,
-                    status="failed",
-                    error_type=type(error).__name__,
-                )
-                raise
-            if installation_status is not None:
-                self._harness = harness
-                self._pending_harness = None
-                self._pending_context_reason = None
-            else:
-                self._ensure_pending_context_installation()
-            self._log_context_installation(
-                harness=harness,
-                reason=reason,
-                status=(
-                    str(installation_status)
-                    if installation_status is not None
-                    else "deferred"
-                ),
-            )
+            await self._refresh_canvas_context_locked(reason=reason)
 
     def _build_live_harness(
         self,
         *,
         reason: DynamicContextBuildReason,
+        scene_override: ActiveSvgCanvasScene | None = None,
     ) -> RealtimeHarness:
         dynamic_context = self._context_assembler.assemble(
             build_id=self._next_context_build_id(),
@@ -1544,7 +1606,9 @@ class DeterministicRealtimeSessionCoordinator:
             current_time_utc=self._current_time_factory(),
             bootstrap_turns=(),
             warm_memories=self._warm_memories,
-            canvas_context=self._current_canvas_context(),
+            canvas_context=self._current_canvas_context(
+                scene_override=scene_override
+            ),
         )
         harness = build_realtime_harness(dynamic_context=dynamic_context)
         self._log_dynamic_context_build(reason, harness)
@@ -1639,8 +1703,14 @@ class DeterministicRealtimeSessionCoordinator:
             },
         )
 
-    def _current_canvas_context(self) -> str | None:
-        context = self._canvas_jobs.render_realtime_context()
+    def _current_canvas_context(
+        self,
+        *,
+        scene_override: ActiveSvgCanvasScene | None = None,
+    ) -> str | None:
+        context = self._canvas_jobs.render_realtime_context(
+            scene_override=scene_override
+        )
         return context or None
 
     async def _install_pending_context_if_idle(

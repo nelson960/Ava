@@ -304,6 +304,24 @@ void main() {
       expect(resultingFile.existsSync(), isTrue);
       expect(resultingFile.readAsBytesSync(), doc.svgBytes);
     });
+
+    test('G: sanitizeFilename cleans title, trims, bounds length, and formats extension', () {
+      final sanitized = IoAvaCanvasSaveService.sanitizeFilename(
+        'Cloud / Storm: <Dangerous> & Café ☁️!',
+      );
+      expect(sanitized, startsWith('ava-Cloud_Storm_Dangerous_Caf'));
+      expect(sanitized, endsWith('.svg'));
+
+      expect(IoAvaCanvasSaveService.sanitizeFilename(''), 'ava-drawing.svg');
+      expect(
+        IoAvaCanvasSaveService.sanitizeFilename('   '),
+        'ava-drawing.svg',
+      );
+      expect(
+        IoAvaCanvasSaveService.sanitizeFilename('A' * 100),
+        'ava-${'A' * 64}.svg',
+      );
+    });
   });
 
   testWidgets(
@@ -335,10 +353,10 @@ void main() {
       ),
     );
 
-    IconButton saveButton() => tester.widget<IconButton>(
+    AvaCanvasNavbarButton saveButton() => tester.widget<AvaCanvasNavbarButton>(
           find.ancestor(
             of: find.byTooltip('Save drawing'),
-            matching: find.byType(IconButton),
+            matching: find.byType(AvaCanvasNavbarButton),
           ),
         );
 
