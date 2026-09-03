@@ -22,7 +22,7 @@ from .svg_document import (
     ValidatedSvgDocument,
 )
 
-SVG_CANVAS_SPECIALIST_PROMPT_VERSION = "ava-svg-canvas-vnext-2"
+SVG_CANVAS_SPECIALIST_PROMPT_VERSION = "ava-svg-canvas-vnext-3"
 SVG_CANVAS_SPECIALIST_BRIEF_MAX_CHARACTERS = INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS
 SVG_CANVAS_SOURCE_TRANSCRIPT_MAX_CHARACTERS = 2_000
 
@@ -285,6 +285,7 @@ INTERACTION METADATA
 
 STATIC SECURITY CONTRACT
 - The versioned renderer capability below is the sole SVG capability authority.
+- The root <svg> must declare the SVG namespace xmlns="http://www.w3.org/2000/svg".
 - The document is accepted or rejected exactly as returned; Ava never normalizes,
   reserializes, truncates, or silently removes part of an accepted document.
 

@@ -1151,7 +1151,7 @@ class SvgDocumentValidator:
 
     def _validate_element_namespace(self, raw_name: str) -> None:
         namespace = _namespace(raw_name)
-        if namespace not in {None, SVG_NAMESPACE}:
+        if namespace != SVG_NAMESPACE:
             self._fail(
                 "namespaceForbidden",
                 f"SVG element namespace {namespace!r} is forbidden",

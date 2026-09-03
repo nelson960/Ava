@@ -109,7 +109,7 @@ body{background:transparent}
   };
   const parseSvg = (encoded) => {
     const parsed = new DOMParser().parseFromString(decodeUtf8(encoded), 'image/svg+xml');
-    if (parsed.querySelector('parsererror') || parsed.documentElement.localName !== 'svg') throw new Error('svgParse');
+    if (parsed.querySelector('parsererror') || parsed.documentElement.localName !== 'svg' || parsed.documentElement.namespaceURI !== 'http://www.w3.org/2000/svg') throw new Error('svgParse');
     return document.importNode(parsed.documentElement, true);
   };
   const frameShell = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; base-uri 'none'; connect-src 'none'; font-src 'none'; frame-src 'none'; img-src data:; media-src 'none'; object-src 'none'; script-src 'none'; style-src 'unsafe-inline'"><style>html,body{position:absolute;inset:0;margin:0;width:100%;height:100%;overflow:hidden;background:transparent}svg{display:block;width:100%;height:100%}</style></head><body></body></html>`;

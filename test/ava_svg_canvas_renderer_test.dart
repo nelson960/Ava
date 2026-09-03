@@ -90,11 +90,14 @@ void main() {
     expect(html, contains('replaceDraft(payload)'));
     expect(html, contains('mountCandidate(payload)'));
     expect(html, contains('activateCandidate(identity, interactive)'));
+    expect(html, contains('const previousActive = active; active = candidate;'));
+    expect(html, contains('requestAnimationFrame(() => requestAnimationFrame'));
     expect(
       html,
-      contains('const previousActive = active; active = candidate;'),
+      contains(
+        "parsed.documentElement.namespaceURI !== 'http://www.w3.org/2000/svg'",
+      ),
     );
-    expect(html, contains('requestAnimationFrame(() => requestAnimationFrame'));
   });
 
   test('duplicate local IDs resolve only in each layer iframe document', () {

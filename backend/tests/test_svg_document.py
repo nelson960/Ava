@@ -480,3 +480,70 @@ def test_legacy_generic_interaction_attributes_are_rejected(attribute: str) -> N
         )
 
     assert raised.value.code == "attributeForbidden"
+
+
+def test_validator_rejects_svg_root_missing_svg_namespace() -> None:
+    svg = (
+        '<svg viewBox="0 0 1000 600" data-ava-interaction-mode="none">'
+        "<title>Water cycle</title>"
+        "<desc>How water moves between the sky and the ground.</desc>"
+        '<circle id="c1" cx="50" cy="50" r="20"/>'
+        "</svg>"
+    )
+    with pytest.raises(SvgDocumentValidationError) as raised:
+        SvgDocumentValidator().validate(svg)
+
+    assert raised.value.code == "namespaceForbidden"
+    assert raised.value.feedback.category.value == "security"
+
+
+def test_validator_accepts_svg_with_valid_svg_namespace() -> None:
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" '
+        'data-ava-interaction-mode="none">'
+        "<title>Water cycle</title>"
+        "<desc>How water moves between the sky and the ground.</desc>"
+        '<circle id="c1" cx="50" cy="50" r="20"/>'
+        "</svg>"
+    )
+    validated = SvgDocumentValidator().validate(svg)
+    assert validated.svg_text == svg
+
+
+def test_validator_rejects_descendant_resetting_to_null_namespace() -> None:
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" '
+        'data-ava-interaction-mode="none">'
+        "<title>Water cycle</title>"
+        "<desc>How water moves between the sky and the ground.</desc>"
+        '<g xmlns=""><circle id="c1" cx="50" cy="50" r="20"/></g>'
+        "</svg>"
+    )
+    with pytest.raises(SvgDocumentValidationError) as raised:
+        SvgDocumentValidator().validate(svg)
+
+    assert raised.value.code == "namespaceForbidden"
+
+
+def test_draft_safety_validator_enforces_svg_namespace() -> None:
+    validator = SvgDocumentValidator()
+    safety_validator = SvgDraftSafetyValidator(validator)
+
+    invalid_draft = (
+        '<svg viewBox="0 0 1000 600" data-ava-interaction-mode="none">'
+        '<circle id="c1" cx="50" cy="50" r="20"/>'
+        "</svg>"
+    )
+    with pytest.raises(SvgDocumentValidationError) as raised:
+        safety_validator.validate(invalid_draft)
+    assert raised.value.code == "namespaceForbidden"
+
+    valid_draft = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" '
+        'data-ava-interaction-mode="none">'
+        '<circle id="c1" cx="50" cy="50" r="20"/>'
+        "</svg>"
+    )
+    draft = safety_validator.validate(valid_draft)
+    assert isinstance(draft, SafeSvgDraftDocument)
+    assert draft.svg_text == valid_draft
