@@ -349,6 +349,7 @@ Future<AvaSvgCanvasSessionHost> _retainedCanvasHost() async {
     'revision': 1,
     'generationId': descriptor.generationId,
     'sourceTurnId': descriptor.sourceTurnId,
+    'operation': 'new',
   });
   await controller.receiveDocumentAvailable(events[0]);
   controller.rendererPrepared();

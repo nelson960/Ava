@@ -187,6 +187,25 @@ final class AvaCanvasPersistenceRepository implements AvaCanvasPersistence {
       });
 
   @override
+  Future<void> persistFocus(String sceneId) {
+    final capturedEpoch = _generationEpoch;
+    return _serialize(() async {
+      if (capturedEpoch != _generationEpoch) return;
+      await _database.transaction(() async {
+        final target = await (_database.select(_database.canvasScenes)
+              ..where((row) => row.sceneId.equals(sceneId)))
+            .getSingleOrNull();
+        if (target == null) {
+          throw const AvaCanvasPersistenceConflict(
+            'Target scene does not exist for focus persistence.',
+          );
+        }
+        await _setSingleFocus(sceneId);
+      });
+    });
+  }
+
+  @override
   Future<void> reset() {
     _generationEpoch += 1;
     return _serialize(() async {

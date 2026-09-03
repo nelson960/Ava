@@ -606,11 +606,18 @@ final class AvaRealtimeServerEventV4 {
             ..._serverCommon,
             'generationId',
             'sourceTurnId',
+            'operation',
           },
           'canvasGenerationStarted',
         );
         _identifier(json, 'generationId', 'canvasGenerationStarted');
         _identifier(json, 'sourceTurnId', 'canvasGenerationStarted');
+        final operation = json['operation'];
+        if (operation != 'new' && operation != 'reviseFocused') {
+          throw const FormatException(
+            'canvasGenerationStarted requires operation new or reviseFocused.',
+          );
+        }
         break;
       case AvaRealtimeServerEventTypeV4.canvasDraftAvailable:
         AvaSvgCanvasDraftDescriptorV4.fromJson(json);
@@ -704,6 +711,7 @@ final class AvaRealtimeServerEventV4 {
             'preparationFailed',
             'presentationFailed',
             'cancelled',
+            'timeout',
           },
         );
         _boundedString(json, 'message', 'canvasRejected', 240);

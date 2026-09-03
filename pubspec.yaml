@@ -21,6 +21,8 @@ dependencies:
   flutter_3d_controller: ^2.3.0
   flutter_inappwebview: ^6.1.5
   flutter_webrtc: ^1.5.2
+  share_plus: ^10.1.4
+  file_picker: ^11.0.3
 
 dev_dependencies:
   flutter_test:

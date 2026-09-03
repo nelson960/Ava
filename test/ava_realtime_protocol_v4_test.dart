@@ -148,6 +148,26 @@ void main() {
     expect(event.toJson()['rejectionCode'], 'generationLimitExceeded');
   });
 
+  test('canvas timeout is a structured rejection with child message', () {
+    final event = AvaRealtimeServerEventV4.fromJson({
+      'protocolVersion': 4,
+      'event': 'canvasRejected',
+      'sessionId': 'session-1234',
+      'sequence': 1,
+      'revision': 1,
+      'generationId': 'generation-1234',
+      'sourceTurnId': 'turn-1234',
+      'rejectionCode': 'timeout',
+      'message': 'That drawing took too long. Try again?',
+      'retryable': true,
+    });
+
+    expect(event.type, AvaRealtimeServerEventTypeV4.canvasRejected);
+    expect(event.toJson()['rejectionCode'], 'timeout');
+    expect(event.toJson()['message'], 'That drawing took too long. Try again?');
+    expect(event.toJson()['retryable'], isTrue);
+  });
+
   test('canvas generation start is a strict session-scoped control', () {
     final event = AvaRealtimeServerEventV4.fromJson(
       _objectFixture('ava_realtime_canvas_generation_v4.json'),
@@ -155,10 +175,25 @@ void main() {
 
     expect(event.type, AvaRealtimeServerEventTypeV4.canvasGenerationStarted);
     expect(event.isCanvas, isTrue);
+    expect(event.toJson()['operation'], 'new');
+    expect(
+      AvaRealtimeServerEventV4.fromJson({
+        ...event.toJson(),
+        'operation': 'reviseFocused',
+      }).toJson()['operation'],
+      'reviseFocused',
+    );
     expect(
       () => AvaRealtimeServerEventV4.fromJson({
         ...event.toJson(),
         'unknown': true,
+      }),
+      throwsFormatException,
+    );
+    expect(
+      () => AvaRealtimeServerEventV4.fromJson({
+        ...event.toJson(),
+        'operation': 'invalidOp',
       }),
       throwsFormatException,
     );

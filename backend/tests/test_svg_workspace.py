@@ -154,7 +154,6 @@ def test_reconstructed_exact_commit_is_idempotent() -> None:
     [
         lambda scene: replace(scene, generation_id="generation-conflict"),
         lambda scene: replace(scene, source_turn_id="turn-conflict"),
-        lambda scene: replace(scene, first_rendered_sample=9_600),
         lambda scene: replace(scene, document=_scene("changed", 1).document),
     ],
 )
@@ -172,6 +171,18 @@ def test_same_revision_conflicting_identity_is_rejected(conflicting) -> None:
 
     assert workspace.scenes == (active,)
     assert workspace.current is active
+
+
+def test_same_revision_different_first_rendered_sample_is_accepted() -> None:
+    workspace = SvgCanvasWorkspace()
+    active = _commit_new(workspace, "A")
+    updated = workspace.commit(
+        replace(active, first_rendered_sample=9_600),
+        base_scene_id=None,
+        base_revision=0,
+        workspace_epoch=workspace.reset_epoch,
+    )
+    assert updated is active
 
 
 def test_clear_advances_reset_epoch_without_ordinary_commit_changes() -> None:

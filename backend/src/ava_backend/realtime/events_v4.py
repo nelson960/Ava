@@ -139,6 +139,7 @@ class CanvasGenerationStartedEventV4(AvaServerEventV4):
     event: Literal[AvaServerEventTypeV4.CANVAS_GENERATION_STARTED]
     generation_id: ProtocolIdentifier
     source_turn_id: ProtocolIdentifier
+    operation: Literal["new", "reviseFocused"]
 
 
 class CanvasDraftAvailableEventV4(AvaServerEventV4):
@@ -220,6 +221,7 @@ class CanvasGenerationRejectionCode(StrEnum):
     PREPARATION_FAILED = "preparationFailed"
     PRESENTATION_FAILED = "presentationFailed"
     CANCELLED = "cancelled"
+    TIMEOUT = "timeout"
 
 
 class CanvasRejectedEventV4(AvaServerEventV4):

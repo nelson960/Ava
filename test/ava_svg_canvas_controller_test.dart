@@ -132,6 +132,9 @@ final class _RestoredWorkspacePersistence implements AvaCanvasPersistence {
   Future<void> persistActive(AvaValidatedSvgCanvasDocument document) async {}
 
   @override
+  Future<void> persistFocus(String sceneId) async {}
+
+  @override
   Future<void> reset() async {}
 }
 
@@ -143,6 +146,9 @@ final class _FailingCanvasPersistence implements AvaCanvasPersistence {
   @override
   Future<void> persistActive(AvaValidatedSvgCanvasDocument document) =>
       Future<void>.error(StateError('deterministic persistence failure'));
+
+  @override
+  Future<void> persistFocus(String sceneId) async {}
 
   @override
   Future<void> reset() async {}
@@ -346,6 +352,7 @@ void main() {
       'revision': 1,
       'generationId': document.descriptor.generationId,
       'sourceTurnId': document.descriptor.sourceTurnId,
+      'operation': 'new',
     });
 
     expect(host.generating, isTrue);
@@ -636,6 +643,7 @@ void main() {
       'revision': 2,
       'generationId': 'generation-interrupted-revision',
       'sourceTurnId': 'turn-interrupted-revision',
+      'operation': 'reviseFocused',
     });
     controller.reportBinding(document.manifest.bindings['select-cloud']!);
     expect(commands, isEmpty);
@@ -1998,6 +2006,7 @@ void main() {
       'revision': 1,
       'generationId': document.descriptor.generationId,
       'sourceTurnId': document.descriptor.sourceTurnId,
+      'operation': 'new',
     });
     controller.beginPlaybackClock('turn-next');
 
@@ -2200,6 +2209,7 @@ void _announceGeneration(
     'revision': 1,
     'generationId': document.descriptor.generationId,
     'sourceTurnId': document.descriptor.sourceTurnId,
+    'operation': 'new',
   });
 }
 

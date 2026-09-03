@@ -6,7 +6,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from html import escape
-from typing import Protocol
+from typing import Literal, Protocol, cast
 
 from ..canvas.svg_delivery import (
     StoredSvgCanvasDocument,
@@ -30,6 +30,7 @@ from ..canvas.svg_specialist import (
     SvgCanvasSpecialistGenerationLimitError,
     SvgCanvasSpecialistInvalidError,
     SvgCanvasSpecialistRequest,
+    SvgCanvasSpecialistTimeoutError,
     SvgCanvasSpecialistUnavailableError,
     SvgCanvasVisibleDraft,
 )
@@ -66,6 +67,7 @@ class SvgCanvasJobEventSink(Protocol):
         *,
         generation_id: str,
         source_turn_id: str,
+        operation: Literal["new", "reviseFocused"] = "new",
     ) -> None: ...
 
     async def draft_available(self, stored: StoredSvgCanvasDraft) -> None: ...
@@ -428,6 +430,10 @@ class SvgCanvasJobCoordinator:
                 await self._event_sink.generation_started(
                     generation_id=output.generation_id,
                     source_turn_id=source_turn_id,
+                    operation=cast(
+                        Literal["new", "reviseFocused"],
+                        str(call.request.operation),
+                    ),
                 )
                 self._log(
                     "generationStarted",
@@ -1338,6 +1344,8 @@ class SvgCanvasJobCoordinator:
 def _generation_failure(
     error: Exception,
 ) -> tuple[CanvasGenerationRejectionCode, bool]:
+    if isinstance(error, SvgCanvasSpecialistTimeoutError):
+        return CanvasGenerationRejectionCode.TIMEOUT, True
     if isinstance(error, SvgCanvasSpecialistGenerationLimitError):
         return CanvasGenerationRejectionCode.GENERATION_LIMIT_EXCEEDED, True
     if isinstance(error, SvgCanvasSpecialistUnavailableError):
@@ -1350,6 +1358,8 @@ def _generation_failure(
 
 
 def _bounded_failure_message(error: Exception) -> str:
+    if isinstance(error, SvgCanvasSpecialistTimeoutError):
+        return "That drawing took too long. Try again?"
     if isinstance(error, SvgCanvasSpecialistGenerationLimitError):
         return "The canvas illustrator exceeded its generation limit."
     if isinstance(error, SvgCanvasSpecialistUnavailableError):

@@ -439,6 +439,100 @@ class RealtimeSessionRegistry:
             raise RealtimeSessionAuthenticationError(RealtimeSessionAuthFailure.CLAIMED)
         return record
 
+    async def focus_canvas(
+        self,
+        *,
+        session_id: str,
+        token: str,
+        subject: str,
+        generation_id: str,
+        source_turn_id: str,
+        scene_id: str,
+        scene_revision: int,
+        expected_svg_sha256: str,
+        expected_manifest_sha256: str,
+        svg_bytes: bytes,
+    ) -> ActiveSvgCanvasScene:
+        """Revalidate and focus one retained scene on the active session."""
+
+        now = self._now()
+        self._token_codec.verify(
+            token,
+            expected_session_id=session_id,
+            expected_scope="canvas",
+            now=now,
+        )
+        token_digest = hashlib.sha256(token.encode("utf-8")).digest()
+        async with self._lock:
+            self._require_canvas_focus_owner(
+                session_id=session_id,
+                subject=subject,
+                token_digest=token_digest,
+                now=now,
+            )
+
+        try:
+            svg_text = svg_bytes.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise ValueError("focused Canvas SVG must be strict UTF-8") from error
+        document = self._canvas_restore_validator.validate(svg_text)
+        if (
+            document.svg_sha256 != expected_svg_sha256
+            or document.manifest_sha256 != expected_manifest_sha256
+        ):
+            raise ValueError("focused Canvas hashes do not match validation output")
+        scene = ActiveSvgCanvasScene(
+            generation_id=generation_id,
+            source_turn_id=source_turn_id,
+            scene_id=scene_id,
+            revision=scene_revision,
+            document=document,
+            first_rendered_sample=0,
+        )
+        async with self._lock:
+            record = self._require_canvas_focus_owner(
+                session_id=session_id,
+                subject=subject,
+                token_digest=token_digest,
+                now=self._now(),
+            )
+            await record.coordinator.focus_canvas(scene)
+        return scene
+
+    def _require_canvas_focus_owner(
+        self,
+        *,
+        session_id: str,
+        subject: str,
+        token_digest: bytes,
+        now: datetime,
+    ) -> _RealtimeSessionRecord:
+        record = self._records.get(session_id)
+        if record is None:
+            raise RealtimeSessionAuthenticationError(RealtimeSessionAuthFailure.UNKNOWN)
+        if record.claimed:
+            if record.active_deadline is None:
+                raise RuntimeError(
+                    "Claimed realtime session has no active deadline"
+                )
+            if record.active_deadline <= now:
+                raise RealtimeSessionAuthenticationError(
+                    RealtimeSessionAuthFailure.EXPIRED
+                )
+            if record.negotiated_call_id is None:
+                raise RealtimeSessionAuthenticationError(
+                    RealtimeSessionAuthFailure.NOT_READY
+                )
+        elif record.expires_at <= now:
+            raise RealtimeSessionAuthenticationError(RealtimeSessionAuthFailure.EXPIRED)
+        if not hmac.compare_digest(
+            record.canvas_token_digest, token_digest
+        ) or not hmac.compare_digest(
+            record.subject.encode("utf-8"), subject.encode("utf-8")
+        ):
+            raise RealtimeSessionAuthenticationError(RealtimeSessionAuthFailure.INVALID)
+        return record
+
     async def claim(
         self,
         *,

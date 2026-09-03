@@ -121,6 +121,7 @@ void main() {
       'revision': 1,
       'generationId': 'generation-v4-vad',
       'sourceTurnId': 'turn-v4-vad',
+      'operation': 'new',
     });
 
     scenario.addControl({
@@ -286,6 +287,7 @@ void main() {
       'revision': 1,
       'generationId': 'generation-v4-tap',
       'sourceTurnId': 'turn-v4-tap',
+      'operation': 'new',
     });
 
     await scenario.runtime.interrupt(reason: 'userTap');

@@ -131,6 +131,10 @@ final class AvaRealtimeRuntimeFactoryV4 implements AvaRealtimeRuntimeBuilder {
         runtime.canvasController,
         initialRenderProfile: canvasRenderProfile,
         renderProfileUpdateSink: runtime.updateCanvasRenderProfile,
+        runtimeFocusSink: (document) => _canvasRestoreService.focusScene(
+          bootstrap: bootstrap,
+          document: document,
+        ),
       );
       trace.mark('runtime.ready');
       return runtime;

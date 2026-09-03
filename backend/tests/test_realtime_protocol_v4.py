@@ -125,7 +125,31 @@ def test_shared_generation_started_fixture_round_trips() -> None:
     event = AVA_SERVER_EVENT_ADAPTER_V4.validate_python(payload)
 
     assert isinstance(event, CanvasGenerationStartedEventV4)
+    assert event.operation == "new"
     assert json.loads(serialize_server_event_v4(event)) == payload
+
+
+def test_canvas_generation_started_requires_valid_operation() -> None:
+    base = _load("ava_realtime_canvas_generation_v4.json")
+
+    # 10. new parses correctly
+    event_new = AVA_SERVER_EVENT_ADAPTER_V4.validate_python({**base, "operation": "new"})
+    assert isinstance(event_new, CanvasGenerationStartedEventV4)
+    assert event_new.operation == "new"
+
+    # 11. reviseFocused parses correctly
+    event_revise = AVA_SERVER_EVENT_ADAPTER_V4.validate_python({**base, "operation": "reviseFocused"})
+    assert isinstance(event_revise, CanvasGenerationStartedEventV4)
+    assert event_revise.operation == "reviseFocused"
+
+    # 9. requires operation (missing rejected)
+    missing = {k: v for k, v in base.items() if k != "operation"}
+    with pytest.raises(ValidationError):
+        AVA_SERVER_EVENT_ADAPTER_V4.validate_python(missing)
+
+    # 12. invalid operation rejected
+    with pytest.raises(ValidationError):
+        AVA_SERVER_EVENT_ADAPTER_V4.validate_python({**base, "operation": "invalidOp"})
 
 
 def test_shared_visible_draft_fixture_has_no_scene_or_manifest_authority() -> None:

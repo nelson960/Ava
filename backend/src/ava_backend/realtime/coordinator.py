@@ -341,6 +341,17 @@ class DeterministicRealtimeSessionCoordinator:
             )
         self._canvas_jobs.state.workspace.restore_focused(scene)
 
+    async def focus_canvas(self, scene: ActiveSvgCanvasScene) -> None:
+        if self._closed:
+            raise CoordinatorStateError(
+                "cannot change canvas focus on a closed coordinator"
+            )
+        self._canvas_jobs.state.workspace.focus_retained(scene)
+        if self._harness is not None and not self._closed:
+            await self._refresh_canvas_context(
+                reason=DynamicContextBuildReason.CANVAS_FOCUSED
+            )
+
     async def memory_reset(self, *, reset_revision: int) -> None:
         if (
             isinstance(reset_revision, bool)

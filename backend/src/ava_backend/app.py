@@ -41,7 +41,10 @@ from .canvas.svg_document import (
     SvgValidationLimits,
 )
 from .canvas.svg_specialist import SVG_CANVAS_SPECIALIST_PROMPT_VERSION
-from .canvas.svg_workspace import SvgCanvasWorkspaceStore
+from .canvas.svg_workspace import (
+    SvgCanvasWorkspaceError,
+    SvgCanvasWorkspaceStore,
+)
 from .diagnostics import (
     RuntimeDiagnostics,
     configure_persistent_development_logging,
@@ -662,6 +665,133 @@ def create_app(
             },
         )
 
+    @app.put(
+        "/v4/realtime/sessions/{session_id}/canvas-focus",
+        name="focus_realtime_canvas_v4",
+    )
+    async def focus_realtime_canvas_v4(
+        request: Request,
+        session_id: str,
+        canvas_token: str | None = Header(default=None, alias="X-Ava-Canvas-Token"),
+        protocol_header: str | None = Header(
+            default=None,
+            alias="X-Ava-Protocol-Version",
+        ),
+        generation_id: str | None = Header(default=None, alias="X-Ava-Generation-ID"),
+        source_turn_id: str | None = Header(default=None, alias="X-Ava-Source-Turn-ID"),
+        scene_id: str | None = Header(default=None, alias="X-Ava-Scene-ID"),
+        scene_revision: str | None = Header(default=None, alias="X-Ava-Scene-Revision"),
+        svg_sha256: str | None = Header(default=None, alias="X-Ava-SVG-SHA256"),
+        manifest_sha256: str | None = Header(
+            default=None, alias="X-Ava-Manifest-SHA256"
+        ),
+    ) -> Response:
+        if protocol_header != "4":
+            return _error_response(
+                request,
+                status_code=409,
+                code=ErrorCode.PROTOCOL_MISMATCH,
+                message="X-Ava-Protocol-Version must be exactly 4.",
+            )
+        if (
+            request.headers.get("content-type", "").split(";", maxsplit=1)[0].strip()
+            != "application/octet-stream"
+        ):
+            return _error_response(
+                request,
+                status_code=415,
+                code=ErrorCode.INVALID_REQUEST,
+                message="Canvas focus requires application/octet-stream.",
+            )
+        try:
+            client = await app.state.authenticator.authenticate(request)
+        except PermissionError:
+            return _error_response(
+                request,
+                status_code=401,
+                code=ErrorCode.UNAUTHORIZED,
+                message="A valid Ava client session is required.",
+            )
+        registry: RealtimeSessionRegistry | None = app.state.realtime_v4_sessions
+        if registry is None or canvas_token is None:
+            return _error_response(
+                request,
+                status_code=401 if canvas_token is None else 503,
+                code=(
+                    ErrorCode.UNAUTHORIZED
+                    if canvas_token is None
+                    else ErrorCode.PROVIDER_UNAVAILABLE
+                ),
+                message="Canvas focus authorization is unavailable.",
+            )
+        try:
+            validated_generation_id = _restore_identifier(generation_id, "generation")
+            validated_source_turn_id = _restore_identifier(
+                source_turn_id, "source turn"
+            )
+            validated_scene_id = _restore_identifier(scene_id, "scene")
+            validated_scene_revision = int(scene_revision or "")
+            if not 1 <= validated_scene_revision <= 10_001:
+                raise ValueError("scene revision is outside its bound")
+            validated_svg_sha256 = _restore_sha256(svg_sha256)
+            validated_manifest_sha256 = _restore_sha256(manifest_sha256)
+            svg_bytes = await _read_bounded_request_body(
+                request, SVG_PROTOCOL_MAX_BYTES
+            )
+            await registry.focus_canvas(
+                session_id=session_id,
+                token=canvas_token,
+                subject=client.subject,
+                generation_id=validated_generation_id,
+                source_turn_id=validated_source_turn_id,
+                scene_id=validated_scene_id,
+                scene_revision=validated_scene_revision,
+                expected_svg_sha256=validated_svg_sha256,
+                expected_manifest_sha256=validated_manifest_sha256,
+                svg_bytes=svg_bytes,
+            )
+        except RealtimeSessionAuthenticationError:
+            return _error_response(
+                request,
+                status_code=401,
+                code=ErrorCode.UNAUTHORIZED,
+                message="The Canvas focus token or lifecycle is invalid.",
+            )
+        except (
+            SvgDocumentValidationError,
+            SvgCanvasWorkspaceError,
+            UnicodeDecodeError,
+            ValueError,
+        ):
+            return _error_response(
+                request,
+                status_code=422,
+                code=ErrorCode.INVALID_REQUEST,
+                message="The focused Canvas document is invalid.",
+            )
+        LOGGER.info(
+            "canvas_focus_completed session_id=%s scene_id=%s scene_revision=%s",
+            session_id,
+            validated_scene_id,
+            validated_scene_revision,
+            extra={
+                "ava_context": {
+                    "sessionId": session_id,
+                    "sceneId": validated_scene_id,
+                    "sceneRevision": validated_scene_revision,
+                    "svgSha256": validated_svg_sha256,
+                    "manifestSha256": validated_manifest_sha256,
+                }
+            },
+        )
+        return Response(
+            status_code=204,
+            headers={
+                "Cache-Control": "no-store",
+                "X-Ava-Protocol-Version": "4",
+            },
+        )
+
     @app.post(
         "/v4/realtime/sessions/{session_id}/webrtc",
         name="negotiate_realtime_webrtc_v4",
@@ -1040,7 +1170,7 @@ def _install_http_boundary(app: FastAPI, settings: Settings) -> None:
                 SVG_PROTOCOL_MAX_BYTES
                 if request.method == "PUT"
                 and re.fullmatch(
-                    r"/v4/realtime/sessions/[A-Za-z][A-Za-z0-9._:-]{0,63}/canvas-restore",
+                    r"/v4/realtime/sessions/[A-Za-z][A-Za-z0-9._:-]{0,63}/canvas-(restore|focus)",
                     request.url.path,
                 )
                 else settings.request_max_bytes

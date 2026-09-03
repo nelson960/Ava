@@ -83,6 +83,7 @@ void main() {
       'revision': 1,
       'generationId': 'generation-v4-factory',
       'sourceTurnId': 'turn-v4-factory',
+      'operation': 'new',
     });
     final canvasTrace = traceEvents.firstWhere(
       (event) => event.stage == 'canvas.generation.started_received',
@@ -345,6 +346,9 @@ final class _DeferredCanvasPersistence implements AvaCanvasPersistence {
   Future<void> persistActive(AvaValidatedSvgCanvasDocument document) async {}
 
   @override
+  Future<void> persistFocus(String sceneId) async {}
+
+  @override
   Future<void> reset() async {}
 }
 
@@ -525,6 +529,7 @@ Future<void> _activateCanvas(
     'revision': 1,
     'generationId': descriptor.generationId,
     'sourceTurnId': descriptor.sourceTurnId,
+    'operation': 'new',
   });
   await controller.receiveDocumentAvailable(withIdentity(events[0]));
   controller.rendererPrepared();

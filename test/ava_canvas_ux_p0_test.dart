@@ -719,6 +719,7 @@ void _announceGeneration(
     'revision': 1,
     'generationId': document.descriptor.generationId,
     'sourceTurnId': document.descriptor.sourceTurnId,
+    'operation': 'new',
   });
 }
 

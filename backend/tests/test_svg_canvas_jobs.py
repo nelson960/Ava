@@ -30,6 +30,7 @@ from ava_backend.canvas.svg_specialist import (
     SvgCanvasSpecialistGenerationLimitError,
     SvgCanvasSpecialistGeneration,
     SvgCanvasSpecialistRequest,
+    SvgCanvasSpecialistTimeoutError,
     SvgCanvasSpecialistUnavailableError,
     SvgCanvasVisibleDraft,
     render_svg_canvas_specialist_instructions,
@@ -178,7 +179,27 @@ class _UnavailableSpecialist(_Specialist):
         self.requests.append(request)
         self.started.set()
         raise SvgCanvasSpecialistUnavailableError(
-            "SVG canvas specialist exceeded its generation deadline"
+            "SVG canvas specialist connection failed"
+        )
+
+
+class _TimeoutSpecialist(_Specialist):
+    def __init__(self, timeout_scope: str = "primaryAttempt") -> None:
+        super().__init__()
+        self.timeout_scope = timeout_scope
+
+    async def generate(
+        self,
+        request: SvgCanvasSpecialistRequest,
+        *,
+        draft_sink: object | None = None,
+    ) -> SvgCanvasSpecialistGeneration:
+        del draft_sink
+        self.requests.append(request)
+        self.started.set()
+        raise SvgCanvasSpecialistTimeoutError(
+            f"SVG canvas specialist exceeded its {self.timeout_scope} deadline",
+            timeout_scope=self.timeout_scope,
         )
 
 
@@ -224,6 +245,7 @@ class _Sink:
         *,
         generation_id: str,
         source_turn_id: str,
+        operation: str = "new",
     ) -> None:
         self.started.append((generation_id, source_turn_id))
 
@@ -1020,6 +1042,70 @@ async def test_generation_deadline_rejects_only_optional_canvas_work() -> None:
     assert sink.available == []
     assert sink.rejected == [
         ("generation-timeout", CanvasGenerationRejectionCode.PROVIDER_UNAVAILABLE)
+    ]
+    assert sink.rejection_details == [
+        (
+            "generation-timeout",
+            CanvasGenerationRejectionCode.PROVIDER_UNAVAILABLE,
+            "Ava could not reach the canvas illustrator.",
+            True,
+        )
+    ]
+    assert coordinator.state.candidate is None
+    await coordinator.close()
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        "primaryAttempt",
+        "streamStall",
+        "firstProviderProgress",
+        "overallSafety",
+        "repairBudget",
+    ],
+)
+async def test_generation_timeout_rejects_with_timeout_code_and_child_message(
+    scope: str,
+) -> None:
+    specialist = _TimeoutSpecialist(scope)
+    sink = _Sink()
+    completions: list[tuple[str, str, InteractiveCanvasToolOutputV4]] = []
+    coordinator = SvgCanvasJobCoordinator(
+        session_id=f"session-timeout-{scope}",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+        specialist=specialist,
+        state=SvgCanvasSessionState(),
+        documents=SvgCanvasDocumentStore(),
+        event_sink=sink,
+        generation_id_factory=lambda: f"generation-timeout-{scope}",
+    )
+
+    output = await coordinator.accept_tool_call(
+        source_turn_id="turn-speech-continues",
+        call=_call(),
+        complete_tool=lambda turn, call, result: _record_completion(
+            completions,
+            turn,
+            call,
+            result,
+        ),
+    )
+    await coordinator.wait_for_background_work()
+
+    assert output.status == InteractiveCanvasToolStatusV4.ACCEPTED
+    assert completions == [("turn-speech-continues", "call_1", output)]
+    assert sink.available == []
+    assert sink.rejected == [
+        (f"generation-timeout-{scope}", CanvasGenerationRejectionCode.TIMEOUT)
+    ]
+    assert sink.rejection_details == [
+        (
+            f"generation-timeout-{scope}",
+            CanvasGenerationRejectionCode.TIMEOUT,
+            "That drawing took too long. Try again?",
+            True,
+        )
     ]
     assert coordinator.state.candidate is None
     await coordinator.close()

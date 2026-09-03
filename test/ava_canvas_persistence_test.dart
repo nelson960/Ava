@@ -53,6 +53,7 @@ void main() {
       'revision': 1,
       'generationId': document.descriptor.generationId,
       'sourceTurnId': document.descriptor.sourceTurnId,
+      'operation': 'new',
     });
     await controller.receiveDocumentAvailable(events[0]);
     controller.rendererPrepared();
@@ -102,6 +103,7 @@ void main() {
       'revision': 1,
       'generationId': document.descriptor.generationId,
       'sourceTurnId': document.descriptor.sourceTurnId,
+      'operation': 'new',
     });
     await controller.receiveDraftAvailable({
       'protocolVersion': 4,
@@ -257,6 +259,9 @@ void main() {
       () => host.presentedDocument!.descriptor.manifestPath,
       throwsStateError,
     );
+    expect(host.panelVisible, isFalse);
+    expect(host.canReopen, isTrue);
+    host.reopenPanel();
     expect(host.panelVisible, isTrue);
     host.dispose();
   });
@@ -328,6 +333,9 @@ final class _HeldCanvasPersistence implements AvaCanvasPersistence {
   }
 
   @override
+  Future<void> persistFocus(String sceneId) async {}
+
+  @override
   Future<void> reset() async {}
 }
 
@@ -338,6 +346,9 @@ final class _NeverCanvasPersistence implements AvaCanvasPersistence {
 
   @override
   Future<void> persistActive(AvaValidatedSvgCanvasDocument document) async {}
+
+  @override
+  Future<void> persistFocus(String sceneId) async {}
 
   @override
   Future<void> reset() async {}
@@ -397,6 +408,7 @@ Future<void> _activateDocument(
     'revision': 1,
     'generationId': document.descriptor.generationId,
     'sourceTurnId': document.descriptor.sourceTurnId,
+    'operation': 'new',
   });
   await controller.receiveDocumentAvailable(events[0]);
   controller.rendererPrepared();

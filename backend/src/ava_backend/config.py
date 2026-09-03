@@ -91,7 +91,7 @@ class Settings(BaseSettings):
         description="Maximum duration of the primary Sol generation attempt.",
     )
     openai_canvas_first_progress_timeout_seconds: float = Field(
-        default=20,
+        default=40,
         ge=1,
         le=60,
     )

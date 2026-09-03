@@ -18,6 +18,7 @@ from ava_backend.canvas.svg_specialist import (
     SvgCanvasSpecialistGenerationLimitError,
     SvgCanvasSpecialistInvalidError,
     SvgCanvasSpecialistRequest,
+    SvgCanvasSpecialistTimeoutError,
     SvgCanvasSpecialistUnavailableError,
 )
 from ava_backend.config import AvaEnvironment, Settings
@@ -297,6 +298,7 @@ async def test_provider_uses_sol_raw_responses_and_preserves_exact_svg() -> None
     assert generation.cached_input_tokens == 12
     arguments = client.responses.arguments[0]
     assert arguments["model"] == "gpt-5.6-sol"
+    assert arguments["reasoning"] == {"effort": "none"}
     assert arguments["stream"] is True
     assert "text_format" not in arguments
     assert arguments["metadata"]["ava_protocol_version"] == "4"
@@ -310,6 +312,31 @@ async def test_provider_uses_sol_raw_responses_and_preserves_exact_svg() -> None
     assert "resolution-independent viewBox" in instructions
     assert "1000 × 600" not in instructions
     assert "7,000 SVG characters" not in instructions
+    assert arguments["max_output_tokens"] == 20_000
+
+
+async def test_canvas_specialist_responses_request_receives_gpt_5_6_sol_none_and_20000_tokens() -> (
+    None
+):
+    svg = _svg()
+    client = _Client([_response(svg)])
+    settings = Settings(
+        environment=AvaEnvironment.TEST,
+        openai_canvas_max_quality_repairs=0,
+    )
+    provider = OpenAISvgCanvasSpecialist(
+        settings,
+        session_id="session_config_test",
+        safety_identifier="ava_test_user_config",
+        client=client,  # type: ignore[arg-type]
+    )
+
+    await provider.generate(_request())
+
+    arguments = client.responses.arguments[0]
+    assert arguments["model"] == "gpt-5.6-sol"
+    assert arguments["reasoning"] == {"effort": "none"}
+    assert arguments["reasoning"]["effort"] == "none"
     assert arguments["max_output_tokens"] == 20_000
 
 
@@ -649,9 +676,11 @@ async def test_repair_receives_its_own_bounded_lifecycle_budget() -> None:
         client=SimpleNamespace(responses=responses),  # type: ignore[arg-type]
     )
 
-    with pytest.raises(SvgCanvasSpecialistUnavailableError, match="deadline"):
+    with pytest.raises(SvgCanvasSpecialistTimeoutError, match="deadline") as caught:
         await asyncio.wait_for(provider.generate(_request()), timeout=0.25)
 
+    assert caught.value.timeout_scope == "repairBudget"
+    assert not isinstance(caught.value, SvgCanvasSpecialistUnavailableError)
     assert blocked.is_set()
 
 
@@ -906,27 +935,33 @@ async def test_security_rejection_does_not_consume_repair_budget() -> None:
 
 
 async def test_stream_stall_terminates_without_starting_repair() -> None:
-    class _CreatedThenStalledStream:
+    class _OutputThenStalledStream:
         def __init__(self) -> None:
-            self._created = False
+            self._step = 0
             self.closed = False
 
-        def __aiter__(self) -> _CreatedThenStalledStream:
+        def __aiter__(self) -> _OutputThenStalledStream:
             return self
 
         async def __anext__(self) -> object:
-            if not self._created:
-                self._created = True
+            if self._step == 0:
+                self._step = 1
                 return SimpleNamespace(
                     type="response.created",
                     response=SimpleNamespace(id="resp_stalled"),
+                )
+            if self._step == 1:
+                self._step = 2
+                return SimpleNamespace(
+                    type="response.output_text.delta",
+                    delta="<svg>",
                 )
             await asyncio.Future()
 
         async def close(self) -> None:
             self.closed = True
 
-    stream = _CreatedThenStalledStream()
+    stream = _OutputThenStalledStream()
     settings = Settings(environment=AvaEnvironment.TEST).model_copy(
         update={"openai_canvas_stream_stall_timeout_seconds": 0.02}
     )
@@ -937,9 +972,112 @@ async def test_stream_stall_terminates_without_starting_repair() -> None:
         client=_ClientWithStream(stream),  # type: ignore[arg-type]
     )
 
-    with pytest.raises(SvgCanvasSpecialistUnavailableError, match="streamStall"):
+    with pytest.raises(SvgCanvasSpecialistTimeoutError, match="streamStall") as caught:
         await provider.generate(_request())
 
+    assert caught.value.timeout_scope == "streamStall"
+    assert not isinstance(caught.value, SvgCanvasSpecialistUnavailableError)
+
+    assert stream.closed
+
+
+async def test_reasoning_silence_before_first_output_does_not_trigger_stream_stall() -> None:
+    class _ReasoningThenOutputStream:
+        def __init__(self) -> None:
+            self._step = 0
+            self.closed = False
+
+        def __aiter__(self) -> _ReasoningThenOutputStream:
+            return self
+
+        async def __anext__(self) -> object:
+            if self._step == 0:
+                self._step = 1
+                return SimpleNamespace(
+                    type="response.created",
+                    response=SimpleNamespace(id="resp_reasoning"),
+                )
+            if self._step == 1:
+                self._step = 2
+                # Delay longer than stream_stall_timeout_seconds (0.02) but well within first_progress (0.1)
+                await asyncio.sleep(0.04)
+                return SimpleNamespace(
+                    type="response.output_text.delta",
+                    delta=_svg(),
+                )
+            if self._step == 2:
+                self._step = 3
+                return SimpleNamespace(
+                    type="response.completed",
+                    response=_response(_svg(), request_id="resp_reasoning"),
+                )
+            raise StopAsyncIteration
+
+        async def close(self) -> None:
+            self.closed = True
+
+    stream = _ReasoningThenOutputStream()
+    settings = Settings(environment=AvaEnvironment.TEST).model_copy(
+        update={
+            "openai_canvas_stream_stall_timeout_seconds": 0.02,
+            "openai_canvas_first_progress_timeout_seconds": 0.1,
+        }
+    )
+    provider = OpenAISvgCanvasSpecialist(
+        settings,
+        session_id="session_reasoning_ok",
+        safety_identifier="ava_test_user_123",
+        client=_ClientWithStream(stream),  # type: ignore[arg-type]
+    )
+
+    generation = await provider.generate(_request())
+    assert generation.document.svg_sha256 is not None
+    assert stream.closed
+
+
+async def test_no_output_past_first_progress_timeout_triggers_first_progress_not_stall() -> None:
+    class _CreatedThenSilentStream:
+        def __init__(self) -> None:
+            self._created = False
+            self.closed = False
+
+        def __aiter__(self) -> _CreatedThenSilentStream:
+            return self
+
+        async def __anext__(self) -> object:
+            if not self._created:
+                self._created = True
+                return SimpleNamespace(
+                    type="response.created",
+                    response=SimpleNamespace(id="resp_silent"),
+                )
+            await asyncio.Future()
+
+        async def close(self) -> None:
+            self.closed = True
+
+    stream = _CreatedThenSilentStream()
+    settings = Settings(environment=AvaEnvironment.TEST).model_copy(
+        update={
+            "openai_canvas_first_progress_timeout_seconds": 0.02,
+            "openai_canvas_stream_stall_timeout_seconds": 0.1,
+        }
+    )
+    provider = OpenAISvgCanvasSpecialist(
+        settings,
+        session_id="session_silent_before_output",
+        safety_identifier="ava_test_user_123",
+        client=_ClientWithStream(stream),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(
+        SvgCanvasSpecialistTimeoutError,
+        match="firstProviderProgress",
+    ) as caught:
+        await provider.generate(_request())
+
+    assert caught.value.timeout_scope == "firstProviderProgress"
+    assert not isinstance(caught.value, SvgCanvasSpecialistUnavailableError)
     assert stream.closed
 
 
@@ -965,11 +1103,13 @@ async def test_first_provider_progress_has_an_independent_deadline() -> None:
     )
 
     with pytest.raises(
-        SvgCanvasSpecialistUnavailableError,
+        SvgCanvasSpecialistTimeoutError,
         match="firstProviderProgress",
-    ):
+    ) as caught:
         await provider.generate(_request())
 
+    assert caught.value.timeout_scope == "firstProviderProgress"
+    assert not isinstance(caught.value, SvgCanvasSpecialistUnavailableError)
     assert create_cancelled.is_set()
 
 
@@ -1134,8 +1274,11 @@ async def test_deadline_before_terminal_closes_suspended_stream() -> None:
         client=_ClientWithStream(stream),  # type: ignore[arg-type]
     )
 
-    with pytest.raises(SvgCanvasSpecialistUnavailableError, match="deadline"):
+    with pytest.raises(SvgCanvasSpecialistTimeoutError, match="deadline") as caught:
         await provider.generate(_request())
+
+    assert caught.value.timeout_scope == "primaryAttempt"
+    assert not isinstance(caught.value, SvgCanvasSpecialistUnavailableError)
 
     assert stream.anext_calls == 1
     assert stream.close_calls == 1
@@ -1221,3 +1364,87 @@ async def test_unexpected_stream_event_is_invalid_not_provider_unavailable(
     assert failed["failureCode"] == "unexpectedStreamEvent"
     assert failed["failureKind"] == "responseEnvelope"
     assert failed["providerRequestId"] == "resp_protocol_error"
+
+
+async def test_live_sol_primary_attempt_deadline_is_not_classified_as_unavailable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    current_time = 0.0
+
+    def fake_monotonic() -> float:
+        return current_time
+
+    class _LiveSlowSolStream:
+        def __init__(self) -> None:
+            self._step = 0
+            self.closed = False
+
+        def __aiter__(self) -> _LiveSlowSolStream:
+            return self
+
+        async def __anext__(self) -> object:
+            nonlocal current_time
+            if self._step == 0:
+                self._step = 1
+                current_time = 4.63
+                return SimpleNamespace(
+                    type="response.created",
+                    response=SimpleNamespace(id="resp_live_slow_sol"),
+                )
+            if self._step == 1:
+                self._step = 2
+                current_time = 34.45
+                return SimpleNamespace(
+                    type="response.output_text.delta",
+                    delta='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" data-ava-interaction-mode="select"><title>Water Cycle</title>',
+                )
+            if self._step == 2:
+                self._step = 3
+                current_time = 82.30
+                return SimpleNamespace(
+                    type="response.output_text.delta",
+                    delta='<ellipse id="cloud" data-ava-binding="select_cloud" aria-label="Cloud" cx="500" cy="250" rx="160" ry="70" fill="#dff5ff"/>',
+                )
+            if self._step == 3:
+                self._step = 4
+                current_time = 90.05
+                return SimpleNamespace(
+                    type="response.output_text.delta",
+                    delta='<path id="rain" d="M 500 350 L 500 450" stroke="#4a90e2"/>',
+                )
+            await asyncio.Future()
+
+        async def close(self) -> None:
+            self.closed = True
+
+    stream = _LiveSlowSolStream()
+    settings = Settings(environment=AvaEnvironment.TEST)
+    provider = OpenAISvgCanvasSpecialist(
+        settings,
+        session_id="session_live_slow_sol",
+        safety_identifier="ava_test_user_123",
+        client=_ClientWithStream(stream),  # type: ignore[arg-type]
+        monotonic=fake_monotonic,
+    )
+
+    with caplog.at_level(logging.INFO, logger="ava_backend.openai_svg_canvas"):
+        with pytest.raises(SvgCanvasSpecialistTimeoutError) as caught:
+            await provider.generate(_request())
+
+    assert caught.value.timeout_scope == "primaryAttempt"
+    assert not isinstance(caught.value, SvgCanvasSpecialistUnavailableError)
+    failed = next(
+        record.ava_context
+        for record in caplog.records
+        if hasattr(record, "ava_context")
+        and record.ava_context["stage"] == "generationFailed"
+    )
+    assert failed["failureKind"] == "timeout"
+    assert failed["timeoutScope"] == "primaryAttempt"
+    assert failed["attemptNumber"] == 1
+    assert failed["firstOutputObserved"] is True
+    assert failed["providerRequestId"] == "resp_live_slow_sol"
+    assert failed["outputDeltaCharacters"] > 0
+    assert failed["accumulatedOutputBytes"] > 0
+    assert failed["timeSinceLastOutputDeltaMs"] is not None
+    assert failed["elapsedMs"] is not None

@@ -737,18 +737,38 @@ class _OpenAIRealtimeEventChannel:
                 },
             }
         )
+        status = getattr(output, "status", None)
+        status_value = (
+            str(status.value)
+            if status is not None and hasattr(status, "value")
+            else (str(status) if status is not None else "")
+        )
+        continuation_instructions = (
+            "The visual drawing request was accepted and is actively being drawn on "
+            "the screen right now. Briefly and naturally let the child know you are "
+            "making or drawing it (e.g., 'I'm drawing that now' or 'Let me make that "
+            "for you'). Never say you cannot draw or display visuals. Never describe a "
+            "substitute text or ASCII diagram. Never claim the drawing is complete before "
+            "actual presentation."
+            if status_value == "accepted"
+            else None
+        )
+        response_payload: dict[str, object] = {
+            "conversation": "auto",
+            "output_modalities": ["text"],
+            "tool_choice": "none",
+            "max_output_tokens": min(
+                _CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS,
+                self._max_output_tokens,
+            ),
+        }
+        if continuation_instructions is not None:
+            response_payload["instructions"] = continuation_instructions
+
         await self._send_json(
             {
                 "type": "response.create",
-                "response": {
-                    "conversation": "auto",
-                    "output_modalities": ["text"],
-                    "tool_choice": "none",
-                    "max_output_tokens": min(
-                        _CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS,
-                        self._max_output_tokens,
-                    ),
-                },
+                "response": response_payload,
             }
         )
         _log_response_diagnostic(

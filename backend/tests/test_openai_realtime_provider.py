@@ -2051,6 +2051,47 @@ async def test_rejected_canvas_continuation_is_outcome_owned_and_bounded() -> No
 
 
 @pytest.mark.asyncio
+async def test_accepted_canvas_continuation_supplies_drawing_instructions() -> None:
+    arguments = (
+        '{"operation":"new","brief":"Show a water cycle.","interactionMode":"none"}'
+    )
+    channel, socket = _channel(
+        [
+            *_canvas_response_events(arguments=arguments, preamble=""),
+            *_text_response_events(
+                response_id=CONTINUATION_RESPONSE_ID,
+                text="I am drawing the water cycle for you now.",
+            ),
+        ]
+    )
+
+    async for event in channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-canvas-accepted",
+    ):
+        if isinstance(event, RealtimeCanvasToolCall):
+            await channel.complete_canvas_tool(
+                turn_id="turn-canvas-accepted",
+                call_id=event.call_id,
+                output=InteractiveCanvasToolOutputV4.model_validate(
+                    {
+                        "status": "accepted",
+                        "generationId": "gen-test-1",
+                    }
+                ),
+            )
+
+    continuation = [
+        sent for sent in socket.sent if sent.get("type") == "response.create"
+    ][-1]["response"]
+    assert continuation["tool_choice"] == "none"
+    assert "instructions" in continuation
+    instructions = continuation["instructions"]
+    assert "actively being drawn" in instructions
+    assert "Never say you cannot draw" in instructions
+
+
+@pytest.mark.asyncio
 async def test_idle_canvas_interaction_can_trigger_existing_semantic_turn() -> None:
     channel, socket = _channel([])
     iterator = channel.stream_turn(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Literal
 
 from ..canvas.svg_delivery import StoredSvgCanvasDocument, StoredSvgCanvasDraft
 from ..canvas.svg_document import (
@@ -44,12 +45,14 @@ class ProtocolV4CanvasEventSink(SvgCanvasJobEventSink):
         *,
         generation_id: str,
         source_turn_id: str,
+        operation: Literal["new", "reviseFocused"] = "new",
     ) -> None:
         await self._put(
             {
                 "event": "canvasGenerationStarted",
                 "generationId": generation_id,
                 "sourceTurnId": source_turn_id,
+                "operation": operation,
             }
         )
 

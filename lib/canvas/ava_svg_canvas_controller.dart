@@ -66,10 +66,12 @@ final class AvaSvgCanvasGenerationState {
   const AvaSvgCanvasGenerationState({
     required this.generationId,
     required this.sourceTurnId,
+    this.operation = 'new',
   });
 
   final String generationId;
   final String sourceTurnId;
+  final String operation;
 }
 
 @immutable
@@ -272,6 +274,34 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Sets the runtime active scene to one previously retained scene.
+  void focusRetainedActive(AvaValidatedSvgCanvasDocument document) {
+    _ensureOpen();
+    if (hasPendingVisual) {
+      throw StateError(
+        'Cannot focus retained Canvas while visual generation is pending.',
+      );
+    }
+    final descriptor = document.descriptor;
+    final retainedRevision = _retainedSceneRevision(descriptor.sceneId);
+    if (retainedRevision != null &&
+        retainedRevision != descriptor.sceneRevision) {
+      throw StateError(
+        'Retained Canvas focus disagrees with workspace revision.',
+      );
+    }
+    _active = AvaSvgCanvasActiveState(
+      document: document,
+      firstRenderedSample: 0,
+    );
+    _interactionRevision = 0;
+    _selectedBindingId = null;
+    _failedActiveRendererGenerationId = null;
+    _lastIssue = null;
+    _lastPendingOutcome = null;
+    notifyListeners();
+  }
+
   void receiveGenerationStarted(Map<String, Object?> event) {
     _ensureOpen();
     _requireExactKeys(
@@ -284,6 +314,7 @@ final class AvaSvgCanvasController extends ChangeNotifier {
         'revision',
         'generationId',
         'sourceTurnId',
+        'operation',
       },
       'canvasGenerationStarted',
     );
@@ -293,10 +324,12 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     }
     final generationId = event['generationId'];
     final sourceTurnId = event['sourceTurnId'];
+    final operation = event['operation'];
     if (generationId is! String ||
         generationId.isEmpty ||
         sourceTurnId is! String ||
-        sourceTurnId.isEmpty) {
+        sourceTurnId.isEmpty ||
+        (operation != 'new' && operation != 'reviseFocused')) {
       throw const FormatException(
         'Canvas generation start identity is invalid.',
       );
@@ -307,6 +340,7 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     _generation = AvaSvgCanvasGenerationState(
       generationId: generationId,
       sourceTurnId: sourceTurnId,
+      operation: operation as String,
     );
     _recordGeneration(
       'canvas.generation.started_received',

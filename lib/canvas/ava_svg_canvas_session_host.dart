@@ -22,10 +22,16 @@ final class AvaRestoredCanvasWorkspace {
   final String? focusedSceneId;
 }
 
+typedef AvaCanvasRuntimeFocusSink = Future<void> Function(
+  AvaValidatedSvgCanvasDocument document,
+);
+
 abstract interface class AvaCanvasPersistence {
   Future<AvaRestoredCanvasWorkspace> loadWorkspace();
 
   Future<void> persistActive(AvaValidatedSvgCanvasDocument document);
+
+  Future<void> persistFocus(String sceneId);
 
   Future<void> reset();
 }
@@ -64,7 +70,10 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
   final AvaCanvasPersistence? _persistence;
   late final Future<void> _restoration;
   bool _restoreInvalidated = false;
+  int _workspaceEpoch = 0;
   AvaSvgCanvasController? _controller;
+  AvaCanvasRuntimeFocusSink? _runtimeFocusSink;
+  bool _focusTransitionPending = false;
   final List<AvaValidatedSvgCanvasDocument> _workspaceDocuments = [];
   AvaValidatedSvgCanvasDocument? _presentedDocument;
   bool _panelDismissed = false;
@@ -132,10 +141,104 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
         phase == AvaSvgCanvasLifecyclePhase.presented;
   }
 
+  bool get focusTransitionPending => _focusTransitionPending;
+
+  int get currentSceneIndex {
+    final presented = _presentedDocument;
+    if (presented == null) return -1;
+    return _workspaceDocuments.indexWhere(
+      (document) => document.descriptor.sceneId == presented.descriptor.sceneId,
+    );
+  }
+
+  bool get canSelectPrevious =>
+      !_focusTransitionPending &&
+      !generating &&
+      !(_controller?.hasPendingVisual ?? false) &&
+      currentSceneIndex > 0;
+
+  bool get canSelectNext =>
+      !_focusTransitionPending &&
+      !generating &&
+      !(_controller?.hasPendingVisual ?? false) &&
+      currentSceneIndex >= 0 &&
+      currentSceneIndex < _workspaceDocuments.length - 1;
+
+  Future<void> selectPreviousScene() async {
+    final index = currentSceneIndex;
+    if (index > 0) {
+      await selectSceneByIndex(index - 1);
+    }
+  }
+
+  Future<void> selectNextScene() async {
+    final index = currentSceneIndex;
+    if (index >= 0 && index < _workspaceDocuments.length - 1) {
+      await selectSceneByIndex(index + 1);
+    }
+  }
+
+  Future<void> selectSceneByIndex(int index) async {
+    if (index < 0 || index >= _workspaceDocuments.length) {
+      throw RangeError.index(index, _workspaceDocuments, 'index');
+    }
+    final target = _workspaceDocuments[index];
+    if (identical(_presentedDocument, target) ||
+        _presentedDocument?.descriptor.sceneId == target.descriptor.sceneId) {
+      return;
+    }
+    if (_focusTransitionPending || (_controller?.hasPendingVisual ?? false)) {
+      return;
+    }
+    final initialController = _controller;
+    final initialEpoch = _workspaceEpoch;
+    _focusTransitionPending = true;
+    notifyListeners();
+
+    try {
+      final sink = _runtimeFocusSink;
+      if (sink != null) {
+        await sink(target);
+      }
+
+      if (_restoreInvalidated ||
+          _workspaceEpoch != initialEpoch ||
+          !identical(_controller, initialController) ||
+          !_workspaceDocuments.contains(target)) {
+        return;
+      }
+
+      final controller = _controller;
+      if (controller != null && identical(_controller, controller)) {
+        controller.focusRetainedActive(target);
+      }
+      _presentedDocument = target;
+      final persistence = _persistence;
+      if (persistence != null) {
+        try {
+          await persistence.persistFocus(target.descriptor.sceneId);
+        } catch (error, stackTrace) {
+          developer.log(
+            'canvas_persist_focus_failed sceneId=${target.descriptor.sceneId} '
+            'failureType=${error.runtimeType}',
+            name: 'ava.canvas.persistence',
+            error: error,
+            stackTrace: stackTrace,
+          );
+        }
+      }
+      notifyListeners();
+    } finally {
+      _focusTransitionPending = false;
+      notifyListeners();
+    }
+  }
+
   void attach(
     AvaSvgCanvasController controller, {
     AvaCanvasRenderProfileV4? initialRenderProfile,
     AvaCanvasRenderProfileUpdateSink? renderProfileUpdateSink,
+    AvaCanvasRuntimeFocusSink? runtimeFocusSink,
   }) {
     if ((initialRenderProfile == null) != (renderProfileUpdateSink == null)) {
       throw ArgumentError(
@@ -143,7 +246,10 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
         'and update sink.',
       );
     }
-    if (identical(_controller, controller)) return;
+    if (identical(_controller, controller)) {
+      _runtimeFocusSink = runtimeFocusSink;
+      return;
+    }
     final previous = _controller;
     if (previous != null) {
       _retainPresentedDocument(previous);
@@ -159,6 +265,7 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     _renderProfileTimer?.cancel();
     _renderProfileTimer = null;
     _controller = controller;
+    _runtimeFocusSink = runtimeFocusSink;
     _renderProfileUpdateSink = renderProfileUpdateSink;
     _lastSentRenderProfile = initialRenderProfile;
     _renderProfileRevision = 0;
@@ -183,6 +290,7 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     _renderProfileTimer?.cancel();
     _renderProfileTimer = null;
     _renderProfileUpdateSink = null;
+    _runtimeFocusSink = null;
     _lastSentRenderProfile = null;
     _renderProfileRevision = 0;
     _controller = null;
@@ -215,6 +323,7 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
       );
     }
     _restoreInvalidated = true;
+    _workspaceEpoch += 1;
     if (_workspaceDocuments.isEmpty &&
         _presentedDocument == null &&
         !_panelDismissed &&
@@ -347,6 +456,10 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
         ..clear()
         ..addAll(restored.documents);
       _presentedDocument = focused;
+      if (focused != null) {
+        _panelDismissed = true;
+        _dismissedGenerationId = focused.descriptor.generationId;
+      }
       notifyListeners();
     } on Object catch (error, stackTrace) {
       developer.log(

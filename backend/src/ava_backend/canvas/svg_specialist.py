@@ -50,6 +50,29 @@ class SvgCanvasSpecialistUnavailableError(SvgCanvasSpecialistError):
     """The provider could not complete a bounded SVG request."""
 
 
+class SvgCanvasSpecialistTimeoutError(SvgCanvasSpecialistError):
+    """A configured lifecycle deadline expired during SVG generation."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        timeout_scope: str,
+        provider_status_code: int | None = None,
+        provider_error_code: str | None = None,
+        provider_error_parameter: str | None = None,
+        provider_request_id: str | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            provider_status_code=provider_status_code,
+            provider_error_code=provider_error_code,
+            provider_error_parameter=provider_error_parameter,
+            provider_request_id=provider_request_id,
+        )
+        self.timeout_scope = timeout_scope
+
+
 class SvgCanvasSpecialistGenerationLimitError(SvgCanvasSpecialistError):
     """The provider exhausted its output allowance before completing the SVG."""
 

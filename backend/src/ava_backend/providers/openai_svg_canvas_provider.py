@@ -32,6 +32,7 @@ from ..canvas.svg_specialist import (
     SvgCanvasDraftSink,
     SvgCanvasSpecialistInvalidError,
     SvgCanvasSpecialistRequest,
+    SvgCanvasSpecialistTimeoutError,
     SvgCanvasSpecialistUnavailableError,
     render_svg_canvas_specialist_instructions,
 )
@@ -86,9 +87,31 @@ class _ResponseShapeError(ValueError):
 class _CanvasGenerationDeadlineExceeded(TimeoutError):
     """A configured lifecycle deadline expired."""
 
-    def __init__(self, scope: str) -> None:
+    def __init__(
+        self,
+        scope: str,
+        *,
+        attempt_number: int | None = None,
+        elapsed_ms: float | None = None,
+        first_output_observed: bool = False,
+        time_since_last_output_delta_ms: float | None = None,
+        output_delta_characters: int = 0,
+        accumulated_output_bytes: int = 0,
+        validated_draft_count: int = 0,
+        latest_validated_draft_byte_length: int | None = None,
+        provider_request_id: str | None = None,
+    ) -> None:
         super().__init__(scope)
         self.scope = scope
+        self.attempt_number = attempt_number
+        self.elapsed_ms = elapsed_ms
+        self.first_output_observed = first_output_observed
+        self.time_since_last_output_delta_ms = time_since_last_output_delta_ms
+        self.output_delta_characters = output_delta_characters
+        self.accumulated_output_bytes = accumulated_output_bytes
+        self.validated_draft_count = validated_draft_count
+        self.latest_validated_draft_byte_length = latest_validated_draft_byte_length
+        self.provider_request_id = provider_request_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,7 +207,13 @@ class OpenAISvgCanvasSpecialist:
                 )
                 attempt_deadline = self._monotonic() + attempt_budget
                 if overall_deadline <= self._monotonic():
-                    raise _CanvasGenerationDeadlineExceeded("overallSafety")
+                    raise _CanvasGenerationDeadlineExceeded(
+                        "overallSafety",
+                        attempt_number=attempt + 1,
+                        elapsed_ms=round(
+                            (self._monotonic() - generation_started_at) * 1000
+                        ),
+                    )
                 attempt_count = attempt + 1
                 try:
                     streamed = await self._request(
@@ -407,15 +436,29 @@ class OpenAISvgCanvasSpecialist:
             )
             raise
         except _CanvasGenerationDeadlineExceeded as error:
+            resolved_provider_request_id = (
+                error.provider_request_id or provider_request_id
+            )
             self._log(
                 "generationFailed",
                 request=request,
                 elapsed_from=generation_started_at,
                 failureKind="timeout",
                 timeoutScope=error.scope,
+                attemptNumber=error.attempt_number,
+                elapsedMs=error.elapsed_ms,
+                firstOutputObserved=error.first_output_observed,
+                timeSinceLastOutputDeltaMs=error.time_since_last_output_delta_ms,
+                outputDeltaCharacters=error.output_delta_characters,
+                accumulatedOutputBytes=error.accumulated_output_bytes,
+                validatedDraftCount=error.validated_draft_count,
+                latestValidatedDraftByteLength=error.latest_validated_draft_byte_length,
+                providerRequestId=resolved_provider_request_id,
             )
-            raise SvgCanvasSpecialistUnavailableError(
-                f"SVG canvas specialist exceeded its {error.scope} deadline"
+            raise SvgCanvasSpecialistTimeoutError(
+                f"SVG canvas specialist exceeded its {error.scope} deadline",
+                timeout_scope=error.scope,
+                provider_request_id=_as_optional_string(resolved_provider_request_id),
             ) from error
         except asyncio.CancelledError as error:
             generation_status = "cancelled"
@@ -429,14 +472,23 @@ class OpenAISvgCanvasSpecialist:
                 "SVG canvas specialist request was cancelled"
             ) from error
         except APITimeoutError as error:
+            resolved_provider_request_id = (
+                getattr(error, "request_id", None) or provider_request_id
+            )
             self._log(
                 "generationFailed",
                 request=request,
                 elapsed_from=generation_started_at,
                 failureKind="timeout",
+                timeoutScope="requestTimeout",
+                attemptNumber=attempt_count,
+                elapsedMs=round((self._monotonic() - generation_started_at) * 1000),
+                providerRequestId=resolved_provider_request_id,
             )
-            raise SvgCanvasSpecialistUnavailableError(
-                "SVG canvas specialist exceeded its deadline"
+            raise SvgCanvasSpecialistTimeoutError(
+                "SVG canvas specialist exceeded its deadline",
+                timeout_scope="requestTimeout",
+                provider_request_id=_as_optional_string(resolved_provider_request_id),
             ) from error
         except RateLimitError as error:
             provider_request_id = (
@@ -585,7 +637,12 @@ class OpenAISvgCanvasSpecialist:
         )
         create_timeout = create_deadline - self._monotonic()
         if create_timeout <= 0:
-            raise _CanvasGenerationDeadlineExceeded(create_scope)
+            raise _CanvasGenerationDeadlineExceeded(
+                create_scope,
+                attempt_number=attempt + 1,
+                elapsed_ms=round((self._monotonic() - attempt_started_at) * 1000),
+                first_output_observed=False,
+            )
         try:
             stream = await asyncio.wait_for(
                 self._client.responses.create(
@@ -616,7 +673,12 @@ class OpenAISvgCanvasSpecialist:
                 timeout=create_timeout,
             )
         except TimeoutError as error:
-            raise _CanvasGenerationDeadlineExceeded(create_scope) from error
+            raise _CanvasGenerationDeadlineExceeded(
+                create_scope,
+                attempt_number=attempt + 1,
+                elapsed_ms=round((self._monotonic() - attempt_started_at) * 1000),
+                first_output_observed=False,
+            ) from error
         if not hasattr(stream, "__aiter__"):
             raise _ResponseShapeError(
                 "responseStreamMissing",
@@ -662,7 +724,9 @@ class OpenAISvgCanvasSpecialist:
         deltas: list[str] = []
         accumulated_output_bytes = 0
         first_delta_recorded = False
-        received_provider_progress = False
+        last_output_progress_at: float | None = None
+        validated_draft_count = 0
+        latest_validated_draft_byte_length: int | None = None
         draft_builder = (
             ProgressiveSvgDraftBuilder(
                 generation_id=request.generation_id,
@@ -676,11 +740,34 @@ class OpenAISvgCanvasSpecialist:
         )
         iterator = stream.__aiter__()
         attempt_scope = "primaryAttempt" if attempt == 0 else "repairBudget"
+
+        def _deadline_exceeded(scope: str) -> _CanvasGenerationDeadlineExceeded:
+            now_ts = self._monotonic()
+            time_since_last_output_delta_ms = (
+                round((now_ts - last_output_progress_at) * 1000)
+                if last_output_progress_at is not None
+                else None
+            )
+            return _CanvasGenerationDeadlineExceeded(
+                scope,
+                attempt_number=attempt + 1,
+                elapsed_ms=round((now_ts - attempt_started_at) * 1000),
+                first_output_observed=first_delta_recorded,
+                time_since_last_output_delta_ms=time_since_last_output_delta_ms,
+                output_delta_characters=sum(len(d) for d in deltas),
+                accumulated_output_bytes=accumulated_output_bytes,
+                validated_draft_count=validated_draft_count,
+                latest_validated_draft_byte_length=latest_validated_draft_byte_length,
+                provider_request_id=provider_request_id,
+            )
+
         while True:
             now = self._monotonic()
-            if received_provider_progress:
+            if first_delta_recorded:
+                assert last_output_progress_at is not None
                 progress_deadline = (
-                    now + self._settings.openai_canvas_stream_stall_timeout_seconds
+                    last_output_progress_at
+                    + self._settings.openai_canvas_stream_stall_timeout_seconds
                 )
                 progress_scope = "streamStall"
             else:
@@ -693,14 +780,13 @@ class OpenAISvgCanvasSpecialist:
             )
             timeout = next_event_deadline - now
             if timeout <= 0:
-                raise _CanvasGenerationDeadlineExceeded(timeout_scope)
+                raise _deadline_exceeded(timeout_scope)
             try:
                 event = await asyncio.wait_for(iterator.__anext__(), timeout=timeout)
             except StopAsyncIteration:
                 break
             except TimeoutError as error:
-                raise _CanvasGenerationDeadlineExceeded(timeout_scope) from error
-            received_provider_progress = True
+                raise _deadline_exceeded(timeout_scope) from error
             event_type = _field(event, "type")
             if not isinstance(event_type, str):
                 raise _ResponseShapeError(
@@ -734,6 +820,10 @@ class OpenAISvgCanvasSpecialist:
                 if draft_builder is not None and draft_sink is not None:
                     draft = draft_builder.feed(delta)
                     if draft is not None:
+                        validated_draft_count += 1
+                        latest_validated_draft_byte_length = len(
+                            draft.document.svg_bytes
+                        )
                         await draft_sink(draft)
                         self._log(
                             "draftValidated",
@@ -744,15 +834,17 @@ class OpenAISvgCanvasSpecialist:
                             svgByteLength=len(draft.document.svg_bytes),
                             svgSha256=draft.document.svg_sha256,
                         )
-                if delta and not first_delta_recorded:
-                    first_delta_recorded = True
-                    self._log(
-                        "firstOutputDelta",
-                        request=request,
-                        attempt=attempt,
-                        elapsed_from=attempt_started_at,
-                        providerRequestId=provider_request_id,
-                    )
+                if delta:
+                    last_output_progress_at = self._monotonic()
+                    if not first_delta_recorded:
+                        first_delta_recorded = True
+                        self._log(
+                            "firstOutputDelta",
+                            request=request,
+                            attempt=attempt,
+                            elapsed_from=attempt_started_at,
+                            providerRequestId=provider_request_id,
+                        )
                 continue
             if event_type in {
                 "response.completed",

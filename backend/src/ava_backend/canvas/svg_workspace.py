@@ -150,6 +150,41 @@ class SvgCanvasWorkspace:
         self._last_interaction = None
         return scene
 
+    def focus_retained(self, scene: ActiveSvgCanvasScene) -> ActiveSvgCanvasScene:
+        """Focus or hydrate one independently validated retained scene at runtime."""
+
+        if any(
+            not execution.status.terminal for execution in self._executions.values()
+        ):
+            raise SvgCanvasWorkspaceError(
+                "cannot change canvas focus while a canvas generation is active"
+            )
+        if scene.revision < 1 or scene.revision > 10_001:
+            raise SvgCanvasWorkspaceError("restored canvas revision is invalid")
+
+        existing = self.scene(scene.scene_id)
+        if existing is not None:
+            if (
+                existing.revision != scene.revision
+                or existing.generation_id != scene.generation_id
+                or existing.source_turn_id != scene.source_turn_id
+                or existing.document.svg_sha256 != scene.document.svg_sha256
+                or existing.document.manifest_sha256 != scene.document.manifest_sha256
+            ):
+                raise SvgCanvasWorkspaceError(
+                    "conflicting canvas scene revision or identity cannot be focused"
+                )
+            self._current_scene_id = scene.scene_id
+            self._last_interaction = None
+            return existing
+
+        if len(self._scenes) >= self.maximum_scene_count:
+            self._scenes.pop(0)
+        self._scenes.append(scene)
+        self._current_scene_id = scene.scene_id
+        self._last_interaction = None
+        return scene
+
     def start_execution(
         self,
         *,
@@ -401,7 +436,6 @@ def _same_committed_scene_identity(
         and existing.source_turn_id == observed.source_turn_id
         and existing.document.svg_sha256 == observed.document.svg_sha256
         and existing.document.manifest_sha256 == observed.document.manifest_sha256
-        and existing.first_rendered_sample == observed.first_rendered_sample
     )
 
 

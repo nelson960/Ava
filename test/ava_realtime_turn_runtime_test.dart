@@ -38,6 +38,7 @@ void main() {
         'revision': 1,
         'generationId': 'generation-runtime-draft',
         'sourceTurnId': 'turn-runtime-draft',
+        'operation': 'new',
       }),
       _control({
         'protocolVersion': 4,

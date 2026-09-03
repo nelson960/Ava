@@ -43,7 +43,7 @@ def test_development_configuration_does_not_hide_missing_model_key() -> None:
     assert settings.openai_realtime_truncation_post_instructions_tokens == 80_000
     assert settings.openai_realtime_truncation_retention_ratio == 0.8
     assert settings.openai_canvas_timeout_seconds == 90
-    assert settings.openai_canvas_first_progress_timeout_seconds == 20
+    assert settings.openai_canvas_first_progress_timeout_seconds == 40
     assert settings.openai_canvas_stream_stall_timeout_seconds == 15
     assert settings.openai_canvas_overall_timeout_seconds == 150
     assert settings.openai_canvas_repair_timeout_seconds == 45
@@ -75,7 +75,11 @@ def test_realtime_truncation_configuration_rejects_nonsensical_values(
         Settings(**{field: value})
 
 
-def test_canvas_specialist_model_is_sol_only() -> None:
+def test_canvas_specialist_model_validation() -> None:
+    settings = Settings()
+    assert settings.openai_canvas_model == "gpt-5.6-sol"
+    assert settings.openai_canvas_reasoning_effort == "none"
+    assert settings.openai_canvas_max_output_tokens == 20_000
     with pytest.raises(ValidationError, match="gpt-5.6-sol"):
         Settings(openai_canvas_model="gpt-5.6-luna")  # type: ignore[arg-type]
 

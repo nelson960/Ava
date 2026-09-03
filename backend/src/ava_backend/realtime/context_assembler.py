@@ -31,6 +31,7 @@ class DynamicContextBuildReason(StrEnum):
     SESSION_RECONNECT = "sessionReconnect"
     TURN_COMMITTED = "turnCommitted"
     CANVAS_ACTIVATED = "canvasActivated"
+    CANVAS_FOCUSED = "canvasFocused"
     CANVAS_INTERACTION_COMMITTED = "canvasInteractionCommitted"
     MEMORY_COMPACTED = "memoryCompacted"
 
