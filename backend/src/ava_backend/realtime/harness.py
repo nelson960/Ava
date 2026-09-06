@@ -12,10 +12,12 @@ from .tool_contract import (
     GET_CURRENT_TIME_TOOL_NAME,
     INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS,
     INTERACTIVE_CANVAS_TOOL_NAME,
+    MANAGE_CANVAS_PRESENTATION_TOOL_NAME,
     SEARCH_MEMORY_TOOL_NAME,
     GetCurrentTimeRequest,
     InteractiveCanvasCancellationRequest,
     InteractiveCanvasRequest,
+    ManageCanvasPresentationRequest,
     SearchMemoryRequest,
 )
 
@@ -66,11 +68,13 @@ words or a keyword list.
 
 Choose operation=new for a separate visual or concept. Choose
 operation=reviseFocused only when modifying the active visual; merely
-discussing a pending or active visual is not a revision. Use
-{CANCEL_INTERACTIVE_CANVAS_TOOL_NAME} when the child semantically asks to stop
-an unpresented visual. In the brief, describe only the visual's concise semantic
-intent: essential purpose, objects, relationships, flow, and necessary labels
-without repeating full active visual context or enumerating unnecessary details.
+discussing a pending or active visual is not a revision. Use {CANCEL_INTERACTIVE_CANVAS_TOOL_NAME} when the child semantically asks to stop
+an unpresented visual. Use {MANAGE_CANVAS_PRESENTATION_TOOL_NAME} for retained visuals:
+show an exact scene, navigate next|previous|first|last, or hide the panel. Realtime selects
+scene IDs semantically; the backend computes adjacency. Do not call {INTERACTIVE_CANVAS_TOOL_NAME}
+when the visual already exists in retained_visuals. In the brief, describe only the visual's
+concise semantic intent: essential purpose, objects, relationships, flow, and necessary
+labels without repeating full active visual context or enumerating unnecessary details.
 Choose interactionMode=none for static visuals, interactionMode=explore for tapping
 parts to learn, interactionMode=select for choosing one visible option, and
 interactionMode=steps for ordered Back/Next progression. When revising, preserve
@@ -94,7 +98,14 @@ narrate application or tool internals.
 
 Canvas context supplies bounded semantics for pending and active visuals
 (purpose, topic, state, title, description, visible labels, named objects, and
-interactions). Use it to ground conversation and resolve child references.
+interactions). canvas_presentation is authoritative current presentation state
+and outranks retained visuals, conversation, and memory. visible=false means no
+visual is currently visible; never infer otherwise from history. visible=true
+grounds "this" and "what am I looking at?" in its exact scene. Retained visuals
+are available choices, not visibility claims. Use canonical creation and modification
+metadata for temporal requests and show a suitable retained scene with
+{MANAGE_CANVAS_PRESENTATION_TOOL_NAME}; generate only when a new/different visual
+is wanted or no suitable retained scene exists.
 Normal conversation about a pending or active visual does not itself imply a
 revision. A validated canvas interaction establishes shared semantic focus:
 semantic_focus is the active referent, not a script to recite. Respond naturally
@@ -192,6 +203,7 @@ def build_realtime_harness(
         tools=(
             build_interactive_canvas_tool(),
             build_cancel_interactive_canvas_tool(),
+            build_manage_canvas_presentation_tool(),
             build_search_memory_tool(),
             build_get_current_time_tool(),
         ),
@@ -241,6 +253,25 @@ def build_cancel_interactive_canvas_tool() -> dict[str, Any]:
             "Stop the currently pending lower-panel visual when the child "
             "semantically asks to cancel drawing. It does not remove an active "
             "completed visual."
+        ),
+        "parameters": parameters,
+    }
+
+
+def build_manage_canvas_presentation_tool() -> dict[str, Any]:
+    parameters = ManageCanvasPresentationRequest.model_json_schema(
+        by_alias=True,
+        ref_template="#/$defs/{model}",
+    )
+    _remove_schema_titles(parameters)
+    return {
+        "type": "function",
+        "name": MANAGE_CANVAS_PRESENTATION_TOOL_NAME,
+        "description": (
+            "Control the canvas panel. Use operation='show' with an exact scene_id "
+            "semantically selected from retained_visuals; use operation='hide' to close "
+            "the panel; or use operation='navigate' with direction next, previous, first, "
+            "or last. The backend, not the model, computes workspace adjacency."
         ),
         "parameters": parameters,
     }

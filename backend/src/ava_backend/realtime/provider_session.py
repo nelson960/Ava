@@ -12,6 +12,7 @@ from .tool_contract import (
     InteractiveCanvasCancellationToolOutputV4,
     InteractiveCanvasToolOutput,
     InteractiveCanvasToolOutputV4,
+    ManageCanvasPresentationToolOutputV4,
     RealtimeUtilityToolOutputV4,
     RealtimeTurnEvent,
 )
@@ -33,6 +34,7 @@ _PROVIDER_CALL_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{7,127}$")
 class RealtimeContextInstallationStatus(StrEnum):
     INSTALLED = "installed"
     DEDUPLICATED = "deduplicated"
+    SUBMITTED = "submitted"
 
 
 class RealtimeProviderError(RuntimeError):
@@ -108,7 +110,13 @@ class NegotiatedRealtimeCall:
             raise ValueError("provider_call_id has an invalid format")
 
 
-type RealtimeProviderTurnEvent = RealtimeTurnEvent
+@dataclass(frozen=True, slots=True)
+class RealtimeCommittedInput:
+    turn_id: str
+    item_id: str
+
+
+type RealtimeProviderTurnEvent = RealtimeTurnEvent | RealtimeCommittedInput
 
 
 class RealtimeProviderSession(Protocol):
@@ -116,8 +124,23 @@ class RealtimeProviderSession(Protocol):
 
     async def negotiate(self, *, offer_sdp: str) -> NegotiatedRealtimeCall: ...
 
+    async def request_child_response(
+        self,
+        *,
+        turn_id: str,
+        item_id: str,
+        permit_degraded_focus_grounding: bool = False,
+    ) -> bool: ...
+
+    async def wait_for_context(self, *, build_id: str) -> None: ...
+
     @property
     def active_context_build_id(self) -> str | None: ...
+
+    @property
+    def desired_context_build_id(self) -> str | None: ...
+
+    def is_context_acknowledged(self, build_id: str) -> bool: ...
 
     async def prepare(
         self,
@@ -159,6 +182,14 @@ class RealtimeProviderSession(Protocol):
             | InteractiveCanvasToolOutputV4
             | InteractiveCanvasCancellationToolOutputV4
         ),
+    ) -> None: ...
+
+    async def complete_manage_canvas_presentation_tool(
+        self,
+        *,
+        turn_id: str,
+        call_id: str,
+        output: ManageCanvasPresentationToolOutputV4,
     ) -> None: ...
 
     async def complete_utility_tool(

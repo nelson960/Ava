@@ -33,6 +33,7 @@ Sha256Digest = Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]
 
 class AvaServerEventTypeV4(StrEnum):
     TURN_CREATED = "turnCreated"
+    TURN_CONTEXT_REQUESTED = "turnContextRequested"
     TURN_PHASE_CHANGED = "turnPhaseChanged"
     SEGMENT_READY = "segmentReady"
     AUDIO_METADATA = "audioMetadata"
@@ -46,6 +47,8 @@ class AvaServerEventTypeV4(StrEnum):
     CANVAS_ACTIVATED = "canvasActivated"
     CANVAS_DOCUMENT_DISCARDED = "canvasDocumentDiscarded"
     CANVAS_REJECTED = "canvasRejected"
+    CANVAS_PRESENTATION_CHANGED = "canvasPresentationChanged"
+    CANVAS_PRESENTATION_COMMAND = "canvasPresentationCommand"
     INTERACTION_REJECTED = "interactionRejected"
     MEMORY_PERSISTENCE_FAILED = "memoryPersistenceFailed"
     TURN_COMPLETED = "turnCompleted"
@@ -68,6 +71,19 @@ class AvaTurnServerEventV4(AvaServerEventV4):
 class TurnCreatedEventV4(AvaTurnServerEventV4):
     event: Literal[AvaServerEventTypeV4.TURN_CREATED]
     request_id: ProtocolIdentifier
+
+
+class TurnContextRequestedEventV4(AvaTurnServerEventV4):
+    event: Literal[AvaServerEventTypeV4.TURN_CONTEXT_REQUESTED]
+    request_id: ProtocolIdentifier
+    provider_item_id: ProtocolIdentifier
+
+
+class FocusedCanvasIdentityV4(RealtimeProtocolModel):
+    scene_id: ProtocolIdentifier
+    scene_revision: int = Field(ge=1, le=10_001)
+    svg_sha256: Sha256Digest
+    manifest_sha256: Sha256Digest
 
 
 class TurnPhaseChangedEventV4(AvaTurnServerEventV4):
@@ -140,6 +156,7 @@ class CanvasGenerationStartedEventV4(AvaServerEventV4):
     generation_id: ProtocolIdentifier
     source_turn_id: ProtocolIdentifier
     operation: Literal["new", "reviseFocused"]
+    focus_revision: int = Field(default=0, ge=0, le=1_000_000)
 
 
 class CanvasDraftAvailableEventV4(AvaServerEventV4):
@@ -195,6 +212,11 @@ class CanvasActivatedEventV4(AvaServerEventV4):
     first_rendered_sample: int = Field(ge=0, le=2_147_483_647)
     svg_sha256: Sha256Digest
     manifest_sha256: Sha256Digest
+    workspace_epoch: int = Field(ge=0)
+    workspace_revision: int = Field(ge=1)
+    creation_sequence: int = Field(ge=1)
+    modification_sequence: int = Field(ge=1)
+    evicted_scene_id: ProtocolIdentifier | None = None
 
 
 class CanvasDocumentDiscardReason(StrEnum):
@@ -239,6 +261,38 @@ class CanvasRejectedEventV4(AvaServerEventV4):
             raise ValueError(
                 "canvasRejected requires exactly one of generationId or callId"
             )
+        return self
+
+
+class CanvasPresentationChangedSource(StrEnum):
+    USER = "user"
+    MODEL = "model"
+    RESTORE = "restore"
+    SYSTEM = "system"
+
+
+class CanvasPresentationChangedEventV4(AvaServerEventV4):
+    event: Literal[AvaServerEventTypeV4.CANVAS_PRESENTATION_CHANGED]
+    visible: bool
+    scene_id: ProtocolIdentifier | None = None
+    focus_revision: int | None = Field(default=None, ge=1, le=10_001)
+    source: CanvasPresentationChangedSource
+
+
+class CanvasPresentationCommandEventV4(AvaServerEventV4):
+    event: Literal[AvaServerEventTypeV4.CANVAS_PRESENTATION_COMMAND]
+    command_id: ProtocolIdentifier
+    action: Literal["show", "hide"]
+    scene_id: ProtocolIdentifier | None = None
+
+    @model_validator(mode="after")
+    def validate_command_action(self) -> CanvasPresentationCommandEventV4:
+        if self.action == "show":
+            if not self.scene_id:
+                raise ValueError("show presentation command requires scene_id")
+        else:
+            if self.scene_id is not None:
+                raise ValueError("hide presentation command cannot include scene_id")
         return self
 
 
@@ -290,6 +344,7 @@ class TurnFailedEventV4(AvaTurnServerEventV4):
 
 AvaServerEventUnionV4 = Annotated[
     TurnCreatedEventV4
+    | TurnContextRequestedEventV4
     | TurnPhaseChangedEventV4
     | SegmentReadyEventV4
     | AudioMetadataEventV4
@@ -303,6 +358,8 @@ AvaServerEventUnionV4 = Annotated[
     | CanvasActivatedEventV4
     | CanvasDocumentDiscardedEventV4
     | CanvasRejectedEventV4
+    | CanvasPresentationChangedEventV4
+    | CanvasPresentationCommandEventV4
     | InteractionRejectedEventV4
     | MemoryPersistenceFailedEventV4
     | TurnCompletedEventV4
@@ -333,6 +390,7 @@ def serialize_server_event_v4(event: AvaServerEventUnionV4) -> str:
 
 class AvaClientEventTypeV4(StrEnum):
     CLIENT_READY = "clientReady"
+    TURN_CONTEXT_SNAPSHOT = "turnContextSnapshot"
     CANVAS_RENDER_PROFILE_UPDATED = "canvasRenderProfileUpdated"
     PLAYBACK_STARTED = "playbackStarted"
     PLAYBACK_PROGRESS = "playbackProgress"
@@ -341,6 +399,9 @@ class AvaClientEventTypeV4(StrEnum):
     CANVAS_PREPARATION_FAILED = "canvasPreparationFailed"
     CANVAS_RUNTIME_FAILED = "canvasRuntimeFailed"
     CANVAS_PRESENTED = "canvasPresented"
+    CANVAS_RETAINED = "canvasRetained"
+    CANVAS_PRESENTATION_UPDATED = "canvasPresentationUpdated"
+    CANVAS_PRESENTATION_ACKNOWLEDGED = "canvasPresentationAcknowledged"
     CANVAS_INTERACTION = "canvasInteraction"
     CANCEL_TURN = "cancelTurn"
 
@@ -356,6 +417,18 @@ class ClientReadyEventV4(AvaClientEventV4):
     event: Literal[AvaClientEventTypeV4.CLIENT_READY]
     renderer_capability_version: Literal["ava-svg-renderer-v2"]
     validator_version: Literal["ava-svg-validator-v2"]
+    canvas_panel_visible: bool | None = None
+    scene_id: ProtocolIdentifier | None = None
+    focus_revision: int | None = Field(default=None, ge=1, le=10_001)
+
+    @model_validator(mode="after")
+    def validate_visible_presentation(self) -> ClientReadyEventV4:
+        if self.canvas_panel_visible is True:
+            if not self.scene_id or self.focus_revision is None:
+                raise ValueError(
+                    "clientReady with canvas_panel_visible=True requires scene_id and focus_revision"
+                )
+        return self
 
 
 class CanvasRenderProfileUpdatedEventV4(AvaClientEventV4):
@@ -436,6 +509,8 @@ class CanvasRuntimeFailedEventV4(AvaClientEventV4):
 
 
 class CanvasPresentedEventV4(AvaClientEventV4):
+    foreground: bool = True
+
     event: Literal[AvaClientEventTypeV4.CANVAS_PRESENTED]
     generation_id: ProtocolIdentifier
     scene_id: ProtocolIdentifier
@@ -443,6 +518,57 @@ class CanvasPresentedEventV4(AvaClientEventV4):
     svg_sha256: Sha256Digest
     manifest_sha256: Sha256Digest
     first_rendered_sample: int = Field(ge=0, le=2_147_483_647)
+
+
+class CanvasRetainedEventV4(AvaClientEventV4):
+    """A prepared document retained without visible presentation."""
+
+    event: Literal[AvaClientEventTypeV4.CANVAS_RETAINED]
+    generation_id: ProtocolIdentifier
+    scene_id: ProtocolIdentifier
+    scene_revision: int = Field(ge=1, le=10_001)
+    svg_sha256: Sha256Digest
+    manifest_sha256: Sha256Digest
+
+
+class CanvasPresentationUpdatedEventV4(AvaClientEventV4):
+    event: Literal[AvaClientEventTypeV4.CANVAS_PRESENTATION_UPDATED]
+    visible: bool
+    scene_id: ProtocolIdentifier | None = None
+    focus_revision: int | None = Field(default=None, ge=1, le=10_001)
+    client_operation_id: ProtocolIdentifier
+
+    @model_validator(mode="after")
+    def validate_visible_state(self) -> CanvasPresentationUpdatedEventV4:
+        if self.visible:
+            if not self.scene_id or self.focus_revision is None:
+                raise ValueError(
+                    "canvasPresentationUpdated with visible=True requires scene_id and focus_revision"
+                )
+        return self
+
+
+class CanvasPresentationAcknowledgedEventV4(AvaClientEventV4):
+    event: Literal[AvaClientEventTypeV4.CANVAS_PRESENTATION_ACKNOWLEDGED]
+    command_id: ProtocolIdentifier
+    applied: bool
+    scene_id: ProtocolIdentifier | None = None
+    focus_revision: int | None = Field(default=None, ge=1, le=10_001)
+    reason: Annotated[str, StringConstraints(max_length=240)] | None = None
+
+    @model_validator(mode="after")
+    def validate_acknowledgement(self) -> CanvasPresentationAcknowledgedEventV4:
+        if self.applied:
+            if self.reason is not None:
+                raise ValueError(
+                    "applied presentation acknowledgement cannot include reason"
+                )
+        else:
+            if not self.reason:
+                raise ValueError(
+                    "unapplied presentation acknowledgement requires reason"
+                )
+        return self
 
 
 class CanvasInteractionEventV4(AvaClientEventV4):
@@ -455,6 +581,16 @@ class CanvasInteractionEventV4(AvaClientEventV4):
     binding_id: ProtocolIdentifier
 
 
+class TurnContextSnapshotEventV4(AvaClientEventV4):
+    event: Literal[AvaClientEventTypeV4.TURN_CONTEXT_SNAPSHOT]
+    turn_id: ProtocolIdentifier
+    request_id: ProtocolIdentifier
+    provider_item_id: ProtocolIdentifier
+    # PROTOCOL: same bounded monotonic revision domain as session controls.
+    focus_revision: int = Field(ge=0, le=1_000_000)
+    focused_canvas: FocusedCanvasIdentityV4 | None
+
+
 class CancelTurnEventV4(AvaClientEventV4):
     event: Literal[AvaClientEventTypeV4.CANCEL_TURN]
     turn_id: ProtocolIdentifier
@@ -464,6 +600,7 @@ class CancelTurnEventV4(AvaClientEventV4):
 
 AvaClientEventUnionV4 = Annotated[
     ClientReadyEventV4
+    | TurnContextSnapshotEventV4
     | CanvasRenderProfileUpdatedEventV4
     | PlaybackStartedEventV4
     | PlaybackProgressEventV4
@@ -472,6 +609,9 @@ AvaClientEventUnionV4 = Annotated[
     | CanvasPreparationFailedEventV4
     | CanvasRuntimeFailedEventV4
     | CanvasPresentedEventV4
+    | CanvasRetainedEventV4
+    | CanvasPresentationUpdatedEventV4
+    | CanvasPresentationAcknowledgedEventV4
     | CanvasInteractionEventV4
     | CancelTurnEventV4,
     Field(discriminator="event"),

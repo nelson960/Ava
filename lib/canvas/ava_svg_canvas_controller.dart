@@ -30,12 +30,21 @@ enum AvaSvgCanvasLifecyclePhase {
   superseded,
 }
 
+enum AvaSvgSemanticTransportState {
+  ready,
+  pending,
+  unaccepted,
+}
+
 enum AvaSvgCanvasCommandType {
   canvasDocumentPrepared,
   canvasPreparationFailed,
   canvasPresented,
+  canvasRetained,
   canvasRuntimeFailed,
   canvasInteraction,
+  canvasPresentationUpdated,
+  canvasPresentationAcknowledged,
 }
 
 @immutable
@@ -67,11 +76,13 @@ final class AvaSvgCanvasGenerationState {
     required this.generationId,
     required this.sourceTurnId,
     this.operation = 'new',
+    this.focusRevision = 0,
   });
 
   final String generationId;
   final String sourceTurnId;
   final String operation;
+  final int focusRevision;
 }
 
 @immutable
@@ -156,6 +167,16 @@ typedef AvaSvgCanvasCommandSink = FutureOr<void> Function(
 
 typedef AvaRetainedSceneRevisionLookup = int? Function(String sceneId);
 
+typedef AvaPresentationCommandHandler = Future<void> Function({
+  required String commandId,
+  required String action,
+  String? sceneId,
+});
+
+typedef AvaPresentationChangedHandler = void Function(
+  Map<String, Object?> event,
+);
+
 final class AvaSvgCanvasController extends ChangeNotifier {
   AvaSvgCanvasController({
     required AvaSvgDocumentLoader documents,
@@ -192,11 +213,75 @@ final class AvaSvgCanvasController extends ChangeNotifier {
   int _interactionRevision = 0;
   String? _selectedBindingId;
   String? _failedActiveRendererGenerationId;
+  AvaSvgSemanticTransportState _semanticTransportState =
+      AvaSvgSemanticTransportState.unaccepted;
+  int _activeFocusRevision = 0;
   bool _closed = false;
   ({String generationId, Duration startedAt})? _rendererPreparation;
   ({String generationId, Duration startedAt})? _presentationRequest;
 
+  AvaSvgSemanticTransportState get semanticTransportState =>
+      _semanticTransportState;
+  int get activeFocusRevision => _activeFocusRevision;
+  int get deferredSemanticCommandCount => 0;
   AvaSvgCanvasGenerationState? get generation => _generation;
+  int Function()? currentFocusRevision;
+  AvaValidatedSvgCanvasDocument? retainedCompletion;
+  ({
+    int workspaceEpoch,
+    int workspaceRevision,
+    int creationSequence,
+    int modificationSequence,
+    String? evictedSceneId,
+  })? structuralMutationCompletion;
+  AvaPresentationCommandHandler? presentationCommandHandler;
+  AvaPresentationChangedHandler? presentationChangedHandler;
+  bool get generationMayFocus =>
+      _generation == null ||
+      (currentFocusRevision?.call() ?? 0) == _generation!.focusRevision;
+
+  void emitPresentationUpdated({
+    required bool visible,
+    String? sceneId,
+    int? focusRevision,
+    required String clientOperationId,
+  }) {
+    _ensureOpen();
+    _emit(
+      AvaSvgCanvasClientCommand(
+        AvaSvgCanvasCommandType.canvasPresentationUpdated,
+        {
+          'visible': visible,
+          if (visible && sceneId != null) 'sceneId': sceneId,
+          if (visible && focusRevision != null) 'focusRevision': focusRevision,
+          'clientOperationId': clientOperationId,
+        },
+      ),
+    );
+  }
+
+  void emitPresentationAcknowledged({
+    required String commandId,
+    required bool applied,
+    String? sceneId,
+    int? focusRevision,
+    String? reason,
+  }) {
+    _ensureOpen();
+    _emit(
+      AvaSvgCanvasClientCommand(
+        AvaSvgCanvasCommandType.canvasPresentationAcknowledged,
+        {
+          'commandId': commandId,
+          'applied': applied,
+          if (sceneId != null) 'sceneId': sceneId,
+          if (focusRevision != null) 'focusRevision': focusRevision,
+          if (reason != null) 'reason': reason,
+        },
+      ),
+    );
+  }
+
   AvaSvgCanvasDraftState? get draft => _draft;
   AvaSvgCanvasCandidateState? get candidate => _candidate;
   AvaSvgCanvasActiveState? get active => _active;
@@ -271,17 +356,18 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     _failedActiveRendererGenerationId = null;
     _lastIssue = null;
     _lastPendingOutcome = null;
+    _activeFocusRevision = 0;
+    _semanticTransportState = AvaSvgSemanticTransportState.unaccepted;
     notifyListeners();
   }
 
   /// Sets the runtime active scene to one previously retained scene.
-  void focusRetainedActive(AvaValidatedSvgCanvasDocument document) {
+  void focusRetainedActive(
+    AvaValidatedSvgCanvasDocument document, {
+    int focusRevision = 0,
+    bool pendingSync = true,
+  }) {
     _ensureOpen();
-    if (hasPendingVisual) {
-      throw StateError(
-        'Cannot focus retained Canvas while visual generation is pending.',
-      );
-    }
     final descriptor = document.descriptor;
     final retainedRevision = _retainedSceneRevision(descriptor.sceneId);
     if (retainedRevision != null &&
@@ -299,6 +385,64 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     _failedActiveRendererGenerationId = null;
     _lastIssue = null;
     _lastPendingOutcome = null;
+    _activeFocusRevision = focusRevision;
+    _semanticTransportState = pendingSync
+        ? AvaSvgSemanticTransportState.pending
+        : AvaSvgSemanticTransportState.unaccepted;
+    notifyListeners();
+  }
+
+  void completeFocusSync({
+    required String sceneId,
+    required int focusRevision,
+  }) {
+    final active = _active;
+    if (active == null ||
+        active.document.descriptor.sceneId != sceneId ||
+        _activeFocusRevision != focusRevision) {
+      return;
+    }
+    // Focus acceptance alone is insufficient for semantic transport. The host
+    // enables transport only after the same scene is canonically presented.
+    _semanticTransportState = AvaSvgSemanticTransportState.unaccepted;
+    notifyListeners();
+  }
+
+  void acceptPresentedScene({
+    required String sceneId,
+    required int focusRevision,
+  }) {
+    final active = _active;
+    if (active == null ||
+        active.document.descriptor.sceneId != sceneId ||
+        _activeFocusRevision > focusRevision) {
+      return;
+    }
+    _activeFocusRevision = focusRevision;
+    _semanticTransportState = AvaSvgSemanticTransportState.ready;
+    notifyListeners();
+  }
+
+  void markPresentationUnavailable({bool focusPending = false}) {
+    if (_active == null) return;
+    _semanticTransportState = focusPending
+        ? AvaSvgSemanticTransportState.pending
+        : AvaSvgSemanticTransportState.unaccepted;
+    notifyListeners();
+  }
+
+  void failFocusSync({
+    required String sceneId,
+    required int focusRevision,
+    required Object error,
+  }) {
+    final active = _active;
+    if (active == null ||
+        active.document.descriptor.sceneId != sceneId ||
+        _activeFocusRevision != focusRevision) {
+      return;
+    }
+    _semanticTransportState = AvaSvgSemanticTransportState.unaccepted;
     notifyListeners();
   }
 
@@ -315,6 +459,7 @@ final class AvaSvgCanvasController extends ChangeNotifier {
         'generationId',
         'sourceTurnId',
         'operation',
+        'focusRevision',
       },
       'canvasGenerationStarted',
     );
@@ -341,6 +486,7 @@ final class AvaSvgCanvasController extends ChangeNotifier {
       generationId: generationId,
       sourceTurnId: sourceTurnId,
       operation: operation as String,
+      focusRevision: event['focusRevision']! as int,
     );
     _recordGeneration(
       'canvas.generation.started_received',
@@ -694,7 +840,11 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     if (advanced) notifyListeners();
   }
 
-  void firstFramePresented() {
+  void retainPreparedCandidate() => _settlePreparedCandidate(retained: true);
+
+  void firstFramePresented() => _settlePreparedCandidate(retained: false);
+
+  void _settlePreparedCandidate({required bool retained}) {
     _ensureOpen();
     final candidate = _requireCandidate(
       AvaSvgCanvasCandidatePhase.presentationRequested,
@@ -709,13 +859,13 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     }
     _candidate = candidate.copyWith(
       phase: AvaSvgCanvasCandidatePhase.awaitingActivation,
-      firstRenderedSample: sourceRenderedSample,
+      firstRenderedSample: retained ? 0 : sourceRenderedSample,
     );
     // The trusted final candidate now owns the visible pending layer. The
     // draft remains non-authoritative and must not survive presentation.
     _draft = null;
     _recordDescriptor(
-      'canvas.presentation.first_frame',
+      retained ? 'canvas.document.retained' : 'canvas.presentation.first_frame',
       candidate.descriptor,
       stageDuration: _elapsedFor(
         candidate.descriptor,
@@ -734,10 +884,13 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     );
     _emit(
       AvaSvgCanvasClientCommand(
-        AvaSvgCanvasCommandType.canvasPresented,
+        retained
+            ? AvaSvgCanvasCommandType.canvasRetained
+            : AvaSvgCanvasCommandType.canvasPresented,
         {
           ..._identityFields(candidate.descriptor),
-          'firstRenderedSample': sourceRenderedSample,
+          if (!retained) 'firstRenderedSample': sourceRenderedSample,
+          if (!retained) 'foreground': generationMayFocus,
         },
         telemetryGenerationId: candidate.descriptor.generationId,
         telemetrySourceTurnId: candidate.descriptor.sourceTurnId,
@@ -763,6 +916,11 @@ final class AvaSvgCanvasController extends ChangeNotifier {
         'firstRenderedSample',
         'svgSha256',
         'manifestSha256',
+        'workspaceEpoch',
+        'workspaceRevision',
+        'creationSequence',
+        'modificationSequence',
+        'evictedSceneId',
       },
       'canvasActivated',
     );
@@ -782,10 +940,22 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     if (document == null || candidate.firstRenderedSample == null) {
       throw StateError('Activated candidate lost its prepared document.');
     }
-    _active = AvaSvgCanvasActiveState(
-      document: document,
-      firstRenderedSample: candidate.firstRenderedSample!,
+    retainedCompletion = document;
+    structuralMutationCompletion = (
+      workspaceEpoch: event['workspaceEpoch'] as int,
+      workspaceRevision: event['workspaceRevision'] as int,
+      creationSequence: event['creationSequence'] as int,
+      modificationSequence: event['modificationSequence'] as int,
+      evictedSceneId: event['evictedSceneId'] as String?,
     );
+    if (generationMayFocus) {
+      _active = AvaSvgCanvasActiveState(
+        document: document,
+        firstRenderedSample: candidate.firstRenderedSample!,
+      );
+      _activeFocusRevision = _generation?.focusRevision ?? 0;
+      _semanticTransportState = AvaSvgSemanticTransportState.ready;
+    }
     _candidate = null;
     _generation = null;
     _draft = null;
@@ -813,6 +983,9 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     if (!identical(canonical, binding)) {
       throw StateError('SVG binding does not belong to the active manifest.');
     }
+    if (_semanticTransportState != AvaSvgSemanticTransportState.ready) {
+      return;
+    }
     final interactionMode = active.document.manifest.interactionMode;
     final selectionChanged = _selectedBindingId != binding.bindingId;
     if (interactionMode == AvaSvgInteractionMode.select && !selectionChanged) {
@@ -821,21 +994,20 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     _selectedBindingId = binding.bindingId;
     _interactionRevision += 1;
     final descriptor = active.document.descriptor;
-    _emit(
-      AvaSvgCanvasClientCommand(
-        AvaSvgCanvasCommandType.canvasInteraction,
-        {
-          'sceneId': descriptor.sceneId,
-          'sceneRevision': descriptor.sceneRevision,
-          'interactionRevision': _interactionRevision,
-          'svgSha256': descriptor.svgSha256,
-          'manifestSha256': descriptor.manifestSha256,
-          'bindingId': binding.bindingId,
-        },
-        telemetryGenerationId: descriptor.generationId,
-        telemetrySourceTurnId: descriptor.sourceTurnId,
-      ),
+    final command = AvaSvgCanvasClientCommand(
+      AvaSvgCanvasCommandType.canvasInteraction,
+      {
+        'sceneId': descriptor.sceneId,
+        'sceneRevision': descriptor.sceneRevision,
+        'interactionRevision': _interactionRevision,
+        'svgSha256': descriptor.svgSha256,
+        'manifestSha256': descriptor.manifestSha256,
+        'bindingId': binding.bindingId,
+      },
+      telemetryGenerationId: descriptor.generationId,
+      telemetrySourceTurnId: descriptor.sourceTurnId,
     );
+    _emit(command);
   }
 
   Future<void> rendererFailed(
@@ -1046,6 +1218,64 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     notifyListeners();
   }
 
+  void receivePresentationChanged(Map<String, Object?> event) {
+    _ensureOpen();
+    _requireExactKeys(
+      event,
+      {
+        'protocolVersion',
+        'event',
+        'sessionId',
+        'sequence',
+        'revision',
+        'visible',
+        if (event.containsKey('sceneId')) 'sceneId',
+        if (event.containsKey('focusRevision')) 'focusRevision',
+        'source',
+      },
+      'canvasPresentationChanged',
+    );
+    presentationChangedHandler?.call(event);
+    notifyListeners();
+  }
+
+  void receivePresentationCommand(Map<String, Object?> event) {
+    _ensureOpen();
+    _requireExactKeys(
+      event,
+      {
+        'protocolVersion',
+        'event',
+        'sessionId',
+        'sequence',
+        'revision',
+        'commandId',
+        'action',
+        if (event.containsKey('sceneId')) 'sceneId',
+      },
+      'canvasPresentationCommand',
+    );
+    final commandId = event['commandId']! as String;
+    final action = event['action']! as String;
+    final sceneId = event['sceneId'] as String?;
+    final handler = presentationCommandHandler;
+    if (handler != null) {
+      unawaited(
+        handler(
+          commandId: commandId,
+          action: action,
+          sceneId: sceneId,
+        ),
+      );
+    } else {
+      emitPresentationAcknowledged(
+        commandId: commandId,
+        applied: false,
+        reason: 'clientUnavailable',
+      );
+    }
+  }
+
   @override
   void dispose() {
     if (!_closed) {
@@ -1161,7 +1391,13 @@ final class AvaSvgCanvasController extends ChangeNotifier {
   }
 
   void _emit(AvaSvgCanvasClientCommand command) {
-    unawaited(Future.sync(() => _commandSink(command)));
+    unawaited(
+      Future.sync(() => _commandSink(command)).catchError(
+        (Object error, StackTrace stackTrace) {
+          // Non-terminal wire error.
+        },
+      ),
+    );
   }
 
   void _ensureOpen() {

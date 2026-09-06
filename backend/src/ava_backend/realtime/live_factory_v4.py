@@ -94,8 +94,10 @@ class LiveRealtimeCoordinatorFactoryV4:
             session_id=session_id,
             safety_identifier=safety_id,
         )
+        workspace = self._canvas_workspaces.workspace_for(subject)
         state = SvgCanvasSessionState(
-            workspace=self._canvas_workspaces.workspace_for(subject)
+            workspace=workspace,
+            inherit_focus=False,
         )
         canvas_events = ProtocolV4CanvasEventSink()
         jobs = SvgCanvasJobCoordinator(
@@ -114,6 +116,7 @@ class LiveRealtimeCoordinatorFactoryV4:
 
         suffix = uuid4().hex
         return DeterministicRealtimeSessionCoordinator(
+            turn_context_timeout_seconds=self._settings.realtime_max_turn_seconds,
             session_id=session_id,
             turn_id=f"turn-{suffix}",
             request_id=request_id,

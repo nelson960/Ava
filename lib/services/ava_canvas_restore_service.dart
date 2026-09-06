@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import '../config/ava_backend_configuration.dart';
@@ -84,6 +85,38 @@ final class AvaCanvasRestoreService {
   final AvaBackendConfiguration _configuration;
   final AvaCanvasRestoreTransport _transport;
 
+  Future<void> synchronizeWorkspace({
+    required AvaSessionBootstrapV4 bootstrap,
+    required Map<String, Object?> manifest,
+  }) async {
+    final body = utf8.encode(jsonEncode(manifest));
+    if (body.length > 32 * 1024) {
+      throw const FormatException(
+        'Canvas workspace manifest exceeds its transport bound.',
+      );
+    }
+    final response = await _transport.putBytes(
+      endpoint: _configuration.canvasWorkspaceEndpoint(bootstrap.sessionId),
+      headers: {
+        HttpHeaders.acceptHeader: 'application/json',
+        HttpHeaders.contentTypeHeader: 'application/json',
+        'x-ava-protocol-version': '$avaRealtimeProtocolVersionV4',
+        'x-ava-canvas-token': bootstrap.canvasToken,
+      },
+      body: body,
+      timeout: _configuration.requestTimeout,
+    );
+    await _drain(response.bytes);
+    if (response.statusCode != HttpStatus.ok ||
+        response.protocolVersion != '$avaRealtimeProtocolVersionV4') {
+      throw AvaCanvasRestoreException(
+        message: 'Ava backend rejected local Canvas workspace synchronization.',
+        statusCode: response.statusCode,
+        requestId: response.requestId,
+      );
+    }
+  }
+
   Future<void> restoreFocused({
     required AvaSessionBootstrapV4 bootstrap,
     required AvaValidatedSvgCanvasDocument document,
@@ -118,6 +151,7 @@ final class AvaCanvasRestoreService {
   }
 
   Future<void> focusScene({
+    required int focusRevision,
     required AvaSessionBootstrapV4 bootstrap,
     required AvaValidatedSvgCanvasDocument document,
   }) async {
@@ -125,6 +159,7 @@ final class AvaCanvasRestoreService {
     final response = await _transport.putBytes(
       endpoint: _configuration.canvasFocusEndpoint(bootstrap.sessionId),
       headers: {
+        'x-ava-focus-revision': '$focusRevision',
         HttpHeaders.acceptHeader: 'application/json',
         HttpHeaders.contentTypeHeader: 'application/octet-stream',
         'x-ava-protocol-version': '$avaRealtimeProtocolVersionV4',
@@ -139,7 +174,12 @@ final class AvaCanvasRestoreService {
       body: document.svgBytes,
       timeout: _configuration.requestTimeout,
     );
-    await _drain(response.bytes);
+    final responseBytes = await _readBounded(response.bytes);
+    if (response.statusCode == HttpStatus.conflict &&
+        response.protocolVersion == '$avaRealtimeProtocolVersionV4' &&
+        _isFocusRevisionConflict(responseBytes)) {
+      return;
+    }
     if (response.statusCode != HttpStatus.noContent ||
         response.protocolVersion != '$avaRealtimeProtocolVersionV4') {
       throw AvaCanvasRestoreException(
@@ -151,6 +191,11 @@ final class AvaCanvasRestoreService {
   }
 
   Future<void> _drain(Stream<List<int>> source) async {
+    await _readBounded(source);
+  }
+
+  Future<List<int>> _readBounded(Stream<List<int>> source) async {
+    final bytes = <int>[];
     var length = 0;
     await for (final chunk in source) {
       length += chunk.length;
@@ -159,6 +204,22 @@ final class AvaCanvasRestoreService {
           'Canvas restore response exceeded its error-body bound.',
         );
       }
+      bytes.addAll(chunk);
     }
+    return bytes;
+  }
+
+  bool _isFocusRevisionConflict(List<int> bytes) {
+    if (bytes.isEmpty) return false;
+    final Object? decoded;
+    try {
+      decoded = jsonDecode(utf8.decode(bytes, allowMalformed: false));
+    } on FormatException {
+      return false;
+    }
+    if (decoded is! Map<String, Object?>) return false;
+    final error = decoded['error'];
+    return error is Map<String, Object?> &&
+        error['code'] == 'focusRevisionConflict';
   }
 }

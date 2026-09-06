@@ -246,6 +246,7 @@ class _Sink:
         generation_id: str,
         source_turn_id: str,
         operation: str = "new",
+        focus_revision: int = 0,
     ) -> None:
         self.started.append((generation_id, source_turn_id))
 
@@ -520,10 +521,10 @@ async def test_source_turn_transcript_and_realtime_brief_remain_distinct_for_sol
 
         request = specialist.requests[0]
         assert request.source_turn_id == "turn-grounding"
-        assert request.source_transcript == "source-subject-A"
+        assert "source-subject-A" not in request.model_input()
         assert request.brief == "visual-brief-subject-B"
         model_input = request.model_input()
-        assert "source-subject-A" in model_input
+        assert "source-subject-A" not in model_input
         assert "visual-brief-subject-B" in model_input
         instructions = render_svg_canvas_specialist_instructions(SvgDocumentValidator())
         assert "supplied request describes what to visualize" in instructions
@@ -1181,6 +1182,7 @@ async def test_unpresented_candidate_times_out_to_failed_and_preserves_active() 
     specialist = _Specialist()
     sink = _Sink()
     state = SvgCanvasSessionState(workspace=workspace)
+    state.set_presentation_visible(True)
     documents = SvgCanvasDocumentStore()
     completions: list[tuple[str, str, InteractiveCanvasToolOutputV4]] = []
     coordinator = SvgCanvasJobCoordinator(
@@ -1535,6 +1537,7 @@ async def test_active_renderer_failure_preserves_backend_committed_scene() -> No
     assert sink.active_discarded == []
     assert sink.discarded == []
     replacement = SvgCanvasSessionState(workspace=workspaces.workspace_for("child:X"))
+    replacement.set_presentation_visible(True)
     assert replacement.active is active
     assert replacement.render_realtime_context() == state.render_realtime_context()
     await coordinator.close()
@@ -1754,6 +1757,7 @@ async def test_committed_workspace_survives_coordinator_replacement() -> None:
     replacement_state = SvgCanvasSessionState(
         workspace=workspaces.workspace_for("child:X")
     )
+    replacement_state.set_presentation_visible(True)
     (
         replacement,
         _specialist,
@@ -1820,6 +1824,7 @@ async def test_restored_revision_four_supports_tap_and_revise_to_five() -> None:
     )
     workspace.restore_focused(restored)
     state = SvgCanvasSessionState(workspace=workspace)
+    state.set_presentation_visible(True)
 
     recorded = state.record_interaction(
         scene_id=restored.scene_id,
@@ -1884,7 +1889,13 @@ async def test_different_subject_session_cannot_see_committed_workspace() -> Non
 
     request = specialist.requests[-1]
     assert isolated_state.active is None
-    assert isolated_state.render_realtime_context() == ""
+    assert (
+        isolated_state.render_realtime_context()
+        == '<canvas_context trust="untrusted_model_generated_data">'
+        '<canvas_presentation trust="validated_current_state" visible="false"/>'
+        '<canvas_workspace synchronized="false"/>'
+        "</canvas_context>"
+    )
     assert request.current_scene_id is None
     assert request.current_revision is None
     assert request.current_svg is None
@@ -2501,6 +2512,7 @@ async def test_candidate_renderer_failure_remains_non_committing_backend() -> No
         CanvasGenerationRejectionCode.PREPARATION_FAILED,
     )
     replacement = SvgCanvasSessionState(workspace=workspaces.workspace_for("child:X"))
+    replacement.set_presentation_visible(True)
     assert replacement.active is active
     assert replacement.active.document is stored.document
     assert replacement.render_realtime_context() == context_before

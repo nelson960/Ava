@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ava_backend.realtime.provider_session import RealtimeCommittedInput
+
 import asyncio
 from builtins import anext
 import json
@@ -41,16 +43,20 @@ from ava_backend.realtime.tool_contract import (
     CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
     CANVAS_MODEL_SAFE_REJECTION_REASON,
     INTERACTIVE_CANVAS_TOOL_NAME,
+    MANAGE_CANVAS_PRESENTATION_TOOL_NAME,
     GET_CURRENT_TIME_TOOL_NAME,
     SEARCH_MEMORY_TOOL_NAME,
     GetCurrentTimeToolOutputV4,
     InteractiveCanvasToolOutput,
     InteractiveCanvasToolOutputV4,
     InteractiveCanvasCancellationToolOutputV4,
+    ManageCanvasPresentationStatus,
+    ManageCanvasPresentationToolOutputV4,
     RealtimeCancelCanvasToolCall,
     RealtimeCanvasToolCall,
     RealtimeRejectedCanvasToolCall,
     RealtimeGetCurrentTimeToolCall,
+    RealtimeManageCanvasPresentationToolCall,
     RealtimeRejectedUtilityToolCall,
     RealtimeSearchMemoryToolCall,
     RejectedUtilityToolOutputV4,
@@ -177,7 +183,10 @@ async def _close_test_sideband_channels():  # type: ignore[no-untyped-def]
 
 
 class _FakeRealtimeSocket:
-    def __init__(self, events: list[dict[str, object]]) -> None:
+    def __init__(
+        self, events: list[dict[str, object]], *, acknowledge_updates: bool = False
+    ) -> None:
+        self.acknowledge_updates = acknowledge_updates
         self.events = deque(json.dumps(event) for event in events)
         self.sent: list[dict[str, object]] = []
         self.closed = False
@@ -190,6 +199,11 @@ class _FakeRealtimeSocket:
 
     async def send(self, message: str) -> None:
         self.sent.append(json.loads(message))
+        if self.acknowledge_updates and self.sent[-1]["type"] == "session.update":
+            self.events.appendleft(
+                json.dumps({"type": "session.updated", "session": {"id": "sess_test"}})
+            )
+            self._available.set()
         self._sent.set()
 
     async def recv(self) -> str:
@@ -435,6 +449,60 @@ def _canvas_response_events(
     ]
 
 
+@pytest.mark.asyncio
+async def test_canvas_control_call_retains_response_and_continuation_correlation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.openai_realtime")
+    channel, _ = _channel(
+        [
+            *_canvas_response_events(
+                arguments='{"operation":"hide"}',
+                function_name=MANAGE_CANVAS_PRESENTATION_TOOL_NAME,
+                preamble="I’ll close it. ",
+            ),
+            *_text_response_events(
+                response_id=CONTINUATION_RESPONSE_ID,
+                text="It’s closed.",
+            ),
+        ]
+    )
+    iterator = channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-control-correlation",
+    ).__aiter__()
+
+    assert await anext(iterator) == RealtimeSpeechTextDelta(delta="I’ll close it. ")
+    call = await anext(iterator)
+    assert isinstance(call, RealtimeManageCanvasPresentationToolCall)
+    assert call.provider_response_id == RESPONSE_ID
+    await channel.complete_manage_canvas_presentation_tool(
+        turn_id="turn-control-correlation",
+        call_id=call.call_id,
+        output=ManageCanvasPresentationToolOutputV4(
+            status=ManageCanvasPresentationStatus.ACCEPTED,
+            operation="hide",
+            changed=True,
+            visible=False,
+        ),
+    )
+    assert await anext(iterator) == RealtimeSpeechTextDelta(delta="It’s closed.")
+    with pytest.raises(StopAsyncIteration):
+        await anext(iterator)
+
+    correlation = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage().startswith("canvas_control_continuation_started")
+    )
+    assert correlation == {
+        "turnId": "turn-control-correlation",
+        "functionCallId": FUNCTION_CALL_ID,
+        "continuationResponseId": CONTINUATION_RESPONSE_ID,
+    }
+    await channel.close()
+
+
 def _channel(
     events: list[dict[str, object]],
     *,
@@ -444,9 +512,7 @@ def _channel(
     _OpenAIRealtimeEventChannel,
     _FakeRealtimeSocket,
 ]:
-    socket = _FakeRealtimeSocket(
-        [{"type": "session.updated", "session": {"id": "sess_test"}}, *events]
-    )
+    socket = _FakeRealtimeSocket(events, acknowledge_updates=True)
     channel = _OpenAIRealtimeEventChannel(
         socket,
         model="gpt-realtime-test",
@@ -464,13 +530,17 @@ async def _collect_turn_events(
     turn_id: str,
     harness=None,  # type: ignore[no-untyped-def]
 ) -> list[object]:
-    return [
-        event
-        async for event in channel.stream_turn(
-            harness=harness or _harness(),
-            turn_id=turn_id,
-        )
-    ]
+    received: list[object] = []
+    async for event in channel.stream_turn(
+        harness=harness or _harness(), turn_id=turn_id
+    ):
+        if isinstance(event, RealtimeCommittedInput):
+            await channel.request_child_response(
+                turn_id=event.turn_id, item_id=event.item_id
+            )
+        else:
+            received.append(event)
+    return received
 
 
 async def _advance_ready_callbacks(*, rounds: int = 4) -> None:
@@ -570,7 +640,7 @@ async def test_pending_input_is_admitted_by_item_id_at_next_turn_boundary() -> N
         ]
     )
     await channel.start_receiver()
-    await socket.wait_received(3)
+    await socket.wait_received(2)
 
     assert await channel.child_transcript_for_turn("turn-a") is None
     admitted = await channel.admit_pending_input_items(turn_id="turn-b")
@@ -880,13 +950,14 @@ def test_session_update_uses_text_output_and_bounded_semantic_tools() -> None:
     assert [tool["name"] for tool in session["tools"]] == [
         INTERACTIVE_CANVAS_TOOL_NAME,
         CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
+        MANAGE_CANVAS_PRESENTATION_TOOL_NAME,
         SEARCH_MEMORY_TOOL_NAME,
         GET_CURRENT_TIME_TOOL_NAME,
     ]
     turn_detection = session["audio"]["input"]["turn_detection"]
     assert session["audio"]["input"]["transcription"] == {"model": "gpt-transcribe"}
-    assert turn_detection["create_response"] is True
-    assert turn_detection["interrupt_response"] is True
+    assert turn_detection["create_response"] is False
+    assert turn_detection["interrupt_response"] is False
     assert session["parallel_tool_calls"] is False
     assert session["reasoning"] == {"effort": "low"}
     assert session["truncation"] == {
@@ -969,7 +1040,6 @@ async def test_failed_context_install_keeps_previous_active_build_identity() -> 
         provider_call_id="rtc_failed_context",
     )
     _TEST_CHANNELS.add(channel)
-    await channel.start_receiver()
     await channel.prepare(harness=_harness(build_id="ctx-21"))
     assert channel.active_context_build_id == "ctx-21"
 
@@ -1422,10 +1492,7 @@ async def test_cancel_preserves_transcription_progress_for_its_committed_item(
     cancel_events = [
         event for event in socket.sent if event["type"] == "response.cancel"
     ]
-    assert len(cancel_events) == 1
-    assert cancel_events[0]["response_id"] == RESPONSE_ID
-    assert isinstance(cancel_events[0]["event_id"], str)
-    assert cancel_events[0]["event_id"].startswith("ava_response_cancel_")
+    assert cancel_events == []
     cancelled_usage = next(
         record.ava_context
         for record in caplog.records
@@ -1449,6 +1516,236 @@ async def test_cancel_preserves_transcription_progress_for_its_committed_item(
         "outputAudioTokens": 0,
         "totalTokens": 3,
     }
+
+
+@pytest.mark.asyncio
+async def test_done_dequeued_before_cancel_settles_without_second_terminal() -> None:
+    channel, socket = _channel([])
+    await channel.prepare(harness=_harness())
+    turn_id = "turn-done-before-cancel"
+    response_id = "resp-done-before-cancel"
+    socket.push({"type": "response.created", "response": {"id": response_id}})
+    created = await channel._receive_event(timeout_seconds=1)
+    channel._validate_response_owner(
+        created,
+        turn_id=turn_id,
+        consumer_phase="turnResponse",
+    )
+    channel._active_turn_id = turn_id
+    channel._active_response_id = response_id
+
+    destructive_consumer = asyncio.create_task(
+        channel._receive_event(timeout_seconds=1)
+    )
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": response_id,
+                "status": "completed",
+                "output": [],
+                "usage": _usage(3, 1),
+            },
+        }
+    )
+    terminal = await destructive_consumer
+    assert terminal["type"] == "response.done"
+    assert channel._response_lifecycle_by_id[response_id].terminal_observed
+
+    sent_before_cancel = len(socket.sent)
+    await asyncio.wait_for(channel.cancel(turn_id=turn_id), timeout=0.2)
+
+    assert len(socket.sent) == sent_before_cancel
+    lifecycle = channel._response_lifecycle_by_id[response_id]
+    assert lifecycle.terminal_consumed
+    assert lifecycle.settled
+    assert channel._active_response_id is None
+    assert channel._active_turn_id is None
+    assert turn_id in channel._cancelled_turn_ids
+
+
+@pytest.mark.asyncio
+async def test_cancel_not_active_after_terminal_dequeued_by_other_consumer_settles(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    channel, socket = _channel([])
+    await channel.prepare(harness=_harness())
+    turn_id = "turn-done-before-cancel"
+    response_id = "resp-done-before-cancel"
+    socket.push({"type": "response.created", "response": {"id": response_id}})
+    created = await channel._receive_event(timeout_seconds=1)
+    channel._validate_response_owner(
+        created,
+        turn_id=turn_id,
+        consumer_phase="turnResponse",
+    )
+    channel._active_turn_id = turn_id
+    channel._active_response_id = response_id
+
+    destructive_consumer = asyncio.create_task(
+        channel._receive_event(timeout_seconds=1)
+    )
+    await asyncio.sleep(0)
+    cancellation = asyncio.create_task(channel.cancel(turn_id=turn_id))
+    await socket.wait_sent(2)
+    cancel_event = socket.sent[-1]
+    assert cancel_event["type"] == "response.cancel"
+
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": response_id,
+                "status": "completed",
+                "output": [],
+                "usage": _usage(3, 1),
+            },
+        }
+    )
+    terminal = await destructive_consumer
+    assert terminal["type"] == "response.done"
+    socket.push(
+        {
+            "type": "error",
+            "error": {
+                "event_id": cancel_event["event_id"],
+                "code": "response_cancel_not_active",
+                "message": "The completed response is no longer active.",
+            },
+        }
+    )
+
+    with caplog.at_level(logging.INFO, logger="ava_backend.openai_realtime"):
+        await asyncio.wait_for(cancellation, timeout=0.2)
+
+    lifecycle = channel._response_lifecycle_by_id[response_id]
+    assert lifecycle.terminal_observed
+    assert lifecycle.terminal_consumed
+    assert lifecycle.settled
+    assert lifecycle.terminal_sideband_sequence is not None
+    assert channel._consumed_terminal_response_owner_by_id[response_id] == turn_id
+    assert channel._active_response_id is None
+    assert channel._active_turn_id is None
+    assert turn_id in channel._cancelled_turn_ids
+    assert (
+        sum(
+            record.getMessage().startswith("openai_realtime_cancellation_lifecycle")
+            for record in caplog.records
+        )
+        == 1
+    )
+
+    for event in _text_response_events(
+        response_id="resp-after-lost-terminal",
+        text="The next turn responds.",
+    ):
+        socket.push(event)
+    received = await _collect_turn_events(channel, turn_id="turn-after-lost-terminal")
+    assert received == [RealtimeSpeechTextDelta(delta="The next turn responds.")]
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_done_and_cancel_never_leaks_response_ownership() -> None:
+    channel, socket = _channel([])
+    await channel.prepare(harness=_harness())
+
+    for index in range(30):
+        turn_id = f"turn-race-{index}"
+        response_id = f"resp-race-{index}"
+        socket.push({"type": "response.created", "response": {"id": response_id}})
+        created = await channel._receive_event(timeout_seconds=1)
+        channel._validate_response_owner(
+            created,
+            turn_id=turn_id,
+            consumer_phase="turnResponse",
+        )
+        channel._active_turn_id = turn_id
+        channel._active_response_id = response_id
+        terminal = {
+            "type": "response.done",
+            "response": {
+                "id": response_id,
+                "status": "cancelled",
+                "output": [],
+                "usage": _usage(3, 0),
+            },
+        }
+
+        if index % 2 == 0:
+            received_count = socket.received_count
+            socket.push(terminal)
+            await socket.wait_received(received_count + 1)
+            await asyncio.sleep(0)
+            await asyncio.wait_for(channel.cancel(turn_id=turn_id), timeout=0.2)
+        else:
+            sent_count = len(socket.sent)
+            cancellation = asyncio.create_task(channel.cancel(turn_id=turn_id))
+            await socket.wait_sent(sent_count + 1)
+            socket.push(terminal)
+            await asyncio.wait_for(cancellation, timeout=0.2)
+
+        lifecycle = channel._response_lifecycle_by_id[response_id]
+        assert lifecycle.terminal_observed
+        assert lifecycle.terminal_consumed
+        assert lifecycle.settled
+        assert channel._consumed_terminal_response_owner_by_id[response_id] == turn_id
+        assert channel._active_response_id is None
+        assert channel._active_turn_id is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_not_active_before_terminal_waits_for_legitimate_terminal() -> (
+    None
+):
+    channel, socket = _channel([])
+    await channel.prepare(harness=_harness())
+    turn_id = "turn-cancel-error-first"
+    response_id = "resp-cancel-error-first"
+    socket.push({"type": "response.created", "response": {"id": response_id}})
+    created = await channel._receive_event(timeout_seconds=1)
+    channel._validate_response_owner(
+        created,
+        turn_id=turn_id,
+        consumer_phase="turnResponse",
+    )
+    channel._active_turn_id = turn_id
+    channel._active_response_id = response_id
+
+    sent_count = len(socket.sent)
+    cancellation = asyncio.create_task(channel.cancel(turn_id=turn_id))
+    await socket.wait_sent(sent_count + 1)
+    cancel_event = socket.sent[-1]
+    received_count = socket.received_count
+    socket.push(
+        {
+            "type": "error",
+            "error": {
+                "event_id": cancel_event["event_id"],
+                "code": "response_cancel_not_active",
+                "message": "The response terminal is still in transit.",
+            },
+        }
+    )
+    await socket.wait_received(received_count + 1)
+    await asyncio.sleep(0)
+    assert not cancellation.done()
+
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": response_id,
+                "status": "completed",
+                "output": [],
+                "usage": _usage(3, 1),
+            },
+        }
+    )
+    await asyncio.wait_for(cancellation, timeout=0.2)
+    lifecycle = channel._response_lifecycle_by_id[response_id]
+    assert lifecycle.terminal_observed
+    assert lifecycle.terminal_consumed
+    assert lifecycle.settled
 
 
 @pytest.mark.asyncio
@@ -2434,7 +2731,7 @@ async def test_already_owned_child_input_suppresses_interaction_response() -> No
         ]
     )
     await channel.start_receiver()
-    await socket.wait_received(2)
+    await socket.wait_received(1)
     assert await channel.admit_pending_input_items(turn_id="turn-owned-child") == (
         "item_owned_child",
     )
@@ -2546,6 +2843,9 @@ async def test_generic_admission_never_reconstructs_response_trigger_ownership()
     )
 
     channel._response_owner_by_id["resp-prior"] = None
+    channel._observe_response_lifecycle(
+        {"type": "response.created", "response": {"id": "resp-prior"}}
+    )
     channel._admit_response(response_id="resp-prior", turn_id="turn-prior")
 
     assert channel._awaiting_response_trigger_turn_id is None
@@ -2627,7 +2927,7 @@ async def test_unresolved_input_owner_wakes_and_triggers_interaction() -> None:
         ]
     )
     await channel.start_receiver()
-    await socket.wait_received(2)
+    await socket.wait_received(1)
     turn_id = "turn-unresolved-input"
 
     iterator = channel.stream_turn(
@@ -3136,33 +3436,25 @@ async def test_cancelled_canvas_continuation_cannot_escape_into_next_turn(
         (13, "resp_turn_b", "turn-b", "turn-b", "turnResponse"),
     ]
 
-    cancel_wait = next(
+    assert not any(
         record.ava_context
         for record in caplog.records
         if record.getMessage().startswith(
             "openai_realtime_cancel_not_active_waiting_for_terminal"
         )
     )
-    assert cancel_wait == {
-        "component": "realtimeProvider",
-        "sidebandSequence": 11,
-        "eventType": "error",
-        "responseId": CONTINUATION_RESPONSE_ID,
-        "responseOwnerTurnId": "turn-canvas-a",
-        "consumerTurnId": "turn-canvas-a",
-        "consumerPhase": "cancellation",
-        "activeTurnId": "turn-canvas-a",
-        "activeResponseId": CONTINUATION_RESPONSE_ID,
-    }
-    drained = next(
+    settled = next(
         record.ava_context
         for record in caplog.records
-        if record.getMessage().startswith("openai_realtime_response_drained")
+        if record.getMessage().startswith("openai_realtime_cancellation_lifecycle")
     )
-    assert drained["sidebandSequence"] == 12
-    assert drained["responseId"] == CONTINUATION_RESPONSE_ID
-    assert drained["responseOwnerTurnId"] == "turn-canvas-a"
-    assert drained["consumerTurnId"] == "turn-canvas-a"
+    assert settled["responseId"] == CONTINUATION_RESPONSE_ID
+    assert settled["ownerTurnId"] == "turn-canvas-a"
+    assert settled["terminalObserved"] is True
+    assert settled["terminalConsumed"] is True
+    assert settled["settled"] is True
+    assert settled["terminalSidebandSequence"] == 12
+    assert settled["cancelOutcome"] == "cancelNotActiveAfterTerminal"
 
 
 @pytest.mark.asyncio
@@ -3518,33 +3810,49 @@ async def test_late_cancel_error_arriving_after_next_response_created_is_consume
         response_id=CONTINUATION_RESPONSE_ID,
         text="The next turn remains healthy.",
     )
-    channel, socket = _channel(
-        [
-            {
-                "type": "response.done",
-                "response": {
-                    "id": RESPONSE_ID,
-                    "status": "completed",
-                    "output": [],
-                    "usage": _usage(3, 1),
-                },
-            },
-            next_turn_events[0],
-            {
-                "type": "error",
-                "error": {
-                    "code": "response_cancel_not_active",
-                    "message": "The completed response is no longer active.",
-                },
-            },
-            *next_turn_events[1:],
-        ]
-    )
+    channel, socket = _channel([])
     await channel.prepare(harness=_harness())
+    socket.push({"type": "response.created", "response": {"id": RESPONSE_ID}})
+    created = await channel._receive_event(timeout_seconds=1)
+    channel._validate_response_owner(
+        created,
+        turn_id="turn-completed-before-cancel",
+        consumer_phase="turnResponse",
+    )
     channel._active_turn_id = "turn-completed-before-cancel"
     channel._active_response_id = RESPONSE_ID
 
-    await channel.cancel(turn_id="turn-completed-before-cancel")
+    sent_count = len(socket.sent)
+    cancellation = asyncio.create_task(
+        channel.cancel(turn_id="turn-completed-before-cancel")
+    )
+    await socket.wait_sent(sent_count + 1)
+    cancel_event = socket.sent[-1]
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": RESPONSE_ID,
+                "status": "completed",
+                "output": [],
+                "usage": _usage(3, 1),
+            },
+        }
+    )
+    await cancellation
+    socket.push(next_turn_events[0])
+    socket.push(
+        {
+            "type": "error",
+            "error": {
+                "event_id": cancel_event["event_id"],
+                "code": "response_cancel_not_active",
+                "message": "The completed response is no longer active.",
+            },
+        }
+    )
+    for event in next_turn_events[1:]:
+        socket.push(event)
     received = [
         event
         async for event in channel.stream_turn(
@@ -3575,25 +3883,35 @@ async def test_late_cancel_error_survives_a_complete_later_turn() -> None:
         response_id="resp_subsequent_turn",
         text="The persistent session remains usable.",
     )
-    channel, socket = _channel(
-        [
-            {
-                "type": "response.done",
-                "response": {
-                    "id": "resp_cancelled_turn",
-                    "status": "completed",
-                    "output": [],
-                    "usage": _usage(3, 1),
-                },
-            },
-            *later_turn_events,
-        ]
-    )
+    channel, socket = _channel([])
     await channel.prepare(harness=_harness())
+    socket.push({"type": "response.created", "response": {"id": "resp_cancelled_turn"}})
+    created = await channel._receive_event(timeout_seconds=1)
+    channel._validate_response_owner(
+        created,
+        turn_id="turn-cancelled",
+        consumer_phase="turnResponse",
+    )
     channel._active_turn_id = "turn-cancelled"
     channel._active_response_id = "resp_cancelled_turn"
 
-    await channel.cancel(turn_id="turn-cancelled")
+    sent_count = len(socket.sent)
+    cancellation = asyncio.create_task(channel.cancel(turn_id="turn-cancelled"))
+    await socket.wait_sent(sent_count + 1)
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp_cancelled_turn",
+                "status": "completed",
+                "output": [],
+                "usage": _usage(3, 1),
+            },
+        }
+    )
+    await cancellation
+    for event in later_turn_events:
+        socket.push(event)
     later_received = await _collect_turn_events(channel, turn_id="turn-later")
 
     assert later_received == [
@@ -3651,32 +3969,45 @@ async def test_late_cancel_error_survives_a_complete_later_turn() -> None:
 
 @pytest.mark.asyncio
 async def test_multiple_cancel_outcomes_do_not_overwrite_each_other() -> None:
-    channel, socket = _channel(
-        [
-            {
-                "type": "response.done",
-                "response": {
-                    "id": "resp_cancel_a",
-                    "status": "completed",
-                    "output": [],
-                    "usage": _usage(3, 1),
-                },
-            },
-            {
-                "type": "response.created",
-                "response": {"id": "resp_cancel_b"},
-            },
-        ]
-    )
+    channel, socket = _channel([])
     await channel.prepare(harness=_harness())
+    socket.push({"type": "response.created", "response": {"id": "resp_cancel_a"}})
+    created_a = await channel._receive_event(timeout_seconds=1)
+    channel._validate_response_owner(
+        created_a,
+        turn_id="turn-cancel-a",
+        consumer_phase="turnResponse",
+    )
     channel._active_turn_id = "turn-cancel-a"
     channel._active_response_id = "resp_cancel_a"
-    await channel.cancel(turn_id="turn-cancel-a")
+    sent_count = len(socket.sent)
+    cancel_a = asyncio.create_task(channel.cancel(turn_id="turn-cancel-a"))
+    await socket.wait_sent(sent_count + 1)
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp_cancel_a",
+                "status": "completed",
+                "output": [],
+                "usage": _usage(3, 1),
+            },
+        }
+    )
+    await cancel_a
 
+    socket.push({"type": "response.created", "response": {"id": "resp_cancel_b"}})
+    created_b = await channel._receive_event(timeout_seconds=1)
+    channel._validate_response_owner(
+        created_b,
+        turn_id="turn-cancel-b",
+        consumer_phase="turnResponse",
+    )
     channel._active_turn_id = "turn-cancel-b"
     channel._active_response_id = "resp_cancel_b"
+    sent_count = len(socket.sent)
     cancel_b = asyncio.create_task(channel.cancel(turn_id="turn-cancel-b"))
-    await socket.wait_sent(3)
+    await socket.wait_sent(sent_count + 1)
     cancel_events = [
         event for event in socket.sent if event["type"] == "response.cancel"
     ]
@@ -3747,26 +4078,37 @@ async def test_multiple_cancel_outcomes_do_not_overwrite_each_other() -> None:
 
 @pytest.mark.asyncio
 async def test_cancel_not_active_with_unknown_event_id_is_provider_failure() -> None:
-    channel, socket = _channel(
-        [
-            {
-                "type": "response.done",
-                "response": {
-                    "id": "resp_cancelled_before_unknown_error",
-                    "status": "completed",
-                    "output": [],
-                    "usage": _usage(3, 1),
-                },
-            }
-        ]
-    )
+    channel, socket = _channel([])
     await channel.prepare(harness=_harness())
-    channel._active_turn_id = "turn-cancelled-before-unknown-error"
-    channel._active_response_id = "resp_cancelled_before_unknown_error"
-    await channel.cancel(turn_id="turn-cancelled-before-unknown-error")
+    response_id = "resp_cancelled_before_unknown_error"
+    turn_id = "turn-cancelled-before-unknown-error"
+    socket.push({"type": "response.created", "response": {"id": response_id}})
+    created = await channel._receive_event(timeout_seconds=1)
+    channel._validate_response_owner(
+        created,
+        turn_id=turn_id,
+        consumer_phase="turnResponse",
+    )
+    channel._active_turn_id = turn_id
+    channel._active_response_id = response_id
+    sent_count = len(socket.sent)
+    cancellation = asyncio.create_task(channel.cancel(turn_id=turn_id))
+    await socket.wait_sent(sent_count + 1)
     cancel_event = next(
         event for event in socket.sent if event["type"] == "response.cancel"
     )
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": response_id,
+                "status": "completed",
+                "output": [],
+                "usage": _usage(3, 1),
+            },
+        }
+    )
+    await cancellation
     assert cancel_event["event_id"] != "unknown_client_event"
     socket.push(
         {
@@ -3936,7 +4278,9 @@ async def test_response_cancelled_by_turn_detected_completes_cleanly() -> None:
 
 
 @pytest.mark.asyncio
-async def test_accepted_canvas_tool_completion_contains_no_response_instructions() -> None:
+async def test_accepted_canvas_tool_completion_contains_no_response_instructions() -> (
+    None
+):
     channel, socket = _channel(
         [
             *_canvas_response_events(
@@ -3992,14 +4336,15 @@ async def test_prepare_if_idle_not_ready_before_send() -> None:
     new_harness = _harness(build_id="ctx-2")
     status = await channel.prepare_if_idle(harness=new_harness, turn_id="turn-inactive")
 
-    assert status is None
-    # No new session.update emitted
+    assert status == RealtimeContextInstallationStatus.DEDUPLICATED
+    # Identical context does not require another wire update.
     assert len(socket.sent) == initial_sent_count
 
 
 @pytest.mark.asyncio
 async def test_prepare_if_idle_readiness_changes_after_send() -> None:
     """prepare_if_idle must return non-None once update is sent, even if readiness changes."""
+
     class _MutatingSocket(_FakeRealtimeSocket):
         def __init__(self, events: list[dict[str, object]]) -> None:
             super().__init__(events)
@@ -4013,7 +4358,9 @@ async def test_prepare_if_idle_readiness_changes_after_send() -> None:
                     self.channel_ref._active_response_id = "resp_racing"
             await super().send(message)
 
-    socket = _MutatingSocket([{"type": "session.updated", "session": {"id": "sess_test"}}])
+    socket = _MutatingSocket(
+        [{"type": "session.updated", "session": {"id": "sess_test"}}]
+    )
     channel = _OpenAIRealtimeEventChannel(
         socket,
         model="gpt-realtime-test",
@@ -4044,5 +4391,195 @@ async def test_prepare_if_idle_readiness_changes_after_send() -> None:
     assert session_update_msg.get("type") == "session.update"
 
     # Point of no return: once sent, prepare_if_idle must NOT return None
-    assert status == RealtimeContextInstallationStatus.INSTALLED
+    assert status == RealtimeContextInstallationStatus.SUBMITTED
+    assert channel._installed_context_build_id != new_harness.context.build_id
+    socket.push({"type": "session.updated", "session": {"id": "sess_test"}})
+    await channel.wait_for_context(build_id=new_harness.context.build_id)
     assert channel._installed_context_build_id == new_harness.context.build_id
+
+
+@pytest.mark.asyncio
+async def test_prepare_context_unacknowledged_until_session_updated() -> None:
+    socket = _FakeRealtimeSocket([], acknowledge_updates=True)
+    channel = _OpenAIRealtimeEventChannel(
+        socket,
+        model="gpt-realtime-test",
+        max_output_tokens=800,
+        turn_timeout_seconds=5,
+    )
+    _TEST_CHANNELS.add(channel)
+    await channel.start_receiver()
+
+    # 1. Initial prepare succeeds and is immediately installed/acknowledged
+    status_a = await channel.prepare(harness=_harness(build_id="ctx-1"))
+    assert status_a == RealtimeContextInstallationStatus.INSTALLED
+    assert channel.desired_context_build_id == "ctx-1"
+    assert channel.active_context_build_id == "ctx-1"
+    assert channel.is_context_acknowledged("ctx-1") is True
+
+    # 2. Prepare context B (non-initial) with unacknowledged socket updates
+    socket.acknowledge_updates = False
+    status_b = await channel.prepare(
+        harness=_harness(build_id="ctx-2", timezone_id="America/New_York")
+    )
+
+    # Before session.updated:
+    assert status_b == RealtimeContextInstallationStatus.SUBMITTED
+    assert channel.desired_context_build_id == "ctx-2"
+    assert channel._inflight_context is not None
+    assert channel._inflight_context[2] == "ctx-2"
+    assert channel.active_context_build_id == "ctx-1"
+    assert channel.is_context_acknowledged("ctx-2") is False
+
+    # 3. Deliver session.updated for B
+    socket.push({"type": "session.updated", "session": {"id": "sess_b"}})
+    await channel.wait_for_context(build_id="ctx-2")
+
+    # After session.updated:
+    assert channel.is_context_acknowledged("ctx-2") is True
+    assert channel.active_context_build_id == "ctx-2"
+    await channel.close()
+
+
+@pytest.mark.asyncio
+async def test_context_coalescing_and_acknowledgement() -> None:
+    socket = _FakeRealtimeSocket([], acknowledge_updates=True)
+    channel = _OpenAIRealtimeEventChannel(
+        socket,
+        model="gpt-realtime-test",
+        max_output_tokens=800,
+        turn_timeout_seconds=5,
+    )
+    _TEST_CHANNELS.add(channel)
+    await channel.start_receiver()
+
+    # Initial prepare A
+    await channel.prepare(harness=_harness(build_id="ctx-1"))
+    assert channel.is_context_acknowledged("ctx-1") is True
+
+    # Prepare B (inflight) without auto-ack
+    socket.acknowledge_updates = False
+    status_b = await channel.prepare(
+        harness=_harness(build_id="ctx-2", timezone_id="America/New_York")
+    )
+    assert status_b == RealtimeContextInstallationStatus.SUBMITTED
+    assert channel._inflight_context[2] == "ctx-2"
+
+    # Prepare C while B is inflight (supersedes B)
+    status_c = await channel.prepare(
+        harness=_harness(build_id="ctx-3", timezone_id="America/Chicago")
+    )
+    assert status_c == RealtimeContextInstallationStatus.SUBMITTED
+    assert channel.desired_context_build_id == "ctx-3"
+    # B remains inflight on the wire until B ACK arrives
+    assert channel._inflight_context[2] == "ctx-2"
+
+    # Now deliver B ACK
+    socket.push({"type": "session.updated", "session": {"id": "sess_b"}})
+    await asyncio.sleep(0.01)
+
+    # B was acknowledged, but C is the latest desired context and is NOT yet acknowledged
+    assert channel.is_context_acknowledged("ctx-2") is True
+    assert channel.is_context_acknowledged("ctx-3") is False
+    # C was now sent onto the wire
+    assert channel._inflight_context is not None
+    assert channel._inflight_context[2] == "ctx-3"
+
+    # Deliver C ACK
+    socket.push({"type": "session.updated", "session": {"id": "sess_c"}})
+    await channel.wait_for_context(build_id="ctx-3")
+    assert channel.is_context_acknowledged("ctx-3") is True
+    assert channel.active_context_build_id == "ctx-3"
+    await channel.close()
+
+
+@pytest.mark.asyncio
+async def test_request_child_response_pending_create_returns_false_and_does_not_commit() -> (
+    None
+):
+    socket = _FakeRealtimeSocket([], acknowledge_updates=True)
+    channel = _OpenAIRealtimeEventChannel(
+        socket, model="test", max_output_tokens=800, turn_timeout_seconds=5
+    )
+    _TEST_CHANNELS.add(channel)
+    await channel.prepare(harness=_harness(build_id="ctx-1"))
+    channel._active_turn_id = "turn-child"
+    channel._input_item_turn_ids["item-pending"] = "turn-child"
+
+    # Simulate response_create_pending is already True
+    channel._response_create_pending = True
+
+    committed = await channel.request_child_response(
+        turn_id="turn-child",
+        item_id="item-pending",
+    )
+    # A. response_create_pending -> no send, no committed item, False
+    assert committed is False
+    assert "item-pending" not in channel._committed_response_items
+    assert not any(event.get("type") == "response.create" for event in socket.sent)
+    await channel.close()
+
+
+@pytest.mark.asyncio
+async def test_request_child_response_active_response_returns_false_and_does_not_commit() -> (
+    None
+):
+    socket = _FakeRealtimeSocket([], acknowledge_updates=True)
+    channel = _OpenAIRealtimeEventChannel(
+        socket, model="test", max_output_tokens=800, turn_timeout_seconds=5
+    )
+    _TEST_CHANNELS.add(channel)
+    await channel.prepare(harness=_harness(build_id="ctx-1"))
+    channel._active_turn_id = "turn-child"
+    channel._input_item_turn_ids["item-active"] = "turn-child"
+
+    # Simulate active response already exists
+    channel._active_response_id = "resp-active-123"
+
+    committed = await channel.request_child_response(
+        turn_id="turn-child",
+        item_id="item-active",
+    )
+    # B. active response -> no send, no committed item, False
+    assert committed is False
+    assert "item-active" not in channel._committed_response_items
+    assert not any(event.get("type") == "response.create" for event in socket.sent)
+    await channel.close()
+
+
+@pytest.mark.asyncio
+async def test_request_child_response_successful_readiness_commits_exactly_once() -> (
+    None
+):
+    socket = _FakeRealtimeSocket([], acknowledge_updates=True)
+    channel = _OpenAIRealtimeEventChannel(
+        socket, model="test", max_output_tokens=800, turn_timeout_seconds=5
+    )
+    _TEST_CHANNELS.add(channel)
+    await channel.prepare(harness=_harness(build_id="ctx-1"))
+    channel._active_turn_id = "turn-child"
+    channel._input_item_turn_ids["item-success"] = "turn-child"
+
+    # C. successful readiness -> exactly one send, item committed, True
+    committed = await channel.request_child_response(
+        turn_id="turn-child",
+        item_id="item-success",
+    )
+    assert committed is True
+    assert "item-success" in channel._committed_response_items
+    response_create_events = [
+        e for e in socket.sent if e.get("type") == "response.create"
+    ]
+    assert len(response_create_events) == 1
+
+    # Calling again with the same item_id is idempotent: returns True, does not duplicate send
+    committed_again = await channel.request_child_response(
+        turn_id="turn-child",
+        item_id="item-success",
+    )
+    assert committed_again is True
+    response_create_events_after = [
+        e for e in socket.sent if e.get("type") == "response.create"
+    ]
+    assert len(response_create_events_after) == 1
+    await channel.close()

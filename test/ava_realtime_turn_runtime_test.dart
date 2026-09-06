@@ -33,6 +33,7 @@ void main() {
       _control({
         'protocolVersion': 4,
         'event': 'canvasGenerationStarted',
+      'focusRevision': 0,
         'sessionId': _sessionId,
         'sequence': 0,
         'revision': 1,

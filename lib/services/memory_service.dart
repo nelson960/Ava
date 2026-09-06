@@ -60,9 +60,25 @@ class CanvasScenes extends Table {
   TextColumn get manifestVersion => text()();
   IntColumn get workspaceOrder => integer()();
   BoolColumn get isFocused => boolean()();
+  IntColumn get creationSequence => integer().nullable()();
+  IntColumn get modificationSequence => integer().nullable()();
+  TextColumn get title => text().nullable()();
+  TextColumn get summary => text().nullable()();
 
   @override
   Set<Column> get primaryKey => {sceneId};
+}
+
+@DataClassName('StoredCanvasWorkspace')
+class CanvasWorkspaces extends Table {
+  IntColumn get id => integer()();
+  IntColumn get workspaceEpoch => integer()();
+  IntColumn get workspaceRevision => integer()();
+  IntColumn get nextCreationSequence => integer()();
+  IntColumn get nextModificationSequence => integer()();
+
+  @override
+  Set<Column> get primaryKey => {id};
 }
 
 @DriftDatabase(
@@ -71,6 +87,7 @@ class CanvasScenes extends Table {
     SessionHistory,
     LearningProgressEvents,
     CanvasScenes,
+    CanvasWorkspaces,
   ],
 )
 class AppDatabase extends _$AppDatabase {
@@ -79,7 +96,7 @@ class AppDatabase extends _$AppDatabase {
   AppDatabase.forTesting(super.executor);
 
   @override
-  int get schemaVersion => 4;
+  int get schemaVersion => 5;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -100,6 +117,25 @@ class AppDatabase extends _$AppDatabase {
           }
           if (from < 4) {
             await migrator.createTable(canvasScenes);
+          }
+          if (from < 5) {
+            await migrator.addColumn(
+                canvasScenes, canvasScenes.creationSequence);
+            await migrator.addColumn(
+                canvasScenes, canvasScenes.modificationSequence);
+            await migrator.addColumn(canvasScenes, canvasScenes.title);
+            await migrator.addColumn(canvasScenes, canvasScenes.summary);
+            await migrator.createTable(canvasWorkspaces);
+            await customStatement(
+              'UPDATE canvas_scenes SET creation_sequence = workspace_order + 1, '
+              "title = '', summary = '' WHERE creation_sequence IS NULL",
+            );
+            await customStatement(
+              'INSERT INTO canvas_workspaces '
+              '(id, workspace_epoch, workspace_revision, next_creation_sequence, next_modification_sequence) '
+              'VALUES (1, 0, 0, '
+              'COALESCE((SELECT MAX(creation_sequence) + 1 FROM canvas_scenes), 1), 1)',
+            );
           }
         },
       );

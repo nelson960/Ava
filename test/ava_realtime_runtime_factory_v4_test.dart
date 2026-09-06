@@ -78,6 +78,7 @@ void main() {
     host.controller!.receiveGenerationStarted({
       'protocolVersion': 4,
       'event': 'canvasGenerationStarted',
+      'focusRevision': 0,
       'sessionId': 'session-v4-factory',
       'sequence': 0,
       'revision': 1,
@@ -199,7 +200,8 @@ void main() {
       volume: 0.8,
     );
 
-    expect(restoreTransport.putCount, 1);
+    expect(restoreTransport.restorePutCount, 1);
+    expect(restoreTransport.focusPutCount, 1);
     expect(restoreTransport.completedBeforeMediaConnect, isTrue);
 
     await _activateCanvas(runtime.canvasController, revised);
@@ -207,6 +209,262 @@ void main() {
     expect(host.sceneCount, 1);
     expect(host.workspaceDocuments, orderedEquals([revised]));
     expect(host.presentedDocument, same(revised));
+    await runtime.close();
+  });
+
+  test('canvas restore HTTP 422 is non-terminal to conversation startup',
+      () async {
+    final retained = _canvasDocument(
+      generationId: 'generation-retained-422',
+      sourceTurnId: 'turn-retained-422',
+      sceneRevision: 1,
+    );
+    final host = AvaSvgCanvasSessionHost();
+    host.updateRenderProfile(_profile);
+    final owner = AvaSvgCanvasController(
+      documents: _Loader(retained),
+      commandSink: (_) {},
+    );
+    host.attach(owner);
+    await _activateCanvas(owner, retained);
+    host.detach(owner);
+    owner.dispose();
+
+    final bootstrapTransport = _BootstrapTransport();
+    // Simulate backend returning 422 Unprocessable Entity on canvas-restore:
+    final restoreTransport = _CanvasRestoreTransport(
+      retained,
+      HttpStatus.unprocessableEntity,
+    );
+    var mediaConnectorCalled = false;
+    final media = DeterministicAvaRealtimeMediaSession(offerSdp: _offerSdp);
+    final raw = DeterministicAvaRealtimeRawTransportV4(const []);
+    final factory = AvaRealtimeRuntimeFactoryV4(
+      bootstrapService: AvaRealtimeBootstrapService(
+        configuration: AvaBackendConfiguration.parse(
+          'https://ava.example.test',
+        ),
+        transport: bootstrapTransport,
+        deviceContext: const _DeviceContextFake(),
+      ),
+      canvasRestoreService: _restoreService(restoreTransport),
+      mediaConnector: (_) async {
+        mediaConnectorCalled = true;
+        return media;
+      },
+      transportConnector: (_) async => raw,
+      documentLoaderFactory: (_, __) => _Loader(),
+      canvasHost: host,
+      speechOutput: const _NoopPcmOutput(),
+      presentation: AvaRealtimePresentationController(),
+      cancelRequestIdFactory: () => 'cancel-v4-422-nonterminal',
+    );
+    addTearDown(factory.close);
+    addTearDown(host.dispose);
+
+    // Factory create MUST NOT throw:
+    final runtime = await factory.create(
+      ageBand: AvaRealtimeAgeBand.middleChildhood,
+      volume: 0.8,
+    );
+
+    expect(restoreTransport.putCount, 2);
+    // Crucial: media connector MUST be reached despite 422 restore failure:
+    expect(mediaConnectorCalled, isTrue);
+    expect(runtime.snapshot.sessionId, 'session-v4-factory');
+    // Presented document must be cleared so unaccepted canvas is not active:
+    expect(host.presentedDocument, isNull);
+    expect(runtime.canvasController.active, isNull);
+    await runtime.close();
+  });
+
+  test(
+      'canvas restore timeout/network failure is non-terminal to conversation startup',
+      () async {
+    final retained = _canvasDocument(
+      generationId: 'generation-retained-timeout',
+      sourceTurnId: 'turn-retained-timeout',
+      sceneRevision: 1,
+    );
+    final host = AvaSvgCanvasSessionHost();
+    host.updateRenderProfile(_profile);
+    final owner = AvaSvgCanvasController(
+      documents: _Loader(retained),
+      commandSink: (_) {},
+    );
+    host.attach(owner);
+    await _activateCanvas(owner, retained);
+    host.detach(owner);
+    owner.dispose();
+
+    final bootstrapTransport = _BootstrapTransport();
+    final restoreTransport = _CanvasRestoreTransport(
+      retained,
+      HttpStatus.noContent,
+      const SocketException('Connection refused'),
+    );
+    var mediaConnectorCalled = false;
+    final media = DeterministicAvaRealtimeMediaSession(offerSdp: _offerSdp);
+    final raw = DeterministicAvaRealtimeRawTransportV4(const []);
+    final factory = AvaRealtimeRuntimeFactoryV4(
+      bootstrapService: AvaRealtimeBootstrapService(
+        configuration: AvaBackendConfiguration.parse(
+          'https://ava.example.test',
+        ),
+        transport: bootstrapTransport,
+        deviceContext: const _DeviceContextFake(),
+      ),
+      canvasRestoreService: _restoreService(restoreTransport),
+      mediaConnector: (_) async {
+        mediaConnectorCalled = true;
+        return media;
+      },
+      transportConnector: (_) async => raw,
+      documentLoaderFactory: (_, __) => _Loader(),
+      canvasHost: host,
+      speechOutput: const _NoopPcmOutput(),
+      presentation: AvaRealtimePresentationController(),
+      cancelRequestIdFactory: () => 'cancel-v4-timeout-nonterminal',
+    );
+    addTearDown(factory.close);
+    addTearDown(host.dispose);
+
+    final runtime = await factory.create(
+      ageBand: AvaRealtimeAgeBand.middleChildhood,
+      volume: 0.8,
+    );
+
+    expect(restoreTransport.putCount, 2);
+    expect(mediaConnectorCalled, isTrue);
+    expect(host.presentedDocument, isNull);
+    expect(runtime.canvasController.active, isNull);
+    await runtime.close();
+  });
+
+  test(
+      'canvas restore failure does not create endless new sessions on mic intent',
+      () async {
+    final retained = _canvasDocument(
+      generationId: 'generation-retained-mic',
+      sourceTurnId: 'turn-retained-mic',
+      sceneRevision: 1,
+    );
+    final host = AvaSvgCanvasSessionHost();
+    host.updateRenderProfile(_profile);
+    final owner = AvaSvgCanvasController(
+      documents: _Loader(retained),
+      commandSink: (_) {},
+    );
+    host.attach(owner);
+    await _activateCanvas(owner, retained);
+    host.detach(owner);
+    owner.dispose();
+
+    final bootstrapTransport = _BootstrapTransport();
+    final restoreTransport = _CanvasRestoreTransport(
+      retained,
+      HttpStatus.unprocessableEntity,
+    );
+    final media = DeterministicAvaRealtimeMediaSession(offerSdp: _offerSdp);
+    final raw = DeterministicAvaRealtimeRawTransportV4(const []);
+    final factory = AvaRealtimeRuntimeFactoryV4(
+      bootstrapService: AvaRealtimeBootstrapService(
+        configuration: AvaBackendConfiguration.parse(
+          'https://ava.example.test',
+        ),
+        transport: bootstrapTransport,
+        deviceContext: const _DeviceContextFake(),
+      ),
+      canvasRestoreService: _restoreService(restoreTransport),
+      mediaConnector: (_) async => media,
+      transportConnector: (_) async => raw,
+      documentLoaderFactory: (_, __) => _Loader(),
+      canvasHost: host,
+      speechOutput: const _NoopPcmOutput(),
+      presentation: AvaRealtimePresentationController(),
+      cancelRequestIdFactory: () => 'cancel-v4-no-retry-loop',
+    );
+    addTearDown(factory.close);
+    addTearDown(host.dispose);
+
+    // Initial session bootstrap creates exactly 1 session despite canvas restore 422:
+    final runtime = await factory.create(
+      ageBand: AvaRealtimeAgeBand.middleChildhood,
+      volume: 0.8,
+    );
+    expect(bootstrapTransport.postCount, 1);
+
+    // Factory create succeeds and establishes media instead of throwing:
+    expect(runtime.snapshot.sessionId, 'session-v4-factory');
+    expect(runtime.isTerminal, isFalse);
+    expect(media.closed, isFalse);
+    expect(bootstrapTransport.postCount, 1);
+
+    await runtime.close();
+  });
+
+  test(
+      'canvas restore failure preserves local document but suppresses active presentation and semantic commands',
+      () async {
+    final retained = _canvasDocument(
+      generationId: 'generation-retained-safety',
+      sourceTurnId: 'turn-retained-safety',
+      sceneRevision: 1,
+    );
+    final host = AvaSvgCanvasSessionHost();
+    host.updateRenderProfile(_profile);
+    final owner = AvaSvgCanvasController(
+      documents: _Loader(retained),
+      commandSink: (_) {},
+    );
+    host.attach(owner);
+    await _activateCanvas(owner, retained);
+    host.detach(owner);
+    owner.dispose();
+
+    expect(host.workspaceDocuments, contains(retained));
+
+    final bootstrapTransport = _BootstrapTransport();
+    final restoreTransport = _CanvasRestoreTransport(
+      retained,
+      HttpStatus.unprocessableEntity,
+    );
+    final media = DeterministicAvaRealtimeMediaSession(offerSdp: _offerSdp);
+    final raw = DeterministicAvaRealtimeRawTransportV4(const []);
+    final factory = AvaRealtimeRuntimeFactoryV4(
+      bootstrapService: AvaRealtimeBootstrapService(
+        configuration: AvaBackendConfiguration.parse(
+          'https://ava.example.test',
+        ),
+        transport: bootstrapTransport,
+        deviceContext: const _DeviceContextFake(),
+      ),
+      canvasRestoreService: _restoreService(restoreTransport),
+      mediaConnector: (_) async => media,
+      transportConnector: (_) async => raw,
+      documentLoaderFactory: (_, __) => _Loader(),
+      canvasHost: host,
+      speechOutput: const _NoopPcmOutput(),
+      presentation: AvaRealtimePresentationController(),
+      cancelRequestIdFactory: () => 'cancel-v4-safety',
+    );
+    addTearDown(factory.close);
+    addTearDown(host.dispose);
+
+    final runtime = await factory.create(
+      ageBand: AvaRealtimeAgeBand.middleChildhood,
+      volume: 0.8,
+    );
+
+    // 1. Local document is preserved in workspace documents:
+    expect(host.workspaceDocuments, contains(retained));
+    // 2. But NOT presented as active conversational canvas:
+    expect(host.presentedDocument, isNull);
+    expect(runtime.canvasController.active, isNull);
+    // 3. Turn context snapshot reports no focused canvas:
+    final snapshot = host.turnContextSnapshot();
+    expect(snapshot['focusedCanvas'], isNull);
+
     await runtime.close();
   });
 
@@ -287,6 +545,45 @@ void main() {
     await runtime.close();
     await run;
   });
+
+  test('focus revision conflict is nonterminal and is not retried', () async {
+    final bootstrap = await AvaRealtimeBootstrapService(
+      configuration: AvaBackendConfiguration.parse('https://ava.example.test'),
+      transport: _BootstrapTransport(),
+      deviceContext: const _DeviceContextFake(),
+    ).createSessionV4(
+      ageBand: AvaRealtimeAgeBand.middleChildhood,
+      canvasRenderProfile: _profile,
+    );
+    final document = _canvasDocument(
+      generationId: 'generation-focus-conflict',
+      sourceTurnId: 'turn-focus-conflict',
+      sceneRevision: 1,
+    );
+    final transport = _CanvasRestoreTransport(
+      document,
+      HttpStatus.conflict,
+      null,
+      utf8.encode(
+        jsonEncode({
+          'error': {
+            'code': 'focusRevisionConflict',
+            'message': 'The revision is already bound.',
+            'requestId': 'request-focus-conflict',
+          },
+        }),
+      ),
+    );
+
+    await _restoreService(transport).focusScene(
+      focusRevision: 7,
+      bootstrap: bootstrap,
+      document: document,
+    );
+
+    expect(transport.focusPutCount, 1);
+    expect(transport.putCount, 1);
+  });
 }
 
 AvaCanvasRestoreService _restoreService(AvaCanvasRestoreTransport transport) =>
@@ -296,10 +593,21 @@ AvaCanvasRestoreService _restoreService(AvaCanvasRestoreTransport transport) =>
     );
 
 final class _CanvasRestoreTransport implements AvaCanvasRestoreTransport {
-  _CanvasRestoreTransport([this.expectedDocument]);
+  _CanvasRestoreTransport([
+    this.expectedDocument,
+    this.statusCode = HttpStatus.noContent,
+    this.error,
+    this.responseBody = const <int>[],
+  ]);
 
   final AvaValidatedSvgCanvasDocument? expectedDocument;
+  final int statusCode;
+  final Object? error;
+  final List<int> responseBody;
   int putCount = 0;
+  int restorePutCount = 0;
+  int focusPutCount = 0;
+  int workspacePutCount = 0;
   bool completedBeforeMediaConnect = false;
 
   @override
@@ -310,7 +618,23 @@ final class _CanvasRestoreTransport implements AvaCanvasRestoreTransport {
     required Duration timeout,
   }) async {
     putCount += 1;
-    expect(endpoint.path, endsWith('/canvas-restore'));
+    if (endpoint.path.endsWith('/canvas-workspace')) {
+      workspacePutCount += 1;
+      expect(headers['content-type'], 'application/json');
+      expect(jsonDecode(utf8.decode(body)), isA<Map<String, Object?>>());
+      completedBeforeMediaConnect = true;
+      return AvaCanvasRestoreResponse(
+        statusCode: HttpStatus.ok,
+        protocolVersion: '4',
+        bytes: const Stream.empty(),
+      );
+    } else if (endpoint.path.endsWith('/canvas-restore')) {
+      restorePutCount += 1;
+    } else {
+      expect(endpoint.path, endsWith('/canvas-focus'));
+      focusPutCount += 1;
+      expect(headers['x-ava-focus-revision'], isNotNull);
+    }
     expect(headers['content-type'], 'application/octet-stream');
     expect(body, isNotEmpty);
     final expected = expectedDocument;
@@ -322,11 +646,14 @@ final class _CanvasRestoreTransport implements AvaCanvasRestoreTransport {
       expect(headers['x-ava-svg-sha256'], descriptor.svgSha256);
       expect(headers['x-ava-manifest-sha256'], descriptor.manifestSha256);
     }
+    if (error != null) {
+      throw error!;
+    }
     completedBeforeMediaConnect = true;
-    return const AvaCanvasRestoreResponse(
-      statusCode: HttpStatus.noContent,
+    return AvaCanvasRestoreResponse(
+      statusCode: statusCode,
       protocolVersion: '4',
-      bytes: Stream.empty(),
+      bytes: Stream.value(responseBody),
     );
   }
 
@@ -343,7 +670,8 @@ final class _DeferredCanvasPersistence implements AvaCanvasPersistence {
   Future<AvaRestoredCanvasWorkspace> loadWorkspace() => workspace;
 
   @override
-  Future<void> persistActive(AvaValidatedSvgCanvasDocument document) async {}
+  Future<void> persistActive(AvaValidatedSvgCanvasDocument document,
+      {bool focused = true}) async {}
 
   @override
   Future<void> persistFocus(String sceneId) async {}
@@ -524,6 +852,7 @@ Future<void> _activateCanvas(
   controller.receiveGenerationStarted({
     'protocolVersion': 4,
     'event': 'canvasGenerationStarted',
+    'focusRevision': 0,
     'sessionId': 'session-v4-factory',
     'sequence': 0,
     'revision': 1,

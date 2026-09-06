@@ -18,7 +18,8 @@ final class AvaCanvasPersistenceConflict implements Exception {
 }
 
 /// Serializes the bounded local Canvas workspace into the existing Drift DB.
-final class AvaCanvasPersistenceRepository implements AvaCanvasPersistence {
+final class AvaCanvasPersistenceRepository
+    implements AvaStructuralCanvasPersistence {
   AvaCanvasPersistenceRepository(this._database);
 
   final AppDatabase _database;
@@ -28,7 +29,39 @@ final class AvaCanvasPersistenceRepository implements AvaCanvasPersistence {
   Future<void> get idle => _tail;
 
   @override
-  Future<void> persistActive(AvaValidatedSvgCanvasDocument document) {
+  Future<void> persistActive(AvaValidatedSvgCanvasDocument document,
+          {bool focused = true}) =>
+      _persistActive(document, focused: focused);
+
+  @override
+  Future<void> persistStructuralActive(
+    AvaValidatedSvgCanvasDocument document, {
+    required bool focused,
+    required int workspaceEpoch,
+    required int workspaceRevision,
+    required int creationSequence,
+    required int modificationSequence,
+    String? evictedSceneId,
+  }) =>
+      _persistActive(
+        document,
+        focused: focused,
+        workspaceEpoch: workspaceEpoch,
+        workspaceRevision: workspaceRevision,
+        creationSequence: creationSequence,
+        modificationSequence: modificationSequence,
+        evictedSceneId: evictedSceneId,
+      );
+
+  Future<void> _persistActive(
+    AvaValidatedSvgCanvasDocument document, {
+    required bool focused,
+    int? workspaceEpoch,
+    int? workspaceRevision,
+    int? creationSequence,
+    int? modificationSequence,
+    String? evictedSceneId,
+  }) {
     final capturedEpoch = _generationEpoch;
     return _serialize(() async {
       if (capturedEpoch != _generationEpoch) return;
@@ -42,7 +75,27 @@ final class AvaCanvasPersistenceRepository implements AvaCanvasPersistence {
         final descriptor = document.descriptor;
         final existing =
             rows.where((row) => row.sceneId == descriptor.sceneId).firstOrNull;
-        final focusedSceneId = descriptor.sceneId;
+        final focusedSceneId = focused
+            ? descriptor.sceneId
+            : rows.where((row) => row.isFocused).firstOrNull?.sceneId;
+        final structural = workspaceEpoch != null;
+        if (structural &&
+            (workspaceRevision == null ||
+                creationSequence == null ||
+                modificationSequence == null)) {
+          throw const AvaCanvasPersistenceConflict(
+            'Canvas structural persistence metadata must be atomic.',
+          );
+        }
+        final expectedEvicted = existing == null &&
+                rows.length == AvaSvgCanvasSessionHost.maximumSceneCount
+            ? rows.first.sceneId
+            : null;
+        if (structural && evictedSceneId != expectedEvicted) {
+          throw const AvaCanvasPersistenceConflict(
+            'Canvas structural persistence eviction does not match durable order.',
+          );
+        }
 
         if (existing != null) {
           if (descriptor.sceneRevision < existing.sceneRevision) {
@@ -63,7 +116,10 @@ final class AvaCanvasPersistenceRepository implements AvaCanvasPersistence {
               _companion(
                 document,
                 workspaceOrder: existing.workspaceOrder,
-                isFocused: true,
+                isFocused: focused || existing.isFocused,
+                creationSequence: creationSequence ?? existing.creationSequence,
+                modificationSequence:
+                    modificationSequence ?? existing.modificationSequence,
               ),
             );
           }
@@ -78,12 +134,14 @@ final class AvaCanvasPersistenceRepository implements AvaCanvasPersistence {
                 _companion(
                   document,
                   workspaceOrder: workspaceOrder,
-                  isFocused: true,
+                  isFocused: focused,
+                  creationSequence: creationSequence ?? workspaceOrder + 1,
+                  modificationSequence: modificationSequence,
                 ),
               );
         }
 
-        await _setSingleFocus(focusedSceneId);
+        if (focusedSceneId != null) await _setSingleFocus(focusedSceneId);
         final retained = await (_database.select(_database.canvasScenes)
               ..orderBy([
                 (row) => OrderingTerm.asc(row.workspaceOrder),
@@ -114,6 +172,41 @@ final class AvaCanvasPersistenceRepository implements AvaCanvasPersistence {
             ),
           );
         }
+        if (structural) {
+          final durableWorkspace =
+              await (_database.select(_database.canvasWorkspaces)
+                    ..where((row) => row.id.equals(1)))
+                  .getSingleOrNull();
+          final currentEpoch = durableWorkspace?.workspaceEpoch ?? 0;
+          final currentRevision = durableWorkspace?.workspaceRevision ?? 0;
+          final durableNextCreation =
+              durableWorkspace?.nextCreationSequence ?? 1;
+          final durableNextModification =
+              durableWorkspace?.nextModificationSequence ?? 1;
+          if (workspaceEpoch != currentEpoch ||
+              workspaceRevision != currentRevision + 1) {
+            throw const AvaCanvasPersistenceConflict(
+              'Canvas structural persistence revision is stale or has a gap.',
+            );
+          }
+          await _database
+              .into(_database.canvasWorkspaces)
+              .insertOnConflictUpdate(
+                CanvasWorkspacesCompanion.insert(
+                  id: const Value(1),
+                  workspaceEpoch: workspaceEpoch,
+                  workspaceRevision: workspaceRevision!,
+                  nextCreationSequence:
+                      durableNextCreation > creationSequence! + 1
+                          ? durableNextCreation
+                          : creationSequence + 1,
+                  nextModificationSequence:
+                      durableNextModification > modificationSequence! + 1
+                          ? durableNextModification
+                          : modificationSequence + 1,
+                ),
+              );
+        }
       });
     });
   }
@@ -129,6 +222,8 @@ final class AvaCanvasPersistenceRepository implements AvaCanvasPersistence {
                 ..limit(AvaSvgCanvasSessionHost.maximumSceneCount))
               .get();
           final documents = <AvaValidatedSvgCanvasDocument>[];
+          final creationSequences = <String, int>{};
+          final modificationSequences = <String, int?>{};
           final focusedCandidates = <String>[];
           for (final row in rows) {
             try {
@@ -156,6 +251,9 @@ final class AvaCanvasPersistenceRepository implements AvaCanvasPersistence {
                 manifestBytes: Uint8List.fromList(row.manifestBytes),
               );
               documents.add(document);
+              creationSequences[row.sceneId] =
+                  row.creationSequence ?? row.workspaceOrder + 1;
+              modificationSequences[row.sceneId] = row.modificationSequence;
               if (row.isFocused) focusedCandidates.add(row.sceneId);
             } on Object catch (error, stackTrace) {
               await (_database.delete(_database.canvasScenes)
@@ -179,9 +277,37 @@ final class AvaCanvasPersistenceRepository implements AvaCanvasPersistence {
               ? focusedCandidates.single
               : documents.lastOrNull?.descriptor.sceneId;
           if (focusedSceneId != null) await _setSingleFocus(focusedSceneId);
+          var workspace = await (_database.select(_database.canvasWorkspaces)
+                ..where((row) => row.id.equals(1)))
+              .getSingleOrNull();
+          if (workspace == null) {
+            final nextCreation = creationSequences.values.fold<int>(
+                  0,
+                  (current, value) => value > current ? value : current,
+                ) +
+                1;
+            await _database.into(_database.canvasWorkspaces).insert(
+                  CanvasWorkspacesCompanion.insert(
+                    id: const Value(1),
+                    workspaceEpoch: 0,
+                    workspaceRevision: 0,
+                    nextCreationSequence: nextCreation,
+                    nextModificationSequence: 1,
+                  ),
+                );
+            workspace = await (_database.select(_database.canvasWorkspaces)
+                  ..where((row) => row.id.equals(1)))
+                .getSingle();
+          }
           return AvaRestoredCanvasWorkspace(
             documents: List.unmodifiable(documents),
             focusedSceneId: focusedSceneId,
+            workspaceEpoch: workspace.workspaceEpoch,
+            workspaceRevision: workspace.workspaceRevision,
+            nextCreationSequence: workspace.nextCreationSequence,
+            nextModificationSequence: workspace.nextModificationSequence,
+            creationSequences: Map.unmodifiable(creationSequences),
+            modificationSequences: Map.unmodifiable(modificationSequences),
           );
         });
       });
@@ -211,6 +337,18 @@ final class AvaCanvasPersistenceRepository implements AvaCanvasPersistence {
     return _serialize(() async {
       await _database.transaction(() async {
         await _database.delete(_database.canvasScenes).go();
+        final workspace = await (_database.select(_database.canvasWorkspaces)
+              ..where((row) => row.id.equals(1)))
+            .getSingleOrNull();
+        await _database.into(_database.canvasWorkspaces).insertOnConflictUpdate(
+              CanvasWorkspacesCompanion.insert(
+                id: const Value(1),
+                workspaceEpoch: (workspace?.workspaceEpoch ?? 0) + 1,
+                workspaceRevision: 0,
+                nextCreationSequence: 1,
+                nextModificationSequence: 1,
+              ),
+            );
       });
     });
   }
@@ -245,6 +383,8 @@ final class AvaCanvasPersistenceRepository implements AvaCanvasPersistence {
     AvaValidatedSvgCanvasDocument document, {
     required int workspaceOrder,
     required bool isFocused,
+    required int? creationSequence,
+    required int? modificationSequence,
   }) {
     final descriptor = document.descriptor;
     return CanvasScenesCompanion.insert(
@@ -263,6 +403,10 @@ final class AvaCanvasPersistenceRepository implements AvaCanvasPersistence {
       manifestVersion: avaSvgManifestVersion,
       workspaceOrder: workspaceOrder,
       isFocused: isFocused,
+      creationSequence: Value(creationSequence),
+      modificationSequence: Value(modificationSequence),
+      title: Value(document.manifest.title),
+      summary: Value(document.manifest.description),
     );
   }
 

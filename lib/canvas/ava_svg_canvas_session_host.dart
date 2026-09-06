@@ -16,24 +16,51 @@ final class AvaRestoredCanvasWorkspace {
   const AvaRestoredCanvasWorkspace({
     required this.documents,
     required this.focusedSceneId,
+    this.workspaceEpoch = 0,
+    this.workspaceRevision = 0,
+    this.nextCreationSequence = 1,
+    this.nextModificationSequence = 1,
+    this.creationSequences = const {},
+    this.modificationSequences = const {},
   });
 
   final List<AvaValidatedSvgCanvasDocument> documents;
   final String? focusedSceneId;
+  final int workspaceEpoch;
+  final int workspaceRevision;
+  final int nextCreationSequence;
+  final int nextModificationSequence;
+  final Map<String, int> creationSequences;
+  final Map<String, int?> modificationSequences;
 }
 
 typedef AvaCanvasRuntimeFocusSink = Future<void> Function(
   AvaValidatedSvgCanvasDocument document,
+  int focusRevision,
 );
 
 abstract interface class AvaCanvasPersistence {
   Future<AvaRestoredCanvasWorkspace> loadWorkspace();
 
-  Future<void> persistActive(AvaValidatedSvgCanvasDocument document);
+  Future<void> persistActive(AvaValidatedSvgCanvasDocument document,
+      {bool focused = true});
 
   Future<void> persistFocus(String sceneId);
 
   Future<void> reset();
+}
+
+abstract interface class AvaStructuralCanvasPersistence
+    implements AvaCanvasPersistence {
+  Future<void> persistStructuralActive(
+    AvaValidatedSvgCanvasDocument document, {
+    required bool focused,
+    required int workspaceEpoch,
+    required int workspaceRevision,
+    required int creationSequence,
+    required int modificationSequence,
+    String? evictedSceneId,
+  });
 }
 
 /// Application-level owner of the presented SVG and the controller attached
@@ -44,9 +71,11 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
   AvaSvgCanvasSessionHost({
     Duration renderProfileDebounce = const Duration(milliseconds: 150),
     Duration persistenceRestoreTimeout = const Duration(seconds: 2),
+    Duration clientPresentationTimeout = const Duration(seconds: 3),
     AvaCanvasPersistence? persistence,
   })  : _renderProfileDebounce = renderProfileDebounce,
         _persistenceRestoreTimeout = persistenceRestoreTimeout,
+        _clientPresentationTimeout = clientPresentationTimeout,
         _persistence = persistence {
     if (renderProfileDebounce.isNegative) {
       throw ArgumentError.value(
@@ -62,18 +91,71 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
         'must be positive',
       );
     }
+    if (clientPresentationTimeout <= Duration.zero) {
+      throw ArgumentError.value(
+        clientPresentationTimeout,
+        'clientPresentationTimeout',
+        'must be positive',
+      );
+    }
     _restoration = _restorePersistedWorkspace();
   }
 
   final Duration _renderProfileDebounce;
   final Duration _persistenceRestoreTimeout;
+  final Duration _clientPresentationTimeout;
   final AvaCanvasPersistence? _persistence;
   late final Future<void> _restoration;
   bool _restoreInvalidated = false;
   int _workspaceEpoch = 0;
+  int _structuralWorkspaceEpoch = 0;
+  int _structuralWorkspaceRevision = 0;
+  int _nextCreationSequence = 1;
+  int _nextModificationSequence = 1;
+  final Map<String, int> _creationSequences = {};
+  final Map<String, int?> _modificationSequences = {};
   AvaSvgCanvasController? _controller;
   AvaCanvasRuntimeFocusSink? _runtimeFocusSink;
   bool _focusTransitionPending = false;
+  int _focusRevision = 0;
+  int _clientOperationSequence = 0;
+  String? _pendingClientOperationId;
+  Timer? _pendingClientOperationTimer;
+  int _lastAppliedCanonicalRevision = 0;
+  bool _acceptedPresentationVisible = false;
+  String? _acceptedPresentationSceneId;
+  int? _acceptedPresentationFocusRevision;
+
+  int get focusRevision => _focusRevision;
+  String? get pendingClientOperationId => _pendingClientOperationId;
+  int get lastAppliedCanonicalRevision => _lastAppliedCanonicalRevision;
+
+  AvaCanvasPresentationSnapshot presentationSnapshot() {
+    final visible = panelVisible;
+    final descriptor = _presentedDocument?.descriptor;
+    final rev = _focusRevision > 0 ? _focusRevision : 1;
+    return AvaCanvasPresentationSnapshot(
+      visible: visible,
+      sceneId: visible ? descriptor?.sceneId : null,
+      focusRevision: visible ? rev : null,
+    );
+  }
+
+  Map<String, Object?> turnContextSnapshot() {
+    final descriptor = _presentedDocument?.descriptor;
+    return {
+      'focusRevision': _focusRevision,
+      'focusedCanvas': descriptor == null
+          ? null
+          : {
+              'sceneId': descriptor.sceneId,
+              'sceneRevision': descriptor.sceneRevision,
+              'svgSha256': descriptor.svgSha256,
+              'manifestSha256': descriptor.manifestSha256,
+            },
+    };
+  }
+
   final List<AvaValidatedSvgCanvasDocument> _workspaceDocuments = [];
   AvaValidatedSvgCanvasDocument? _presentedDocument;
   bool _panelDismissed = false;
@@ -93,6 +175,42 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
   bool get panelDismissed => _panelDismissed;
   AvaCanvasRenderProfileV4? get renderProfile => _renderProfile;
   Future<void> get restoration => _restoration;
+
+  Map<String, Object?> workspaceManifestJson() {
+    return {
+      'protocolVersion': 4,
+      'workspaceEpoch': _structuralWorkspaceEpoch,
+      'workspaceRevision': _structuralWorkspaceRevision,
+      'nextCreationSequence': _nextCreationSequence,
+      'nextModificationSequence': _nextModificationSequence,
+      'focusedSceneId': _presentedDocument?.descriptor.sceneId,
+      'scenes': _workspaceDocuments.map((document) {
+        final descriptor = document.descriptor;
+        final creation = _creationSequences[descriptor.sceneId];
+        if (creation == null) {
+          throw StateError(
+              'Canvas scene is missing durable creation sequence.');
+        }
+        return {
+          'sceneId': descriptor.sceneId,
+          'sceneRevision': descriptor.sceneRevision,
+          'generationId': descriptor.generationId,
+          'sourceTurnId': descriptor.sourceTurnId,
+          'svgSha256': descriptor.svgSha256,
+          'manifestSha256': descriptor.manifestSha256,
+          'svgByteLength': descriptor.svgByteLength,
+          'manifestByteLength': descriptor.manifestByteLength,
+          'rendererCapabilityVersion': avaSvgRendererCapabilityVersion,
+          'validatorVersion': avaSvgValidatorVersion,
+          'manifestVersion': avaSvgManifestVersion,
+          'creationSequence': creation,
+          'modificationSequence': _modificationSequences[descriptor.sceneId],
+          'title': document.manifest.title,
+          'summary': document.manifest.description,
+        };
+      }).toList(growable: false),
+    };
+  }
 
   void updateRenderProfile(AvaCanvasRenderProfileV4 profile) {
     if (_sameRenderProfile(_renderProfile, profile)) return;
@@ -151,16 +269,9 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     );
   }
 
-  bool get canSelectPrevious =>
-      !_focusTransitionPending &&
-      !generating &&
-      !(_controller?.hasPendingVisual ?? false) &&
-      currentSceneIndex > 0;
+  bool get canSelectPrevious => currentSceneIndex > 0;
 
   bool get canSelectNext =>
-      !_focusTransitionPending &&
-      !generating &&
-      !(_controller?.hasPendingVisual ?? false) &&
       currentSceneIndex >= 0 &&
       currentSceneIndex < _workspaceDocuments.length - 1;
 
@@ -178,7 +289,10 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     }
   }
 
-  Future<void> selectSceneByIndex(int index) async {
+  Future<void> selectSceneByIndex(
+    int index, {
+    bool synchronizeVisiblePresentation = true,
+  }) async {
     if (index < 0 || index >= _workspaceDocuments.length) {
       throw RangeError.index(index, _workspaceDocuments, 'index');
     }
@@ -187,50 +301,70 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
         _presentedDocument?.descriptor.sceneId == target.descriptor.sceneId) {
       return;
     }
-    if (_focusTransitionPending || (_controller?.hasPendingVisual ?? false)) {
-      return;
+    if (_focusRevision == 1000000) {
+      throw StateError('Canvas focus revision exhausted its protocol bound.');
     }
-    final initialController = _controller;
-    final initialEpoch = _workspaceEpoch;
+    final revision = ++_focusRevision;
+    final epoch = _workspaceEpoch;
+    final targetSceneId = target.descriptor.sceneId;
+    final previousSceneId = _presentedDocument?.descriptor.sceneId;
+    final presentationRemainsAccepted = _acceptedPresentationVisible &&
+        _acceptedPresentationSceneId == previousSceneId &&
+        _acceptedPresentationFocusRevision == revision - 1;
+    final visibleNeedsPresentationSync = synchronizeVisiblePresentation &&
+        panelVisible &&
+        !presentationRemainsAccepted;
+    _clearPendingClientOperation();
+    _presentedDocument = target;
+    _clearAcceptedPresentation();
+    _controller?.focusRetainedActive(
+      target,
+      focusRevision: revision,
+      pendingSync: _runtimeFocusSink != null,
+    );
     _focusTransitionPending = true;
+    _persistence
+        ?.persistFocus(targetSceneId)
+        .catchError((Object error, StackTrace stackTrace) {
+      // Non-terminal local persistence error.
+    });
     notifyListeners();
-
     try {
       final sink = _runtimeFocusSink;
       if (sink != null) {
-        await sink(target);
+        await sink(target, revision);
       }
-
-      if (_restoreInvalidated ||
-          _workspaceEpoch != initialEpoch ||
-          !identical(_controller, initialController) ||
-          !_workspaceDocuments.contains(target)) {
-        return;
-      }
-
-      final controller = _controller;
-      if (controller != null && identical(_controller, controller)) {
-        controller.focusRetainedActive(target);
-      }
-      _presentedDocument = target;
-      final persistence = _persistence;
-      if (persistence != null) {
-        try {
-          await persistence.persistFocus(target.descriptor.sceneId);
-        } catch (error, stackTrace) {
-          developer.log(
-            'canvas_persist_focus_failed sceneId=${target.descriptor.sceneId} '
-            'failureType=${error.runtimeType}',
-            name: 'ava.canvas.persistence',
-            error: error,
-            stackTrace: stackTrace,
+      if (_workspaceEpoch == epoch && _focusRevision == revision) {
+        _controller?.completeFocusSync(
+          sceneId: targetSceneId,
+          focusRevision: revision,
+        );
+        if (presentationRemainsAccepted) {
+          _acceptPresentation(
+            sceneId: targetSceneId,
+            focusRevision: revision,
+          );
+        } else if (visibleNeedsPresentationSync && _controller != null) {
+          _emitVisiblePresentation(
+            document: target,
+            focusRevision: revision,
           );
         }
       }
-      notifyListeners();
+    } catch (error) {
+      if (_workspaceEpoch == epoch && _focusRevision == revision) {
+        _controller?.failFocusSync(
+          sceneId: targetSceneId,
+          focusRevision: revision,
+          error: error,
+        );
+      }
+      rethrow;
     } finally {
-      _focusTransitionPending = false;
-      notifyListeners();
+      if (_workspaceEpoch == epoch && _focusRevision == revision) {
+        _focusTransitionPending = false;
+        notifyListeners();
+      }
     }
   }
 
@@ -248,6 +382,13 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     }
     if (identical(_controller, controller)) {
       _runtimeFocusSink = runtimeFocusSink;
+      if (runtimeFocusSink != null &&
+          panelVisible &&
+          _presentedDocument != null) {
+        _clearAcceptedPresentation();
+        controller.markPresentationUnavailable(focusPending: true);
+        unawaited(_synchronizeReopenedPresentation());
+      }
       return;
     }
     final previous = _controller;
@@ -265,12 +406,17 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     _renderProfileTimer?.cancel();
     _renderProfileTimer = null;
     _controller = controller;
+    controller.currentFocusRevision = () => _focusRevision;
     _runtimeFocusSink = runtimeFocusSink;
     _renderProfileUpdateSink = renderProfileUpdateSink;
     _lastSentRenderProfile = initialRenderProfile;
     _renderProfileRevision = 0;
     _observedPendingGenerationId = null;
+    _clearPendingClientOperation();
+    _clearAcceptedPresentation();
     controller.addListener(_handleControllerChanged);
+    controller.presentationCommandHandler = handlePresentationCommand;
+    controller.presentationChangedHandler = handlePresentationChanged;
     _observePendingGeneration(controller);
     _clearDismissalWithoutCanvasState();
     if (renderProfileUpdateSink != null &&
@@ -280,6 +426,12 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
         _flushRenderProfileUpdate,
       );
     }
+    if (runtimeFocusSink != null &&
+        panelVisible &&
+        _presentedDocument != null) {
+      controller.markPresentationUnavailable(focusPending: true);
+      unawaited(_synchronizeReopenedPresentation());
+    }
     notifyListeners();
   }
 
@@ -287,12 +439,16 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     if (!identical(_controller, controller)) return;
     _retainPresentedDocument(controller);
     controller.removeListener(_handleControllerChanged);
+    controller.presentationCommandHandler = null;
+    controller.presentationChangedHandler = null;
     _renderProfileTimer?.cancel();
     _renderProfileTimer = null;
     _renderProfileUpdateSink = null;
     _runtimeFocusSink = null;
     _lastSentRenderProfile = null;
     _renderProfileRevision = 0;
+    controller.currentFocusRevision = null;
+    _clearPendingClientOperation();
     _controller = null;
     _observedPendingGenerationId = null;
     _clearDismissalWithoutCanvasState();
@@ -305,13 +461,185 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     if (generationId == null) return;
     _panelDismissed = true;
     _dismissedGenerationId = generationId;
+    final opId = _beginClientOperation();
+    _clearAcceptedPresentation();
+    _controller?.markPresentationUnavailable();
     notifyListeners();
+    _controller?.emitPresentationUpdated(
+      visible: false,
+      clientOperationId: opId,
+    );
   }
 
   void reopenPanel() {
     if (!canReopen) return;
     _panelDismissed = false;
     _dismissedGenerationId = null;
+    if (_focusRevision == 0) {
+      _focusRevision = 1;
+    }
+    _clearAcceptedPresentation();
+    _controller?.markPresentationUnavailable(
+        focusPending: _runtimeFocusSink != null);
+    notifyListeners();
+    unawaited(_synchronizeReopenedPresentation());
+  }
+
+  Future<void> handlePresentationCommand({
+    required String commandId,
+    required String action,
+    String? sceneId,
+  }) async {
+    if (_pendingClientOperationId != null) {
+      _controller?.emitPresentationAcknowledged(
+        commandId: commandId,
+        applied: false,
+        reason: 'supersededByClient',
+      );
+      return;
+    }
+
+    if (action == 'hide') {
+      _panelDismissed = true;
+      _clearAcceptedPresentation();
+      _controller?.markPresentationUnavailable();
+      notifyListeners();
+      _controller?.emitPresentationAcknowledged(
+        commandId: commandId,
+        applied: true,
+      );
+      return;
+    }
+
+    if (action == 'show') {
+      if (sceneId == null) {
+        _controller?.emitPresentationAcknowledged(
+          commandId: commandId,
+          applied: false,
+          reason: 'sceneNotFound',
+        );
+        return;
+      }
+      final index = _workspaceDocuments.indexWhere(
+        (doc) => doc.descriptor.sceneId == sceneId,
+      );
+      if (index < 0) {
+        _controller?.emitPresentationAcknowledged(
+          commandId: commandId,
+          applied: false,
+          reason: 'sceneNotFound',
+        );
+        return;
+      }
+
+      final target = _workspaceDocuments[index];
+      _panelDismissed = false;
+      _dismissedGenerationId = null;
+
+      if (_presentedDocument?.descriptor.sceneId == target.descriptor.sceneId) {
+        if (_focusRevision == 0) {
+          _focusRevision = 1;
+        }
+        notifyListeners();
+        _controller?.emitPresentationAcknowledged(
+          commandId: commandId,
+          applied: true,
+          sceneId: target.descriptor.sceneId,
+          focusRevision: _focusRevision,
+        );
+        return;
+      }
+
+      final targetFocusRevision = _focusRevision + 1;
+      try {
+        await selectSceneByIndex(
+          index,
+          synchronizeVisiblePresentation: false,
+        );
+        if (_pendingClientOperationId != null ||
+            _presentedDocument?.descriptor.sceneId !=
+                target.descriptor.sceneId ||
+            _focusRevision != targetFocusRevision ||
+            _controller?.activeFocusRevision != targetFocusRevision) {
+          _controller?.emitPresentationAcknowledged(
+            commandId: commandId,
+            applied: false,
+            reason: 'supersededByClient',
+          );
+          return;
+        }
+        _controller?.emitPresentationAcknowledged(
+          commandId: commandId,
+          applied: true,
+          sceneId: target.descriptor.sceneId,
+          focusRevision: _focusRevision,
+        );
+      } catch (error) {
+        _controller?.emitPresentationAcknowledged(
+          commandId: commandId,
+          applied: false,
+          reason: 'clientSyncFailed',
+        );
+      }
+    }
+  }
+
+  void handlePresentationChanged(Map<String, Object?> event) {
+    final revision = event['revision'] as int? ?? 0;
+    final source = event['source'] as String? ?? 'user';
+    final visible = event['visible'] as bool? ?? false;
+    final sceneId = event['sceneId'] as String?;
+    final focusRevision = event['focusRevision'] as int?;
+
+    if (source == 'user' || source == 'restore') {
+      _lastAppliedCanonicalRevision = revision;
+      final matchesLocal = _recordAcceptedPresentation(
+        visible: visible,
+        sceneId: sceneId,
+        focusRevision: focusRevision,
+      );
+      if (matchesLocal) {
+        _clearPendingClientOperation();
+      }
+      return;
+    }
+
+    if (_pendingClientOperationId != null) {
+      return;
+    }
+
+    if (revision <= _lastAppliedCanonicalRevision) {
+      return;
+    }
+
+    _lastAppliedCanonicalRevision = revision;
+    if (visible != panelVisible) {
+      if (visible) {
+        _panelDismissed = false;
+        _dismissedGenerationId = null;
+      } else {
+        _panelDismissed = true;
+      }
+      notifyListeners();
+    }
+    _recordAcceptedPresentation(
+      visible: visible,
+      sceneId: sceneId,
+      focusRevision: focusRevision,
+    );
+  }
+
+  void clearPresentedFocus() {
+    if (_presentedDocument == null &&
+        !_panelDismissed &&
+        _dismissedGenerationId == null &&
+        _observedPendingGenerationId == null) {
+      return;
+    }
+    _presentedDocument = null;
+    _panelDismissed = false;
+    _dismissedGenerationId = null;
+    _observedPendingGenerationId = null;
     notifyListeners();
   }
 
@@ -324,6 +652,16 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     }
     _restoreInvalidated = true;
     _workspaceEpoch += 1;
+    _structuralWorkspaceEpoch += 1;
+    _structuralWorkspaceRevision = 0;
+    _nextCreationSequence = 1;
+    _nextModificationSequence = 1;
+    _creationSequences.clear();
+    _modificationSequences.clear();
+    _lastAppliedCanonicalRevision = 0;
+    _clientOperationSequence = 0;
+    _clearPendingClientOperation();
+    _clearAcceptedPresentation();
     if (_workspaceDocuments.isEmpty &&
         _presentedDocument == null &&
         !_panelDismissed &&
@@ -339,9 +677,168 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> _synchronizeReopenedPresentation() async {
+    final presented = _presentedDocument;
+    final controller = _controller;
+    if (presented == null || controller == null || !panelVisible) return;
+    final sceneId = presented.descriptor.sceneId;
+    final focusRevision = _focusRevision;
+    final epoch = _workspaceEpoch;
+    final opId = _beginClientOperation();
+    try {
+      final sink = _runtimeFocusSink;
+      if (sink != null) {
+        controller.focusRetainedActive(
+          presented,
+          focusRevision: focusRevision,
+          pendingSync: true,
+        );
+        await sink(presented, focusRevision);
+        if (_workspaceEpoch != epoch ||
+            _focusRevision != focusRevision ||
+            _presentedDocument?.descriptor.sceneId != sceneId ||
+            !panelVisible ||
+            _pendingClientOperationId != opId) {
+          return;
+        }
+        controller.completeFocusSync(
+          sceneId: sceneId,
+          focusRevision: focusRevision,
+        );
+      }
+      if (_workspaceEpoch != epoch ||
+          _focusRevision != focusRevision ||
+          _presentedDocument?.descriptor.sceneId != sceneId ||
+          !panelVisible ||
+          _pendingClientOperationId != opId) {
+        return;
+      }
+      controller.emitPresentationUpdated(
+        visible: true,
+        sceneId: sceneId,
+        focusRevision: focusRevision,
+        clientOperationId: opId,
+      );
+    } catch (error, stackTrace) {
+      if (_pendingClientOperationId == opId) {
+        _clearPendingClientOperation();
+      }
+      controller.failFocusSync(
+        sceneId: sceneId,
+        focusRevision: focusRevision,
+        error: error,
+      );
+      developer.log(
+        'canvas_reopen_sync_failed sceneId=$sceneId focusRevision=$focusRevision',
+        name: 'ava.canvas.presentation',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      notifyListeners();
+    }
+  }
+
+  bool _recordAcceptedPresentation({
+    required bool visible,
+    required String? sceneId,
+    required int? focusRevision,
+  }) {
+    if (!visible) {
+      _clearAcceptedPresentation();
+      _controller?.markPresentationUnavailable();
+      return !panelVisible;
+    }
+    if (sceneId == null || focusRevision == null) return false;
+    if (_presentedDocument?.descriptor.sceneId != sceneId ||
+        _focusRevision > focusRevision) {
+      return false;
+    }
+    _focusRevision = focusRevision;
+    _acceptPresentation(sceneId: sceneId, focusRevision: focusRevision);
+    return true;
+  }
+
+  void _acceptPresentation({
+    required String sceneId,
+    required int focusRevision,
+  }) {
+    _acceptedPresentationVisible = true;
+    _acceptedPresentationSceneId = sceneId;
+    _acceptedPresentationFocusRevision = focusRevision;
+    _controller?.acceptPresentedScene(
+      sceneId: sceneId,
+      focusRevision: focusRevision,
+    );
+  }
+
+  void _clearAcceptedPresentation() {
+    _acceptedPresentationVisible = false;
+    _acceptedPresentationSceneId = null;
+    _acceptedPresentationFocusRevision = null;
+  }
+
+  String _beginClientOperation() {
+    _clearPendingClientOperation();
+    final operationId = 'op_${++_clientOperationSequence}';
+    _pendingClientOperationId = operationId;
+    _pendingClientOperationTimer = Timer(_clientPresentationTimeout, () {
+      if (_pendingClientOperationId != operationId) return;
+      _pendingClientOperationId = null;
+      _pendingClientOperationTimer = null;
+      _controller?.markPresentationUnavailable();
+      developer.log(
+        'canvas_presentation_client_operation_timeout operationId=$operationId',
+        name: 'ava.canvas.presentation',
+      );
+      notifyListeners();
+    });
+    return operationId;
+  }
+
+  void _clearPendingClientOperation() {
+    _pendingClientOperationTimer?.cancel();
+    _pendingClientOperationTimer = null;
+    _pendingClientOperationId = null;
+  }
+
+  void _emitVisiblePresentation({
+    required AvaValidatedSvgCanvasDocument document,
+    required int focusRevision,
+  }) {
+    final operationId = _beginClientOperation();
+    _controller?.emitPresentationUpdated(
+      visible: true,
+      sceneId: document.descriptor.sceneId,
+      focusRevision: focusRevision,
+      clientOperationId: operationId,
+    );
+  }
+
   void _handleControllerChanged() {
     final controller = _controller;
     if (controller == null) return;
+    final completed = controller.retainedCompletion;
+    if (completed != null) {
+      controller.retainedCompletion = null;
+      final mutation = controller.structuralMutationCompletion;
+      controller.structuralMutationCompletion = null;
+      if (mutation == null) {
+        throw StateError('Canvas activation omitted its structural mutation.');
+      }
+      final foreground = identical(controller.active?.document, completed);
+      _retainDocument(
+        completed,
+        foreground: foreground,
+        mutation: mutation,
+      );
+      if (foreground) {
+        _focusRevision = controller.activeFocusRevision;
+        _acceptPresentation(
+          sceneId: completed.descriptor.sceneId,
+          focusRevision: controller.activeFocusRevision,
+        );
+      }
+    }
     _retainPresentedDocument(controller);
     _observePendingGeneration(controller);
     _clearDismissalWithoutCanvasState();
@@ -384,6 +881,20 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
   void _retainPresentedDocument(AvaSvgCanvasController controller) {
     final active = controller.active?.document;
     if (active == null) return;
+    _retainDocument(active, foreground: true);
+  }
+
+  void _retainDocument(
+    AvaValidatedSvgCanvasDocument active, {
+    required bool foreground,
+    ({
+      int workspaceEpoch,
+      int workspaceRevision,
+      int creationSequence,
+      int modificationSequence,
+      String? evictedSceneId,
+    })? mutation,
+  }) {
     final descriptor = active.descriptor;
     final index = _workspaceDocuments.indexWhere(
       (document) => document.descriptor.sceneId == descriptor.sceneId,
@@ -394,12 +905,32 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
           'A new canvas scene must enter the workspace at revision 1.',
         );
       }
-      if (_workspaceDocuments.length == maximumSceneCount) {
+      if (mutation != null) {
+        _validateStructuralMutation(mutation);
+      }
+      final expectedEvicted = _workspaceDocuments.length == maximumSceneCount
+          ? _workspaceDocuments.first.descriptor.sceneId
+          : null;
+      if (_persistence is AvaStructuralCanvasPersistence &&
+          mutation != null &&
+          mutation.evictedSceneId != expectedEvicted) {
+        throw StateError(
+            'Canvas structural mutation reported an unexpected eviction.');
+      }
+      if (expectedEvicted != null) {
         _workspaceDocuments.removeAt(0);
+        _creationSequences.remove(expectedEvicted);
+        _modificationSequences.remove(expectedEvicted);
       }
       _workspaceDocuments.add(active);
-      _presentedDocument = active;
-      _persistActive(active);
+      final creationSequence =
+          mutation?.creationSequence ?? _nextCreationSequence;
+      final modificationSequence = mutation?.modificationSequence;
+      _creationSequences[descriptor.sceneId] = creationSequence;
+      _modificationSequences[descriptor.sceneId] = modificationSequence;
+      if (mutation != null) _acceptStructuralMutation(mutation);
+      if (foreground) _presentedDocument = active;
+      _persistActive(active, foreground: foreground, mutation: mutation);
       return;
     }
 
@@ -418,9 +949,57 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
       }
       return;
     }
+    if (mutation != null && _persistence is AvaStructuralCanvasPersistence) {
+      _validateStructuralMutation(mutation);
+      if (mutation.evictedSceneId != null ||
+          mutation.creationSequence != _creationSequences[descriptor.sceneId]) {
+        throw StateError(
+            'Canvas revision changed creation order or evicted a scene.');
+      }
+    }
     _workspaceDocuments[index] = active;
-    _presentedDocument = active;
-    _persistActive(active);
+    if (mutation != null) {
+      _modificationSequences[descriptor.sceneId] =
+          mutation.modificationSequence;
+      _acceptStructuralMutation(mutation);
+    }
+    if (foreground) _presentedDocument = active;
+    _persistActive(active, foreground: foreground, mutation: mutation);
+  }
+
+  void _validateStructuralMutation(
+      ({
+        int workspaceEpoch,
+        int workspaceRevision,
+        int creationSequence,
+        int modificationSequence,
+        String? evictedSceneId,
+      }) mutation) {
+    if (_persistence is! AvaStructuralCanvasPersistence) return;
+    if (mutation.workspaceEpoch != _structuralWorkspaceEpoch ||
+        mutation.workspaceRevision != _structuralWorkspaceRevision + 1) {
+      throw StateError(
+          'Canvas structural mutation is stale or has a revision gap.');
+    }
+  }
+
+  void _acceptStructuralMutation(
+      ({
+        int workspaceEpoch,
+        int workspaceRevision,
+        int creationSequence,
+        int modificationSequence,
+        String? evictedSceneId,
+      }) mutation) {
+    if (mutation.workspaceRevision > _structuralWorkspaceRevision) {
+      _structuralWorkspaceRevision = mutation.workspaceRevision;
+    }
+    if (_nextCreationSequence <= mutation.creationSequence) {
+      _nextCreationSequence = mutation.creationSequence + 1;
+    }
+    if (_nextModificationSequence <= mutation.modificationSequence) {
+      _nextModificationSequence = mutation.modificationSequence + 1;
+    }
   }
 
   Future<void> _restorePersistedWorkspace() async {
@@ -455,6 +1034,33 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
       _workspaceDocuments
         ..clear()
         ..addAll(restored.documents);
+      _structuralWorkspaceEpoch = restored.workspaceEpoch;
+      _structuralWorkspaceRevision = restored.workspaceRevision;
+      _creationSequences.clear();
+      _modificationSequences.clear();
+      for (var index = 0; index < restored.documents.length; index++) {
+        final sceneId = restored.documents[index].descriptor.sceneId;
+        _creationSequences[sceneId] =
+            restored.creationSequences[sceneId] ?? index + 1;
+        _modificationSequences[sceneId] =
+            restored.modificationSequences[sceneId];
+      }
+      final creationHighWater = _creationSequences.values.fold<int>(
+        0,
+        (current, value) => value > current ? value : current,
+      );
+      final knownModifications = _modificationSequences.values.whereType<int>();
+      final modificationHighWater = knownModifications.fold<int>(
+        0,
+        (current, value) => value > current ? value : current,
+      );
+      _nextCreationSequence = restored.nextCreationSequence > creationHighWater
+          ? restored.nextCreationSequence
+          : creationHighWater + 1;
+      _nextModificationSequence =
+          restored.nextModificationSequence > modificationHighWater
+              ? restored.nextModificationSequence
+              : modificationHighWater + 1;
       _presentedDocument = focused;
       if (focused != null) {
         _panelDismissed = true;
@@ -470,14 +1076,38 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
       );
       _workspaceDocuments.clear();
       _presentedDocument = null;
+      _creationSequences.clear();
+      _modificationSequences.clear();
     }
   }
 
-  void _persistActive(AvaValidatedSvgCanvasDocument document) {
+  void _persistActive(
+    AvaValidatedSvgCanvasDocument document, {
+    bool foreground = true,
+    ({
+      int workspaceEpoch,
+      int workspaceRevision,
+      int creationSequence,
+      int modificationSequence,
+      String? evictedSceneId,
+    })? mutation,
+  }) {
     final persistence = _persistence;
     if (persistence == null || document.descriptor.isLocallyRestored) return;
+    final operation =
+        persistence is AvaStructuralCanvasPersistence && mutation != null
+            ? persistence.persistStructuralActive(
+                document,
+                focused: foreground,
+                workspaceEpoch: mutation.workspaceEpoch,
+                workspaceRevision: mutation.workspaceRevision,
+                creationSequence: mutation.creationSequence,
+                modificationSequence: mutation.modificationSequence,
+                evictedSceneId: mutation.evictedSceneId,
+              )
+            : persistence.persistActive(document, focused: foreground);
     unawaited(
-      persistence.persistActive(document).onError((error, stackTrace) {
+      operation.onError((error, stackTrace) {
         final descriptor = document.descriptor;
         developer.log(
           'canvas_persist_failed sceneId=${descriptor.sceneId} '
@@ -529,10 +1159,13 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
   void dispose() {
     _renderProfileTimer?.cancel();
     _renderProfileTimer = null;
+    _clearPendingClientOperation();
     _renderProfileUpdateSink = null;
     _controller?.removeListener(_handleControllerChanged);
     _controller = null;
     _workspaceDocuments.clear();
+    _creationSequences.clear();
+    _modificationSequences.clear();
     _presentedDocument = null;
     _panelDismissed = false;
     _dismissedGenerationId = null;

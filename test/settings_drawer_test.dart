@@ -344,6 +344,7 @@ Future<AvaSvgCanvasSessionHost> _retainedCanvasHost() async {
   controller.receiveGenerationStarted({
     'protocolVersion': 4,
     'event': 'canvasGenerationStarted',
+      'focusRevision': 0,
     'sessionId': 'session-1234',
     'sequence': 0,
     'revision': 1,

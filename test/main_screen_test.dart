@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:ava/config/ava_backend_configuration.dart';
 import 'package:ava/models/ava_realtime_protocol.dart';
 import 'package:ava/models/ava_realtime_protocol_v4.dart';
+import 'package:ava/services/ava_canvas_restore_service.dart';
 import 'package:ava/services/ava_device_context_service.dart';
 import 'package:ava/services/ava_realtime_bootstrap_service.dart';
 import 'package:ava/services/ava_realtime_session_v4.dart';
@@ -50,9 +51,11 @@ void main() {
   ) async {
     final database = AppDatabase.forTesting(NativeDatabase.memory());
     final bootstrapTransport = _CountingBootstrapTransport();
+    final canvasRestoreTransport = _AcceptingCanvasRestoreTransport();
     final realtimeTransport = _HoldingRealtimeTransport();
     addTearDown(database.close);
     addTearDown(bootstrapTransport.close);
+    addTearDown(canvasRestoreTransport.close);
     addTearDown(realtimeTransport.close);
 
     await tester.pumpWidget(
@@ -64,6 +67,9 @@ void main() {
           ),
           avaRealtimeBootstrapTransportProvider.overrideWithValue(
             bootstrapTransport,
+          ),
+          avaCanvasRestoreTransportProvider.overrideWithValue(
+            canvasRestoreTransport,
           ),
           avaDeviceContextProvider.overrideWithValue(
             const _DeviceContextFake(),
@@ -83,6 +89,7 @@ void main() {
     await tester.pump();
 
     expect(bootstrapTransport.requestCount, 1);
+    expect(canvasRestoreTransport.requestCount, 1);
     expect(find.byIcon(CupertinoIcons.mic_slash_fill), findsOneWidget);
   });
 
@@ -122,6 +129,32 @@ void main() {
     expect(tester.takeException(), isNull);
     expect(find.text('Thinking'), findsOneWidget);
   });
+}
+
+final class _AcceptingCanvasRestoreTransport
+    implements AvaCanvasRestoreTransport {
+  int requestCount = 0;
+
+  @override
+  Future<AvaCanvasRestoreResponse> putBytes({
+    required Uri endpoint,
+    required Map<String, String> headers,
+    required List<int> body,
+    required Duration timeout,
+  }) async {
+    requestCount += 1;
+    expect(endpoint.path, endsWith('/canvas-workspace'));
+    expect(headers['x-ava-canvas-token'], 'canvas-token-main-screen');
+    expect(jsonDecode(utf8.decode(body)), isA<Map<String, Object?>>());
+    return const AvaCanvasRestoreResponse(
+      statusCode: HttpStatus.ok,
+      protocolVersion: '4',
+      bytes: Stream.empty(),
+    );
+  }
+
+  @override
+  void close() {}
 }
 
 final class _DeviceContextFake implements AvaDeviceContext {

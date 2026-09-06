@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,10 @@ from ava_backend.canvas.svg_workspace import (
 )
 from ava_backend.config import AvaEnvironment, Settings
 from ava_backend.protocol import AgeBand
-from ava_backend.realtime.coordinator import DeterministicRealtimeSessionCoordinator
+from ava_backend.realtime.coordinator import (
+    CanvasFocusRevisionConflictError,
+    DeterministicRealtimeSessionCoordinator,
+)
 from ava_backend.realtime.coordinator_v4 import (
     ProtocolV4CanvasEventSink,
 )
@@ -160,7 +164,7 @@ def test_svg_workspace_focus_retained_basic() -> None:
     assert workspace.scene_count == 2
 
 
-def test_svg_workspace_focus_retained_rejects_active_execution() -> None:
+def test_svg_workspace_focus_retained_preserves_active_execution() -> None:
     workspace = SvgCanvasWorkspace()
     validator = SvgDocumentValidator(SvgValidationLimits())
     doc1 = validator.validate(VALID_SVG)
@@ -189,8 +193,9 @@ def test_svg_workspace_focus_retained_rejects_active_execution() -> None:
         document=doc2,
         first_rendered_sample=0,
     )
-    with pytest.raises(SvgCanvasWorkspaceError, match="canvas generation is active"):
-        workspace.focus_retained(scene2)
+    workspace.focus_retained(scene2)
+    assert workspace.current == scene2
+    assert not workspace.execution("gen-pending").status.terminal
 
 
 def test_svg_workspace_focus_retained_rejects_conflicting_identity() -> None:
@@ -247,14 +252,32 @@ class _StubCoordinator:
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
         self.focused_scene: ActiveSvgCanvasScene | None = None
+        self.focus_revision = 0
+        self.focus_mutation_count = 0
         self.restored_scene: ActiveSvgCanvasScene | None = None
         self.turn_id = f"turn-{session_id}"
 
     def restore_focused_canvas(self, scene: ActiveSvgCanvasScene) -> None:
         self.restored_scene = scene
 
-    async def focus_canvas(self, scene: ActiveSvgCanvasScene) -> None:
+    async def focus_canvas(
+        self, scene: ActiveSvgCanvasScene, *, focus_revision: int
+    ) -> None:
+        if focus_revision < self.focus_revision:
+            return
+        if focus_revision == self.focus_revision:
+            if self.focused_scene is None:
+                raise RuntimeError("positive focus revision lost canonical scene")
+            if self.focused_scene.scene_id != scene.scene_id:
+                raise CanvasFocusRevisionConflictError(
+                    incoming_scene_id=scene.scene_id,
+                    incoming_focus_revision=focus_revision,
+                    canonical_scene_id=self.focused_scene.scene_id,
+                )
+            return
         self.focused_scene = scene
+        self.focus_revision = focus_revision
+        self.focus_mutation_count += 1
 
     async def negotiate(self, *, offer_sdp: str) -> NegotiatedRealtimeCall:
         return NegotiatedRealtimeCall(
@@ -323,6 +346,7 @@ def test_canvas_focus_http_route_success() -> None:
                 "X-Ava-Generation-ID": "gen-focus-1",
                 "X-Ava-Source-Turn-ID": "turn-focus-1",
                 "X-Ava-Scene-ID": "scene-focus-1",
+                "X-Ava-Focus-Revision": "1",
                 "X-Ava-Scene-Revision": "1",
                 "X-Ava-SVG-SHA256": validated.svg_sha256,
                 "X-Ava-Manifest-SHA256": validated.manifest_sha256,
@@ -332,6 +356,151 @@ def test_canvas_focus_http_route_success() -> None:
         assert response.status_code == 204
         assert factory.coordinators[0].focused_scene is not None
         assert factory.coordinators[0].focused_scene.scene_id == "scene-focus-1"
+
+
+def test_canvas_focus_http_revision_semantics_are_nonterminal() -> None:
+    factory = _StubFactory()
+    validated = SvgDocumentValidator(SvgValidationLimits()).validate(VALID_SVG)
+    app = create_app(
+        Settings(
+            environment=AvaEnvironment.TEST,
+            realtime_session_token_secret=SecretStr("k" * 32),
+        ),
+        authoritative_memory=DevelopmentAuthoritativeMemoryStore(),
+        realtime_v4_coordinator_factory=factory,
+    )
+    with TestClient(app, base_url="https://127.0.0.1") as client:
+        bootstrap = client.post(
+            "/v4/realtime/sessions",
+            headers={"X-Ava-Protocol-Version": "4"},
+            json={"protocolVersion": 4, "ageBand": "unknown", "timezoneId": "UTC"},
+        ).json()
+
+        def focus(scene_id: str, focus_revision: int):  # type: ignore[no-untyped-def]
+            return client.put(
+                f"/v4/realtime/sessions/{bootstrap['sessionId']}/canvas-focus",
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "X-Ava-Protocol-Version": "4",
+                    "X-Ava-Canvas-Token": bootstrap["canvasToken"],
+                    "X-Ava-Generation-ID": f"gen-{scene_id}",
+                    "X-Ava-Source-Turn-ID": "turn-focus-semantics",
+                    "X-Ava-Scene-ID": scene_id,
+                    "X-Ava-Focus-Revision": str(focus_revision),
+                    "X-Ava-Scene-Revision": "1",
+                    "X-Ava-SVG-SHA256": validated.svg_sha256,
+                    "X-Ava-Manifest-SHA256": validated.manifest_sha256,
+                },
+                content=validated.svg_bytes,
+            )
+
+        coordinator = factory.coordinators[0]
+        accepted = focus("scene-a", 1)
+        assert accepted.status_code == 204
+        assert coordinator.focused_scene is not None
+        assert coordinator.focused_scene.scene_id == "scene-a"
+        assert coordinator.focus_mutation_count == 1
+
+        idempotent = focus("scene-a", 1)
+        assert idempotent.status_code == 204
+        assert coordinator.focus_mutation_count == 1
+
+        newer = focus("scene-b", 2)
+        assert newer.status_code == 204
+        assert coordinator.focused_scene is not None
+        assert coordinator.focused_scene.scene_id == "scene-b"
+        assert coordinator.focus_mutation_count == 2
+
+        stale = focus("scene-a", 1)
+        assert stale.status_code == 204
+        assert coordinator.focused_scene is not None
+        assert coordinator.focused_scene.scene_id == "scene-b"
+        assert coordinator.focus_revision == 2
+        assert coordinator.focus_mutation_count == 2
+
+        conflict = focus("scene-a", 2)
+        assert conflict.status_code == 409
+        assert conflict.headers["x-ava-protocol-version"] == "4"
+        assert conflict.json()["error"]["code"] == "focusRevisionConflict"
+        assert coordinator.focused_scene is not None
+        assert coordinator.focused_scene.scene_id == "scene-b"
+        assert coordinator.focus_revision == 2
+        assert coordinator.focus_mutation_count == 2
+
+        still_usable = focus("scene-a", 3)
+        assert still_usable.status_code == 204
+        assert coordinator.focused_scene is not None
+        assert coordinator.focused_scene.scene_id == "scene-a"
+        assert coordinator.focus_revision == 3
+        assert coordinator.focus_mutation_count == 3
+
+
+@pytest.mark.asyncio
+async def test_canvas_focus_classification_log_is_attributable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    (
+        coordinator,
+        _provider,
+        _events,
+        _memory,
+        _specialist,
+        jobs,
+    ) = await _create_real_coordinator()
+    validator = SvgDocumentValidator(SvgValidationLimits())
+    scene_a = ActiveSvgCanvasScene(
+        generation_id="gen-log-a",
+        source_turn_id="turn-log-a",
+        scene_id="scene-log-a",
+        revision=1,
+        document=validator.validate(VALID_SVG),
+        first_rendered_sample=0,
+    )
+    scene_b = ActiveSvgCanvasScene(
+        generation_id="gen-log-b",
+        source_turn_id="turn-log-b",
+        scene_id="scene-log-b",
+        revision=1,
+        document=validator.validate(VALID_SVG_2),
+        first_rendered_sample=0,
+    )
+    try:
+        with caplog.at_level(logging.INFO, logger="ava_backend.realtime_coordinator"):
+            await coordinator.focus_canvas(scene_a, focus_revision=1)
+            await coordinator.focus_canvas(scene_a, focus_revision=1)
+            with pytest.raises(CanvasFocusRevisionConflictError):
+                await coordinator.focus_canvas(scene_b, focus_revision=1)
+            await coordinator.focus_canvas(scene_b, focus_revision=2)
+            await coordinator.focus_canvas(scene_a, focus_revision=1)
+
+        records = [
+            record.ava_context
+            for record in caplog.records
+            if record.getMessage().startswith("canvas_focus_submission_result")
+        ]
+        assert [record["classification"] for record in records] == [
+            "accepted",
+            "idempotent",
+            "conflict",
+            "accepted",
+            "stale",
+        ]
+        conflict = records[2]
+        assert conflict == {
+            "sessionId": "session-real-coord",
+            "incomingSceneId": scene_b.scene_id,
+            "incomingSceneRevision": scene_b.revision,
+            "incomingFocusRevision": 1,
+            "canonicalSceneIdBefore": scene_a.scene_id,
+            "canonicalFocusRevisionBefore": 1,
+            "classification": "conflict",
+            "canonicalSceneIdAfter": scene_a.scene_id,
+            "canonicalFocusRevisionAfter": 1,
+        }
+        assert jobs.state.focused_scene == scene_b
+        assert jobs.state.focus_revision == 2
+    finally:
+        await coordinator.close()
 
 
 # Contract A: Valid canvas token from DIFFERENT session is rejected
@@ -368,6 +537,7 @@ def test_canvas_focus_rejects_token_from_different_session() -> None:
                 "X-Ava-Generation-ID": "gen-1",
                 "X-Ava-Source-Turn-ID": "turn-1",
                 "X-Ava-Scene-ID": "scene-1",
+                "X-Ava-Focus-Revision": "1",
                 "X-Ava-Scene-Revision": "1",
                 "X-Ava-SVG-SHA256": validated.svg_sha256,
                 "X-Ava-Manifest-SHA256": validated.manifest_sha256,
@@ -412,6 +582,7 @@ def test_canvas_focus_rejects_wrong_subject() -> None:
                 "X-Ava-Generation-ID": "gen-1",
                 "X-Ava-Source-Turn-ID": "turn-1",
                 "X-Ava-Scene-ID": "scene-1",
+                "X-Ava-Focus-Revision": "1",
                 "X-Ava-Scene-Revision": "1",
                 "X-Ava-SVG-SHA256": validated.svg_sha256,
                 "X-Ava-Manifest-SHA256": validated.manifest_sha256,
@@ -451,6 +622,7 @@ def test_canvas_focus_rejects_manifest_sha_mismatch() -> None:
                 "X-Ava-Generation-ID": "gen-1",
                 "X-Ava-Source-Turn-ID": "turn-1",
                 "X-Ava-Scene-ID": "scene-1",
+                "X-Ava-Focus-Revision": "1",
                 "X-Ava-Scene-Revision": "1",
                 "X-Ava-SVG-SHA256": validated.svg_sha256,
                 "X-Ava-Manifest-SHA256": "0" * 64,
@@ -490,6 +662,7 @@ def test_canvas_focus_rejects_svg_sha_mismatch() -> None:
                 "X-Ava-Generation-ID": "gen-1",
                 "X-Ava-Source-Turn-ID": "turn-1",
                 "X-Ava-Scene-ID": "scene-1",
+                "X-Ava-Focus-Revision": "1",
                 "X-Ava-Scene-Revision": "1",
                 "X-Ava-SVG-SHA256": "0" * 64,
                 "X-Ava-Manifest-SHA256": validated.manifest_sha256,
@@ -542,6 +715,7 @@ def test_canvas_focus_http_boundary_limits() -> None:
                 "X-Ava-Generation-ID": "gen-1",
                 "X-Ava-Source-Turn-ID": "turn-1",
                 "X-Ava-Scene-ID": "scene-1",
+                "X-Ava-Focus-Revision": "1",
                 "X-Ava-Scene-Revision": "1",
                 "X-Ava-SVG-SHA256": validated.svg_sha256,
                 "X-Ava-Manifest-SHA256": validated.manifest_sha256,
@@ -562,6 +736,7 @@ def test_canvas_focus_http_boundary_limits() -> None:
                 "X-Ava-Generation-ID": "gen-1",
                 "X-Ava-Source-Turn-ID": "turn-1",
                 "X-Ava-Scene-ID": "scene-1",
+                "X-Ava-Focus-Revision": "1",
                 "X-Ava-Scene-Revision": "1",
                 "X-Ava-SVG-SHA256": validated.svg_sha256,
                 "X-Ava-Manifest-SHA256": validated.manifest_sha256,
@@ -699,7 +874,7 @@ async def test_real_coordinator_focus_canvas_refreshes_dynamic_context_canvas_fo
         initial_updates = len(realtime.prepared_session_updates)
         assert initial_updates >= 1
 
-        await coordinator.focus_canvas(scene)
+        await coordinator.focus_canvas(scene, focus_revision=1)
 
         assert len(realtime.prepared_session_updates) == initial_updates + 1
         latest_instructions = realtime.prepared_session_updates[-1]["session"][
@@ -707,7 +882,7 @@ async def test_real_coordinator_focus_canvas_refreshes_dynamic_context_canvas_fo
         ]
         assert "Café cloud ☁️" in latest_instructions
         assert jobs.state.workspace.focused_scene_id == "scene-g"
-        assert jobs.state.active == scene
+        assert jobs.state.focused_scene == scene
     finally:
         await coordinator.close()
 
@@ -740,7 +915,7 @@ async def test_real_coordinator_focus_canvas_emits_no_presentation_or_turn_or_me
         initial_turn_id = coordinator._turn_id
         initial_committed = len(memory._committed_turn_ids[coordinator._subject])
 
-        await coordinator.focus_canvas(scene)
+        await coordinator.focus_canvas(scene, focus_revision=1)
 
         assert coordinator._turn_id == initial_turn_id
         assert (
@@ -774,7 +949,7 @@ async def test_real_coordinator_interaction_against_retained_scene_succeeds() ->
             first_rendered_sample=0,
         )
 
-        await coordinator.focus_canvas(scene)
+        await coordinator.focus_canvas(scene, focus_revision=1)
 
         client_interaction = AVA_CLIENT_EVENT_ADAPTER_V4.validate_python(
             {
@@ -790,6 +965,7 @@ async def test_real_coordinator_interaction_against_retained_scene_succeeds() ->
                 "bindingId": "select-cloud",
             }
         )
+        jobs.state.set_presentation_visible(True)
         await coordinator.receive(client_interaction)
 
         last_interaction = jobs.state.last_interaction
@@ -827,9 +1003,9 @@ async def test_real_coordinator_revise_focused_uses_retained_base_and_stages_rev
             first_rendered_sample=0,
         )
 
-        await coordinator.focus_canvas(scene_b3)
+        await coordinator.focus_canvas(scene_b3, focus_revision=1)
         assert jobs.state.workspace.focused_scene_id == "scene-b"
-        assert jobs.state.active == scene_b3
+        assert jobs.state.focused_scene == scene_b3
 
         tool_call = RealtimeCanvasToolCall(
             call_id="call-revise-1",
@@ -874,7 +1050,9 @@ async def test_real_coordinator_revise_focused_uses_retained_base_and_stages_rev
 
 
 @pytest.mark.asyncio
-async def test_claimed_canvas_focus_succeeds_after_bootstrap_ttl_and_fails_after_active_deadline() -> None:
+async def test_claimed_canvas_focus_succeeds_after_bootstrap_ttl_and_fails_after_active_deadline() -> (
+    None
+):
     current_time = datetime(2026, 8, 25, 12, 0, 0, tzinfo=UTC)
     factory = _StubFactory()
     codec = RealtimeSessionTokenCodec("k" * 32)
@@ -931,6 +1109,7 @@ async def test_claimed_canvas_focus_succeeds_after_bootstrap_ttl_and_fails_after
 
     # 4 & 5. Canvas focus succeeds after bootstrap TTL because active_deadline is valid
     focused = await registry.focus_canvas(
+        focus_revision=1,
         session_id=created.session_id,
         token=created.canvas_token,
         subject="child:owner",
@@ -949,6 +1128,7 @@ async def test_claimed_canvas_focus_succeeds_after_bootstrap_ttl_and_fails_after
     current_time += timedelta(seconds=3600)
     with pytest.raises(RealtimeSessionAuthenticationError) as exc_focus:
         await registry.focus_canvas(
+            focus_revision=1,
             session_id=created.session_id,
             token=created.canvas_token,
             subject="child:owner",
@@ -964,7 +1144,9 @@ async def test_claimed_canvas_focus_succeeds_after_bootstrap_ttl_and_fails_after
 
 
 @pytest.mark.asyncio
-async def test_focus_canvas_fails_atomically_when_provider_installation_throws() -> None:
+async def test_focus_canvas_fails_atomically_when_provider_installation_throws() -> (
+    None
+):
     plan = AvaTurnPlan.model_validate_json(
         (FIXTURE_ROOT / "ava_turn_plan_conversation_v3.json").read_text(
             encoding="utf-8"
@@ -976,15 +1158,22 @@ async def test_focus_canvas_fails_atomically_when_provider_installation_throws()
             super().__init__(plan)
             self.fail_prepare = False
 
-        async def prepare_if_idle(self, *, harness: Any, turn_id: str) -> Any:
+        async def prepare(self, *, harness: Any) -> Any:
             if self.fail_prepare:
-                raise RuntimeError("Deterministic Realtime context installation failure")
-            return await super().prepare_if_idle(harness=harness, turn_id=turn_id)
+                raise RuntimeError(
+                    "Deterministic Realtime context installation failure"
+                )
+            return await super().prepare(harness=harness)
 
     provider = _FailingRealtimeProvider(plan)
-    coordinator, _realtime, canvas_events, memory, _specialist, jobs = (
-        await _create_real_coordinator(realtime_provider=provider)
-    )
+    (
+        coordinator,
+        _realtime,
+        canvas_events,
+        memory,
+        _specialist,
+        jobs,
+    ) = await _create_real_coordinator(realtime_provider=provider)
     try:
         validator = SvgDocumentValidator(SvgValidationLimits())
         doc_a = validator.validate(VALID_SVG)
@@ -1007,29 +1196,23 @@ async def test_focus_canvas_fails_atomically_when_provider_installation_throws()
         )
 
         # Initial backend focus: Scene A
-        await coordinator.focus_canvas(scene_a)
+        await coordinator.focus_canvas(scene_a, focus_revision=1)
         assert jobs.state.workspace.focused_scene_id == "scene-a"
-        assert jobs.state.active == scene_a
+        assert jobs.state.focused_scene == scene_a
 
         # Now make Realtime context installation throw on Scene B
         provider.fail_prepare = True
 
-        with pytest.raises(RuntimeError, match="Deterministic Realtime context installation failure"):
-            await coordinator.focus_canvas(scene_b)
+        with pytest.raises(
+            RuntimeError, match="Deterministic Realtime context installation failure"
+        ):
+            await coordinator.focus_canvas(scene_b, focus_revision=2)
 
-        # Expected:
-        # - coordinator.focus_canvas(B) fails;
-        # - workspace.focused_scene_id remains A;
-        # - workspace.active/current remains A;
-        # - no fake canvasActivated;
-        # - no canvasPresented;
-        # - no memory commit;
-        # - no fake turn;
-        # - B is NOT semantically committed.
-        assert jobs.state.workspace.focused_scene_id == "scene-a"
-        assert jobs.state.active == scene_a
-        assert jobs.state.workspace.current == scene_a
-        assert jobs.state.workspace.scene("scene-b") is None
+        # Failed installation preserves the new canonical focus; the child barrier
+        # cannot use it until its context is acknowledged.
+        assert jobs.state.workspace.focused_scene_id == "scene-b"
+        assert jobs.state.focused_scene == scene_b
+        assert coordinator._focus_context_revision < jobs.state.workspace.focus_revision
         assert canvas_events._events.empty()
         assert coordinator._turn_id == "turn-real-coord"
         assert len(memory._committed_turn_ids[coordinator._subject]) == 0
@@ -1038,83 +1221,42 @@ async def test_focus_canvas_fails_atomically_when_provider_installation_throws()
 
 
 @pytest.mark.asyncio
-async def test_focus_canvas_retries_and_commits_only_after_installation_confirmed() -> None:
-    plan = AvaTurnPlan.model_validate_json(
-        (FIXTURE_ROOT / "ava_turn_plan_conversation_v3.json").read_text(
-            encoding="utf-8"
-        )
+async def test_focus_during_active_response_never_asks_for_response_readiness() -> None:
+    coordinator, provider, _, _, _, jobs = await _create_real_coordinator()
+
+    async def forbidden_readiness(*, turn_id: str) -> bool:
+        raise AssertionError("focus depends on response readiness")
+
+    provider.wait_until_canvas_interaction_response_ready = forbidden_readiness
+    provider._active_response_turn_id = coordinator.turn_id
+    scene = ActiveSvgCanvasScene(
+        generation_id="gen-focus",
+        source_turn_id="turn-focus",
+        scene_id="scene-focus",
+        revision=1,
+        document=SvgDocumentValidator().validate(VALID_SVG),
+        first_rendered_sample=0,
     )
-
-    class _DeferredThenReadyProvider(_RealtimeFocusPlanProvider):
-        def __init__(self, plan: Any) -> None:
-            super().__init__(plan)
-            self.attempts = 0
-            self.workspace_ref: SvgCanvasWorkspace | None = None
-            self.workspace_focus_on_first_attempt: str | None = None
-
-        async def prepare_if_idle(self, *, harness: Any, turn_id: str) -> Any:
-            self.attempts += 1
-            if self.attempts == 1:
-                if self.workspace_ref is not None:
-                    self.workspace_focus_on_first_attempt = self.workspace_ref.focused_scene_id
-                return None
-            return await super().prepare_if_idle(harness=harness, turn_id=turn_id)
-
-    provider = _DeferredThenReadyProvider(plan)
-    coordinator, _realtime, _canvas_events, _memory, _specialist, jobs = (
-        await _create_real_coordinator(realtime_provider=provider)
-    )
-    provider.workspace_ref = jobs.state.workspace
     try:
-        validator = SvgDocumentValidator(SvgValidationLimits())
-        doc_a = validator.validate(VALID_SVG)
-        scene_a = ActiveSvgCanvasScene(
-            generation_id="gen-a",
-            source_turn_id="turn-a",
-            scene_id="scene-a",
-            revision=1,
-            document=doc_a,
-            first_rendered_sample=0,
-        )
-        doc_b = validator.validate(VALID_SVG_2)
-        scene_b = ActiveSvgCanvasScene(
-            generation_id="gen-b",
-            source_turn_id="turn-b",
-            scene_id="scene-b",
-            revision=1,
-            document=doc_b,
-            first_rendered_sample=0,
-        )
-
-        # Initial backend focus: Scene A (attempts count reset)
-        await coordinator.focus_canvas(scene_a)
-        assert jobs.state.workspace.focused_scene_id == "scene-a"
-        provider.attempts = 0  # reset for scene B focus
-
-        # Focus B: first prepare_if_idle returns None, then retry succeeds
-        await coordinator.focus_canvas(scene_b)
-
-        # Assertions before installation confirmation:
-        # workspace focus was == "scene-a"
-        assert provider.workspace_focus_on_first_attempt == "scene-a"
-        assert provider.attempts >= 2
-
-        # Assertions after successful confirmation:
-        # workspace focus == "scene-b"
-        assert jobs.state.workspace.focused_scene_id == "scene-b"
-        assert jobs.state.active == scene_b
+        await coordinator.focus_canvas(scene, focus_revision=6)
+        assert jobs.state.workspace.current == scene
+        assert jobs.state.workspace.focus_revision == 6
     finally:
         await coordinator.close()
 
 
 @pytest.mark.asyncio
-async def test_registry_focus_canvas_does_not_hold_registry_lock_during_coordinator_await() -> None:
+async def test_registry_focus_canvas_does_not_hold_registry_lock_during_coordinator_await() -> (
+    None
+):
     current_time = datetime(2026, 8, 25, 12, 0, 0, tzinfo=UTC)
     block_focus = asyncio.Event()
     focus_entered = asyncio.Event()
 
     class _BlockingCoordinator(_StubCoordinator):
-        async def focus_canvas(self, scene: ActiveSvgCanvasScene) -> None:
+        async def focus_canvas(
+            self, scene: ActiveSvgCanvasScene, *, focus_revision: int
+        ) -> None:
             focus_entered.set()
             await block_focus.wait()
             self.focused_scene = scene
@@ -1180,6 +1322,7 @@ async def test_registry_focus_canvas_does_not_hold_registry_lock_during_coordina
     # Start focus on Session A in background task
     task_a = asyncio.create_task(
         registry.focus_canvas(
+            focus_revision=1,
             session_id=session_a.session_id,
             token=session_a.canvas_token,
             subject="child:owner-a",
@@ -1212,13 +1355,17 @@ async def test_registry_focus_canvas_does_not_hold_registry_lock_during_coordina
 
 
 @pytest.mark.asyncio
-async def test_registry_focus_canvas_fails_if_session_released_during_coordinator_focus() -> None:
+async def test_registry_focus_canvas_fails_if_session_released_during_coordinator_focus() -> (
+    None
+):
     current_time = datetime(2026, 8, 25, 12, 0, 0, tzinfo=UTC)
     block_focus = asyncio.Event()
     focus_entered = asyncio.Event()
 
     class _BlockingCoordinator(_StubCoordinator):
-        async def focus_canvas(self, scene: ActiveSvgCanvasScene) -> None:
+        async def focus_canvas(
+            self, scene: ActiveSvgCanvasScene, *, focus_revision: int
+        ) -> None:
             focus_entered.set()
             await block_focus.wait()
             self.focused_scene = scene
@@ -1264,6 +1411,7 @@ async def test_registry_focus_canvas_fails_if_session_released_during_coordinato
 
     task_a = asyncio.create_task(
         registry.focus_canvas(
+            focus_revision=1,
             session_id=session_a.session_id,
             token=session_a.canvas_token,
             subject="child:owner-a",
@@ -1320,18 +1468,21 @@ async def test_post_install_infallible_commit_cannot_produce_split_brain() -> No
             first_rendered_sample=0,
         )
 
-        await coordinator.focus_canvas(scene_a)
+        await coordinator.focus_canvas(scene_a, focus_revision=1)
         assert jobs.state.workspace.focused_scene_id == "scene-a"
 
         # Now focus B: provider installation succeeds
-        await coordinator.focus_canvas(scene_b)
+        await coordinator.focus_canvas(scene_b, focus_revision=2)
 
         # Invariant: Once provider has B, workspace MUST have B and live harness MUST have B
         assert jobs.state.workspace.focused_scene_id == "scene-b"
-        assert jobs.state.active == scene_b
+        assert jobs.state.focused_scene == scene_b
         assert jobs.state.workspace.current == scene_b
         assert coordinator.harness is not None
-        assert "Café cloud ☁️" not in coordinator.harness.instructions
+        assert (
+            '<active_visual scene_id="scene-a"' not in coordinator.harness.instructions
+        )
+        assert '<visual scene_id="scene-b"' in coordinator.harness.instructions
     finally:
         await coordinator.close()
 
@@ -1347,12 +1498,13 @@ async def test_concurrent_memory_reset_serialized_with_canvas_focus() -> None:
 
     prepare_started = asyncio.Event()
     unblock_prepare = asyncio.Event()
+    unblock_prepare.set()
 
     class _ControllableProvider(_RealtimeFocusPlanProvider):
-        async def prepare_if_idle(self, *, harness: Any, turn_id: str) -> Any:
+        async def prepare(self, *, harness: Any) -> Any:
             prepare_started.set()
             await unblock_prepare.wait()
-            return await super().prepare_if_idle(harness=harness, turn_id=turn_id)
+            return await super().prepare(harness=harness)
 
     provider = _ControllableProvider(plan)
     (
@@ -1385,12 +1537,14 @@ async def test_concurrent_memory_reset_serialized_with_canvas_focus() -> None:
         )
 
         unblock_prepare.set()
-        await coordinator.focus_canvas(scene_a)
+        await coordinator.focus_canvas(scene_a, focus_revision=1)
         assert jobs.state.workspace.focused_scene_id == "scene-a"
 
         # Now start focus B with controllable prepare
         unblock_prepare.clear()
-        focus_task = asyncio.create_task(coordinator.focus_canvas(scene_b))
+        focus_task = asyncio.create_task(
+            coordinator.focus_canvas(scene_b, focus_revision=2)
+        )
         await prepare_started.wait()
 
         # While focus_canvas is inside canvas_context_lock awaiting prepare_if_idle,
@@ -1418,7 +1572,9 @@ async def test_concurrent_memory_reset_serialized_with_canvas_focus() -> None:
 
 
 @pytest.mark.asyncio
-async def test_registry_focus_canvas_does_not_fail_if_deadline_passes_during_coordinator_work() -> None:
+async def test_registry_focus_canvas_does_not_fail_if_deadline_passes_during_coordinator_work() -> (
+    None
+):
     current_time = datetime(2026, 8, 25, 12, 0, 0, tzinfo=UTC)
 
     class _SlowCoordinator(_StubCoordinator):
@@ -1426,7 +1582,9 @@ async def test_registry_focus_canvas_does_not_fail_if_deadline_passes_during_coo
             super().__init__(session_id)
             self._advance = clock_advance_fn
 
-        async def focus_canvas(self, scene: ActiveSvgCanvasScene) -> None:
+        async def focus_canvas(
+            self, scene: ActiveSvgCanvasScene, *, focus_revision: int
+        ) -> None:
             # Advance time past active_deadline while coordinator is working
             self._advance(timedelta(seconds=4000))
             self.focused_scene = scene
@@ -1478,6 +1636,7 @@ async def test_registry_focus_canvas_does_not_fail_if_deadline_passes_during_coo
     # Focus was authorized when requested; deadline passed while coordinator was committing.
     # Registry must NOT convert this committed focus on a live session into an HTTP failure!
     focused = await registry.focus_canvas(
+        focus_revision=1,
         session_id=session_a.session_id,
         token=session_a.canvas_token,
         subject="child:owner-a",
@@ -1494,7 +1653,9 @@ async def test_registry_focus_canvas_does_not_fail_if_deadline_passes_during_coo
 
 
 @pytest.mark.asyncio
-async def test_focus_canvas_converges_to_b_when_readiness_changes_after_provider_send() -> None:
+async def test_focus_canvas_converges_to_b_when_readiness_changes_after_provider_send() -> (
+    None
+):
     """Prove that if provider send succeeds, coordinator converges canonical workspace to B."""
     plan = AvaTurnPlan.model_validate_json(
         (FIXTURE_ROOT / "ava_turn_plan_conversation_v3.json").read_text(
@@ -1545,20 +1706,23 @@ async def test_focus_canvas_converges_to_b_when_readiness_changes_after_provider
 
         # Baseline: initial focus A
         provider._active_response_id = None
-        await coordinator.focus_canvas(scene_a)
+        await coordinator.focus_canvas(scene_a, focus_revision=1)
         assert jobs.state.workspace.focused_scene_id == "scene-a"
 
         # Now focus B: provider.prepare sends B and mutates readiness during send
         provider._active_response_id = None
-        await coordinator.focus_canvas(scene_b)
+        await coordinator.focus_canvas(scene_b, focus_revision=2)
 
         # Provider send succeeded
         assert provider.send_count >= 2
         # Invariant: canonical workspace MUST converge to Scene B, not stay on A
         assert jobs.state.workspace.focused_scene_id == "scene-b"
-        assert jobs.state.active == scene_b
+        assert jobs.state.focused_scene == scene_b
         assert jobs.state.workspace.current == scene_b
         assert coordinator.harness is not None
-        assert "Café cloud ☁️" not in coordinator.harness.instructions
+        assert (
+            '<active_visual scene_id="scene-a"' not in coordinator.harness.instructions
+        )
+        assert '<visual scene_id="scene-b"' in coordinator.harness.instructions
     finally:
         await coordinator.close()

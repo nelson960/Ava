@@ -6,5 +6,6 @@
   "revision": 1,
   "generationId": "generation-1234",
   "sourceTurnId": "turn-1234",
-  "operation": "new"
+  "operation": "new",
+  "focusRevision": 0
 }

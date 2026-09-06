@@ -312,10 +312,14 @@ def test_capability_manifest_is_versioned_and_bounded() -> None:
     assert manifest["allowedDataAttributes"] == [
         "data-ava-background",
         "data-ava-binding",
+        "data-ava-checkpoints",
+        "data-ava-control",
+        "data-ava-control-kind",
         "data-ava-interaction-mode",
         "data-ava-reveal",
         "data-ava-step",
         "data-ava-target",
+        "data-ava-track",
     ]
     assert manifest["limits"]["bytes"] > 0
     assert manifest["limits"]["bytes"] == 384 * 1024

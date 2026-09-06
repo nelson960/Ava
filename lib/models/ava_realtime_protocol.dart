@@ -303,6 +303,7 @@ void _validateFailure(Map<String, Object?> json) {
       'playbackUnavailable',
       'cancelled',
       'internal',
+      'turnContextFailed',
     },
   );
   _boundedString(json, 'message', 'realtime failure', 240);

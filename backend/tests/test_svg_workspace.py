@@ -72,6 +72,8 @@ def test_backend_workspace_max_ten_fifo_and_revision_replacement() -> None:
         *((f"scene-{scene}", 1) for scene in "BCDEFGHIJ"),
     ]
     assert workspace.current is revised_a
+    assert workspace.scene_recency("scene-A") > workspace.scene_recency("scene-J")
+    revised_a_recency = workspace.scene_recency("scene-A")
 
     committed_k = _commit_new(workspace, "K")
 
@@ -81,6 +83,7 @@ def test_backend_workspace_max_ten_fifo_and_revision_replacement() -> None:
         "scene-K",
     ]
     assert workspace.current is committed_k
+    assert workspace.scene_recency("scene-K") > revised_a_recency
 
 
 def test_revision_does_not_refresh_backend_fifo() -> None:
@@ -95,6 +98,19 @@ def test_revision_does_not_refresh_backend_fifo() -> None:
         "scene-B",
         "scene-C",
     ]
+
+
+def test_restored_scene_eviction_removes_obsolete_recency_identity() -> None:
+    workspace = SvgCanvasWorkspace()
+    for scene in "ABCDEFGHIJK":
+        workspace.restore_focused(_scene(scene, 1))
+
+    assert [scene.scene_id for scene in workspace.scenes] == [
+        *(f"scene-{scene}" for scene in "BCDEFGHIJ"),
+        "scene-K",
+    ]
+    with pytest.raises(SvgCanvasWorkspaceError, match="requires a retained scene"):
+        workspace.scene_recency("scene-A")
 
 
 def test_stale_revision_cannot_overwrite_shared_workspace() -> None:
@@ -210,8 +226,59 @@ def test_restore_hydrates_only_active_scene_without_fake_execution() -> None:
     assert workspace.executions == ()
     assert workspace.last_interaction is None
 
-    with pytest.raises(SvgCanvasWorkspaceError, match="empty"):
-        workspace.restore_focused(_scene("other", 1))
+
+def test_restore_into_populated_workspace_exact_scene_is_idempotent() -> None:
+    workspace = SvgCanvasWorkspace()
+    scene_a = _scene("scene-a", 1)
+    workspace.restore_focused(scene_a)
+    assert workspace.scenes == (scene_a,)
+    assert workspace.current is scene_a
+
+    # Restore exact same scene again: must be idempotent, no duplicate scenes
+    observed = workspace.restore_focused(scene_a)
+    assert observed is scene_a
+    assert workspace.scenes == (scene_a,)
+    assert workspace.current is scene_a
+
+
+def test_restore_into_populated_workspace_with_different_valid_scene() -> None:
+    workspace = SvgCanvasWorkspace()
+    scene_a = _scene("scene-a", 1)
+    scene_b = _scene("scene-b", 2)
+
+    workspace.restore_focused(scene_a)
+    assert workspace.current is scene_a
+
+    # Restoring valid scene_b into populated workspace must admit and focus scene_b
+    observed = workspace.restore_focused(scene_b)
+    assert observed is scene_b
+    assert workspace.current is scene_b
+    assert workspace.scenes == (scene_a, scene_b)
+
+
+def test_repeated_restore_idempotency() -> None:
+    workspace = SvgCanvasWorkspace()
+    scene_a = _scene("scene-a", 1)
+
+    for _ in range(3):
+        workspace.restore_focused(scene_a)
+
+    assert len(workspace.scenes) == 1
+    assert workspace.scenes == (scene_a,)
+    assert workspace.current is scene_a
+
+
+def test_restore_conflicting_canonical_identity_is_rejected() -> None:
+    workspace = SvgCanvasWorkspace()
+    scene_a = _scene("scene-a", 1)
+    workspace.restore_focused(scene_a)
+
+    conflicting = replace(scene_a, generation_id="generation-conflict")
+    with pytest.raises(SvgCanvasWorkspaceError, match="conflicting"):
+        workspace.restore_focused(conflicting)
+
+    assert workspace.scenes == (scene_a,)
+    assert workspace.current is scene_a
 
 
 def test_different_subjects_have_isolated_workspaces() -> None:

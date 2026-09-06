@@ -44,6 +44,7 @@ from .events_v4 import (
     CanvasRuntimeFailedEventV4,
     CanvasInteractionEventV4,
     CanvasPresentedEventV4,
+    CanvasRetainedEventV4,
 )
 from .tool_contract import (
     CANVAS_MODEL_SAFE_REJECTION_REASON,
@@ -68,6 +69,7 @@ class SvgCanvasJobEventSink(Protocol):
         generation_id: str,
         source_turn_id: str,
         operation: Literal["new", "reviseFocused"] = "new",
+        focus_revision: int = 0,
     ) -> None: ...
 
     async def draft_available(self, stored: StoredSvgCanvasDraft) -> None: ...
@@ -224,7 +226,7 @@ class SvgCanvasJobCoordinator:
                 )
             elif (
                 call.request.operation == InteractiveCanvasOperation.REVISE_FOCUSED
-                and self._state.active is None
+                and self._state.focused_scene is None
                 and not any(
                     job.workspace_owned
                     and job.generation_id not in self._cancelled_generations
@@ -242,7 +244,7 @@ class SvgCanvasJobCoordinator:
             else:
                 generation_id = self._generation_id_factory()
                 active = (
-                    self._state.active
+                    self._state.focused_scene
                     if call.request.operation
                     == InteractiveCanvasOperation.REVISE_FOCUSED
                     else None
@@ -252,7 +254,6 @@ class SvgCanvasJobCoordinator:
                     {
                         "generationId": generation_id,
                         "sourceTurnId": source_turn_id,
-                        "sourceTranscript": source_transcript,
                         "brief": call.request.brief,
                         "interactionMode": call.request.interaction_mode,
                         "ageBand": self._age_band,
@@ -427,7 +428,11 @@ class SvgCanvasJobCoordinator:
                 # Serialize the visible start with cancellation. Once this
                 # event is queued, an interrupt may follow with a rejection;
                 # a rejection can never be followed by a late start.
+                execution = self._state.workspace.execution(output.generation_id)
+                if execution is None:
+                    raise RuntimeError("accepted Canvas lost execution ownership")
                 await self._event_sink.generation_started(
+                    focus_revision=execution.focus_revision,
                     generation_id=output.generation_id,
                     source_turn_id=source_turn_id,
                     operation=cast(
@@ -712,7 +717,7 @@ class SvgCanvasJobCoordinator:
 
     async def presented(
         self,
-        event: CanvasPresentedEventV4,
+        event: CanvasPresentedEventV4 | CanvasRetainedEventV4,
     ) -> ActiveSvgCanvasScene:
         async with self._lock:
             candidate = self._state.candidate_or_error(event.generation_id)
@@ -721,16 +726,24 @@ class SvgCanvasJobCoordinator:
                 scene_id=event.scene_id,
                 scene_revision=event.scene_revision,
             )
+            execution = self._state.workspace.execution(event.generation_id)
+            retained = isinstance(event, CanvasRetainedEventV4)
+            foreground = (
+                isinstance(event, CanvasPresentedEventV4) and event.foreground
+                and (execution is None or execution.focus_revision == self._state.workspace.focus_revision)
+            )
             active = self._state.mark_presented(
                 generation_id=event.generation_id,
                 svg_sha256=event.svg_sha256,
                 manifest_sha256=event.manifest_sha256,
-                first_rendered_sample=event.first_rendered_sample,
+                first_rendered_sample=event.first_rendered_sample if isinstance(event, CanvasPresentedEventV4) else 0,
+                foreground=foreground,
+                retained=retained,
             )
             self._presentation_offsets.pop(event.generation_id, None)
             self._cancel_presentation_timeout(event.generation_id)
             self._log(
-                "presentationAcknowledged",
+                "documentRetained" if retained else "presentationAcknowledged",
                 generation_id=active.generation_id,
                 source_turn_id=active.source_turn_id,
                 sceneId=active.scene_id,
@@ -871,6 +884,7 @@ class SvgCanvasJobCoordinator:
             if candidate is not None:
                 self._presentation_offsets.pop(candidate.generation_id, None)
             if clear_workspace:
+                self._state.clear()
                 self._state.workspace.clear()
         return await self._finalize_pending_cancellation(
             jobs=jobs,
@@ -962,17 +976,12 @@ class SvgCanvasJobCoordinator:
             self._traces.pop(candidate.generation_id, None)
         return tuple(retired)
 
-    def render_realtime_context(
-        self,
-        *,
-        scene_override: ActiveSvgCanvasScene | None = None,
-    ) -> str:
+    def render_realtime_context(self) -> str:
         """Render bounded semantic canvas state without transport identifiers."""
 
         pending_visual = self._render_pending_visual_context()
         return self._state.render_realtime_context(
             pending_visual=pending_visual,
-            scene_override=scene_override,
         )
 
     def _render_pending_visual_context(self) -> str:

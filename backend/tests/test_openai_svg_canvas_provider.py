@@ -427,10 +427,7 @@ def test_render_svg_canvas_specialist_instructions_contract() -> None:
     # Verify no unapproved instructions, heuristics, or decision checklists leaked in
     assert "autonomous" not in instructions
     assert "there is no required" not in instructions.lower()
-    assert "resolution-independent viewBox" not in instructions
-    assert "drag" not in instructions
-    assert "slider" not in instructions
-    assert "timeline" not in instructions
+    assert "controlsContract" in instructions
     assert "child-friendly" not in instructions
     assert "editorial vector illustration" not in instructions
 

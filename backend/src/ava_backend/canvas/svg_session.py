@@ -72,9 +72,22 @@ class SvgCanvasPresentationCue:
 class SvgCanvasSessionState:
     """Session-local candidate state backed by a committed canvas workspace."""
 
-    def __init__(self, *, workspace: SvgCanvasWorkspace | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        workspace: SvgCanvasWorkspace | None = None,
+        inherit_focus: bool = True,
+    ) -> None:
         self._candidate: SvgCanvasCandidate | None = None
         self._workspace = workspace or SvgCanvasWorkspace()
+        self._focused_scene: ActiveSvgCanvasScene | None = (
+            self._workspace.current if inherit_focus else None
+        )
+        self._last_interaction: RecordedSvgCanvasInteraction | None = (
+            self._workspace.last_interaction if inherit_focus else None
+        )
+        self.focus_revision: int = 0
+        self._presentation_visible: bool = False
 
     @property
     def workspace(self) -> SvgCanvasWorkspace:
@@ -85,12 +98,64 @@ class SvgCanvasSessionState:
         return self._candidate
 
     @property
+    def presentation_visible(self) -> bool:
+        return self._presentation_visible
+
+    @property
+    def focused_scene(self) -> ActiveSvgCanvasScene | None:
+        return self._focused_scene
+
+    @property
+    def presented_scene(self) -> ActiveSvgCanvasScene | None:
+        return self._focused_scene if self._presentation_visible else None
+
+    @property
     def active(self) -> ActiveSvgCanvasScene | None:
-        return self._workspace.current
+        return self.presented_scene
 
     @property
     def last_interaction(self) -> RecordedSvgCanvasInteraction | None:
-        return self._workspace.last_interaction
+        return self._last_interaction
+
+    def set_presentation_visible(self, visible: bool) -> None:
+        self._presentation_visible = visible
+        if not visible:
+            self._last_interaction = None
+
+    def hide_presentation(self) -> None:
+        self.set_presentation_visible(False)
+
+    def present_focused(self) -> ActiveSvgCanvasScene | None:
+        if self._focused_scene is not None:
+            self.set_presentation_visible(True)
+        return self.presented_scene
+
+    def clear(self) -> None:
+        self._focused_scene = None
+        self._last_interaction = None
+        self.focus_revision = 0
+        self._presentation_visible = False
+
+    def restore_focused(self, scene: ActiveSvgCanvasScene) -> ActiveSvgCanvasScene:
+        restored = self._workspace.restore_focused(scene)
+        self._focused_scene = restored
+        self._presentation_visible = False
+        self._last_interaction = None
+        return restored
+
+    def focus_retained(
+        self,
+        scene: ActiveSvgCanvasScene,
+        *,
+        focus_revision: int | None = None,
+    ) -> ActiveSvgCanvasScene:
+        focused = self._workspace.focus_retained(scene)
+        self._focused_scene = focused
+        if focus_revision is not None:
+            self.focus_revision = focus_revision
+            self._workspace.focus_revision = focus_revision
+        self._last_interaction = None
+        return focused
 
     def stage_generation(
         self,
@@ -270,6 +335,8 @@ class SvgCanvasSessionState:
         svg_sha256: str,
         manifest_sha256: str,
         first_rendered_sample: int,
+        foreground: bool = True,
+        retained: bool = False,
     ) -> ActiveSvgCanvasScene:
         candidate = self._require_candidate(generation_id)
         if candidate.status is not SvgCandidateStatus.PRESENTATION_SCHEDULED:
@@ -279,7 +346,7 @@ class SvgCanvasSessionState:
             )
         if first_rendered_sample < 0:
             raise ValueError("first_rendered_sample cannot be negative")
-        if (
+        if not retained and (
             candidate.presentation_sample_offset is None
             or first_rendered_sample < candidate.presentation_sample_offset
         ):
@@ -306,17 +373,22 @@ class SvgCanvasSessionState:
                     generation_id,
                     SvgCanvasExecutionStatus.PRESENTED,
                 )
-            self._workspace.commit(
+            activated = self._workspace.commit(
                 activated,
                 base_scene_id=candidate.base_scene_id,
                 base_revision=candidate.base_revision,
                 workspace_epoch=candidate.workspace_epoch,
+                foreground=foreground,
             )
         except SvgCanvasWorkspaceError as error:
             self._fail(
                 SvgCanvasStateErrorCode.CANONICAL_SCENE_CHANGED,
                 str(error),
             )
+        if foreground:
+            self._focused_scene = activated
+            self._presentation_visible = True
+            self._last_interaction = None
         self._candidate = None
         return activated
 
@@ -430,28 +502,204 @@ class SvgCanvasSessionState:
             interaction_revision=interaction_revision,
         )
         try:
+            self._last_interaction = recorded
             return self._workspace.record_interaction(recorded)
         except SvgCanvasWorkspaceError as error:
             self._fail(SvgCanvasStateErrorCode.CANONICAL_SCENE_CHANGED, str(error))
+
+    def _render_retained_catalog(self, *, max_characters: int) -> str:
+        if self._workspace.navigation_ready:
+            return self._render_synchronized_retained_catalog(
+                max_characters=max_characters
+            )
+        scenes = self._workspace.scenes
+        if not scenes or max_characters <= 0:
+            return ""
+        retained_prefix = '<retained_visuals purpose="available_to_show">'
+        retained_suffix = "</retained_visuals>"
+        overhead = len(retained_prefix) + len(retained_suffix)
+        if overhead >= max_characters:
+            return ""
+
+        focused = self._focused_scene
+        presented = self.presented_scene
+        recent_scenes = sorted(
+            scenes,
+            key=lambda scene: self._workspace.scene_recency(scene.scene_id),
+            reverse=True,
+        )
+        ordered_scenes: list[ActiveSvgCanvasScene] = []
+        for priority_scene in (presented, focused, recent_scenes[0]):
+            if priority_scene is not None and priority_scene not in ordered_scenes:
+                ordered_scenes.append(priority_scene)
+        for scene in recent_scenes:
+            if scene not in ordered_scenes:
+                ordered_scenes.append(scene)
+
+        entries: list[str] = []
+        current_len = overhead
+        for index, scene in enumerate(ordered_scenes, start=1):
+            is_focused = focused is not None and scene.scene_id == focused.scene_id
+            is_presented = self._presentation_visible and is_focused
+            title = _bounded_escaped_text(
+                scene.document.title,
+                source_characters=60,
+                rendered_characters=80,
+            )
+            summary = _bounded_escaped_text(
+                scene.document.description,
+                source_characters=100,
+                rendered_characters=120,
+            )
+            recency = self._workspace.scene_recency(scene.scene_id)
+            recent_rank = recent_scenes.index(scene) + 1
+            entry = (
+                f'<visual scene_id="{scene.scene_id}" revision="{scene.revision}" '
+                f'focused="{"true" if is_focused else "false"}" '
+                f'presented="{"true" if is_presented else "false"}" '
+                f'order="{index}" recency="{recency}" recent_rank="{recent_rank}">'
+                f"<title>{title}</title>"
+                f"<summary>{summary}</summary>"
+                f"</visual>"
+            )
+            if current_len + len(entry) > max_characters:
+                break
+            entries.append(entry)
+            current_len += len(entry)
+
+        if not entries:
+            return ""
+        return f"{retained_prefix}{''.join(entries)}{retained_suffix}"
+
+    def _render_synchronized_retained_catalog(self, *, max_characters: int) -> str:
+        rows = self._workspace.manifest_scenes
+        if not rows or max_characters <= 0:
+            return ""
+        retained_prefix = '<retained_visuals purpose="available_to_show">'
+        retained_suffix = "</retained_visuals>"
+        if len(retained_prefix) + len(retained_suffix) >= max_characters:
+            return ""
+        focused_id = self._focused_scene.scene_id if self._focused_scene else None
+        presented_id = self.presented_scene.scene_id if self.presented_scene else None
+        prioritized_ids = [
+            presented_id,
+            focused_id,
+            self._workspace.latest_created_scene_id,
+            self._workspace.latest_modified_scene_id,
+        ]
+        ordered_rows = []
+        for scene_id in prioritized_ids:
+            row = self._workspace.manifest_scene(scene_id) if scene_id else None
+            if row is not None and row not in ordered_rows:
+                ordered_rows.append(row)
+        ordered_rows.extend(row for row in rows if row not in ordered_rows)
+        known_modified = sorted(
+            (row for row in rows if row.modification_sequence is not None),
+            key=lambda row: row.modification_sequence or 0,
+        )
+        modification_ranks = {
+            row.scene_id: index + 1 for index, row in enumerate(known_modified)
+        }
+        entries: list[str] = []
+        current_len = len(retained_prefix) + len(retained_suffix)
+        for row in ordered_rows:
+            position = next(
+                index + 1
+                for index, candidate in enumerate(rows)
+                if candidate.scene_id == row.scene_id
+            )
+            modification_rank = modification_ranks.get(row.scene_id)
+            modification_attribute = (
+                f' modification_rank="{modification_rank}"'
+                if modification_rank is not None
+                else ""
+            )
+            entry = (
+                f'<visual scene_id="{escape(row.scene_id)}" revision="{row.scene_revision}" '
+                f'position="{position}" creation_rank="{position}"{modification_attribute} '
+                f'focused="{"true" if row.scene_id == focused_id else "false"}" '
+                f'presented="{"true" if row.scene_id == presented_id else "false"}">'
+                f"<title>{_bounded_escaped_text(row.title, source_characters=60, rendered_characters=80)}</title>"
+                f"<summary>{_bounded_escaped_text(row.summary, source_characters=100, rendered_characters=120)}</summary>"
+                "</visual>"
+            )
+            if current_len + len(entry) > max_characters:
+                continue
+            entries.append(entry)
+            current_len += len(entry)
+        return (
+            f"{retained_prefix}{''.join(entries)}{retained_suffix}" if entries else ""
+        )
+
+    def _render_workspace_header(self) -> str:
+        if not self._workspace.navigation_ready:
+            return '<canvas_workspace synchronized="false"/>'
+        rows = self._workspace.manifest_scenes
+        focused_id = self._focused_scene.scene_id if self._focused_scene else None
+        position = next(
+            (index + 1 for index, row in enumerate(rows) if row.scene_id == focused_id),
+            None,
+        )
+        attributes = [
+            'synchronized="true"',
+            f'workspace_epoch="{self._workspace.workspace_epoch}"',
+            f'workspace_revision="{self._workspace.workspace_revision}"',
+            f'total="{len(rows)}"',
+        ]
+        if focused_id is not None and position is not None:
+            assert self._focused_scene is not None
+            focused = self._workspace.manifest_scene(focused_id)
+            attributes.extend(
+                [
+                    f'focused_scene_id="{escape(focused_id)}"',
+                    f'focused_revision="{focused.scene_revision if focused else self._focused_scene.revision}"',
+                    f'focused_position="{position}"',
+                    f'has_previous="{"true" if position > 1 else "false"}"',
+                    f'has_next="{"true" if position < len(rows) else "false"}"',
+                ]
+            )
+        latest_created = self._workspace.latest_created_scene_id
+        latest_modified = self._workspace.latest_modified_scene_id
+        if latest_created is not None:
+            attributes.append(f'latest_created_scene_id="{escape(latest_created)}"')
+        if latest_modified is not None:
+            attributes.append(f'latest_modified_scene_id="{escape(latest_modified)}"')
+        return f"<canvas_workspace {' '.join(attributes)}/>"
 
     def render_realtime_context(
         self,
         *,
         pending_visual: str = "",
-        scene_override: ActiveSvgCanvasScene | None = None,
     ) -> str:
-        active = scene_override if scene_override is not None else self.active
-        if active is None and not pending_visual:
-            return ""
+        active = self.active
         prefix = '<canvas_context trust="untrusted_model_generated_data">'
         suffix = "</canvas_context>"
+        presentation = (
+            '<canvas_presentation trust="validated_current_state" visible="false"/>'
+            if active is None
+            else (
+                '<canvas_presentation trust="validated_current_state" visible="true" '
+                f'scene_id="{active.scene_id}" revision="{active.revision}"/>'
+            )
+        )
+        workspace_header = self._render_workspace_header()
+        base_overhead = (
+            len(prefix)
+            + len(suffix)
+            + len(presentation)
+            + len(workspace_header)
+            + len(pending_visual)
+        )
+        if base_overhead > _MAX_REALTIME_CANVAS_CONTEXT_CHARACTERS:
+            raise ValueError("pending canvas context exceeds its bounded limit")
+
+        available_chars = _MAX_REALTIME_CANVAS_CONTEXT_CHARACTERS - base_overhead
+
         if active is None:
-            if len(prefix) + len(pending_visual) + len(suffix) > (
-                _MAX_REALTIME_CANVAS_CONTEXT_CHARACTERS
-            ):
-                raise ValueError("pending canvas context exceeds its bounded limit")
-            return f"{prefix}{pending_visual}{suffix}"
-        interaction = None if scene_override is not None else self.last_interaction
+            catalog_xml = self._render_retained_catalog(max_characters=available_chars)
+            return f"{prefix}{presentation}{workspace_header}{pending_visual}{catalog_xml}{suffix}"
+
+        interaction = self.last_interaction
         interaction_xml = ""
         if interaction is not None:
             step_attribute = (
@@ -466,12 +714,26 @@ class SvgCanvasSessionState:
                 "</last_interaction>"
             )
         active_prefix = (
-            f'<active_visual interaction_mode="{escape(active.document.interaction_mode.value)}">'
-            f"<title>{escape(active.document.title)}</title>"
-            f"<description>{escape(active.document.description)}</description>"
+            f'<active_visual scene_id="{active.scene_id}" revision="{active.revision}" '
+            f'interaction_mode="{escape(active.document.interaction_mode.value)}">'
+            "<title>"
+            f"{_bounded_escaped_text(active.document.title, source_characters=160, rendered_characters=240)}"
+            "</title>"
+            "<description>"
+            f"{_bounded_escaped_text(active.document.description, source_characters=800, rendered_characters=600)}"
+            "</description>"
             f"{interaction_xml}"
         )
         active_suffix = "</active_visual>"
+        active_core_len = len(active_prefix) + len(active_suffix)
+
+        reserved_active_semantics = 200
+        catalog_budget = max(
+            0, available_chars - active_core_len - reserved_active_semantics
+        )
+        catalog_xml = self._render_retained_catalog(max_characters=catalog_budget)
+
+        remaining_for_active = available_chars - len(catalog_xml) - active_core_len
         semantic_items = [
             f'<item kind="visibleText">{escape(label)}</item>'
             for label in active.document.visible_text_labels
@@ -488,27 +750,28 @@ class SvgCanvasSessionState:
                 key=lambda item: item.binding_id,
             )
         )
+
         selected: list[str] = []
+        semantics_prefix = "<semantics>"
+        semantics_suffix = "</semantics>"
         for item in semantic_items:
-            semantic_xml = f"<semantics>{''.join((*selected, item))}</semantics>"
-            if (
-                len(prefix)
-                + len(pending_visual)
-                + len(active_prefix)
-                + len(semantic_xml)
-                + len(active_suffix)
-                + len(suffix)
-                > _MAX_REALTIME_CANVAS_CONTEXT_CHARACTERS
-            ):
+            test_xml = (
+                f"{semantics_prefix}{''.join((*selected, item))}{semantics_suffix}"
+            )
+            if len(test_xml) > remaining_for_active:
                 break
             selected.append(item)
-        semantic_xml = f"<semantics>{''.join(selected)}</semantics>" if selected else ""
+        semantic_xml = (
+            f"{semantics_prefix}{''.join(selected)}</semantics>" if selected else ""
+        )
         active_context = f"{active_prefix}{semantic_xml}{active_suffix}"
-        if len(prefix) + len(pending_visual) + len(active_context) + len(suffix) > (
-            _MAX_REALTIME_CANVAS_CONTEXT_CHARACTERS
-        ):
+        total_content = (
+            f"{prefix}{presentation}{workspace_header}{pending_visual}"
+            f"{catalog_xml}{active_context}{suffix}"
+        )
+        if len(total_content) > _MAX_REALTIME_CANVAS_CONTEXT_CHARACTERS:
             raise ValueError("canvas context exceeds its bounded limit")
-        return f"{prefix}{pending_visual}{active_context}{suffix}"
+        return total_content
 
     def _require_candidate(self, generation_id: str) -> SvgCanvasCandidate:
         candidate = self._candidate
@@ -543,6 +806,23 @@ class SvgCanvasSessionState:
 def _scene_identifier(generation_id: str) -> str:
     digest = sha256(generation_id.encode("utf-8")).hexdigest()[:16]
     return f"scene_{digest}"
+
+
+def _bounded_escaped_text(
+    value: str,
+    *,
+    source_characters: int,
+    rendered_characters: int,
+) -> str:
+    rendered: list[str] = []
+    rendered_length = 0
+    for character in value[:source_characters]:
+        escaped = escape(character, quote=False)
+        if rendered_length + len(escaped) > rendered_characters:
+            break
+        rendered.append(escaped)
+        rendered_length += len(escaped)
+    return "".join(rendered)
 
 
 def _recorded_interaction(

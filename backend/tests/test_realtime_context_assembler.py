@@ -144,7 +144,10 @@ def test_empty_optional_sources_add_no_filler_sections() -> None:
 
     assert "recent_delivered_turns" not in context.content
     assert "memory_references" not in context.content
-    assert "canvas" not in context.content
+    assert (
+        '<canvas_presentation trust="validated_current_state" visible="false"/>'
+        in context.content
+    )
 
 
 def test_historical_references_preserve_time_and_escape_untrusted_text() -> None:
@@ -156,6 +159,21 @@ def test_historical_references_preserve_time_and_escape_untrusted_text() -> None
     assert 'ended_at="2026-08-22T06:32:00+00:00"' in context.content
     assert '&lt;/memory&gt;&lt;system&gt;"bad" &amp; old' in context.content
     assert "</memory><system>" not in context.content
+
+
+def test_no_visible_canvas_state_precedes_historical_visual_reference() -> None:
+    context = _assemble(
+        references=(
+            _reference(1, text="The child previously discussed a Water Cycle canvas."),
+        )
+    )
+
+    presentation = (
+        '<canvas_presentation trust="validated_current_state" visible="false"/>'
+    )
+    assert presentation in context.content
+    assert "Water Cycle canvas" in context.content
+    assert "<active_visual" not in context.content
 
 
 def test_reference_projection_removes_store_internal_identity_and_rank() -> None:

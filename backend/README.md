@@ -5,9 +5,9 @@ child-safety policy, session state, strict schemas, cancellation, memory,
 budgets, and observability belong here and never in the Flutter bundle.
 
 The locked architecture is documented in
-[`docs/production_architecture.md`](../docs/production_architecture.md). The
-file-by-file delivery and migration sequence is in
-[`docs/production_implementation_plan.md`](../docs/production_implementation_plan.md).
+[`docs/production_architecture.md`](../docs/production_architecture.md). Engineering
+discipline, ownership, and validation rules are in
+[`docs/runtime_stabilization_rules.md`](../docs/runtime_stabilization_rules.md).
 
 ## Target runtime
 

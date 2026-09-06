@@ -57,6 +57,7 @@ from .protocol import (
     ErrorEnvelope,
 )
 from .providers.openai_realtime_provider import OpenAIRealtimeProviderError
+from .realtime.coordinator import CanvasFocusRevisionConflictError
 from .realtime.events_v4 import (
     PROTOCOL_V4,
     AvaSessionBootstrapV4,
@@ -80,6 +81,7 @@ from .realtime.provider_session import (
 )
 from .realtime.session import (
     AvaSessionCreateRequestV4,
+    CanvasWorkspaceManifestV4,
     RealtimeSessionAuthenticationError,
     RealtimeSessionAuthFailure,
     RealtimeSessionCapacityError,
@@ -544,6 +546,101 @@ def create_app(
         )
 
     @app.put(
+        "/v4/realtime/sessions/{session_id}/canvas-workspace",
+        name="synchronize_realtime_canvas_workspace_v4",
+    )
+    async def synchronize_realtime_canvas_workspace_v4(
+        request: Request,
+        session_id: str,
+        canvas_token: str | None = Header(default=None, alias="X-Ava-Canvas-Token"),
+        protocol_header: str | None = Header(
+            default=None, alias="X-Ava-Protocol-Version"
+        ),
+    ) -> Response:
+        if protocol_header != "4":
+            return _error_response(
+                request,
+                status_code=409,
+                code=ErrorCode.PROTOCOL_MISMATCH,
+                message="X-Ava-Protocol-Version must be exactly 4.",
+            )
+        if (
+            request.headers.get("content-type", "").split(";", maxsplit=1)[0].strip()
+            != "application/json"
+        ):
+            return _error_response(
+                request,
+                status_code=415,
+                code=ErrorCode.INVALID_REQUEST,
+                message="Canvas workspace synchronization requires application/json.",
+            )
+        try:
+            client = await app.state.authenticator.authenticate(request)
+        except PermissionError:
+            return _error_response(
+                request,
+                status_code=401,
+                code=ErrorCode.UNAUTHORIZED,
+                message="A valid Ava client session is required.",
+            )
+        registry: RealtimeSessionRegistry | None = app.state.realtime_v4_sessions
+        if registry is None or canvas_token is None:
+            return _error_response(
+                request,
+                status_code=401 if canvas_token is None else 503,
+                code=ErrorCode.UNAUTHORIZED
+                if canvas_token is None
+                else ErrorCode.PROVIDER_UNAVAILABLE,
+                message="Canvas workspace synchronization authorization is unavailable.",
+            )
+        try:
+            body = await _read_bounded_request_body(request, 32 * 1024)
+            manifest = CanvasWorkspaceManifestV4.model_validate_json(body)
+            adopted = await registry.synchronize_canvas_workspace(
+                session_id=session_id,
+                token=canvas_token,
+                subject=client.subject,
+                manifest=manifest,
+            )
+        except RealtimeSessionAuthenticationError:
+            return _error_response(
+                request,
+                status_code=401,
+                code=ErrorCode.UNAUTHORIZED,
+                message="The Canvas workspace token or lifecycle is invalid.",
+            )
+        except SvgCanvasWorkspaceError as exc:
+            LOGGER.warning(
+                "canvas_workspace_conflict session_id=%s reason=%s",
+                session_id,
+                exc,
+            )
+            return _error_response(
+                request,
+                status_code=409,
+                code=ErrorCode.INVALID_REQUEST,
+                message="The Canvas workspace structural identity conflicts with canonical state.",
+            )
+        except ValueError as exc:
+            LOGGER.warning(
+                "canvas_workspace_rejected session_id=%s error_type=%s reason=%s",
+                session_id,
+                type(exc).__name__,
+                exc,
+            )
+            return _error_response(
+                request,
+                status_code=422,
+                code=ErrorCode.INVALID_REQUEST,
+                message="The Canvas workspace manifest is invalid.",
+            )
+        return JSONResponse(
+            status_code=200,
+            content={"status": "accepted", "changed": adopted},
+            headers={"Cache-Control": "no-store", "X-Ava-Protocol-Version": "4"},
+        )
+
+    @app.put(
         "/v4/realtime/sessions/{session_id}/canvas-restore",
         name="restore_realtime_canvas_v4",
     )
@@ -635,7 +732,13 @@ def create_app(
                 code=ErrorCode.UNAUTHORIZED,
                 message="The Canvas restore token or lifecycle is invalid.",
             )
-        except (SvgDocumentValidationError, UnicodeDecodeError, ValueError):
+        except (SvgDocumentValidationError, UnicodeDecodeError, ValueError) as exc:
+            LOGGER.warning(
+                "canvas_restore_rejected session_id=%s error_type=%s reason=%s",
+                session_id,
+                type(exc).__name__,
+                exc,
+            )
             return _error_response(
                 request,
                 status_code=422,
@@ -672,6 +775,7 @@ def create_app(
     async def focus_realtime_canvas_v4(
         request: Request,
         session_id: str,
+        focus_revision: str | None = Header(default=None, alias="X-Ava-Focus-Revision"),
         canvas_token: str | None = Header(default=None, alias="X-Ava-Canvas-Token"),
         protocol_header: str | None = Header(
             default=None,
@@ -738,7 +842,11 @@ def create_app(
             svg_bytes = await _read_bounded_request_body(
                 request, SVG_PROTOCOL_MAX_BYTES
             )
+            validated_focus_revision = int(focus_revision or "")
+            if not 1 <= validated_focus_revision <= 1_000_000:
+                raise ValueError("focus revision is outside its protocol bound")
             await registry.focus_canvas(
+                focus_revision=validated_focus_revision,
                 session_id=session_id,
                 token=canvas_token,
                 subject=client.subject,
@@ -757,12 +865,43 @@ def create_app(
                 code=ErrorCode.UNAUTHORIZED,
                 message="The Canvas focus token or lifecycle is invalid.",
             )
+        except CanvasFocusRevisionConflictError:
+            response = _error_response(
+                request,
+                status_code=409,
+                code=ErrorCode.FOCUS_REVISION_CONFLICT,
+                message=(
+                    "The Canvas focus revision is already bound to a different scene."
+                ),
+            )
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["X-Ava-Protocol-Version"] = "4"
+            return response
         except (
             SvgDocumentValidationError,
             SvgCanvasWorkspaceError,
             UnicodeDecodeError,
             ValueError,
-        ):
+        ) as exc:
+            LOGGER.warning(
+                "canvas_focus_submission_result session_id=%s classification=rejected "
+                "error_type=%s",
+                session_id,
+                type(exc).__name__,
+                extra={
+                    "ava_context": {
+                        "sessionId": session_id,
+                        "incomingSceneId": scene_id,
+                        "incomingSceneRevision": scene_revision,
+                        "incomingFocusRevision": focus_revision,
+                        "canonicalSceneIdBefore": None,
+                        "canonicalFocusRevisionBefore": None,
+                        "classification": "rejected",
+                        "canonicalSceneIdAfter": None,
+                        "canonicalFocusRevisionAfter": None,
+                    }
+                },
+            )
             return _error_response(
                 request,
                 status_code=422,

@@ -118,6 +118,7 @@ def test_v4_failure_code_values_are_frozen() -> None:
         "playbackUnavailable",
         "cancelled",
         "internal",
+        "turnContextFailed",
     }
 
 

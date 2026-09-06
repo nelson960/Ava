@@ -7,7 +7,7 @@ Read these only when backend, voice, canvas, memory, or release work is in
 scope:
 
 - `docs/production_architecture.md`
-- `docs/production_implementation_plan.md`
+- `docs/runtime_stabilization_rules.md`
 
 Do not revive superseded lesson APIs, fixed diagram catalogs,
 activity/progress features, platform TTS, or experimental response-animation

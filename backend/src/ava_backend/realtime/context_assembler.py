@@ -33,6 +33,7 @@ class DynamicContextBuildReason(StrEnum):
     CANVAS_ACTIVATED = "canvasActivated"
     CANVAS_FOCUSED = "canvasFocused"
     CANVAS_INTERACTION_COMMITTED = "canvasInteractionCommitted"
+    CANVAS_PRESENTATION_CHANGED = "canvasPresentationChanged"
     MEMORY_COMPACTED = "memoryCompacted"
 
 
@@ -129,6 +130,7 @@ class DynamicContextAssembler:
         bootstrap_turns: tuple[DeliveredConversationTurn, ...] = (),
         warm_memories: tuple[MemoryReference, ...] = (),
         canvas_context: str | None = None,
+        active_visual_present: bool = False,
     ) -> AssembledRealtimeContext:
         validated_build_id = _validate_context_build_id(build_id)
         validated_reason = DynamicContextBuildReason(reason)
@@ -136,6 +138,12 @@ class DynamicContextAssembler:
         validated_timezone_id = validate_iana_timezone_id(timezone_id)
         validated_now = _validate_aware_utc(current_time_utc)
         validated_canvas = _validate_canvas_context(canvas_context)
+        if validated_canvas is None:
+            validated_canvas = (
+                '<canvas_context trust="untrusted_model_generated_data">'
+                '<canvas_presentation trust="validated_current_state" visible="false"/>'
+                "</canvas_context>"
+            )
         eligible_bootstrap = validated_reason in {
             DynamicContextBuildReason.SESSION_BOOTSTRAP,
             DynamicContextBuildReason.SESSION_RECONNECT,
@@ -193,6 +201,9 @@ class DynamicContextAssembler:
                 "mandatory current dynamic context exceeds its UTF-8 byte contract"
             )
 
+        if not isinstance(active_visual_present, bool):
+            raise ValueError("active_visual_present must be a boolean")
+
         return AssembledRealtimeContext(
             build_id=validated_build_id,
             content=content,
@@ -202,7 +213,7 @@ class DynamicContextAssembler:
             omitted_bootstrap_turns=omitted_bootstrap,
             included_memory_references=len(retained_references),
             omitted_memory_references=omitted_references,
-            canvas_included=validated_canvas is not None,
+            canvas_included=active_visual_present,
         )
 
 

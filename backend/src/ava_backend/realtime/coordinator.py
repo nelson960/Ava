@@ -8,10 +8,16 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from time import monotonic
-from typing import TypeAlias, TypeVar, cast
+from typing import Literal, TypeAlias, TypeVar, cast
 from zoneinfo import ZoneInfo
 
-from ..canvas.svg_workspace import ActiveSvgCanvasScene, RecordedSvgCanvasInteraction
+from ..canvas.svg_workspace import (
+    ActiveSvgCanvasScene,
+    CanvasNavigationDirection,
+    CanvasWorkspaceManifest,
+    RecordedSvgCanvasInteraction,
+    SvgCanvasWorkspaceError,
+)
 from ..diagnostics import new_failure_id
 from ..protocol import AgeBand
 from .bounded_queue import BoundedAsyncQueue, QueueClosed
@@ -41,10 +47,15 @@ from .events_v4 import (
     CanvasDocumentPreparedEventV4,
     CanvasInteractionEventV4,
     CanvasPreparationFailedEventV4,
+    CanvasPresentationAcknowledgedEventV4,
+    CanvasPresentationChangedSource,
+    CanvasPresentationUpdatedEventV4,
     CanvasPresentedEventV4,
+    CanvasRetainedEventV4,
     CanvasRenderProfileUpdatedEventV4,
     CanvasRuntimeFailedEventV4,
     ClientReadyEventV4,
+    TurnContextSnapshotEventV4,
     PlaybackProgressEventV4,
     PlaybackStartedEventV4,
     PlaybackStoppedEventV4,
@@ -71,6 +82,7 @@ from .provider_session import (
     RealtimeProviderProtocolError,
     RealtimeProviderResponseIncompleteError,
     RealtimeProviderTurnEvent,
+    RealtimeCommittedInput,
     RealtimeProviderSession,
     RealtimeProviderUnavailableError,
 )
@@ -89,7 +101,13 @@ from .tool_contract import (
     InteractiveCanvasToolOutputV4,
     InteractiveCanvasToolStatusV4,
     GetCurrentTimeToolOutputV4,
+    ManageCanvasPresentationAction,
+    ManageCanvasNavigationDirection,
+    ManageCanvasPresentationStatus,
+    ManageCanvasPresentationToolOutputV4,
     RealtimeGetCurrentTimeToolCall,
+    RealtimeManageCanvasPresentationToolCall,
+    RealtimeRejectedManageCanvasPresentationToolCall,
     RealtimeRejectedUtilityToolCall,
     RealtimeSearchMemoryToolCall,
     RealtimeUtilityToolKind,
@@ -114,8 +132,28 @@ LOGGER = logging.getLogger("ava_backend.realtime_coordinator")
 RECENT_LIVE_ECHO_SUPPRESSION_TURNS = 8
 
 
+class TurnContextSynchronizationError(RuntimeError):
+    """The exact device context could not be established for child reasoning."""
+
+
 class CoordinatorStateError(RuntimeError):
     """Raised when a client command violates coordinator ownership or ordering."""
+
+
+class CanvasFocusRevisionConflictError(CoordinatorStateError):
+    """An external focus revision was reused for a different retained scene."""
+
+    def __init__(
+        self,
+        *,
+        incoming_scene_id: str,
+        incoming_focus_revision: int,
+        canonical_scene_id: str,
+    ) -> None:
+        super().__init__("focus revision cannot change scene identity")
+        self.incoming_scene_id = incoming_scene_id
+        self.incoming_focus_revision = incoming_focus_revision
+        self.canonical_scene_id = canonical_scene_id
 
 
 IdentifierFactory: TypeAlias = Callable[[], str]
@@ -162,6 +200,17 @@ class _CapturedMemoryCommit:
     warm_refresh_revision: int
 
 
+@dataclass(slots=True)
+class _PendingPresentationCommand:
+    command_id: str
+    action: ManageCanvasPresentationAction
+    target_scene_id: str | None
+    future: asyncio.Future[ManageCanvasPresentationToolOutputV4]
+    direction: ManageCanvasNavigationDirection | None = None
+    changed: bool = True
+    superseded: bool = False
+
+
 class DeterministicRealtimeSessionCoordinator:
     """Protocol-v4 conversation using injected provider and memory seams.
 
@@ -193,6 +242,7 @@ class DeterministicRealtimeSessionCoordinator:
         failure_id_factory: IdentifierFactory = new_failure_id,
         occurrence_time_factory: OccurrenceTimeFactory = _utc_now,
         memory_commit_drain_timeout_seconds: float = 2.0,
+        turn_context_timeout_seconds: float = 90.0,
         context_assembler: DynamicContextAssembler | None = None,
         current_time_factory: OccurrenceTimeFactory = _utc_now,
     ) -> None:
@@ -225,6 +275,7 @@ class DeterministicRealtimeSessionCoordinator:
         self._failure_id_factory = failure_id_factory
         self._occurrence_time_factory = occurrence_time_factory
         self._memory_commit_drain_timeout_seconds = memory_commit_drain_timeout_seconds
+        self._turn_context_timeout_seconds = turn_context_timeout_seconds
         self._context_assembler = context_assembler or DynamicContextAssembler()
         self._current_time_factory = current_time_factory
         if persistent and (
@@ -247,6 +298,7 @@ class DeterministicRealtimeSessionCoordinator:
         self._memory_reset_revision: int | None = None
         self._harness: RealtimeHarness | None = None
         self._pending_harness: RealtimeHarness | None = None
+        self._pending_focus_revision: int | None = None
         self._pending_context_reason: DynamicContextBuildReason | None = None
         self._context_installation_task: asyncio.Task[None] | None = None
         self._warm_memories: tuple[MemoryReference, ...] = ()
@@ -290,6 +342,22 @@ class DeterministicRealtimeSessionCoordinator:
         self._previous_terminal_turn_id: str | None = None
         self._previous_terminal_stream_id: str | None = None
         self._pending_provider_input_item_ids: set[str] = set()
+        self._submitted_focus_revision = 0
+        self._submitted_focus_build_id: str | None = None
+        self._focus_build_id_by_revision: dict[int, str] = {}
+        self._acknowledged_focus_revision = 0
+        self._focus_changed = asyncio.Event()
+        self._presentation_focus_changed = asyncio.Event()
+        self._focus_linearization_lock = asyncio.Lock()
+        self._turn_context_request: RealtimeCommittedInput | None = None
+        self._turn_context_snapshot: (
+            asyncio.Future[TurnContextSnapshotEventV4] | None
+        ) = None
+        self._turn_context_sync_task: asyncio.Task[None] | None = None
+        self._turn_context_sync_owner: RealtimeCommittedInput | None = None
+        self._turn_controls: asyncio.Queue[AvaServerControlFrameV4] = asyncio.Queue(
+            maxsize=16
+        )
         self._interrupt_signalled_item_ids: set[str] = set()
         self._interruption_provider_item_id: str | None = None
         self._interruption_provider_audio_start_ms: int | None = None
@@ -303,6 +371,8 @@ class DeterministicRealtimeSessionCoordinator:
         self._canvas_interaction_response_turn_id: str | None = None
         self._turn_canvas_interaction_input: RecordedSvgCanvasInteraction | None = None
         self._server_preemption_reason: str | None = None
+        self._canonical_presentation_revision = 0
+        self._pending_presentation_commands: dict[str, _PendingPresentationCommand] = {}
 
     @property
     def harness(self) -> RealtimeHarness:
@@ -334,78 +404,372 @@ class DeterministicRealtimeSessionCoordinator:
             raise CoordinatorStateError("Realtime media has not been negotiated")
         return self._negotiated_call
 
+    @property
+    def accepted_focus_revision(self) -> int:
+        return self._canvas_jobs.state.focus_revision
+
+    @property
+    def submitted_focus_revision(self) -> int:
+        return self._submitted_focus_revision
+
+    @property
+    def acknowledged_focus_revision(self) -> int:
+        return self._acknowledged_focus_revision
+
+    @property
+    def _focus_context_revision(self) -> int:
+        return self._submitted_focus_revision
+
     def restore_focused_canvas(self, scene: ActiveSvgCanvasScene) -> None:
         if self._closed or self._started or self._negotiated_call is not None:
             raise CoordinatorStateError(
                 "Canvas restore must complete before realtime negotiation"
             )
-        self._canvas_jobs.state.workspace.restore_focused(scene)
+        self._canvas_jobs.state.restore_focused(scene)
 
-    async def focus_canvas(self, scene: ActiveSvgCanvasScene) -> None:
-        if self._closed:
+    def synchronize_canvas_workspace(self, manifest: CanvasWorkspaceManifest) -> bool:
+        if self._closed or self._started or self._negotiated_call is not None:
             raise CoordinatorStateError(
-                "cannot change canvas focus on a closed coordinator"
+                "Canvas workspace synchronization must complete before realtime negotiation"
             )
-        self._canvas_jobs.state.workspace.validate_retained_focus(scene)
-        if self._harness is None:
-            self._canvas_jobs.state.workspace.commit_retained_focus(scene)
-            return
+        return self._canvas_jobs.state.workspace.adopt_manifest(manifest)
 
-        while True:
-            if self._closed:
-                raise CoordinatorStateError(
-                    "cannot change canvas focus on a closed coordinator"
+    async def focus_canvas(
+        self, scene: ActiveSvgCanvasScene, *, focus_revision: int
+    ) -> None:
+        if self._closed:
+            raise CoordinatorStateError("cannot focus a closed session")
+        superseded_commands: list[_PendingPresentationCommand] = []
+        async with self._focus_linearization_lock:
+            state = self._canvas_jobs.state
+            current_revision = state.focus_revision
+            current_scene_id = (
+                state.focused_scene.scene_id
+                if state.focused_scene is not None
+                else None
+            )
+            if focus_revision < current_revision:
+                self._log_canvas_focus_result(
+                    scene=scene,
+                    focus_revision=focus_revision,
+                    canonical_scene_id_before=current_scene_id,
+                    canonical_focus_revision_before=current_revision,
+                    classification="stale",
                 )
-            self._canvas_jobs.state.workspace.validate_retained_focus(scene)
-
-            turn_id = self._turn_id
-            async with self._canvas_context_lock:
-                if self._closed:
+                return
+            state.workspace.validate_retained_focus(scene)
+            if focus_revision == current_revision:
+                if state.focused_scene is None:
                     raise CoordinatorStateError(
-                        "cannot change canvas focus on a closed coordinator"
+                        "positive focus revision lost canonical scene identity"
                     )
-                self._canvas_jobs.state.workspace.validate_retained_focus(scene)
+                if state.focused_scene.scene_id != scene.scene_id:
+                    self._log_canvas_focus_result(
+                        scene=scene,
+                        focus_revision=focus_revision,
+                        canonical_scene_id_before=current_scene_id,
+                        canonical_focus_revision_before=current_revision,
+                        classification="conflict",
+                    )
+                    raise CanvasFocusRevisionConflictError(
+                        incoming_scene_id=scene.scene_id,
+                        incoming_focus_revision=focus_revision,
+                        canonical_scene_id=state.focused_scene.scene_id,
+                    )
+                self._log_canvas_focus_result(
+                    scene=scene,
+                    focus_revision=focus_revision,
+                    canonical_scene_id_before=current_scene_id,
+                    canonical_focus_revision_before=current_revision,
+                    classification="idempotent",
+                )
+                return
+            state.focus_retained(scene, focus_revision=focus_revision)
+            self._signal_presentation_focus_changed()
+            for command_id, pending in tuple(
+                self._pending_presentation_commands.items()
+            ):
+                incompatible_show = (
+                    pending.action
+                    in {
+                        ManageCanvasPresentationAction.SHOW,
+                        ManageCanvasPresentationAction.NAVIGATE,
+                    }
+                    and pending.target_scene_id != scene.scene_id
+                )
+                incompatible_hide = (
+                    pending.action == ManageCanvasPresentationAction.HIDE
+                    and state.presentation_visible
+                )
+                if not incompatible_show and not incompatible_hide:
+                    continue
+                pending.superseded = True
+                self._pending_presentation_commands.pop(command_id, None)
+                superseded_commands.append(pending)
+            self._focus_changed.set()
+        if self._harness is not None:
+            await self._refresh_canvas_context(
+                reason=DynamicContextBuildReason.CANVAS_FOCUSED
+            )
+        self._complete_superseded_presentation_commands(
+            superseded_commands,
+            reason="superseded by newer client focus",
+        )
+        self._log_canvas_focus_result(
+            scene=scene,
+            focus_revision=focus_revision,
+            canonical_scene_id_before=current_scene_id,
+            canonical_focus_revision_before=current_revision,
+            classification="accepted",
+        )
 
-                staged_harness = self._build_live_harness(
-                    reason=DynamicContextBuildReason.CANVAS_FOCUSED,
-                    scene_override=scene,
-                )
-                installation_status = await self._realtime.prepare_if_idle(
-                    harness=staged_harness,
-                    turn_id=turn_id,
-                )
-                if installation_status is not None:
-                    self._canvas_jobs.state.workspace.commit_retained_focus(scene)
-                    self._harness = staged_harness
-                    self._pending_harness = None
-                    self._pending_context_reason = None
-                    if (
-                        self._context_installation_task is not None
-                        and not self._context_installation_task.done()
-                    ):
-                        self._context_installation_task.cancel()
-                    self._log_context_installation(
-                        harness=staged_harness,
-                        reason=DynamicContextBuildReason.CANVAS_FOCUSED,
-                        status=str(installation_status),
-                    )
+    def _log_canvas_focus_result(
+        self,
+        *,
+        scene: ActiveSvgCanvasScene,
+        focus_revision: int,
+        canonical_scene_id_before: str | None,
+        canonical_focus_revision_before: int,
+        classification: Literal["accepted", "idempotent", "stale", "conflict"],
+    ) -> None:
+        state = self._canvas_jobs.state
+        LOGGER.info(
+            "canvas_focus_submission_result session_id=%s incoming_scene_id=%s "
+            "incoming_focus_revision=%s classification=%s",
+            self._session_id,
+            scene.scene_id,
+            focus_revision,
+            classification,
+            extra={
+                "ava_context": {
+                    "sessionId": self._session_id,
+                    "incomingSceneId": scene.scene_id,
+                    "incomingSceneRevision": scene.revision,
+                    "incomingFocusRevision": focus_revision,
+                    "canonicalSceneIdBefore": canonical_scene_id_before,
+                    "canonicalFocusRevisionBefore": canonical_focus_revision_before,
+                    "classification": classification,
+                    "canonicalSceneIdAfter": (
+                        state.focused_scene.scene_id
+                        if state.focused_scene is not None
+                        else None
+                    ),
+                    "canonicalFocusRevisionAfter": state.focus_revision,
+                }
+            },
+        )
+
+    def _turn_context_requested_frame(
+        self,
+        *,
+        turn_id: str,
+        request_id: str,
+        provider_item_id: str,
+    ) -> AvaServerControlFrameV4:
+        return self._control_frame(
+            {
+                "event": "turnContextRequested",
+                "turnId": turn_id,
+                "requestId": request_id,
+                "providerItemId": provider_item_id,
+                "revision": self._revision,
+            }
+        )
+
+    async def _synchronize_turn_context(
+        self, committed: RealtimeCommittedInput
+    ) -> None:
+        self._latest_canvas_interaction_intent = None
+        self._canvas_interaction_response_wakeup.set()
+        self._turn_context_sync_owner = committed
+        focus_grounding_degraded = False
+
+        try:
+            while True:
+                if (
+                    self._closed
+                    or self._cancellation_requested.is_set()
+                    or self._turn_id != committed.turn_id
+                    or self._turn_context_sync_owner != committed
+                ):
                     return
 
-            try:
-                ready = await asyncio.wait_for(
-                    self._realtime.wait_until_canvas_interaction_response_ready(
-                        turn_id=turn_id,
-                    ),
-                    timeout=5.0,
-                )
-            except TimeoutError:
-                raise CoordinatorStateError(
-                    "Realtime channel timed out waiting for canvas focus readiness"
-                )
-            if not ready:
-                raise CoordinatorStateError(
-                    "Realtime channel unready for canvas focus context installation"
-                )
+                if self._pending_harness is not None:
+                    await self._install_pending_context_if_idle(
+                        turn_id=committed.turn_id
+                    )
+
+                accepted_focus = self._canvas_jobs.state.focus_revision
+                if (
+                    not focus_grounding_degraded
+                    and accepted_focus > self._acknowledged_focus_revision
+                ):
+                    target_build_id = self._focus_build_id_by_revision.get(
+                        accepted_focus
+                    )
+                    if target_build_id is None:
+                        if self._pending_harness is not None:
+                            await self._install_pending_context_if_idle(
+                                turn_id=committed.turn_id
+                            )
+                        target_build_id = self._focus_build_id_by_revision.get(
+                            accepted_focus
+                        )
+
+                    if target_build_id is None:
+                        self._focus_changed.clear()
+                        if (
+                            self._canvas_jobs.state.focus_revision
+                            <= self._acknowledged_focus_revision
+                        ):
+                            continue
+                        try:
+                            async with asyncio.timeout(
+                                self._turn_context_timeout_seconds
+                            ):
+                                await self._focus_changed.wait()
+                            continue
+                        except TimeoutError:
+                            LOGGER.warning(
+                                "realtime_canvas_focus_grounding_degraded "
+                                "turn_id=%s item_id=%s accepted_focus=%s acknowledged_focus=%s "
+                                "reason=focus_changed_timeout",
+                                committed.turn_id,
+                                committed.item_id,
+                                self._canvas_jobs.state.focus_revision,
+                                self._acknowledged_focus_revision,
+                            )
+                            focus_grounding_degraded = True
+                    else:
+                        try:
+                            LOGGER.info(
+                                "realtime_response_blocked_waiting_for_context "
+                                "session_id=%s turn_id=%s item_id=%s target_build_id=%s focus_revision=%s",
+                                self._session_id,
+                                committed.turn_id,
+                                committed.item_id,
+                                target_build_id,
+                                accepted_focus,
+                            )
+                            async with asyncio.timeout(
+                                self._turn_context_timeout_seconds
+                            ):
+                                await self._realtime.wait_for_context(
+                                    build_id=target_build_id
+                                )
+                            self._acknowledged_focus_revision = max(
+                                self._acknowledged_focus_revision,
+                                accepted_focus,
+                            )
+                            LOGGER.info(
+                                "realtime_context_acknowledged session_id=%s turn_id=%s "
+                                "build_id=%s focus_revision=%s",
+                                self._session_id,
+                                committed.turn_id,
+                                target_build_id,
+                                accepted_focus,
+                            )
+                        except TimeoutError:
+                            LOGGER.warning(
+                                "realtime_canvas_focus_grounding_degraded "
+                                "turn_id=%s item_id=%s build_id=%s accepted_focus=%s acknowledged_focus=%s "
+                                "reason=wait_for_context_timeout",
+                                committed.turn_id,
+                                committed.item_id,
+                                target_build_id,
+                                accepted_focus,
+                                self._acknowledged_focus_revision,
+                            )
+                            focus_grounding_degraded = True
+
+                desired_build_id = self._realtime.desired_context_build_id
+                if (
+                    desired_build_id is not None
+                    and not self._realtime.is_context_acknowledged(desired_build_id)
+                ):
+                    LOGGER.info(
+                        "realtime_response_blocked_waiting_for_context "
+                        "session_id=%s turn_id=%s item_id=%s desired_build_id=%s",
+                        self._session_id,
+                        committed.turn_id,
+                        committed.item_id,
+                        desired_build_id,
+                    )
+                    try:
+                        async with asyncio.timeout(self._turn_context_timeout_seconds):
+                            await self._realtime.wait_for_context(
+                                build_id=desired_build_id
+                            )
+                        LOGGER.info(
+                            "realtime_context_acknowledged session_id=%s turn_id=%s build_id=%s",
+                            self._session_id,
+                            committed.turn_id,
+                            desired_build_id,
+                        )
+                    except TimeoutError:
+                        LOGGER.warning(
+                            "realtime_context_ack_timeout session_id=%s turn_id=%s "
+                            "item_id=%s desired_build_id=%s reason=wait_for_context_timeout",
+                            self._session_id,
+                            committed.turn_id,
+                            committed.item_id,
+                            desired_build_id,
+                        )
+
+                async with self._focus_linearization_lock:
+                    if (
+                        self._closed
+                        or self._cancellation_requested.is_set()
+                        or self._turn_id != committed.turn_id
+                        or self._turn_context_sync_owner != committed
+                    ):
+                        return
+
+                    latest_accepted_focus = self._canvas_jobs.state.focus_revision
+                    if not focus_grounding_degraded:
+                        if latest_accepted_focus > self._acknowledged_focus_revision:
+                            continue
+                    else:
+                        if latest_accepted_focus > accepted_focus:
+                            focus_grounding_degraded = False
+                            continue
+
+                    if self._pending_harness is not None:
+                        continue
+
+                    committed_response = await self._realtime.request_child_response(
+                        turn_id=committed.turn_id,
+                        item_id=committed.item_id,
+                        permit_degraded_focus_grounding=focus_grounding_degraded,
+                    )
+                    if committed_response is False:
+                        continue
+                    LOGGER.info(
+                        "realtime_child_response_committed session_id=%s turn_id=%s "
+                        "item_id=%s active_context_build_id=%s",
+                        self._session_id,
+                        committed.turn_id,
+                        committed.item_id,
+                        self._realtime.active_context_build_id,
+                    )
+                    return
+        finally:
+            if self._turn_context_sync_owner is committed:
+                self._turn_context_sync_owner = None
+
+    @staticmethod
+    def _matches_focus(
+        scene: ActiveSvgCanvasScene | None, snapshot: TurnContextSnapshotEventV4
+    ) -> bool:
+        identity = snapshot.focused_canvas
+        if identity is None:
+            return scene is None
+        return scene is not None and (
+            scene.scene_id == identity.scene_id
+            and scene.revision == identity.scene_revision
+            and scene.document.svg_sha256 == identity.svg_sha256
+            and scene.document.manifest_sha256 == identity.manifest_sha256
+        )
 
     async def memory_reset(self, *, reset_revision: int) -> None:
         if (
@@ -466,6 +830,10 @@ class DeterministicRealtimeSessionCoordinator:
                 bootstrap_turns=tuple(snapshot.delivered_turns),
                 warm_memories=self._warm_memories,
                 canvas_context=self._current_canvas_context(),
+                active_visual_present=(
+                    self._canvas_jobs.state.presentation_visible
+                    and self._canvas_jobs.state.focused_scene is not None
+                ),
             )
             harness = build_realtime_harness(
                 dynamic_context=dynamic_context,
@@ -561,6 +929,27 @@ class DeterministicRealtimeSessionCoordinator:
             )
         self._next_client_sequence += 1
 
+        if isinstance(event, TurnContextSnapshotEventV4):
+            request = self._turn_context_request
+            future = self._turn_context_snapshot
+            if (
+                request is None
+                or event.turn_id != request.turn_id
+                or event.provider_item_id != request.item_id
+                or event.request_id != self._request_id
+            ):
+                LOGGER.info(
+                    "stale_turn_context_snapshot_ignored session_id=%s turn_id=%s item_id=%s",
+                    self._session_id,
+                    event.turn_id,
+                    event.provider_item_id,
+                )
+                return
+            if future is None or future.done():
+                return
+            future.set_result(event)
+            return
+
         if isinstance(event, ClientReadyEventV4):
             if self._client_ready:
                 raise CoordinatorStateError("clientReady may occur only once")
@@ -569,6 +958,44 @@ class DeterministicRealtimeSessionCoordinator:
                     "clientReady must arrive before turn streaming starts"
                 )
             self._client_ready = True
+            if (
+                event.scene_id is not None
+                and self._canvas_jobs.state.focused_scene is not None
+                and self._canvas_jobs.state.focused_scene.scene_id == event.scene_id
+                and event.focus_revision is not None
+                and self._canvas_jobs.state.focus_revision < event.focus_revision
+            ):
+                self._canvas_jobs.state.focus_revision = event.focus_revision
+                self._canvas_jobs.state.workspace.focus_revision = event.focus_revision
+
+            if event.canvas_panel_visible is not None:
+                if (
+                    event.canvas_panel_visible
+                    and event.scene_id is not None
+                    and self._canvas_jobs.state.focused_scene is not None
+                    and self._canvas_jobs.state.focused_scene.scene_id == event.scene_id
+                ):
+                    self._canvas_jobs.state.set_presentation_visible(True)
+                    self._canonical_presentation_revision += 1
+                    await self._canvas_events.presentation_changed(
+                        visible=True,
+                        scene_id=event.scene_id,
+                        focus_revision=self._canvas_jobs.state.focus_revision,
+                        source=CanvasPresentationChangedSource.RESTORE.value,
+                    )
+                    await self._refresh_canvas_context(
+                        reason=DynamicContextBuildReason.CANVAS_PRESENTATION_CHANGED
+                    )
+                else:
+                    self._canvas_jobs.state.set_presentation_visible(False)
+            return
+
+        if isinstance(event, CanvasPresentationUpdatedEventV4):
+            await self._handle_client_presentation_updated(event)
+            return
+
+        if isinstance(event, CanvasPresentationAcknowledgedEventV4):
+            await self._handle_client_presentation_acknowledged(event)
             return
 
         if isinstance(event, CanvasRenderProfileUpdatedEventV4):
@@ -588,7 +1015,7 @@ class DeterministicRealtimeSessionCoordinator:
         if isinstance(event, CanvasPreparationFailedEventV4):
             await self._canvas_jobs.preparation_failed(event)
             return
-        if isinstance(event, CanvasPresentedEventV4):
+        if isinstance(event, (CanvasPresentedEventV4, CanvasRetainedEventV4)):
             await self._canvas_jobs.presented(event)
             await self._refresh_canvas_context()
             return
@@ -729,29 +1156,44 @@ class DeterministicRealtimeSessionCoordinator:
             self._canvas_events.next_payload(),
             name="ava-v4-canvas-control",
         )
+        turn_control_task: asyncio.Task[AvaServerControlFrameV4] = asyncio.create_task(
+            self._turn_controls.get(),
+            name="ava-v4-turn-control",
+        )
         try:
             while conversation_task is not None:
                 pending: set[asyncio.Task[object]] = {
                     cast(asyncio.Task[object], conversation_task),
                     cast(asyncio.Task[object], canvas_task),
+                    cast(asyncio.Task[object], turn_control_task),
                 }
                 done, _ = await asyncio.wait(
                     pending,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
 
+                if turn_control_task in done:
+                    frame = turn_control_task.result()
+                    yield frame
+                    turn_control_task = asyncio.create_task(
+                        self._turn_controls.get(),
+                        name="ava-v4-turn-control",
+                    )
+
                 # Conversation frames have priority because the task may have
                 # already allocated the next sequence. Keep PCM descriptors
                 # and their binary payload atomic on the wire.
                 if conversation_task in done:
                     try:
-                        frame = conversation_task.result()
+                        conversation_frame = conversation_task.result()
                     except StopAsyncIteration:
                         conversation_task = None
                     else:
-                        yield frame
-                        if isinstance(frame, AvaServerControlFrameV4) and isinstance(
-                            frame.event,
+                        yield conversation_frame
+                        if isinstance(
+                            conversation_frame, AvaServerControlFrameV4
+                        ) and isinstance(
+                            conversation_frame.event,
                             AudioChunkEventV4,
                         ):
                             pcm = await anext(conversation)
@@ -765,16 +1207,17 @@ class DeterministicRealtimeSessionCoordinator:
                         )
 
                 if canvas_task in done:
-                    yield AvaServerControlFrameV4(
-                        event=self._canvas_event(canvas_task.result())
-                    )
+                    payload = canvas_task.result()
+                    yield AvaServerControlFrameV4(event=self._canvas_event(payload))
                     canvas_task = asyncio.create_task(
                         self._canvas_events.next_payload(),
                         name="ava-v4-canvas-control",
                     )
         finally:
             tasks = tuple(
-                task for task in (conversation_task, canvas_task) if task is not None
+                task
+                for task in (conversation_task, canvas_task, turn_control_task)
+                if task is not None
             )
             for task in tasks:
                 task.cancel()
@@ -1151,6 +1594,15 @@ class DeterministicRealtimeSessionCoordinator:
                     error,
                 ),
                 False,
+            )
+        except TurnContextSynchronizationError as error:
+            await self._cancel_planning_work(planning_task=planning_task)
+            self._last_error = error
+            provider_error = (
+                SpeechFailureCode.TURN_CONTEXT_FAILED,
+                SpeechFailureComponent.COORDINATOR,
+                str(error),
+                True,
             )
         except RealtimeProviderUnavailableError as error:
             await self._cancel_planning_work(
@@ -1546,9 +1998,12 @@ class DeterministicRealtimeSessionCoordinator:
             raise CoordinatorStateError(
                 "canvas context cannot refresh before session negotiation"
             )
-        harness = self._build_live_harness(reason=reason)
-        self._pending_harness = harness
-        self._pending_context_reason = reason
+        async with self._focus_linearization_lock:
+            focus_revision = self._canvas_jobs.state.focus_revision
+            harness = self._build_live_harness(reason=reason)
+            self._pending_harness = harness
+            self._pending_focus_revision = focus_revision
+            self._pending_context_reason = reason
         try:
             installation_status = await self._realtime.prepare_if_idle(
                 harness=harness,
@@ -1564,8 +2019,15 @@ class DeterministicRealtimeSessionCoordinator:
             raise
         if installation_status is not None:
             self._harness = harness
-            self._pending_harness = None
-            self._pending_context_reason = None
+            if focus_revision >= self._submitted_focus_revision:
+                self._submitted_focus_revision = focus_revision
+                self._submitted_focus_build_id = harness.context.build_id
+            self._focus_build_id_by_revision[focus_revision] = harness.context.build_id
+            self._focus_changed.set()
+            if self._pending_harness is harness:
+                self._pending_harness = None
+                self._pending_focus_revision = None
+                self._pending_context_reason = None
         else:
             self._ensure_pending_context_installation()
         self._log_context_installation(
@@ -1596,8 +2058,11 @@ class DeterministicRealtimeSessionCoordinator:
         self,
         *,
         reason: DynamicContextBuildReason,
-        scene_override: ActiveSvgCanvasScene | None = None,
     ) -> RealtimeHarness:
+        active_visual_present = (
+            self._canvas_jobs.state.presentation_visible
+            and self._canvas_jobs.state.focused_scene is not None
+        )
         dynamic_context = self._context_assembler.assemble(
             build_id=self._next_context_build_id(),
             reason=reason,
@@ -1606,9 +2071,8 @@ class DeterministicRealtimeSessionCoordinator:
             current_time_utc=self._current_time_factory(),
             bootstrap_turns=(),
             warm_memories=self._warm_memories,
-            canvas_context=self._current_canvas_context(
-                scene_override=scene_override
-            ),
+            canvas_context=self._current_canvas_context(),
+            active_visual_present=active_visual_present,
         )
         harness = build_realtime_harness(dynamic_context=dynamic_context)
         self._log_dynamic_context_build(reason, harness)
@@ -1703,14 +2167,8 @@ class DeterministicRealtimeSessionCoordinator:
             },
         )
 
-    def _current_canvas_context(
-        self,
-        *,
-        scene_override: ActiveSvgCanvasScene | None = None,
-    ) -> str | None:
-        context = self._canvas_jobs.render_realtime_context(
-            scene_override=scene_override
-        )
+    def _current_canvas_context(self) -> str | None:
+        context = self._canvas_jobs.render_realtime_context()
         return context or None
 
     async def _install_pending_context_if_idle(
@@ -1725,8 +2183,9 @@ class DeterministicRealtimeSessionCoordinator:
     ]:
         async with self._canvas_context_lock:
             harness = self._pending_harness
+            focus_revision = self._pending_focus_revision
             reason = self._pending_context_reason
-            if harness is None:
+            if harness is None or focus_revision is None:
                 return True, None, None, None
             try:
                 installation_status = await self._realtime.prepare_if_idle(
@@ -1743,8 +2202,17 @@ class DeterministicRealtimeSessionCoordinator:
                 raise
             if installation_status is not None:
                 self._harness = harness
-                self._pending_harness = None
-                self._pending_context_reason = None
+                if focus_revision >= self._submitted_focus_revision:
+                    self._submitted_focus_revision = focus_revision
+                    self._submitted_focus_build_id = harness.context.build_id
+                self._focus_build_id_by_revision[focus_revision] = (
+                    harness.context.build_id
+                )
+                self._focus_changed.set()
+                if self._pending_harness is harness:
+                    self._pending_harness = None
+                    self._pending_focus_revision = None
+                    self._pending_context_reason = None
             return (
                 installation_status is not None,
                 installation_status,
@@ -1979,6 +2447,21 @@ class DeterministicRealtimeSessionCoordinator:
     ) -> _TurnResult | None:
         try:
             async for event in self._turn_events_until_cancelled():
+                if isinstance(event, RealtimeCommittedInput):
+                    if (
+                        self._turn_context_sync_task is not None
+                        and not self._turn_context_sync_task.done()
+                    ):
+                        self._turn_context_sync_task.cancel()
+                        await asyncio.gather(
+                            self._turn_context_sync_task, return_exceptions=True
+                        )
+                    self._turn_context_sync_owner = event
+                    self._turn_context_sync_task = asyncio.create_task(
+                        self._synchronize_turn_context(event),
+                        name=f"ava-turn-context-sync-{event.turn_id}-{event.item_id}",
+                    )
+                    continue
                 if isinstance(event, RealtimeSpeechTextDelta):
                     if event.delta and state.first_text_delta_at is None:
                         state.first_text_delta_at = monotonic()
@@ -2042,6 +2525,73 @@ class DeterministicRealtimeSessionCoordinator:
                         source_turn_id=self._turn_id,
                         message=event.reason,
                     )
+                    continue
+                if isinstance(event, RealtimeRejectedManageCanvasPresentationToolCall):
+                    for segment in parser.finish_response_chunk():
+                        await updates.put(segment)
+                    self._claim_canvas(event.call_id, state=state)
+                    LOGGER.warning(
+                        "manage_canvas_presentation_arguments_rejected session_id=%s "
+                        "turn_id=%s call_id=%s reason=%s",
+                        self._session_id,
+                        self._turn_id,
+                        event.call_id,
+                        event.reason,
+                    )
+                    output = ManageCanvasPresentationToolOutputV4(
+                        status=ManageCanvasPresentationStatus.REJECTED,
+                        operation=ManageCanvasPresentationAction.HIDE,
+                        changed=False,
+                        reason=event.reason,
+                    )
+                    await self._realtime.complete_manage_canvas_presentation_tool(
+                        turn_id=self._turn_id,
+                        call_id=event.call_id,
+                        output=output,
+                    )
+                    LOGGER.info(
+                        "canvas_control_completion session_id=%s turn_id=%s "
+                        "function_call_id=%s operation=invalid status=%s",
+                        self._session_id,
+                        self._turn_id,
+                        event.call_id,
+                        output.status,
+                        extra={
+                            "ava_context": {
+                                "sessionId": self._session_id,
+                                "turnId": self._turn_id,
+                                "providerResponseId": event.provider_response_id,
+                                "functionCallId": event.call_id,
+                                "operation": None,
+                                "direction": None,
+                                "requestedSceneId": None,
+                                "status": str(output.status),
+                                "changed": False,
+                                "reason": event.reason,
+                                "resolvedSceneId": None,
+                                "sceneRevision": None,
+                                "position": None,
+                                "total": None,
+                                "workspaceEpoch": None,
+                                "workspaceRevision": None,
+                                "focusRevision": (
+                                    self._canvas_jobs.state.focus_revision
+                                ),
+                                "presentationCommandId": None,
+                                "supersessionResult": "rejected",
+                                "resultingContextBuildId": (
+                                    self._realtime.active_context_build_id
+                                ),
+                                "continuationResponseId": None,
+                            }
+                        },
+                    )
+                    continue
+                if isinstance(event, RealtimeManageCanvasPresentationToolCall):
+                    for segment in parser.finish_response_chunk():
+                        await updates.put(segment)
+                    self._claim_canvas(event.call_id, state=state)
+                    await self._run_manage_canvas_presentation_tool(event, state=state)
                     continue
                 if isinstance(event, RealtimeCancelCanvasToolCall):
                     for segment in parser.finish_response_chunk():
@@ -2331,6 +2881,554 @@ class DeterministicRealtimeSessionCoordinator:
         )
         await self._refresh_canvas_context()
 
+    async def _run_manage_canvas_presentation_tool(
+        self,
+        call: RealtimeManageCanvasPresentationToolCall,
+        *,
+        state: _PlanningState,
+    ) -> None:
+        action = call.request.action
+        scene_id = call.request.scene_id
+        direction = call.request.direction
+        workspace = self._canvas_jobs.state.workspace
+
+        if action == ManageCanvasPresentationAction.NAVIGATE:
+            if direction is None:
+                raise CoordinatorStateError("validated navigate request lost direction")
+            try:
+                resolution = workspace.resolve_navigation(
+                    CanvasNavigationDirection(direction)
+                )
+            except SvgCanvasWorkspaceError as error:
+                await self._complete_manage_canvas_presentation(
+                    call=call,
+                    output=self._canvas_presentation_output(
+                        status=ManageCanvasPresentationStatus.REJECTED,
+                        operation=action,
+                        direction=direction,
+                        changed=False,
+                        reason=str(error),
+                    ),
+                )
+                return
+            if resolution.reason is not None:
+                await self._complete_manage_canvas_presentation(
+                    call=call,
+                    output=self._canvas_presentation_output(
+                        status=ManageCanvasPresentationStatus.REJECTED,
+                        operation=action,
+                        direction=direction,
+                        changed=False,
+                        reason=resolution.reason,
+                        scene_id=resolution.scene.scene_id
+                        if resolution.scene
+                        else None,
+                    ),
+                )
+                return
+            if resolution.scene is None:
+                raise CoordinatorStateError("navigation resolution lost target scene")
+            scene_id = resolution.scene.scene_id
+            if not resolution.changed:
+                await self._complete_manage_canvas_presentation(
+                    call=call,
+                    output=self._canvas_presentation_output(
+                        status=ManageCanvasPresentationStatus.ACCEPTED,
+                        operation=action,
+                        direction=direction,
+                        changed=False,
+                        scene_id=scene_id,
+                    ),
+                )
+                return
+
+        if action == ManageCanvasPresentationAction.SHOW:
+            if scene_id is None or (
+                workspace.scene(scene_id) is None
+                and workspace.manifest_scene(scene_id) is None
+            ):
+                LOGGER.warning(
+                    "manage_canvas_presentation_scene_not_found session_id=%s turn_id=%s call_id=%s scene_id=%s",
+                    self._session_id,
+                    self._turn_id,
+                    call.call_id,
+                    scene_id,
+                )
+                await self._complete_manage_canvas_presentation(
+                    call=call,
+                    output=self._canvas_presentation_output(
+                        status=ManageCanvasPresentationStatus.REJECTED,
+                        operation=action,
+                        changed=False,
+                        scene_id=scene_id,
+                        reason="scene not found in retained visuals",
+                    ),
+                )
+                return
+
+        import uuid
+
+        command_id = f"cmd-{uuid.uuid4().hex[:12]}"
+        future: asyncio.Future[ManageCanvasPresentationToolOutputV4] = (
+            asyncio.get_running_loop().create_future()
+        )
+        pending_cmd = _PendingPresentationCommand(
+            command_id=command_id,
+            action=action,
+            target_scene_id=scene_id,
+            future=future,
+            direction=direction,
+            changed=(
+                action != ManageCanvasPresentationAction.SHOW
+                or self._canvas_jobs.state.focused_scene is None
+                or self._canvas_jobs.state.focused_scene.scene_id != scene_id
+            ),
+        )
+        self._pending_presentation_commands[command_id] = pending_cmd
+
+        physical_action = (
+            ManageCanvasPresentationAction.SHOW
+            if action == ManageCanvasPresentationAction.NAVIGATE
+            else action
+        )
+        action_val: Literal["show", "hide"] = (
+            "show" if physical_action == ManageCanvasPresentationAction.SHOW else "hide"
+        )
+        await self._canvas_events.presentation_command(
+            command_id=command_id,
+            action=action_val,
+            scene_id=scene_id,
+        )
+
+        try:
+            async with asyncio.timeout(2.0):
+                output = await future
+        except TimeoutError:
+            pending_cmd.superseded = True
+            self._pending_presentation_commands.pop(command_id, None)
+            output = ManageCanvasPresentationToolOutputV4(
+                status=ManageCanvasPresentationStatus.REJECTED,
+                operation=action,
+                direction=direction,
+                scene_id=scene_id,
+                changed=False,
+                reason="presentation command timed out",
+            )
+
+        required_context_build_id = self._realtime.desired_context_build_id
+        while required_context_build_id is not None:
+            await self._realtime.wait_for_context(build_id=required_context_build_id)
+            latest_desired = self._realtime.desired_context_build_id
+            if latest_desired in {None, required_context_build_id}:
+                break
+            required_context_build_id = latest_desired
+        await self._complete_manage_canvas_presentation(
+            call=call,
+            output=output,
+            presentation_command_id=command_id,
+            supersession_result=(
+                "superseded"
+                if pending_cmd.superseded
+                else (
+                    "applied"
+                    if output.status == ManageCanvasPresentationStatus.ACCEPTED
+                    else "rejected"
+                )
+            ),
+        )
+
+    async def _complete_manage_canvas_presentation(
+        self,
+        *,
+        call: RealtimeManageCanvasPresentationToolCall,
+        output: ManageCanvasPresentationToolOutputV4,
+        presentation_command_id: str | None = None,
+        supersession_result: str | None = None,
+    ) -> None:
+        await self._realtime.complete_manage_canvas_presentation_tool(
+            turn_id=self._turn_id,
+            call_id=call.call_id,
+            output=output,
+        )
+        LOGGER.info(
+            "canvas_control_completion session_id=%s turn_id=%s "
+            "function_call_id=%s operation=%s status=%s",
+            self._session_id,
+            self._turn_id,
+            call.call_id,
+            call.request.action,
+            output.status,
+            extra={
+                "ava_context": {
+                    "sessionId": self._session_id,
+                    "turnId": self._turn_id,
+                    "providerResponseId": call.provider_response_id,
+                    "functionCallId": call.call_id,
+                    "operation": str(call.request.action),
+                    "direction": (
+                        str(call.request.direction)
+                        if call.request.direction is not None
+                        else None
+                    ),
+                    "requestedSceneId": call.request.scene_id,
+                    "status": str(output.status),
+                    "changed": output.changed,
+                    "reason": output.reason,
+                    "resolvedSceneId": output.scene_id,
+                    "sceneRevision": output.scene_revision,
+                    "position": output.position,
+                    "total": output.total,
+                    "workspaceEpoch": output.workspace_epoch,
+                    "workspaceRevision": output.workspace_revision,
+                    "focusRevision": self._canvas_jobs.state.focus_revision,
+                    "presentationCommandId": presentation_command_id,
+                    "supersessionResult": supersession_result,
+                    "resultingContextBuildId": (self._realtime.active_context_build_id),
+                    "continuationResponseId": None,
+                }
+            },
+        )
+
+    def _canvas_presentation_output(
+        self,
+        *,
+        status: ManageCanvasPresentationStatus,
+        operation: ManageCanvasPresentationAction,
+        changed: bool,
+        direction: ManageCanvasNavigationDirection | None = None,
+        reason: str | None = None,
+        scene_id: str | None = None,
+    ) -> ManageCanvasPresentationToolOutputV4:
+        state = self._canvas_jobs.state
+        workspace = state.workspace
+        effective_scene_id = (
+            None
+            if operation == ManageCanvasPresentationAction.HIDE
+            else (
+                scene_id
+                or (
+                    state.focused_scene.scene_id
+                    if state.focused_scene is not None
+                    else None
+                )
+            )
+        )
+        ordered_ids = workspace.ordered_scene_ids()
+        position = (
+            ordered_ids.index(effective_scene_id) + 1
+            if effective_scene_id is not None and effective_scene_id in ordered_ids
+            else None
+        )
+        metadata = (
+            workspace.manifest_scene(effective_scene_id)
+            if effective_scene_id is not None
+            else None
+        )
+        hydrated = (
+            workspace.scene(effective_scene_id)
+            if effective_scene_id is not None
+            else None
+        )
+        scene_revision = (
+            metadata.scene_revision
+            if metadata is not None
+            else (hydrated.revision if hydrated is not None else None)
+        )
+        total = len(ordered_ids)
+        return ManageCanvasPresentationToolOutputV4(
+            status=status,
+            operation=operation,
+            direction=direction,
+            changed=changed,
+            visible=state.presentation_visible,
+            scene_id=effective_scene_id,
+            scene_revision=scene_revision,
+            position=position,
+            total=total,
+            has_previous=position is not None and position > 1,
+            has_next=position is not None and position < total,
+            workspace_epoch=workspace.workspace_epoch,
+            workspace_revision=workspace.workspace_revision,
+            reason=reason,
+        )
+
+    async def _handle_client_presentation_updated(
+        self,
+        event: CanvasPresentationUpdatedEventV4,
+    ) -> None:
+        if not event.visible:
+            superseded_commands = self._take_pending_presentation_commands()
+            self._canvas_jobs.state.set_presentation_visible(False)
+            self._canonical_presentation_revision += 1
+            await self._canvas_events.presentation_changed(
+                visible=False,
+                scene_id=None,
+                focus_revision=None,
+                source=CanvasPresentationChangedSource.USER.value,
+            )
+            await self._refresh_canvas_context(
+                reason=DynamicContextBuildReason.CANVAS_PRESENTATION_CHANGED
+            )
+            self._complete_superseded_presentation_commands(superseded_commands)
+            return
+
+        if event.focus_revision is None or event.scene_id is None:
+            raise CoordinatorStateError(
+                "validated visible presentation update lost focus identity"
+            )
+        try:
+            async with asyncio.timeout(2.0):
+                while not self._closed:
+                    resolution = self._presentation_focus_resolution(
+                        scene_id=event.scene_id,
+                        focus_revision=event.focus_revision,
+                    )
+                    if resolution == "matched":
+                        break
+                    if resolution == "superseded":
+                        LOGGER.info(
+                            "presentation_visible_focus_superseded "
+                            "session_id=%s scene_id=%s focus_revision=%s "
+                            "canonical_scene_id=%s canonical_focus_revision=%s",
+                            self._session_id,
+                            event.scene_id,
+                            event.focus_revision,
+                            (
+                                self._canvas_jobs.state.focused_scene.scene_id
+                                if self._canvas_jobs.state.focused_scene is not None
+                                else None
+                            ),
+                            self._canvas_jobs.state.focus_revision,
+                            extra={
+                                "ava_context": {
+                                    "sessionId": self._session_id,
+                                    "sceneId": event.scene_id,
+                                    "focusRevision": event.focus_revision,
+                                    "canonicalSceneId": (
+                                        self._canvas_jobs.state.focused_scene.scene_id
+                                        if self._canvas_jobs.state.focused_scene
+                                        is not None
+                                        else None
+                                    ),
+                                    "canonicalFocusRevision": (
+                                        self._canvas_jobs.state.focus_revision
+                                    ),
+                                    "result": "superseded",
+                                }
+                            },
+                        )
+                        return
+                    focus_changed = self._presentation_focus_changed
+                    if (
+                        self._presentation_focus_resolution(
+                            scene_id=event.scene_id,
+                            focus_revision=event.focus_revision,
+                        )
+                        != "pending"
+                    ):
+                        continue
+                    await focus_changed.wait()
+            if self._closed:
+                return
+        except TimeoutError:
+            LOGGER.warning(
+                "presentation_visible_focus_timeout session_id=%s scene_id=%s focus_revision=%s",
+                self._session_id,
+                event.scene_id,
+                str(event.focus_revision),
+            )
+            return
+
+        if (
+            self._presentation_focus_resolution(
+                scene_id=event.scene_id,
+                focus_revision=event.focus_revision,
+            )
+            != "matched"
+        ):
+            return
+
+        superseded_commands = self._take_pending_presentation_commands()
+        self._canvas_jobs.state.set_presentation_visible(True)
+        self._canonical_presentation_revision += 1
+        await self._canvas_events.presentation_changed(
+            visible=True,
+            scene_id=event.scene_id,
+            focus_revision=self._canvas_jobs.state.focus_revision,
+            source=CanvasPresentationChangedSource.USER.value,
+        )
+        await self._refresh_canvas_context(
+            reason=DynamicContextBuildReason.CANVAS_PRESENTATION_CHANGED
+        )
+        self._complete_superseded_presentation_commands(superseded_commands)
+
+    def _presentation_focus_resolution(
+        self,
+        *,
+        scene_id: str,
+        focus_revision: int,
+    ) -> Literal["matched", "pending", "superseded"]:
+        state = self._canvas_jobs.state
+        if state.focus_revision > focus_revision:
+            return "superseded"
+        if state.focus_revision < focus_revision:
+            return "pending"
+        if state.focused_scene is None or state.focused_scene.scene_id != scene_id:
+            return "superseded"
+        return "matched"
+
+    def _signal_presentation_focus_changed(self) -> None:
+        waiting = self._presentation_focus_changed
+        self._presentation_focus_changed = asyncio.Event()
+        waiting.set()
+
+    def _take_pending_presentation_commands(
+        self,
+    ) -> list[_PendingPresentationCommand]:
+        commands = list(self._pending_presentation_commands.values())
+        for command in commands:
+            command.superseded = True
+        self._pending_presentation_commands.clear()
+        return commands
+
+    def _complete_superseded_presentation_commands(
+        self,
+        commands: list[_PendingPresentationCommand],
+        *,
+        reason: str = "superseded by client physical intent",
+    ) -> None:
+        current_scene = self._canvas_jobs.state.focused_scene
+        for command in commands:
+            if command.future.done():
+                continue
+            command.future.set_result(
+                self._canvas_presentation_output(
+                    status=ManageCanvasPresentationStatus.REJECTED,
+                    operation=command.action,
+                    direction=command.direction,
+                    changed=False,
+                    scene_id=(
+                        current_scene.scene_id if current_scene is not None else None
+                    ),
+                    reason=reason,
+                )
+            )
+
+    async def _handle_client_presentation_acknowledged(
+        self,
+        event: CanvasPresentationAcknowledgedEventV4,
+    ) -> None:
+        pending_cmd = self._pending_presentation_commands.pop(event.command_id, None)
+        if pending_cmd is None or pending_cmd.superseded:
+            LOGGER.info(
+                "stale_or_superseded_presentation_ack_ignored session_id=%s command_id=%s",
+                self._session_id,
+                event.command_id,
+            )
+            return
+
+        if not event.applied:
+            if not pending_cmd.future.done():
+                pending_cmd.future.set_result(
+                    self._canvas_presentation_output(
+                        status=ManageCanvasPresentationStatus.REJECTED,
+                        operation=pending_cmd.action,
+                        direction=pending_cmd.direction,
+                        changed=False,
+                        scene_id=pending_cmd.target_scene_id,
+                        reason=event.reason or "client rejected presentation command",
+                    )
+                )
+            return
+
+        if pending_cmd.action in {
+            ManageCanvasPresentationAction.SHOW,
+            ManageCanvasPresentationAction.NAVIGATE,
+        }:
+            if (
+                pending_cmd.target_scene_id is None
+                or event.scene_id != pending_cmd.target_scene_id
+                or event.focus_revision is None
+            ):
+                if not pending_cmd.future.done():
+                    pending_cmd.future.set_result(
+                        ManageCanvasPresentationToolOutputV4(
+                            status=ManageCanvasPresentationStatus.REJECTED,
+                            operation=pending_cmd.action,
+                            direction=pending_cmd.direction,
+                            changed=False,
+                            scene_id=pending_cmd.target_scene_id,
+                            reason="client acknowledgement changed presentation identity",
+                        )
+                    )
+                return
+            state = self._canvas_jobs.state
+            current_focus = state.focused_scene
+            if event.focus_revision < state.focus_revision or (
+                event.focus_revision == state.focus_revision
+                and current_focus is not None
+                and current_focus.scene_id != pending_cmd.target_scene_id
+            ):
+                if not pending_cmd.future.done():
+                    pending_cmd.future.set_result(
+                        ManageCanvasPresentationToolOutputV4(
+                            status=ManageCanvasPresentationStatus.REJECTED,
+                            operation=pending_cmd.action,
+                            direction=pending_cmd.direction,
+                            changed=False,
+                            scene_id=pending_cmd.target_scene_id,
+                            reason="superseded by newer client focus",
+                        )
+                    )
+                return
+            target_scene = state.workspace.scene(pending_cmd.target_scene_id)
+            if target_scene is None:
+                if not pending_cmd.future.done():
+                    pending_cmd.future.set_result(
+                        ManageCanvasPresentationToolOutputV4(
+                            status=ManageCanvasPresentationStatus.REJECTED,
+                            operation=pending_cmd.action,
+                            direction=pending_cmd.direction,
+                            changed=False,
+                            scene_id=pending_cmd.target_scene_id,
+                            reason="retained visual is no longer available",
+                        )
+                    )
+                return
+            state.focus_retained(target_scene, focus_revision=event.focus_revision)
+            self._signal_presentation_focus_changed()
+            self._canvas_jobs.state.set_presentation_visible(True)
+            self._canonical_presentation_revision += 1
+            await self._canvas_events.presentation_changed(
+                visible=True,
+                scene_id=pending_cmd.target_scene_id,
+                focus_revision=self._canvas_jobs.state.focus_revision,
+                source=CanvasPresentationChangedSource.MODEL.value,
+            )
+        else:
+            self._canvas_jobs.state.set_presentation_visible(False)
+            self._canonical_presentation_revision += 1
+            await self._canvas_events.presentation_changed(
+                visible=False,
+                scene_id=None,
+                focus_revision=None,
+                source=CanvasPresentationChangedSource.MODEL.value,
+            )
+
+        await self._refresh_canvas_context(
+            reason=DynamicContextBuildReason.CANVAS_PRESENTATION_CHANGED
+        )
+        if not pending_cmd.future.done():
+            pending_cmd.future.set_result(
+                self._canvas_presentation_output(
+                    status=ManageCanvasPresentationStatus.ACCEPTED,
+                    operation=pending_cmd.action,
+                    direction=pending_cmd.direction,
+                    changed=pending_cmd.changed,
+                    scene_id=pending_cmd.target_scene_id,
+                )
+            )
+
     async def _complete_canvas_tool(
         self,
         turn_id: str,
@@ -2354,6 +3452,17 @@ class DeterministicRealtimeSessionCoordinator:
         await asyncio.gather(planning_task, return_exceptions=True)
 
     async def _cancel_active_turn_work(self) -> None:
+        sync_task = self._turn_context_sync_task
+        self._turn_context_sync_task = None
+        self._turn_context_sync_owner = None
+        if sync_task is not None and not sync_task.done():
+            sync_task.cancel()
+            await asyncio.gather(sync_task, return_exceptions=True)
+        for cmd in list(self._pending_presentation_commands.values()):
+            cmd.superseded = True
+            if not cmd.future.done():
+                cmd.future.cancel()
+        self._pending_presentation_commands.clear()
         planning_task = self._active_planning_task
         await self._cancel_provider_input_observer()
         if planning_task is not None:
@@ -2587,39 +3696,59 @@ class DeterministicRealtimeSessionCoordinator:
             harness=self._harness,
             turn_id=self._turn_id,
         ).__aiter__()
-        while True:
-            next_event = asyncio.create_task(_next_provider_event(iterator))
-            cancellation = asyncio.create_task(self._cancellation_requested.wait())
-            try:
-                done, _ = await asyncio.wait(
-                    {next_event, cancellation},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-            except BaseException:
-                next_event.cancel()
-                cancellation.cancel()
-                await asyncio.gather(
-                    next_event,
-                    cancellation,
-                    return_exceptions=True,
-                )
-                raise
+        next_event: asyncio.Task[RealtimeProviderTurnEvent] | None = None
+        try:
+            while True:
+                if next_event is None:
+                    next_event = asyncio.create_task(_next_provider_event(iterator))
+                cancellation = asyncio.create_task(self._cancellation_requested.wait())
+                tasks: set[asyncio.Task[object]] = {next_event, cancellation}
+                sync_task = self._turn_context_sync_task
+                if sync_task is not None and not sync_task.done():
+                    tasks.add(cast(asyncio.Task[object], sync_task))
+                try:
+                    done, _ = await asyncio.wait(
+                        tasks,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                except BaseException:
+                    next_event.cancel()
+                    cancellation.cancel()
+                    await asyncio.gather(
+                        next_event,
+                        cancellation,
+                        return_exceptions=True,
+                    )
+                    raise
 
-            if cancellation in done:
-                # End the sole socket reader first. The provider retains its
-                # active response ID, then cancel() drains that exact response
-                # boundary so no stale deltas can enter the next turn.
+                cancellation.cancel()
+                await asyncio.gather(cancellation, return_exceptions=True)
+
+                if cancellation in done:
+                    next_event.cancel()
+                    await asyncio.gather(next_event, return_exceptions=True)
+                    await self._realtime.cancel(turn_id=self._turn_id)
+                    return
+
+                if sync_task is not None and sync_task in done:
+                    exc = sync_task.exception()
+                    if exc is not None and not isinstance(exc, asyncio.CancelledError):
+                        next_event.cancel()
+                        await asyncio.gather(next_event, return_exceptions=True)
+                        raise exc
+
+                if next_event in done:
+                    task_to_read = next_event
+                    next_event = None
+                    try:
+                        event = task_to_read.result()
+                    except StopAsyncIteration:
+                        return
+                    yield event
+        finally:
+            if next_event is not None and not next_event.done():
                 next_event.cancel()
                 await asyncio.gather(next_event, return_exceptions=True)
-                await self._realtime.cancel(turn_id=self._turn_id)
-                return
-
-            cancellation.cancel()
-            await asyncio.gather(cancellation, return_exceptions=True)
-            try:
-                yield next_event.result()
-            except StopAsyncIteration:
-                return
 
     async def close(self) -> None:
         if self._closed:

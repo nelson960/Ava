@@ -8,6 +8,7 @@ from .events_v4 import (
     AudioMetadataEventV4,
     AvaServerEventUnionV4,
     InterruptRequestedEventV4,
+    TurnContextRequestedEventV4,
     MemoryPersistenceFailedEventV4,
     SegmentReadyEventV4,
     TurnCancelledEventV4,
@@ -145,6 +146,10 @@ class RealtimeTurnStateMachine:
 
     def _accept_non_phase_event(self, event: AvaServerEventUnionV4) -> None:
         phase = self._require_phase()
+        if isinstance(event, TurnContextRequestedEventV4):
+            if phase != SpeechPhase.LISTENING:
+                raise RealtimeStateError("turn context requires listening")
+            return
         if isinstance(event, SegmentReadyEventV4):
             if phase not in {
                 SpeechPhase.PLANNING,

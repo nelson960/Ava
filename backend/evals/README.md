@@ -50,9 +50,8 @@ implemented by falling back to the legacy Responses runner.
 
 `conversation_cases.json` and the old runner are retained only for regression
 audit during the protocol-v3 migration. Do not run paid generation or expand
-fixed-diagram/learned-motion cases. Their removal follows the protocol-v3
-end-to-end gate described in
-[`docs/production_implementation_plan.md`](../../docs/production_implementation_plan.md).
+fixed-diagram/learned-motion cases. Their removal follows the verification gates described in
+[`docs/production_architecture.md`](../../docs/production_architecture.md).
 
 `conversation_cases.json` was the versioned behavioral gate for the legacy
 prompt. It contains synthetic child conversations only—never copy real child

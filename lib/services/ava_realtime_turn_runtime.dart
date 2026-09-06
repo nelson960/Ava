@@ -62,12 +62,16 @@ final class AvaRealtimeTurnRuntime {
     required String Function() cancelRequestIdFactory,
     AvaSvgCanvasTelemetrySink? canvasTelemetry,
     AvaRetainedSceneRevisionLookup? retainedSceneRevision,
+    Map<String, Object?> Function()? turnContextSnapshot,
+    AvaCanvasPresentationSnapshot Function()? canvasPresentationSnapshot,
     void Function(AvaSvgCanvasController controller)? onCanvasClosed,
     AvaRealtimeTrace? trace,
     void Function(bool enabled)? onMicrophoneTrackChanged,
     bool automaticPlaybackPolling = true,
     bool microphoneInitiallyEnabled = true,
-  })  : _sessionId = sessionId,
+  })  : _turnContextSnapshot = turnContextSnapshot,
+        _canvasPresentationSnapshot = canvasPresentationSnapshot,
+        _sessionId = sessionId,
         _limits = limits,
         _mediaSession = mediaSession,
         _transport = transport,
@@ -96,6 +100,8 @@ final class AvaRealtimeTurnRuntime {
     }
   }
 
+  final Map<String, Object?> Function()? _turnContextSnapshot;
+  final AvaCanvasPresentationSnapshot Function()? _canvasPresentationSnapshot;
   final String _sessionId;
   final AvaSessionLimitsV4 _limits;
   final AvaRealtimeMediaSession _mediaSession;
@@ -132,6 +138,7 @@ final class AvaRealtimeTurnRuntime {
     int revision,
     AvaCanvasRenderProfileV4 profile
   })? _pendingCanvasRenderProfileUpdate;
+  final List<AvaSvgCanvasClientCommand> _pendingCanvasCommands = [];
   bool _started = false;
   bool _clientReadyEnqueued = false;
   bool _closed = false;
@@ -200,10 +207,14 @@ final class AvaRealtimeTurnRuntime {
         name: 'ava.realtime',
       );
       _trace?.mark('runtime.started');
+      final presentation = _canvasPresentationSnapshot?.call();
       final clientReady = _sendClient(
         (sequence) => AvaRealtimeClientEventV4.clientReady(
           sessionId: _sessionId,
           sequence: sequence,
+          canvasPanelVisible: presentation?.visible ?? false,
+          sceneId: presentation?.sceneId,
+          focusRevision: presentation?.focusRevision,
         ),
       );
       _clientReadyEnqueued = true;
@@ -214,6 +225,12 @@ final class AvaRealtimeTurnRuntime {
           profileRevision: pendingProfile.revision,
           renderProfile: pendingProfile.profile,
         );
+      }
+      final pendingCommands =
+          List<AvaSvgCanvasClientCommand>.from(_pendingCanvasCommands);
+      _pendingCanvasCommands.clear();
+      for (final cmd in pendingCommands) {
+        _enqueueCanvasCommand(cmd);
       }
       await clientReady;
       _trace?.mark('client.ready');
@@ -508,6 +525,7 @@ final class AvaRealtimeTurnRuntime {
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
+    _pendingCanvasCommands.clear();
     _progressTimer?.cancel();
     _progressTimer = null;
     Object? microphoneError;
@@ -582,6 +600,24 @@ final class AvaRealtimeTurnRuntime {
     }
 
     switch (event.type) {
+      case AvaRealtimeServerEventTypeV4.turnContextRequested:
+        final snapshot = _turnContextSnapshot;
+        if (snapshot == null) {
+          throw const AvaRealtimeRuntimeException(
+              'Turn context device owner is unavailable.');
+        }
+        final request = event.toJson();
+        final context = snapshot();
+        await _sendClient(
+            (sequence) => AvaRealtimeClientEventV4.turnContextSnapshot(
+                  sessionId: _sessionId,
+                  sequence: sequence,
+                  turnId: event.turnId!,
+                  requestId: request['requestId']! as String,
+                  providerItemId: request['providerItemId']! as String,
+                  context: context,
+                ));
+        break;
       case AvaRealtimeServerEventTypeV4.turnCreated:
         _turnId = event.turnId;
         _trace?.mark('turn.created', fields: {'turnId': event.turnId});
@@ -695,6 +731,8 @@ final class AvaRealtimeTurnRuntime {
       case AvaRealtimeServerEventTypeV4.canvasActivated:
       case AvaRealtimeServerEventTypeV4.canvasDocumentDiscarded:
       case AvaRealtimeServerEventTypeV4.canvasRejected:
+      case AvaRealtimeServerEventTypeV4.canvasPresentationChanged:
+      case AvaRealtimeServerEventTypeV4.canvasPresentationCommand:
       case AvaRealtimeServerEventTypeV4.interactionRejected:
         throw StateError('Canvas event reached the speech runtime.');
     }
@@ -1044,6 +1082,7 @@ final class AvaRealtimeTurnRuntime {
       case AvaRealtimeServerEventTypeV4.turnFailed:
         _acceptFailed(event);
         break;
+      case AvaRealtimeServerEventTypeV4.turnContextRequested:
       case AvaRealtimeServerEventTypeV4.segmentReady:
       case AvaRealtimeServerEventTypeV4.audioMetadata:
       case AvaRealtimeServerEventTypeV4.audioChunk:
@@ -1067,6 +1106,8 @@ final class AvaRealtimeTurnRuntime {
       case AvaRealtimeServerEventTypeV4.canvasActivated:
       case AvaRealtimeServerEventTypeV4.canvasDocumentDiscarded:
       case AvaRealtimeServerEventTypeV4.canvasRejected:
+      case AvaRealtimeServerEventTypeV4.canvasPresentationChanged:
+      case AvaRealtimeServerEventTypeV4.canvasPresentationCommand:
       case AvaRealtimeServerEventTypeV4.interactionRejected:
         throw StateError('Canvas event reached turn validation.');
     }
@@ -1098,6 +1139,12 @@ final class AvaRealtimeTurnRuntime {
   void _acceptNonPhaseEvent(AvaRealtimeServerEventV4 event) {
     final phase = _requirePhase();
     switch (event.type) {
+      case AvaRealtimeServerEventTypeV4.turnContextRequested:
+        if (phase != AvaRealtimeTurnPhase.listening) {
+          throw const AvaRealtimeStateException(
+              'Turn context requires listening.');
+        }
+        break;
       case AvaRealtimeServerEventTypeV4.segmentReady:
         if (phase != AvaRealtimeTurnPhase.planning &&
             phase != AvaRealtimeTurnPhase.synthesizing) {
@@ -1185,6 +1232,8 @@ final class AvaRealtimeTurnRuntime {
       case AvaRealtimeServerEventTypeV4.canvasActivated:
       case AvaRealtimeServerEventTypeV4.canvasDocumentDiscarded:
       case AvaRealtimeServerEventTypeV4.canvasRejected:
+      case AvaRealtimeServerEventTypeV4.canvasPresentationChanged:
+      case AvaRealtimeServerEventTypeV4.canvasPresentationCommand:
       case AvaRealtimeServerEventTypeV4.interactionRejected:
         throw AvaRealtimeStateException(
           'Unsupported non-phase event ${event.type.name}.',
@@ -1324,6 +1373,12 @@ final class AvaRealtimeTurnRuntime {
       case AvaRealtimeServerEventTypeV4.canvasRejected:
         canvasController.receiveRejected(json);
         break;
+      case AvaRealtimeServerEventTypeV4.canvasPresentationChanged:
+        canvasController.receivePresentationChanged(json);
+        break;
+      case AvaRealtimeServerEventTypeV4.canvasPresentationCommand:
+        canvasController.receivePresentationCommand(json);
+        break;
       case AvaRealtimeServerEventTypeV4.interactionRejected:
         canvasController.receiveInteractionRejected(json);
         break;
@@ -1334,23 +1389,32 @@ final class AvaRealtimeTurnRuntime {
 
   void _enqueueCanvasCommand(AvaSvgCanvasClientCommand command) {
     if (_closed) return;
+    if (!_clientReadyEnqueued) {
+      if (command.type == AvaSvgCanvasCommandType.canvasPresentationUpdated ||
+          command.type == AvaSvgCanvasCommandType.canvasInteraction) {
+        return;
+      }
+      _pendingCanvasCommands.add(command);
+      return;
+    }
     final identity = _canvasIdentity(command);
-    final event = AvaRealtimeClientEventV4.canvasCommand(
-      sessionId: _sessionId,
-      sequence: _takeClientSequence(),
-      body: command.toEventBody(),
+    final operation = _sendClient(
+      (sequence) => AvaRealtimeClientEventV4.canvasCommand(
+        sessionId: _sessionId,
+        sequence: sequence,
+        body: command.toEventBody(),
+      ),
     );
     if (identity != null) {
       _recordCanvasCommand('canvas.client.command_enqueued', command, identity);
-    }
-    final operation = _enqueue(event);
-    unawaited(
-      operation.then<void>((_) {
-        if (identity != null) {
+      unawaited(
+        operation.then<void>((_) {
           _recordCanvasCommand('canvas.client.command_sent', command, identity);
-        }
-      }).catchError(_recordAsynchronousFailure),
-    );
+        }).catchError(_recordAsynchronousFailure),
+      );
+    } else {
+      unawaited(operation.catchError(_recordAsynchronousFailure));
+    }
   }
 
   ({String generationId, String sourceTurnId})? _canvasIdentity(
@@ -1433,20 +1497,14 @@ final class AvaRealtimeTurnRuntime {
     );
   }
 
-  Future<void> _enqueue(AvaRealtimeClientEventV4 event) {
-    final operation = _sendTail.then((_) => _transport.send(event));
-    _sendTail = operation;
-    return operation;
-  }
-
   void _enqueueCanvasRenderProfileUpdate({
     required int profileRevision,
     required AvaCanvasRenderProfileV4 renderProfile,
   }) {
-    final operation = _enqueue(
-      AvaRealtimeClientEventV4.canvasRenderProfileUpdated(
+    final operation = _sendClient(
+      (sequence) => AvaRealtimeClientEventV4.canvasRenderProfileUpdated(
         sessionId: _sessionId,
-        sequence: _takeClientSequence(),
+        sequence: sequence,
         profileRevision: profileRevision,
         renderProfile: renderProfile,
       ),
@@ -1503,7 +1561,9 @@ final class AvaRealtimeTurnRuntime {
   Future<void> _sendClient(
     AvaRealtimeClientEventV4 Function(int sequence) build,
   ) {
-    final event = build(_takeClientSequence());
+    final sequence = _nextClientSequence;
+    final event = build(sequence);
+    _takeClientSequence();
     final result = _sendTail.then((_) => _transport.send(event));
     _sendTail = result;
     return result;

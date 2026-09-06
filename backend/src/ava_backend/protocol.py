@@ -483,6 +483,7 @@ class ErrorCode(StrEnum):
     UNAUTHORIZED = "unauthorized"
     INVALID_REQUEST = "invalid_request"
     PROTOCOL_MISMATCH = "protocol_mismatch"
+    FOCUS_REVISION_CONFLICT = "focusRevisionConflict"
     PAYLOAD_TOO_LARGE = "payload_too_large"
     PROVIDER_REFUSAL = "provider_refusal"
     PROVIDER_TIMEOUT = "provider_timeout"

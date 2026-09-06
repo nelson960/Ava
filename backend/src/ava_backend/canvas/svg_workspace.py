@@ -1,9 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from enum import StrEnum
+import hashlib
+import json
+from collections.abc import Callable
 
 from .svg_document import ValidatedSvgDocument
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -14,6 +21,123 @@ class ActiveSvgCanvasScene:
     revision: int
     document: ValidatedSvgDocument
     first_rendered_sample: int
+    workspace_epoch: int | None = None
+    workspace_revision: int | None = None
+    creation_sequence: int | None = None
+    modification_sequence: int | None = None
+    evicted_scene_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CanvasWorkspaceManifestScene:
+    scene_id: str
+    scene_revision: int
+    generation_id: str
+    source_turn_id: str
+    svg_sha256: str
+    manifest_sha256: str
+    svg_byte_length: int
+    manifest_byte_length: int
+    renderer_capability_version: str
+    validator_version: str
+    manifest_version: str
+    creation_sequence: int
+    modification_sequence: int | None
+    title: str
+    summary: str
+
+
+@dataclass(frozen=True, slots=True)
+class CanvasWorkspaceManifest:
+    protocol_version: int
+    workspace_epoch: int
+    workspace_revision: int
+    next_creation_sequence: int
+    next_modification_sequence: int
+    focused_scene_id: str | None
+    scenes: tuple[CanvasWorkspaceManifestScene, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CanvasWorkspaceStructuralMutation:
+    operation: str
+    workspace_epoch: int
+    workspace_revision: int
+    scene_id: str
+    scene_revision: int
+    creation_sequence: int
+    modification_sequence: int
+    evicted_scene_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CanvasSceneEvictedTelemetryEvent:
+    event_type: str
+    scene_id: str
+    scene_revision: int
+    generation_id: str | None
+    source_turn_id: str | None
+    title: str
+    creation_sequence: int
+    modification_sequence: int | None
+    workspace_epoch: int
+    workspace_revision: int
+    eviction_reason: str
+    occurred_at: datetime
+
+    def as_context(self) -> dict[str, object]:
+        return {
+            "component": "svgCanvasWorkspace",
+            "eventType": self.event_type,
+            "sceneId": self.scene_id,
+            "sceneRevision": self.scene_revision,
+            **(
+                {"generationId": self.generation_id}
+                if self.generation_id is not None
+                else {}
+            ),
+            **(
+                {"sourceTurnId": self.source_turn_id}
+                if self.source_turn_id is not None
+                else {}
+            ),
+            "title": self.title,
+            "creationSequence": self.creation_sequence,
+            **(
+                {"modificationSequence": self.modification_sequence}
+                if self.modification_sequence is not None
+                else {}
+            ),
+            "workspaceEpoch": self.workspace_epoch,
+            "workspaceRevision": self.workspace_revision,
+            "evictionReason": self.eviction_reason,
+            "occurredAt": self.occurred_at.isoformat(),
+        }
+
+
+CanvasSceneEvictionTelemetrySink = Callable[[CanvasSceneEvictedTelemetryEvent], None]
+
+
+def _log_canvas_scene_evicted(event: CanvasSceneEvictedTelemetryEvent) -> None:
+    LOGGER.info("canvas_scene_evicted", extra={"ava_context": event.as_context()})
+
+
+class CanvasNavigationDirection(StrEnum):
+    NEXT = "next"
+    PREVIOUS = "previous"
+    FIRST = "first"
+    LAST = "last"
+
+
+@dataclass(frozen=True, slots=True)
+class CanvasNavigationResolution:
+    changed: bool
+    reason: str | None
+    scene: CanvasWorkspaceManifestScene | None
+    position: int | None
+    total: int
+    has_previous: bool
+    has_next: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +186,7 @@ class SvgCanvasExecution:
     source_turn_id: str
     operation: str
     status: SvgCanvasExecutionStatus
+    focus_revision: int = 0
     scene_id: str | None = None
     scene_revision: int | None = None
     terminal_reason: str | None = None
@@ -83,16 +208,64 @@ class SvgCanvasWorkspace:
     maximum_scene_count = 10
     maximum_execution_history = 64
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        eviction_telemetry_sink: CanvasSceneEvictionTelemetrySink = (
+            _log_canvas_scene_evicted
+        ),
+        utc_now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
         self._scenes: list[ActiveSvgCanvasScene] = []
-        self._current_scene_id: str | None = None
+        self._focused_scene: ActiveSvgCanvasScene | None = None
+        self.focus_revision = 0
         self._last_interaction: RecordedSvgCanvasInteraction | None = None
         self._reset_epoch = 0
         self._executions: dict[str, SvgCanvasExecution] = {}
+        self._scene_recency: dict[str, int] = {}
+        self._next_scene_recency = 0
+        self._workspace_epoch = 0
+        self._workspace_revision = 0
+        self._next_creation_sequence = 1
+        self._next_modification_sequence = 1
+        self._manifest_scenes: list[CanvasWorkspaceManifestScene] = []
+        self._structural_manifest_digest: str | None = None
+        self._navigation_ready = False
+        self._last_structural_mutation: CanvasWorkspaceStructuralMutation | None = None
+        self._eviction_telemetry_sink = eviction_telemetry_sink
+        self._utc_now = utc_now
 
     @property
     def reset_epoch(self) -> int:
-        return self._reset_epoch
+        return self._workspace_epoch
+
+    @property
+    def workspace_epoch(self) -> int:
+        return self._workspace_epoch
+
+    @property
+    def workspace_revision(self) -> int:
+        return self._workspace_revision
+
+    @property
+    def next_creation_sequence(self) -> int:
+        return self._next_creation_sequence
+
+    @property
+    def next_modification_sequence(self) -> int:
+        return self._next_modification_sequence
+
+    @property
+    def navigation_ready(self) -> bool:
+        return self._navigation_ready
+
+    @property
+    def manifest_scenes(self) -> tuple[CanvasWorkspaceManifestScene, ...]:
+        return tuple(self._manifest_scenes)
+
+    @property
+    def last_structural_mutation(self) -> CanvasWorkspaceStructuralMutation | None:
+        return self._last_structural_mutation
 
     @property
     def scenes(self) -> tuple[ActiveSvgCanvasScene, ...]:
@@ -100,12 +273,13 @@ class SvgCanvasWorkspace:
 
     @property
     def scene_count(self) -> int:
-        return len(self._scenes)
+        return (
+            len(self._manifest_scenes) if self._navigation_ready else len(self._scenes)
+        )
 
     @property
     def current(self) -> ActiveSvgCanvasScene | None:
-        scene_id = self._current_scene_id
-        return self.scene(scene_id) if scene_id is not None else None
+        return self._focused_scene
 
     @property
     def last_interaction(self) -> RecordedSvgCanvasInteraction | None:
@@ -113,7 +287,7 @@ class SvgCanvasWorkspace:
 
     @property
     def focused_scene_id(self) -> str | None:
-        return self._current_scene_id
+        return self._focused_scene.scene_id if self._focused_scene is not None else None
 
     @property
     def executions(self) -> tuple[SvgCanvasExecution, ...]:
@@ -128,41 +302,223 @@ class SvgCanvasWorkspace:
             None,
         )
 
+    def manifest_scene(self, scene_id: str) -> CanvasWorkspaceManifestScene | None:
+        return next(
+            (scene for scene in self._manifest_scenes if scene.scene_id == scene_id),
+            None,
+        )
+
+    def ordered_scene_ids(self) -> tuple[str, ...]:
+        if self._navigation_ready:
+            return tuple(scene.scene_id for scene in self._manifest_scenes)
+        return tuple(scene.scene_id for scene in self._scenes)
+
+    def adopt_manifest(self, manifest: CanvasWorkspaceManifest) -> bool:
+        """Adopt an authenticated recovery snapshot without hydrating SVG bytes.
+
+        Returns ``False`` for a structurally identical idempotent retry. Focus
+        remains an independent recovery hint and is not adopted here.
+        """
+
+        _validate_workspace_manifest(
+            manifest, maximum_scene_count=self.maximum_scene_count
+        )
+        structural_digest = _structural_manifest_digest(manifest)
+        if self._structural_manifest_digest is not None:
+            if (
+                manifest.workspace_epoch == self._workspace_epoch
+                and manifest.workspace_revision == self._workspace_revision
+            ):
+                if structural_digest == self._structural_manifest_digest:
+                    self._log_manifest_adoption(
+                        manifest=manifest,
+                        incoming_structural_digest=structural_digest,
+                        classification="structurallyIdempotent",
+                    )
+                    return False
+                self._log_manifest_adoption(
+                    manifest=manifest,
+                    incoming_structural_digest=structural_digest,
+                    classification="structuralConflict",
+                )
+                raise SvgCanvasWorkspaceError(
+                    "canvas workspace revision conflicts with previously adopted contents"
+                )
+            raise SvgCanvasWorkspaceError(
+                "canvas workspace manifest cannot replace an adopted structural identity"
+            )
+        if self._scenes:
+            raise SvgCanvasWorkspaceError(
+                "canvas workspace manifest must be adopted before content hydration"
+            )
+        self._workspace_epoch = manifest.workspace_epoch
+        self._reset_epoch = manifest.workspace_epoch
+        self._workspace_revision = manifest.workspace_revision
+        self._next_creation_sequence = manifest.next_creation_sequence
+        self._next_modification_sequence = manifest.next_modification_sequence
+        self._manifest_scenes = list(manifest.scenes)
+        self._structural_manifest_digest = structural_digest
+        self._navigation_ready = True
+        return True
+
+    def _log_manifest_adoption(
+        self,
+        *,
+        manifest: CanvasWorkspaceManifest,
+        incoming_structural_digest: str,
+        classification: str,
+    ) -> None:
+        LOGGER.info(
+            "canvas_workspace_manifest_adoption classification=%s "
+            "workspace_epoch=%d workspace_revision=%d "
+            "incoming_focused_scene_id=%s canonical_focused_scene_id=%s "
+            "structural_digest_incoming=%s structural_digest_canonical=%s",
+            classification,
+            manifest.workspace_epoch,
+            manifest.workspace_revision,
+            manifest.focused_scene_id,
+            self.focused_scene_id,
+            incoming_structural_digest,
+            self._structural_manifest_digest,
+            extra={
+                "ava_context": {
+                    "component": "svgCanvasWorkspace",
+                    "workspaceEpoch": manifest.workspace_epoch,
+                    "workspaceRevision": manifest.workspace_revision,
+                    "incomingFocusedSceneId": manifest.focused_scene_id,
+                    "canonicalFocusedSceneId": self.focused_scene_id,
+                    "structuralDigestIncoming": incoming_structural_digest,
+                    "structuralDigestCanonical": self._structural_manifest_digest,
+                    "classification": classification,
+                }
+            },
+        )
+
+    def resolve_navigation(
+        self, direction: CanvasNavigationDirection
+    ) -> CanvasNavigationResolution:
+        if not self._navigation_ready:
+            raise SvgCanvasWorkspaceError("workspaceNotSynchronized")
+        direction = CanvasNavigationDirection(direction)
+        total = len(self._manifest_scenes)
+        if total == 0:
+            return CanvasNavigationResolution(
+                False, "emptyWorkspace", None, None, 0, False, False
+            )
+        focused_id = self.focused_scene_id
+        current_index = next(
+            (
+                i
+                for i, row in enumerate(self._manifest_scenes)
+                if row.scene_id == focused_id
+            ),
+            None,
+        )
+        if current_index is None:
+            return CanvasNavigationResolution(
+                False, "noFocusedScene", None, None, total, False, total > 1
+            )
+        if direction is CanvasNavigationDirection.NEXT:
+            target_index = current_index + 1
+            boundary_reason = "endOfWorkspace"
+        elif direction is CanvasNavigationDirection.PREVIOUS:
+            target_index = current_index - 1
+            boundary_reason = "startOfWorkspace"
+        elif direction is CanvasNavigationDirection.FIRST:
+            target_index = 0
+            boundary_reason = None
+        else:
+            target_index = total - 1
+            boundary_reason = None
+        if target_index < 0 or target_index >= total:
+            row = self._manifest_scenes[current_index]
+            return CanvasNavigationResolution(
+                False,
+                boundary_reason,
+                row,
+                current_index + 1,
+                total,
+                current_index > 0,
+                current_index < total - 1,
+            )
+        row = self._manifest_scenes[target_index]
+        return CanvasNavigationResolution(
+            target_index != current_index,
+            None,
+            row,
+            target_index + 1,
+            total,
+            target_index > 0,
+            target_index < total - 1,
+        )
+
+    @property
+    def latest_created_scene_id(self) -> str | None:
+        if not self._manifest_scenes:
+            return None
+        return max(
+            self._manifest_scenes, key=lambda row: row.creation_sequence
+        ).scene_id
+
+    @property
+    def latest_modified_scene_id(self) -> str | None:
+        known = [
+            row
+            for row in self._manifest_scenes
+            if row.modification_sequence is not None
+        ]
+        if not known:
+            return None
+        return max(known, key=lambda row: row.modification_sequence or 0).scene_id
+
+    def scene_recency(self, scene_id: str) -> int:
+        try:
+            return self._scene_recency[scene_id]
+        except KeyError as error:
+            raise SvgCanvasWorkspaceError(
+                "canvas scene recency requires a retained scene"
+            ) from error
+
+    def clear_focus(self) -> None:
+        self._focused_scene = None
+        self._last_interaction = None
+
     def focus(self, scene_id: str) -> ActiveSvgCanvasScene:
         scene = self.scene(scene_id)
         if scene is None:
             raise SvgCanvasWorkspaceError("focused SVG canvas scene does not exist")
-        self._current_scene_id = scene_id
+        self._focused_scene = scene
         self._last_interaction = None
         return scene
 
     def restore_focused(self, scene: ActiveSvgCanvasScene) -> ActiveSvgCanvasScene:
         """Hydrate one independently validated scene before realtime negotiation."""
 
-        if self._scenes or self._current_scene_id is not None:
-            raise SvgCanvasWorkspaceError(
-                "canvas restore requires an empty ephemeral workspace"
-            )
-        if scene.revision < 1 or scene.revision > 10_001:
-            raise SvgCanvasWorkspaceError("restored canvas revision is invalid")
-        self._scenes.append(scene)
-        self._current_scene_id = scene.scene_id
-        self._last_interaction = None
-        return scene
+        return self.focus_retained(scene)
 
     def validate_retained_focus(self, scene: ActiveSvgCanvasScene) -> None:
         """Validate one retained scene for runtime focus without mutating workspace."""
 
-        if any(
-            not execution.status.terminal for execution in self._executions.values()
-        ):
-            raise SvgCanvasWorkspaceError(
-                "cannot change canvas focus while a canvas generation is active"
-            )
         if scene.revision < 1 or scene.revision > 10_001:
             raise SvgCanvasWorkspaceError("restored canvas revision is invalid")
 
-        existing = self.scene(scene.scene_id)
+        if self._navigation_ready:
+            expected = self.manifest_scene(scene.scene_id)
+            if expected is None:
+                raise SvgCanvasWorkspaceError(
+                    "focused SVG canvas scene is absent from synchronized workspace"
+                )
+            if not _scene_matches_manifest(scene, expected):
+                raise SvgCanvasWorkspaceError(
+                    "focused SVG canvas content conflicts with synchronized workspace metadata"
+                )
+
+        existing = (
+            self.current
+            if self.current is not None
+            and _same_committed_scene_identity(self.current, scene)
+            else self.scene(scene.scene_id)
+        )
         if existing is not None:
             if (
                 existing.revision != scene.revision
@@ -182,14 +538,16 @@ class SvgCanvasWorkspace:
 
         existing = self.scene(scene.scene_id)
         if existing is not None:
-            self._current_scene_id = scene.scene_id
+            self._focused_scene = scene
             self._last_interaction = None
             return existing
 
-        if len(self._scenes) >= self.maximum_scene_count:
-            self._scenes.pop(0)
+        if not self._navigation_ready and len(self._scenes) >= self.maximum_scene_count:
+            evicted = self._scenes.pop(0)
+            self._scene_recency.pop(evicted.scene_id, None)
         self._scenes.append(scene)
-        self._current_scene_id = scene.scene_id
+        self._record_scene_recency(scene.scene_id)
+        self._focused_scene = scene
         self._last_interaction = None
         return scene
 
@@ -218,6 +576,7 @@ class SvgCanvasWorkspace:
             source_turn_id=source_turn_id,
             operation=operation,
             status=SvgCanvasExecutionStatus.GENERATING,
+            focus_revision=self.focus_revision,
         )
         self._executions[generation_id] = execution
         return execution
@@ -251,6 +610,7 @@ class SvgCanvasWorkspace:
             generation_id=execution.generation_id,
             source_turn_id=execution.source_turn_id,
             operation=execution.operation,
+            focus_revision=execution.focus_revision,
             status=status,
             scene_id=scene_id if scene_id is not None else execution.scene_id,
             scene_revision=(
@@ -284,6 +644,7 @@ class SvgCanvasWorkspace:
             generation_id=execution.generation_id,
             source_turn_id=execution.source_turn_id,
             operation=execution.operation,
+            focus_revision=execution.focus_revision,
             status=status,
             scene_id=execution.scene_id,
             scene_revision=execution.scene_revision,
@@ -299,6 +660,7 @@ class SvgCanvasWorkspace:
         base_scene_id: str | None,
         base_revision: int,
         workspace_epoch: int,
+        foreground: bool = True,
     ) -> ActiveSvgCanvasScene:
         if workspace_epoch != self._reset_epoch:
             raise SvgCanvasWorkspaceError(
@@ -317,13 +679,79 @@ class SvgCanvasWorkspace:
                 raise SvgCanvasWorkspaceError(
                     "canonical SVG canvas has no matching revision base"
                 )
+            creation_sequence = self._next_creation_sequence
+            modification_sequence = self._next_modification_sequence
+            self._next_creation_sequence += 1
+            self._next_modification_sequence += 1
+            resulting_workspace_revision = self._workspace_revision + 1
+            if self._navigation_ready:
+                scene = replace(
+                    scene,
+                    workspace_epoch=self._workspace_epoch,
+                    workspace_revision=resulting_workspace_revision,
+                    creation_sequence=creation_sequence,
+                    modification_sequence=modification_sequence,
+                )
             self._scenes.append(scene)
+            self._record_scene_recency(scene.scene_id)
+            evicted_scene_id: str | None = None
+            evicted_scene: ActiveSvgCanvasScene | None = None
+            evicted_manifest_scene: CanvasWorkspaceManifestScene | None = None
             if len(self._scenes) > self.maximum_scene_count:
                 evicted = self._scenes.pop(0)
-                if self._current_scene_id == evicted.scene_id:
-                    self._current_scene_id = None
-            self._current_scene_id = scene.scene_id
-            self._last_interaction = None
+                evicted_scene = evicted
+                evicted_scene_id = evicted.scene_id
+                self._scene_recency.pop(evicted.scene_id, None)
+                if self.focused_scene_id == evicted.scene_id:
+                    self._focused_scene = None
+            if self._navigation_ready:
+                self._manifest_scenes.append(
+                    _manifest_scene_from_active(
+                        scene,
+                        creation_sequence=creation_sequence,
+                        modification_sequence=modification_sequence,
+                    )
+                )
+                if len(self._manifest_scenes) > self.maximum_scene_count:
+                    expected_evicted = self._manifest_scenes.pop(0)
+                    evicted_manifest_scene = expected_evicted
+                    if evicted_scene_id is None:
+                        evicted_scene_id = expected_evicted.scene_id
+                        self._scenes = [
+                            retained
+                            for retained in self._scenes
+                            if retained.scene_id != evicted_scene_id
+                        ]
+                    elif evicted_scene_id != expected_evicted.scene_id:
+                        raise SvgCanvasWorkspaceError(
+                            "hydrated and canonical workspace eviction order diverged"
+                        )
+            self._workspace_revision += 1
+            if self._navigation_ready:
+                scene = replace(scene, evicted_scene_id=evicted_scene_id)
+            self._scenes = [
+                scene if retained.scene_id == scene.scene_id else retained
+                for retained in self._scenes
+            ]
+            self._last_structural_mutation = CanvasWorkspaceStructuralMutation(
+                operation="create",
+                workspace_epoch=self._workspace_epoch,
+                workspace_revision=self._workspace_revision,
+                scene_id=scene.scene_id,
+                scene_revision=scene.revision,
+                creation_sequence=creation_sequence,
+                modification_sequence=modification_sequence,
+                evicted_scene_id=evicted_scene_id,
+            )
+            if evicted_scene_id is not None:
+                self._emit_capacity_eviction(
+                    scene_id=evicted_scene_id,
+                    hydrated_scene=evicted_scene,
+                    manifest_scene=evicted_manifest_scene,
+                )
+            if foreground:
+                self._focused_scene = scene
+                self._last_interaction = None
             self._finish_active_execution(scene.generation_id)
             return scene
 
@@ -352,10 +780,108 @@ class SvgCanvasWorkspace:
                 "canonical SVG canvas changed before presentation completed"
             )
         self._scenes[existing_index] = scene
-        self._current_scene_id = scene.scene_id
+        self._record_scene_recency(scene.scene_id)
+        modification_sequence = self._next_modification_sequence
+        self._next_modification_sequence += 1
+        creation_sequence = existing_index + 1
+        if self._navigation_ready:
+            manifest_index = next(
+                (
+                    i
+                    for i, row in enumerate(self._manifest_scenes)
+                    if row.scene_id == scene.scene_id
+                ),
+                None,
+            )
+            if manifest_index is None:
+                raise SvgCanvasWorkspaceError(
+                    "revised scene is absent from canonical workspace"
+                )
+            previous_metadata = self._manifest_scenes[manifest_index]
+            creation_sequence = previous_metadata.creation_sequence
+            self._manifest_scenes[manifest_index] = _manifest_scene_from_active(
+                scene,
+                creation_sequence=previous_metadata.creation_sequence,
+                modification_sequence=modification_sequence,
+            )
+        if self._navigation_ready:
+            scene = replace(
+                scene,
+                workspace_epoch=self._workspace_epoch,
+                workspace_revision=self._workspace_revision + 1,
+                creation_sequence=creation_sequence,
+                modification_sequence=modification_sequence,
+            )
+        self._scenes[existing_index] = scene
+        self._workspace_revision += 1
+        self._last_structural_mutation = CanvasWorkspaceStructuralMutation(
+            operation="revise",
+            workspace_epoch=self._workspace_epoch,
+            workspace_revision=self._workspace_revision,
+            scene_id=scene.scene_id,
+            scene_revision=scene.revision,
+            creation_sequence=creation_sequence,
+            modification_sequence=modification_sequence,
+        )
+        if foreground:
+            self._focused_scene = scene
         self._last_interaction = None
         self._finish_active_execution(scene.generation_id)
         return scene
+
+    def _emit_capacity_eviction(
+        self,
+        *,
+        scene_id: str,
+        hydrated_scene: ActiveSvgCanvasScene | None,
+        manifest_scene: CanvasWorkspaceManifestScene | None,
+    ) -> None:
+        if manifest_scene is not None:
+            event = CanvasSceneEvictedTelemetryEvent(
+                event_type="canvasSceneEvicted",
+                scene_id=manifest_scene.scene_id,
+                scene_revision=manifest_scene.scene_revision,
+                generation_id=manifest_scene.generation_id,
+                source_turn_id=manifest_scene.source_turn_id,
+                title=manifest_scene.title,
+                creation_sequence=manifest_scene.creation_sequence,
+                modification_sequence=manifest_scene.modification_sequence,
+                workspace_epoch=self._workspace_epoch,
+                workspace_revision=self._workspace_revision,
+                eviction_reason="capacityFifo",
+                occurred_at=self._utc_now(),
+            )
+        elif hydrated_scene is not None:
+            event = CanvasSceneEvictedTelemetryEvent(
+                event_type="canvasSceneEvicted",
+                scene_id=hydrated_scene.scene_id,
+                scene_revision=hydrated_scene.revision,
+                generation_id=hydrated_scene.generation_id,
+                source_turn_id=hydrated_scene.source_turn_id,
+                title=hydrated_scene.document.title[:160],
+                creation_sequence=1,
+                modification_sequence=None,
+                workspace_epoch=self._workspace_epoch,
+                workspace_revision=self._workspace_revision,
+                eviction_reason="capacityFifo",
+                occurred_at=self._utc_now(),
+            )
+        else:
+            raise SvgCanvasWorkspaceError(
+                f"evicted canvas scene {scene_id} lost its canonical identity"
+            )
+        try:
+            self._eviction_telemetry_sink(event)
+        except Exception as error:
+            LOGGER.warning(
+                "canvas_scene_eviction_telemetry_failed "
+                "scene_id=%s workspace_epoch=%d workspace_revision=%d "
+                "failure_type=%s",
+                event.scene_id,
+                event.workspace_epoch,
+                event.workspace_revision,
+                type(error).__name__,
+            )
 
     def record_interaction(
         self,
@@ -376,7 +902,17 @@ class SvgCanvasWorkspace:
 
     def clear(self) -> None:
         self._scenes.clear()
-        self._current_scene_id = None
+        self._scene_recency.clear()
+        self._next_scene_recency = 0
+        self._manifest_scenes.clear()
+        self._structural_manifest_digest = None
+        self._navigation_ready = False
+        self._workspace_epoch += 1
+        self._workspace_revision = 0
+        self._next_creation_sequence = 1
+        self._next_modification_sequence = 1
+        self._last_structural_mutation = None
+        self._focused_scene = None
         self._last_interaction = None
         for generation_id, execution in tuple(self._executions.items()):
             if not execution.status.terminal:
@@ -385,7 +921,7 @@ class SvgCanvasWorkspace:
                     SvgCanvasExecutionStatus.CANCELLED,
                     reason="workspaceReset",
                 )
-        self._reset_epoch += 1
+        self._reset_epoch = self._workspace_epoch
 
     def _finish_active_execution(self, generation_id: str) -> None:
         execution = self._executions.get(generation_id)
@@ -396,6 +932,10 @@ class SvgCanvasWorkspace:
                 "canvas execution must be presented before activation"
             )
         self.finish_execution(generation_id, SvgCanvasExecutionStatus.ACTIVE)
+
+    def _record_scene_recency(self, scene_id: str) -> None:
+        self._next_scene_recency += 1
+        self._scene_recency[scene_id] = self._next_scene_recency
 
     def _require_execution(self, generation_id: str) -> SvgCanvasExecution:
         execution = self._executions.get(generation_id)
@@ -462,3 +1002,184 @@ def _valid_observation_base(
     if scene.revision == 1:
         return base_scene_id is None and base_revision == 0
     return base_scene_id == scene.scene_id and base_revision == scene.revision - 1
+
+
+def _validate_workspace_manifest(
+    manifest: CanvasWorkspaceManifest,
+    *,
+    maximum_scene_count: int,
+) -> None:
+    if manifest.protocol_version != 4:
+        raise SvgCanvasWorkspaceError("canvas workspace protocolVersion must be 4")
+    for name, value in (
+        ("workspaceEpoch", manifest.workspace_epoch),
+        ("workspaceRevision", manifest.workspace_revision),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise SvgCanvasWorkspaceError(f"canvas workspace {name} is invalid")
+    if not 0 <= len(manifest.scenes) <= maximum_scene_count:
+        raise SvgCanvasWorkspaceError("canvas workspace scene count exceeds its bound")
+    scene_ids: set[str] = set()
+    structural_identities: set[tuple[str, int]] = set()
+    creation_sequences: set[int] = set()
+    ordered_creation_sequences: list[int] = []
+    modification_sequences: set[int] = set()
+    for row in manifest.scenes:
+        if row.scene_id in scene_ids:
+            raise SvgCanvasWorkspaceError("canvas workspace scene IDs must be unique")
+        scene_ids.add(row.scene_id)
+        structural_identity = (row.scene_id, row.scene_revision)
+        if structural_identity in structural_identities:
+            raise SvgCanvasWorkspaceError(
+                "canvas workspace structural identities must be unique"
+            )
+        structural_identities.add(structural_identity)
+        if not 1 <= row.scene_revision <= 10_001:
+            raise SvgCanvasWorkspaceError("canvas workspace scene revision is invalid")
+        if row.creation_sequence < 1 or row.creation_sequence in creation_sequences:
+            raise SvgCanvasWorkspaceError(
+                "canvas workspace creationSequence is invalid"
+            )
+        creation_sequences.add(row.creation_sequence)
+        ordered_creation_sequences.append(row.creation_sequence)
+        if row.modification_sequence is not None:
+            if (
+                row.modification_sequence < 1
+                or row.modification_sequence in modification_sequences
+            ):
+                raise SvgCanvasWorkspaceError(
+                    "canvas workspace modificationSequence is invalid"
+                )
+            modification_sequences.add(row.modification_sequence)
+        for identifier in (row.scene_id, row.generation_id, row.source_turn_id):
+            if not identifier or len(identifier) > 96:
+                raise SvgCanvasWorkspaceError("canvas workspace identifier is invalid")
+        for digest in (row.svg_sha256, row.manifest_sha256):
+            if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+                raise SvgCanvasWorkspaceError(
+                    "canvas workspace content hash is invalid"
+                )
+        if not 1 <= row.svg_byte_length <= 512 * 1024:
+            raise SvgCanvasWorkspaceError("canvas workspace SVG byte length is invalid")
+        if not 1 <= row.manifest_byte_length <= 64 * 1024:
+            raise SvgCanvasWorkspaceError(
+                "canvas workspace manifest byte length is invalid"
+            )
+        if len(row.title) > 160 or len(row.summary) > 800:
+            raise SvgCanvasWorkspaceError(
+                "canvas workspace semantic metadata is too long"
+            )
+        if not all(
+            1 <= len(version) <= 64
+            for version in (
+                row.renderer_capability_version,
+                row.validator_version,
+                row.manifest_version,
+            )
+        ):
+            raise SvgCanvasWorkspaceError(
+                "canvas workspace version metadata is invalid"
+            )
+    max_creation = max(creation_sequences, default=0)
+    max_modification = max(modification_sequences, default=0)
+    if ordered_creation_sequences != sorted(ordered_creation_sequences):
+        raise SvgCanvasWorkspaceError(
+            "canvas workspace order must follow creationSequence"
+        )
+    if manifest.next_creation_sequence <= max_creation:
+        raise SvgCanvasWorkspaceError(
+            "nextCreationSequence does not exceed its high-water mark"
+        )
+    if manifest.next_modification_sequence <= max_modification:
+        raise SvgCanvasWorkspaceError(
+            "nextModificationSequence does not exceed its high-water mark"
+        )
+    if (
+        manifest.focused_scene_id is not None
+        and manifest.focused_scene_id not in scene_ids
+    ):
+        raise SvgCanvasWorkspaceError("focusedSceneId is absent from canvas workspace")
+
+
+def _structural_manifest_digest(manifest: CanvasWorkspaceManifest) -> str:
+    normalized = {
+        "protocolVersion": manifest.protocol_version,
+        "workspaceEpoch": manifest.workspace_epoch,
+        "workspaceRevision": manifest.workspace_revision,
+        "nextCreationSequence": manifest.next_creation_sequence,
+        "nextModificationSequence": manifest.next_modification_sequence,
+        "scenes": [
+            {
+                "sceneId": row.scene_id,
+                "sceneRevision": row.scene_revision,
+                "generationId": row.generation_id,
+                "sourceTurnId": row.source_turn_id,
+                "svgSha256": row.svg_sha256,
+                "manifestSha256": row.manifest_sha256,
+                "svgByteLength": row.svg_byte_length,
+                "manifestByteLength": row.manifest_byte_length,
+                "rendererCapabilityVersion": row.renderer_capability_version,
+                "validatorVersion": row.validator_version,
+                "manifestVersion": row.manifest_version,
+                "creationSequence": row.creation_sequence,
+                "modificationSequence": row.modification_sequence,
+                "title": row.title,
+                "summary": row.summary,
+            }
+            for row in manifest.scenes
+        ],
+    }
+    encoded = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _scene_matches_manifest(
+    scene: ActiveSvgCanvasScene,
+    expected: CanvasWorkspaceManifestScene,
+) -> bool:
+    manifest = scene.document.manifest
+    return (
+        scene.scene_id == expected.scene_id
+        and scene.revision == expected.scene_revision
+        and scene.generation_id == expected.generation_id
+        and scene.source_turn_id == expected.source_turn_id
+        and scene.document.svg_sha256 == expected.svg_sha256
+        and scene.document.manifest_sha256 == expected.manifest_sha256
+        and len(scene.document.svg_bytes) == expected.svg_byte_length
+        and len(scene.document.manifest_bytes) == expected.manifest_byte_length
+        and manifest["rendererCapabilityVersion"]
+        == expected.renderer_capability_version
+        and manifest["validatorVersion"] == expected.validator_version
+        and manifest["manifestVersion"] == expected.manifest_version
+    )
+
+
+def _manifest_scene_from_active(
+    scene: ActiveSvgCanvasScene,
+    *,
+    creation_sequence: int,
+    modification_sequence: int | None,
+) -> CanvasWorkspaceManifestScene:
+    manifest = scene.document.manifest
+    return CanvasWorkspaceManifestScene(
+        scene_id=scene.scene_id,
+        scene_revision=scene.revision,
+        generation_id=scene.generation_id,
+        source_turn_id=scene.source_turn_id,
+        svg_sha256=scene.document.svg_sha256,
+        manifest_sha256=scene.document.manifest_sha256,
+        svg_byte_length=len(scene.document.svg_bytes),
+        manifest_byte_length=len(scene.document.manifest_bytes),
+        renderer_capability_version=str(manifest["rendererCapabilityVersion"]),
+        validator_version=str(manifest["validatorVersion"]),
+        manifest_version=str(manifest["manifestVersion"]),
+        creation_sequence=creation_sequence,
+        modification_sequence=modification_sequence,
+        title=scene.document.title[:160],
+        summary=scene.document.description[:800],
+    )

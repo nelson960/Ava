@@ -249,6 +249,181 @@ final class AvaSvgInteractionBinding {
   }
 }
 
+enum AvaSvgControlKind {
+  drag,
+  slider,
+  timeline;
+
+  static AvaSvgControlKind fromName(String name) {
+    for (final candidate in values) {
+      if (candidate.name == name) return candidate;
+    }
+    throw FormatException('SVG control kind $name is unsupported.');
+  }
+}
+
+final class AvaSvgControlCheckpoint {
+  const AvaSvgControlCheckpoint({
+    required this.value,
+    required this.bindingId,
+  });
+
+  final double value;
+  final String bindingId;
+
+  factory AvaSvgControlCheckpoint.fromJson(Map<String, Object?> json) {
+    _requireExactKeys(
+      json,
+      const {'bindingId', 'value'},
+      'SVG control checkpoint',
+    );
+    final bindingId = _requiredIdentifier(
+      json,
+      'bindingId',
+      'SVG control checkpoint',
+    );
+    final rawValue = json['value'];
+    if (rawValue is! num || !rawValue.isFinite) {
+      throw const FormatException(
+        'SVG control checkpoint.value must be a finite number.',
+      );
+    }
+    final val = rawValue.toDouble();
+    if (val < 0.0 || val > 1.0) {
+      throw const FormatException(
+        'SVG control checkpoint.value must be within [0.0, 1.0].',
+      );
+    }
+    return AvaSvgControlCheckpoint(value: val, bindingId: bindingId);
+  }
+
+  Map<String, Object?> toJson() => {
+        'bindingId': bindingId,
+        'value': value,
+      };
+}
+
+final class AvaSvgContinuousControl {
+  const AvaSvgContinuousControl({
+    required this.controlId,
+    required this.kind,
+    required this.accessibilityLabel,
+    required this.handleElementId,
+    required this.trackElementId,
+    required this.initialValue,
+    required this.checkpoints,
+  });
+
+  final String controlId;
+  final AvaSvgControlKind kind;
+  final String accessibilityLabel;
+  final String handleElementId;
+  final String trackElementId;
+  final double initialValue;
+  final List<AvaSvgControlCheckpoint> checkpoints;
+
+  factory AvaSvgContinuousControl.fromJson(Map<String, Object?> json) {
+    _requireExactKeys(
+      json,
+      const {
+        'accessibilityLabel',
+        'checkpoints',
+        'controlId',
+        'handleElementId',
+        'initialValue',
+        'kind',
+        'trackElementId',
+      },
+      'SVG continuous control',
+    );
+    final controlId = _requiredIdentifier(
+      json,
+      'controlId',
+      'SVG continuous control',
+    );
+    final handleElementId = _requiredIdentifier(
+      json,
+      'handleElementId',
+      'SVG continuous control',
+    );
+    final trackElementId = _requiredIdentifier(
+      json,
+      'trackElementId',
+      'SVG continuous control',
+    );
+    final accessibilityLabel = _boundedString(
+      json,
+      'accessibilityLabel',
+      'SVG continuous control',
+      160,
+    );
+    final kindName = _requiredString(
+      json,
+      'kind',
+      'SVG continuous control',
+    );
+    final kind = AvaSvgControlKind.fromName(kindName);
+    final rawInitialValue = json['initialValue'];
+    if (rawInitialValue is! num || !rawInitialValue.isFinite) {
+      throw const FormatException(
+        'SVG continuous control.initialValue must be a finite number.',
+      );
+    }
+    final initialValue = rawInitialValue.toDouble();
+    if (initialValue < 0.0 || initialValue > 1.0) {
+      throw const FormatException(
+        'SVG continuous control.initialValue must be within [0.0, 1.0].',
+      );
+    }
+    final rawCheckpoints = json['checkpoints'];
+    if (rawCheckpoints is! List ||
+        rawCheckpoints.length < 2 ||
+        rawCheckpoints.length > 32) {
+      throw const FormatException(
+        'SVG continuous control.checkpoints must contain between 2 and 32 items.',
+      );
+    }
+    final checkpoints = <AvaSvgControlCheckpoint>[];
+    for (final item in rawCheckpoints) {
+      if (item is! Map) {
+        throw const FormatException(
+          'SVG continuous control checkpoint must be an object.',
+        );
+      }
+      checkpoints.add(
+        AvaSvgControlCheckpoint.fromJson(item.cast<String, Object?>()),
+      );
+    }
+    for (var i = 0; i < checkpoints.length; i++) {
+      if (i > 0 && checkpoints[i].value <= checkpoints[i - 1].value) {
+        throw const FormatException(
+          'SVG continuous control checkpoints must have strictly ascending unique values.',
+        );
+      }
+    }
+    return AvaSvgContinuousControl(
+      controlId: controlId,
+      kind: kind,
+      accessibilityLabel: accessibilityLabel,
+      handleElementId: handleElementId,
+      trackElementId: trackElementId,
+      initialValue: initialValue,
+      checkpoints: List.unmodifiable(checkpoints),
+    );
+  }
+
+  Map<String, Object?> toJson() => {
+        'accessibilityLabel': accessibilityLabel,
+        'checkpoints':
+            checkpoints.map((c) => c.toJson()).toList(growable: false),
+        'controlId': controlId,
+        'handleElementId': handleElementId,
+        'initialValue': initialValue,
+        'kind': kind.name,
+        'trackElementId': trackElementId,
+      };
+}
+
 final class AvaSvgCanvasManifest {
   AvaSvgCanvasManifest({
     required this.title,
@@ -257,7 +432,8 @@ final class AvaSvgCanvasManifest {
     required this.viewBox,
     required this.interactionMode,
     required Map<String, AvaSvgInteractionBinding> bindings,
-  }) : bindings = Map.unmodifiable(bindings);
+    List<AvaSvgContinuousControl> controls = const [],
+  }) : bindings = Map.unmodifiable(bindings), controls = List.unmodifiable(controls);
 
   final String title;
   final String description;
@@ -265,11 +441,13 @@ final class AvaSvgCanvasManifest {
   final List<double> viewBox;
   final AvaSvgInteractionMode interactionMode;
   final Map<String, AvaSvgInteractionBinding> bindings;
+  final List<AvaSvgContinuousControl> controls;
 
   factory AvaSvgCanvasManifest.fromJson(Map<String, Object?> json) {
     _requireExactKeys(
       json,
-      const {
+      {
+        if (json.containsKey('controls')) 'controls',
         'background',
         'bindings',
         'description',
@@ -338,6 +516,28 @@ final class AvaSvgCanvasManifest {
         throw const FormatException('SVG manifest binding ID is duplicated.');
       }
     }
+    final rawControls = json.containsKey('controls') ? json['controls'] : const [];
+    if (rawControls is! List) {
+      throw const FormatException(
+        'SVG manifest.controls must be a bounded list.',
+      );
+    }
+    final controls = <AvaSvgContinuousControl>[];
+    final seenControlIds = <String>{};
+    for (final value in rawControls) {
+      if (value is! Map) {
+        throw const FormatException(
+          'SVG manifest.controls must contain JSON objects.',
+        );
+      }
+      final control = AvaSvgContinuousControl.fromJson(
+        value.cast<String, Object?>(),
+      );
+      if (!seenControlIds.add(control.controlId)) {
+        throw const FormatException('SVG manifest control ID is duplicated.');
+      }
+      controls.add(control);
+    }
     final modeName = _requiredString(json, 'interactionMode', 'SVG manifest');
     final interactionMode = AvaSvgInteractionMode.values
         .where((candidate) => candidate.name == modeName)
@@ -347,6 +547,15 @@ final class AvaSvgCanvasManifest {
           'SVG manifest.interactionMode is unsupported.');
     }
     _validateInteractionMode(interactionMode, bindings.values);
+    if (controls.isNotEmpty && interactionMode != AvaSvgInteractionMode.explore) {
+      throw const FormatException('Continuous controls require explore mode.');
+    }
+    for (final control in controls) {
+      if (control.checkpoints.map((c) => c.bindingId).toSet().length != control.checkpoints.length ||
+          control.checkpoints.any((c) => !bindings.containsKey(c.bindingId))) {
+        throw const FormatException('Control checkpoint binding is unknown or duplicated.');
+      }
+    }
     return AvaSvgCanvasManifest(
       title: title,
       description: description,
@@ -354,6 +563,7 @@ final class AvaSvgCanvasManifest {
       viewBox: List.unmodifiable(viewBox),
       interactionMode: interactionMode,
       bindings: bindings,
+      controls: controls,
     );
   }
 }

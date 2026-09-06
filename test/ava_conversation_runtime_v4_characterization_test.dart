@@ -117,6 +117,7 @@ void main() {
     scenario.addControl({
       'protocolVersion': 4,
       'event': 'canvasGenerationStarted',
+      'focusRevision': 0,
       'sessionId': _sessionId,
       'revision': 1,
       'generationId': 'generation-v4-vad',
@@ -283,6 +284,7 @@ void main() {
     scenario.addControl({
       'protocolVersion': 4,
       'event': 'canvasGenerationStarted',
+      'focusRevision': 0,
       'sessionId': _sessionId,
       'revision': 1,
       'generationId': 'generation-v4-tap',

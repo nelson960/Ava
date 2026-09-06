@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:ui';
@@ -53,7 +54,8 @@ void main() {
     InAppWebViewPlatform.instance = _TestInAppWebViewPlatform();
   });
 
-  test('startup restore leaves panel closed but semantically focused', () async {
+  test('startup restore leaves panel closed but semantically focused',
+      () async {
     final doc1 = _document(scene: 1, revision: 1);
     final doc2 = _document(scene: 2, revision: 1);
     final persistence = _FakePersistence([doc1, doc2], 'scene-2');
@@ -91,6 +93,7 @@ void main() {
     controller.receiveGenerationStarted({
       'protocolVersion': 4,
       'event': 'canvasGenerationStarted',
+      'focusRevision': 0,
       'sessionId': 'session-nav',
       'sequence': 0,
       'revision': 1,
@@ -106,7 +109,8 @@ void main() {
     host.dispose();
   });
 
-  test('previous/next navigation preserves workspace order and bound', () async {
+  test('previous/next navigation preserves workspace order and bound',
+      () async {
     final doc1 = _document(scene: 1, revision: 1, manifestJson: _manifestJson1);
     final doc2 = _document(scene: 2, revision: 1, manifestJson: _manifestJson2);
     final doc3 = _document(scene: 3, revision: 1, manifestJson: _manifestJson3);
@@ -151,8 +155,7 @@ void main() {
     host.dispose();
   });
 
-  test('history switching disabled during hasPendingVisual and focus transition',
-      () async {
+  test('history switching stays available during generation', () async {
     final doc1 = _document(scene: 1, revision: 1);
     final doc2 = _document(scene: 2, revision: 1);
     final persistence = _FakePersistence([doc1, doc2], 'scene-2');
@@ -168,6 +171,7 @@ void main() {
     controller.receiveGenerationStarted({
       'protocolVersion': 4,
       'event': 'canvasGenerationStarted',
+      'focusRevision': 0,
       'sessionId': 'session-nav',
       'sequence': 0,
       'revision': 1,
@@ -176,9 +180,8 @@ void main() {
       'operation': 'new',
     });
 
-    // 7. history switching disabled during controller.hasPendingVisual
     expect(controller.hasPendingVisual, isTrue);
-    expect(host.canSelectPrevious, isFalse);
+    expect(host.canSelectPrevious, isTrue);
     expect(host.canSelectNext, isFalse);
 
     host.dispose();
@@ -201,7 +204,7 @@ void main() {
     );
     host.attach(
       controller,
-      runtimeFocusSink: (target) async {
+      runtimeFocusSink: (target, focusRevision) async {
         commands.add(target.descriptor.sceneId);
         if (!focusSuccess) {
           throw Exception('Focus switch network error');
@@ -222,13 +225,14 @@ void main() {
     focusSuccess = false;
     await expectLater(host.selectNextScene(), throwsA(isA<Exception>()));
     expect(host.focusTransitionPending, isFalse);
-    // Preserves prior focused scene on failure
-    expect(host.presentedDocument?.descriptor.sceneId, 'scene-1');
+    // A semantic sync failure cannot roll back device focus.
+    expect(host.presentedDocument?.descriptor.sceneId, 'scene-2');
 
     host.dispose();
   });
 
-  testWidgets('AvaSvgCanvasPanel compact navbar shows title, counter, download, and nav',
+  testWidgets(
+      'AvaSvgCanvasPanel compact navbar shows title, counter, download, and nav',
       (tester) async {
     final doc1 = _document(scene: 1, revision: 1, manifestJson: _manifestJson1);
     final doc2 = _document(scene: 2, revision: 1, manifestJson: _manifestJson2);
@@ -293,7 +297,8 @@ void main() {
     final closeButton = buttonWithTooltip('Close drawing');
 
     // Visual layout test: header height <= 34px (33px target derived from 44px * 0.75)
-    final headerSize = tester.getSize(find.byKey(const ValueKey('ava_canvas_navbar')));
+    final headerSize =
+        tester.getSize(find.byKey(const ValueKey('ava_canvas_navbar')));
     expect(headerSize.height, lessThanOrEqualTo(34.0));
     expect(headerSize.height, equals(33.0));
 
@@ -365,10 +370,8 @@ void main() {
     await gesture.moveTo(tester.getCenter(prevFinder));
     await tester.pumpAndSettle();
 
-    final hoveredContainer =
-        tester.widget<AnimatedContainer>(prevVisualFinder);
-    final hoveredDecoration =
-        hoveredContainer.decoration as ShapeDecoration;
+    final hoveredContainer = tester.widget<AnimatedContainer>(prevVisualFinder);
+    final hoveredDecoration = hoveredContainer.decoration as ShapeDecoration;
     expect(hoveredDecoration.shape, isA<CircleBorder>());
     expect(hoveredDecoration.color, AvaColors.ink.withValues(alpha: 0.07));
 
@@ -448,6 +451,7 @@ void main() {
     controller.receiveGenerationStarted({
       'protocolVersion': 4,
       'event': 'canvasGenerationStarted',
+      'focusRevision': 0,
       'sessionId': 'session-nav',
       'sequence': 0,
       'revision': 1,
@@ -529,6 +533,7 @@ void main() {
     controller.receiveGenerationStarted({
       'protocolVersion': 4,
       'event': 'canvasGenerationStarted',
+      'focusRevision': 0,
       'sessionId': 'session-nav',
       'sequence': 0,
       'revision': 1,
@@ -586,6 +591,94 @@ void main() {
       }
     }
   });
+
+  test('hanging persistence does not delay focus sync', () async {
+    final doc1 = _document(scene: 1, revision: 1);
+    final doc2 = _document(scene: 2, revision: 1);
+    final persistence = _HangingPersistence([doc1, doc2], 'scene-1');
+    final host = AvaSvgCanvasSessionHost(persistence: persistence);
+    await host.restoration;
+
+    final commands = <AvaSvgCanvasClientCommand>[];
+    final controller = AvaSvgCanvasController(
+      documents: _DocumentLoader(doc2),
+      commandSink: commands.add,
+    );
+    final syncedRevisions = <int>[];
+    host.attach(
+      controller,
+      runtimeFocusSink: (target, revision) async {
+        syncedRevisions.add(revision);
+      },
+    );
+
+    final switchFuture = host.selectNextScene();
+    await switchFuture;
+
+    expect(host.focusTransitionPending, isFalse);
+    expect(host.presentedDocument?.descriptor.sceneId, 'scene-2');
+    expect(syncedRevisions, [1]);
+    expect(
+      controller.semanticTransportState,
+      AvaSvgSemanticTransportState.unaccepted,
+    );
+
+    controller.reportBinding(doc2.manifest.bindings.values.first);
+    expect(commands, isEmpty);
+
+    host.dispose();
+  });
+
+  test(
+      'session host: rapid switching fences late sink completions across revisions',
+      () async {
+    final doc1 = _document(scene: 1, revision: 1);
+    final doc2 = _document(scene: 2, revision: 1);
+    final persistence = _FakePersistence([doc1, doc2], 'scene-1');
+    final host = AvaSvgCanvasSessionHost(persistence: persistence);
+    await host.restoration;
+
+    final commands = <AvaSvgCanvasClientCommand>[];
+    final controller = AvaSvgCanvasController(
+      documents: _DocumentLoader(doc2),
+      commandSink: commands.add,
+    );
+
+    Completer<void>? firstSinkCompleter;
+    final sinkCalls = <String>[];
+    host.attach(
+      controller,
+      runtimeFocusSink: (target, revision) async {
+        sinkCalls.add('${target.descriptor.sceneId}:$revision');
+        if (revision == 1) {
+          firstSinkCompleter = Completer<void>();
+          await firstSinkCompleter!.future;
+        }
+      },
+    );
+
+    final switch1 = host.selectNextScene();
+    expect(host.presentedDocument?.descriptor.sceneId, 'scene-2');
+    expect(controller.activeFocusRevision, 1);
+
+    final switch2 = host.selectPreviousScene();
+    expect(host.presentedDocument?.descriptor.sceneId, 'scene-1');
+    expect(controller.activeFocusRevision, 2);
+    expect(sinkCalls, ['scene-2:1', 'scene-1:2']);
+
+    firstSinkCompleter!.complete();
+    await switch1;
+
+    await switch2;
+    expect(host.presentedDocument?.descriptor.sceneId, 'scene-1');
+    expect(controller.activeFocusRevision, 2);
+    expect(
+      controller.semanticTransportState,
+      AvaSvgSemanticTransportState.unaccepted,
+    );
+
+    host.dispose();
+  });
 }
 
 final class _FakePersistence implements AvaCanvasPersistence {
@@ -602,7 +695,8 @@ final class _FakePersistence implements AvaCanvasPersistence {
       );
 
   @override
-  Future<void> persistActive(AvaValidatedSvgCanvasDocument document) async {}
+  Future<void> persistActive(AvaValidatedSvgCanvasDocument document,
+      {bool focused = true}) async {}
 
   @override
   Future<void> persistFocus(String sceneId) async {}
@@ -611,6 +705,30 @@ final class _FakePersistence implements AvaCanvasPersistence {
   Future<void> reset() async {}
 }
 
+final class _HangingPersistence implements AvaCanvasPersistence {
+  _HangingPersistence(this.documents, this.focusedSceneId);
+
+  final List<AvaValidatedSvgCanvasDocument> documents;
+  final String? focusedSceneId;
+  final Completer<void> persistFocusCompleter = Completer<void>();
+
+  @override
+  Future<AvaRestoredCanvasWorkspace> loadWorkspace() async =>
+      AvaRestoredCanvasWorkspace(
+        documents: documents,
+        focusedSceneId: focusedSceneId,
+      );
+
+  @override
+  Future<void> persistActive(AvaValidatedSvgCanvasDocument document,
+      {bool focused = true}) async {}
+
+  @override
+  Future<void> persistFocus(String sceneId) => persistFocusCompleter.future;
+
+  @override
+  Future<void> reset() async {}
+}
 
 final class _FakeCanvasSaveService implements AvaCanvasSaveService {
   AvaValidatedSvgCanvasDocument? savedDocument;

@@ -4,6 +4,7 @@ import 'ava_svg_canvas_protocol.dart';
 const avaRealtimeProtocolVersionV4 = 4;
 
 enum AvaRealtimeServerEventTypeV4 {
+  turnContextRequested,
   turnCreated,
   turnPhaseChanged,
   segmentReady,
@@ -18,11 +19,25 @@ enum AvaRealtimeServerEventTypeV4 {
   canvasActivated,
   canvasDocumentDiscarded,
   canvasRejected,
+  canvasPresentationChanged,
+  canvasPresentationCommand,
   interactionRejected,
   memoryPersistenceFailed,
   turnCompleted,
   turnCancelled,
   turnFailed,
+}
+
+final class AvaCanvasPresentationSnapshot {
+  const AvaCanvasPresentationSnapshot({
+    required this.visible,
+    this.sceneId,
+    this.focusRevision,
+  });
+
+  final bool visible;
+  final String? sceneId;
+  final int? focusRevision;
 }
 
 enum AvaCanvasOrientationV4 { portrait, landscape, square }
@@ -544,6 +559,8 @@ final class AvaRealtimeServerEventV4 {
         AvaRealtimeServerEventTypeV4.canvasActivated ||
         AvaRealtimeServerEventTypeV4.canvasDocumentDiscarded ||
         AvaRealtimeServerEventTypeV4.canvasRejected ||
+        AvaRealtimeServerEventTypeV4.canvasPresentationChanged ||
+        AvaRealtimeServerEventTypeV4.canvasPresentationCommand ||
         AvaRealtimeServerEventTypeV4.interactionRejected =>
           true,
         _ => false,
@@ -607,11 +624,14 @@ final class AvaRealtimeServerEventV4 {
             'generationId',
             'sourceTurnId',
             'operation',
+            'focusRevision',
           },
           'canvasGenerationStarted',
         );
         _identifier(json, 'generationId', 'canvasGenerationStarted');
         _identifier(json, 'sourceTurnId', 'canvasGenerationStarted');
+        _boundedInt(json, 'focusRevision', 'canvasGenerationStarted',
+            minimum: 0, maximum: 1000000);
         final operation = json['operation'];
         if (operation != 'new' && operation != 'reviseFocused') {
           throw const FormatException(
@@ -643,7 +663,14 @@ final class AvaRealtimeServerEventV4 {
         _validateCanvasIdentityEvent(
           json,
           label: 'canvasActivated',
-          additional: const {'firstRenderedSample'},
+          additional: const {
+            'firstRenderedSample',
+            'workspaceEpoch',
+            'workspaceRevision',
+            'creationSequence',
+            'modificationSequence',
+            'evictedSceneId',
+          },
         );
         _boundedInt(
           json,
@@ -652,6 +679,18 @@ final class AvaRealtimeServerEventV4 {
           minimum: 0,
           maximum: 2147483647,
         );
+        _boundedInt(json, 'workspaceEpoch', 'canvasActivated',
+            minimum: 0, maximum: 2147483647);
+        _boundedInt(json, 'workspaceRevision', 'canvasActivated',
+            minimum: 1, maximum: 2147483647);
+        _boundedInt(json, 'creationSequence', 'canvasActivated',
+            minimum: 1, maximum: 2147483647);
+        _boundedInt(json, 'modificationSequence', 'canvasActivated',
+            minimum: 1, maximum: 2147483647);
+        final evictedSceneId = json['evictedSceneId'];
+        if (evictedSceneId != null) {
+          _identifier(json, 'evictedSceneId', 'canvasActivated');
+        }
         break;
       case AvaRealtimeServerEventTypeV4.canvasDocumentDiscarded:
         _requireExactKeys(
@@ -717,6 +756,59 @@ final class AvaRealtimeServerEventV4 {
         _boundedString(json, 'message', 'canvasRejected', 240);
         _requiredBool(json, 'retryable', 'canvasRejected');
         break;
+      case AvaRealtimeServerEventTypeV4.canvasPresentationChanged:
+        _requireExactKeys(
+          json,
+          {
+            ..._serverCommon,
+            'visible',
+            if (json.containsKey('sceneId')) 'sceneId',
+            if (json.containsKey('focusRevision')) 'focusRevision',
+            'source',
+          },
+          'canvasPresentationChanged',
+        );
+        final visible =
+            _requiredBool(json, 'visible', 'canvasPresentationChanged');
+        if (visible) {
+          _identifier(json, 'sceneId', 'canvasPresentationChanged');
+          _boundedInt(json, 'focusRevision', 'canvasPresentationChanged',
+              minimum: 1, maximum: 10001);
+        }
+        _allowedString(
+          json,
+          'source',
+          'canvasPresentationChanged',
+          const {'user', 'model', 'restore', 'system'},
+        );
+        break;
+      case AvaRealtimeServerEventTypeV4.canvasPresentationCommand:
+        _requireExactKeys(
+          json,
+          {
+            ..._serverCommon,
+            'commandId',
+            'action',
+            if (json.containsKey('sceneId')) 'sceneId',
+          },
+          'canvasPresentationCommand',
+        );
+        _identifier(json, 'commandId', 'canvasPresentationCommand');
+        final action = _allowedString(
+          json,
+          'action',
+          'canvasPresentationCommand',
+          const {'show', 'hide'},
+        );
+        if (action == 'show') {
+          _identifier(json, 'sceneId', 'canvasPresentationCommand');
+        } else {
+          if (json.containsKey('sceneId') && json['sceneId'] != null) {
+            throw const FormatException(
+                'hide presentation command cannot include sceneId.');
+          }
+        }
+        break;
       case AvaRealtimeServerEventTypeV4.interactionRejected:
         _requireExactKeys(
           json,
@@ -768,6 +860,12 @@ final class AvaRealtimeServerEventV4 {
         turnId = _speechIdentifier(json, 'turnId', 'realtime event');
         const common = {..._serverCommon, 'turnId'};
         switch (type) {
+          case AvaRealtimeServerEventTypeV4.turnContextRequested:
+            _requireExactKeys(json, {...common, 'requestId', 'providerItemId'},
+                'turnContextRequested');
+            _speechIdentifier(json, 'requestId', 'turnContextRequested');
+            _speechIdentifier(json, 'providerItemId', 'turnContextRequested');
+            break;
           case AvaRealtimeServerEventTypeV4.turnCreated:
             _requireExactKeys(json, {...common, 'requestId'}, 'turnCreated');
             _speechIdentifier(json, 'requestId', 'turnCreated');
@@ -948,6 +1046,8 @@ final class AvaRealtimeServerEventV4 {
           case AvaRealtimeServerEventTypeV4.canvasActivated:
           case AvaRealtimeServerEventTypeV4.canvasDocumentDiscarded:
           case AvaRealtimeServerEventTypeV4.canvasRejected:
+          case AvaRealtimeServerEventTypeV4.canvasPresentationChanged:
+          case AvaRealtimeServerEventTypeV4.canvasPresentationCommand:
           case AvaRealtimeServerEventTypeV4.interactionRejected:
             throw StateError('Canvas event reached the speech parser.');
         }
@@ -985,9 +1085,31 @@ final class AvaRealtimeClientEventV4 {
 
   Map<String, Object?> toJson() => _deepCopyMap(_json);
 
+  factory AvaRealtimeClientEventV4.turnContextSnapshot({
+    required String sessionId,
+    required int sequence,
+    required String turnId,
+    required String requestId,
+    required String providerItemId,
+    required Map<String, Object?> context,
+  }) =>
+      AvaRealtimeClientEventV4._validated({
+        'protocolVersion': 4,
+        'event': 'turnContextSnapshot',
+        'sessionId': sessionId,
+        'sequence': sequence,
+        'turnId': turnId,
+        'requestId': requestId,
+        'providerItemId': providerItemId,
+        ...context,
+      });
+
   factory AvaRealtimeClientEventV4.clientReady({
     required String sessionId,
     required int sequence,
+    bool canvasPanelVisible = false,
+    String? sceneId,
+    int? focusRevision,
   }) {
     final json = <String, Object?>{
       'protocolVersion': avaRealtimeProtocolVersionV4,
@@ -996,6 +1118,10 @@ final class AvaRealtimeClientEventV4 {
       'sequence': sequence,
       'rendererCapabilityVersion': avaSvgRendererCapabilityVersion,
       'validatorVersion': avaSvgValidatorVersion,
+      if (canvasPanelVisible) 'canvasPanelVisible': true,
+      if (canvasPanelVisible && sceneId != null) 'sceneId': sceneId,
+      if (canvasPanelVisible && focusRevision != null)
+        'focusRevision': focusRevision,
     };
     _validateClientEvent(json);
     return AvaRealtimeClientEventV4._(json);
@@ -1087,6 +1213,46 @@ final class AvaRealtimeClientEventV4 {
         'reason': reason,
       });
 
+  factory AvaRealtimeClientEventV4.canvasPresentationUpdated({
+    required String sessionId,
+    required int sequence,
+    required bool visible,
+    String? sceneId,
+    int? focusRevision,
+    required String clientOperationId,
+  }) =>
+      AvaRealtimeClientEventV4._validated({
+        'protocolVersion': avaRealtimeProtocolVersionV4,
+        'event': 'canvasPresentationUpdated',
+        'sessionId': sessionId,
+        'sequence': sequence,
+        'visible': visible,
+        if (visible && sceneId != null) 'sceneId': sceneId,
+        if (visible && focusRevision != null) 'focusRevision': focusRevision,
+        'clientOperationId': clientOperationId,
+      });
+
+  factory AvaRealtimeClientEventV4.canvasPresentationAcknowledged({
+    required String sessionId,
+    required int sequence,
+    required String commandId,
+    required bool applied,
+    String? sceneId,
+    int? focusRevision,
+    String? reason,
+  }) =>
+      AvaRealtimeClientEventV4._validated({
+        'protocolVersion': avaRealtimeProtocolVersionV4,
+        'event': 'canvasPresentationAcknowledged',
+        'sessionId': sessionId,
+        'sequence': sequence,
+        'commandId': commandId,
+        'applied': applied,
+        if (sceneId != null) 'sceneId': sceneId,
+        if (focusRevision != null) 'focusRevision': focusRevision,
+        if (reason != null) 'reason': reason,
+      });
+
   factory AvaRealtimeClientEventV4._validated(Map<String, Object?> json) {
     _validateClientEvent(json);
     return AvaRealtimeClientEventV4._(json);
@@ -1175,7 +1341,14 @@ void _validateClientEvent(Map<String, Object?> json) {
     case 'clientReady':
       _requireExactKeys(
         json,
-        {...common, 'rendererCapabilityVersion', 'validatorVersion'},
+        {
+          ...common,
+          'rendererCapabilityVersion',
+          'validatorVersion',
+          if (json.containsKey('canvasPanelVisible')) 'canvasPanelVisible',
+          if (json.containsKey('sceneId')) 'sceneId',
+          if (json.containsKey('focusRevision')) 'focusRevision',
+        },
         event,
       );
       if (json['rendererCapabilityVersion'] !=
@@ -1184,7 +1357,52 @@ void _validateClientEvent(Map<String, Object?> json) {
         throw const FormatException(
             'clientReady SVG versions are unsupported.');
       }
+      final panelVisible = json['canvasPanelVisible'];
+      if (panelVisible != null) {
+        if (panelVisible is! bool) {
+          throw const FormatException(
+              'clientReady.canvasPanelVisible must be boolean.');
+        }
+        if (panelVisible) {
+          _identifier(json, 'sceneId', event);
+          _boundedInt(json, 'focusRevision', event, minimum: 1, maximum: 10001);
+        }
+      }
       _speechIdentifier(json, 'sessionId', event);
+      break;
+    case 'turnContextSnapshot':
+      _requireExactKeys(
+          json,
+          {
+            ...common,
+            'turnId',
+            'requestId',
+            'providerItemId',
+            'focusRevision',
+            'focusedCanvas'
+          },
+          event);
+      _speechIdentifier(json, 'turnId', event);
+      _speechIdentifier(json, 'requestId', event);
+      _speechIdentifier(json, 'providerItemId', event);
+      _boundedInt(json, 'focusRevision', event, minimum: 0, maximum: 1000000);
+      final focus = json['focusedCanvas'];
+      if (focus != null) {
+        final identity = _requiredObject(focus, 'focusedCanvas');
+        _requireExactKeys(
+            identity,
+            {'sceneId', 'sceneRevision', 'svgSha256', 'manifestSha256'},
+            'focusedCanvas');
+        _speechIdentifier(identity, 'sceneId', 'focusedCanvas');
+        _boundedInt(identity, 'sceneRevision', 'focusedCanvas',
+            minimum: 1, maximum: 10001);
+        for (final key in ['svgSha256', 'manifestSha256']) {
+          if (!RegExp(r'^[a-f0-9]{64}$')
+              .hasMatch(_requiredString(identity, key, 'focusedCanvas'))) {
+            throw const FormatException('Invalid focused Canvas hash.');
+          }
+        }
+      }
       break;
     case 'canvasRenderProfileUpdated':
       _requireExactKeys(
@@ -1304,14 +1522,26 @@ void _validateClientEvent(Map<String, Object?> json) {
       _allowedString(json, 'failureCode', event, allowed);
       _boundedString(json, 'message', event, 240);
       break;
+    case 'canvasRetained':
+      _requireExactKeys(json, {...common, ..._canvasClientIdentity}, event);
+      _validateCanvasClientIdentity(json, event);
+      break;
     case 'canvasPresented':
       _requireExactKeys(
         json,
-        {...common, ..._canvasClientIdentity, 'firstRenderedSample'},
+        {
+          ...common,
+          ..._canvasClientIdentity,
+          'firstRenderedSample',
+          'foreground'
+        },
         event,
       );
       _validateCanvasClientIdentity(json, event);
       _sample(json, 'firstRenderedSample', event);
+      if (json['foreground'] is! bool) {
+        throw const FormatException('Canvas foreground must be boolean.');
+      }
       break;
     case 'canvasInteraction':
       _requireExactKeys(
@@ -1345,6 +1575,56 @@ void _validateClientEvent(Map<String, Object?> json) {
       _digest(json, 'svgSha256', event);
       _digest(json, 'manifestSha256', event);
       _identifier(json, 'bindingId', event);
+      break;
+    case 'canvasPresentationUpdated':
+      _requireExactKeys(
+        json,
+        {
+          ...common,
+          'visible',
+          if (json.containsKey('sceneId')) 'sceneId',
+          if (json.containsKey('focusRevision')) 'focusRevision',
+          'clientOperationId',
+        },
+        event,
+      );
+      final visible = _requiredBool(json, 'visible', event);
+      if (visible) {
+        _identifier(json, 'sceneId', event);
+        _boundedInt(json, 'focusRevision', event, minimum: 1, maximum: 10001);
+      }
+      _identifier(json, 'clientOperationId', event);
+      break;
+    case 'canvasPresentationAcknowledged':
+      _requireExactKeys(
+        json,
+        {
+          ...common,
+          'commandId',
+          'applied',
+          if (json.containsKey('sceneId')) 'sceneId',
+          if (json.containsKey('focusRevision')) 'focusRevision',
+          if (json.containsKey('reason')) 'reason',
+        },
+        event,
+      );
+      _identifier(json, 'commandId', event);
+      final applied = _requiredBool(json, 'applied', event);
+      if (applied) {
+        if (json.containsKey('reason') && json['reason'] != null) {
+          throw const FormatException(
+              'applied presentation acknowledgement cannot include reason.');
+        }
+        if (json.containsKey('sceneId') && json['sceneId'] != null) {
+          _identifier(json, 'sceneId', event);
+        }
+        if (json.containsKey('focusRevision') &&
+            json['focusRevision'] != null) {
+          _boundedInt(json, 'focusRevision', event, minimum: 1, maximum: 10001);
+        }
+      } else {
+        _boundedString(json, 'reason', event, 240);
+      }
       break;
     default:
       throw FormatException('Unsupported protocol-v4 client event "$event".');

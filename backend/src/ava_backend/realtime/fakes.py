@@ -31,6 +31,7 @@ from .tool_contract import (
     RealtimeRejectedCanvasToolCall,
     RealtimeUtilityToolOutputV4,
     RealtimeSpeechTextDelta,
+    ManageCanvasPresentationToolOutputV4,
 )
 
 
@@ -153,6 +154,9 @@ class DeterministicRealtimePlanProvider:
             )
         ] = []
         self.completed_utility_outputs: list[RealtimeUtilityToolOutputV4] = []
+        self.completed_manage_canvas_presentation_outputs: list[
+            ManageCanvasPresentationToolOutputV4
+        ] = []
         self.canvas_interaction_response_turn_ids: list[str] = []
         self.canvas_interaction_response_interactions: list[
             RecordedSvgCanvasInteraction
@@ -166,10 +170,54 @@ class DeterministicRealtimePlanProvider:
         self._active_response_turn_id: str | None = None
         self._settled_turn_ids: set[str] = set()
         self._installed_context_build_id: str | None = None
+        self._installed_context_build_ids: set[str] = set()
         self._pending_call_id: str | None = None
         self._input_events: asyncio.Queue[RealtimeProviderInputEvent] = asyncio.Queue()
         self._input_item_turn_ids: dict[str, str | None] = {}
+        self._desired_context_build_id: str | None = None
+        self.defer_acknowledgement = False
+        self.context_changed = asyncio.Event()
+        self.requested_child_responses: list[tuple[str, str]] = []
         self.closed = False
+
+    @property
+    def desired_context_build_id(self) -> str | None:
+        return self._desired_context_build_id
+
+    def is_context_acknowledged(self, build_id: str) -> bool:
+        return (
+            self._installed_context_build_id == build_id
+            or build_id in self._installed_context_build_ids
+        )
+
+    def acknowledge_context(self, build_id: str) -> None:
+        self._installed_context_build_id = build_id
+        self._installed_context_build_ids.add(build_id)
+        self.context_changed.set()
+
+    async def wait_for_context(self, *, build_id: str) -> None:
+        while not self.is_context_acknowledged(build_id):
+            await self.context_changed.wait()
+            self.context_changed.clear()
+
+    async def request_child_response(
+        self,
+        *,
+        turn_id: str,
+        item_id: str,
+        permit_degraded_focus_grounding: bool = False,
+    ) -> bool:
+        if self._input_item_turn_ids.get(item_id) != turn_id:
+            raise RuntimeError("fake child response input owner mismatch")
+        desired = self._desired_context_build_id
+        if (
+            desired is not None
+            and not self.is_context_acknowledged(desired)
+        ):
+            if not permit_degraded_focus_grounding:
+                return False
+        self.requested_child_responses.append((turn_id, item_id))
+        return True
 
     async def negotiate(self, *, offer_sdp: str) -> NegotiatedRealtimeCall:
         if self.closed:
@@ -200,6 +248,7 @@ class DeterministicRealtimePlanProvider:
         self._canvas_interaction_response_requested.clear()
         self._settled_turn_ids.discard(turn_id)
         self._active_turn_id = turn_id
+        self._active_response_turn_id = None
         self._interaction_response_readiness_changed.set()
 
         async def _owned_stream() -> AsyncIterator[RealtimeProviderTurnEvent]:
@@ -253,12 +302,18 @@ class DeterministicRealtimePlanProvider:
         ):
             self.prepared_session_updates.append(update)
         await asyncio.sleep(0)
-        self._installed_context_build_id = harness.context.build_id
-        return (
-            RealtimeContextInstallationStatus.DEDUPLICATED
-            if deduplicated
-            else RealtimeContextInstallationStatus.INSTALLED
-        )
+        self._desired_context_build_id = harness.context.build_id
+        if deduplicated:
+            self._installed_context_build_id = harness.context.build_id
+            self._installed_context_build_ids.add(harness.context.build_id)
+            self.context_changed.set()
+            return RealtimeContextInstallationStatus.DEDUPLICATED
+        if not self.defer_acknowledgement:
+            self._installed_context_build_id = harness.context.build_id
+            self._installed_context_build_ids.add(harness.context.build_id)
+            self.context_changed.set()
+            return RealtimeContextInstallationStatus.INSTALLED
+        return RealtimeContextInstallationStatus.SUBMITTED
 
     async def prepare_if_idle(
         self,
@@ -267,7 +322,7 @@ class DeterministicRealtimePlanProvider:
         turn_id: str,
     ) -> RealtimeContextInstallationStatus | None:
         async with self._readiness_transition_lock:
-            if self._canvas_interaction_response_readiness(turn_id) is not None:
+            if self._context_installation_readiness(turn_id) is not None:
                 return None
             return await self.prepare(harness=harness)
 
@@ -382,6 +437,18 @@ class DeterministicRealtimePlanProvider:
         self.completed_canvas_outputs.append(output)
         await asyncio.sleep(0)
 
+    async def complete_manage_canvas_presentation_tool(
+        self,
+        *,
+        turn_id: str,
+        call_id: str,
+        output: ManageCanvasPresentationToolOutputV4,
+    ) -> None:
+        if not turn_id or not call_id:
+            raise ValueError("presentation completion requires turn and call identity")
+        self.completed_manage_canvas_presentation_outputs.append(output)
+        await asyncio.sleep(0)
+
     async def complete_utility_tool(
         self,
         *,
@@ -418,6 +485,17 @@ class DeterministicRealtimePlanProvider:
         self._canvas_interaction_response_requested.set()
         self._interaction_response_readiness_changed.set()
         return True
+
+    def _context_installation_readiness(self, turn_id: str) -> str | None:
+        if self.closed:
+            return "providerClosed"
+        if turn_id in self.cancelled_turn_ids or turn_id in self._settled_turn_ids:
+            return "turnSettledOrCancelled"
+        if self._active_turn_id != turn_id:
+            return "turnMismatch"
+        if self._active_response_turn_id == turn_id:
+            return "activeResponse"
+        return None
 
     def _canvas_interaction_response_readiness(self, turn_id: str) -> str | None:
         if self.closed:

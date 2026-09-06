@@ -208,6 +208,11 @@ body{background:transparent}
     target.root.removeAttribute('aria-label');
     target.root.classList.remove('ava-visible');
   };
+  const isFiniteInvertibleCTM = (matrix) => Boolean(
+      matrix &&
+      [matrix.a,matrix.b,matrix.c,matrix.d,matrix.e,matrix.f].every(Number.isFinite) &&
+      matrix.a * matrix.d - matrix.b * matrix.c !== 0
+    );
   const installDocument = async (target, payload) => {
     const manifest = JSON.parse(decodeUtf8(payload.manifestBase64));
     const svg = await mountScopedDocument(target, payload.svgBase64, payload.identity, 'candidate');
@@ -227,6 +232,73 @@ body{background:transparent}
         if (!scopedElement(target, id)) throw new Error('bindingTargetMissing');
       }
     }
+    const continuousControls = [];
+    if (Array.isArray(manifest.controls)) {
+      for (const ctrl of manifest.controls) {
+        const handleElement = scopedElement(target, ctrl.handleElementId);
+        if (!handleElement) throw new Error('controlHandleMissing');
+        if (handleElement.getAttribute('data-ava-binding')) throw new Error('controlHandleHasBinding');
+        if (handleElement.getAttribute('data-ava-control') !== ctrl.controlId) throw new Error('controlIdMismatch');
+
+        const trackElement = scopedElement(target, ctrl.trackElementId);
+        if (!trackElement) throw new Error('controlTrackMissing');
+        if (trackElement.tagName.toLowerCase() !== 'path') throw new Error('controlTrackNotPath');
+
+        const totalLength = trackElement.getTotalLength();
+        if (!Number.isFinite(totalLength) || totalLength <= 0) throw new Error('controlTrackInvalidLength');
+        const p0 = trackElement.getPointAtLength(0);
+        const pEnd = trackElement.getPointAtLength(totalLength);
+        if (!Number.isFinite(p0.x) || !Number.isFinite(p0.y) || !Number.isFinite(pEnd.x) || !Number.isFinite(pEnd.y)) {
+          throw new Error('controlTrackInvalidPoint');
+        }
+        const trackCTM = trackElement.getScreenCTM();
+        if (!isFiniteInvertibleCTM(trackCTM)) {
+          throw new Error('controlTrackSingularCTM');
+        }
+
+        const wrapper = target.document.createElementNS('http://www.w3.org/2000/svg', 'g');
+        wrapper.setAttribute('class', 'ava-handle-wrapper');
+        handleElement.parentNode.insertBefore(wrapper, handleElement);
+        wrapper.appendChild(handleElement);
+
+        const handleBounds = handleElement.getBBox();
+        if (![handleBounds.x,handleBounds.y,handleBounds.width,handleBounds.height].every(Number.isFinite)) {
+          throw new Error('controlHandleInvalidBounds');
+        }
+        const handleAnchor = target.svg.createSVGPoint();
+        handleAnchor.x = handleBounds.x + handleBounds.width / 2;
+        handleAnchor.y = handleBounds.y + handleBounds.height / 2;
+        const handleCTM = handleElement.getScreenCTM();
+        const handleParent = wrapper.parentElement;
+        const handleParentCTM = handleParent && handleParent.getScreenCTM();
+        if (!isFiniteInvertibleCTM(handleCTM) || !isFiniteInvertibleCTM(handleParentCTM)) {
+          throw new Error('controlHandleSingularCTM');
+        }
+        const baseHandleAnchorScreen = handleAnchor.matrixTransform(handleCTM);
+        const baseHandleAnchorParent = baseHandleAnchorScreen.matrixTransform(handleParentCTM.inverse());
+        if (![baseHandleAnchorParent.x,baseHandleAnchorParent.y].every(Number.isFinite)) {
+          throw new Error('controlHandleInvalidAnchor');
+        }
+
+        continuousControls.push({
+          spec: ctrl,
+          handleElement,
+          trackElement,
+          wrapper,
+          handleParent,
+          baseHandleAnchorParent: Object.freeze({
+            x: baseHandleAnchorParent.x,
+            y: baseHandleAnchorParent.y,
+          }),
+          totalLength,
+          currentValue: ctrl.initialValue,
+          activeCheckpoint: null,
+          gestureStartValue: ctrl.initialValue,
+          gestureStartCheckpoint: null,
+          isDragging: false,
+        });
+      }
+    }
     const show = (id) => {
       const node = scopedElement(target, id);
       if (!node) return;
@@ -236,6 +308,84 @@ body{background:transparent}
       const node = scopedElement(target, id);
       if (node) node.style.display = 'none';
     };
+    const positionHandleAt = (ctrlRecord, val) => {
+      const s = val * ctrlRecord.totalLength;
+      const trackCTM = ctrlRecord.trackElement.getScreenCTM();
+      if (!isFiniteInvertibleCTM(trackCTM)) throw new Error('controlTrackSingularCTM');
+      const ptTrack = ctrlRecord.trackElement.getPointAtLength(s);
+      const ptScreen = ptTrack.matrixTransform(trackCTM);
+
+      const parentCTM = ctrlRecord.handleParent.getScreenCTM();
+      if (!isFiniteInvertibleCTM(parentCTM)) throw new Error('controlParentSingularCTM');
+      const parentInverse = parentCTM.inverse();
+      const ptParent = ptScreen.matrixTransform(parentInverse);
+
+      const dx = ptParent.x - ctrlRecord.baseHandleAnchorParent.x;
+      const dy = ptParent.y - ctrlRecord.baseHandleAnchorParent.y;
+      ctrlRecord.wrapper.setAttribute('transform', 'translate(' + dx + ',' + dy + ')');
+    };
+    const findActiveCheckpoint = (ctrlRecord, val) => {
+      const checkpoints = ctrlRecord.spec.checkpoints;
+      let best = checkpoints[0];
+      let minDiff = Math.abs(val - best.value);
+      for (let i = 1; i < checkpoints.length; i++) {
+        const diff = Math.abs(val - checkpoints[i].value);
+        if (diff < minDiff) {
+          minDiff = diff;
+          best = checkpoints[i];
+        }
+      }
+      return best;
+    };
+    const projectPointerToTrack = (control, clientX, clientY) => {
+      const ctm = control.trackElement.getScreenCTM();
+      if (!isFiniteInvertibleCTM(ctm)) throw new Error('controlTrackSingularCTM');
+      const frame = target.frame.getBoundingClientRect();
+      const x = clientX - frame.left, y = clientY - frame.top;
+      // ALGORITHMIC: arc intervals are refined to one physical display pixel.
+      // The matrix norm bounds screen displacement over any path arc.
+      const scale = Math.hypot(ctm.a, ctm.b, ctm.c, ctm.d);
+      const tolerance = 1 / window.devicePixelRatio;
+      const distance = (s) => {
+        const p = control.trackElement.getPointAtLength(s).matrixTransform(ctm);
+        return Math.hypot(p.x - x, p.y - y);
+      };
+      let bestS = 0, bestDistance = distance(0);
+      const endDistance = distance(control.totalLength);
+      if (endDistance < bestDistance) { bestS = control.totalLength; bestDistance = endDistance; }
+      const intervals = [[0, control.totalLength]];
+      while (intervals.length) {
+        const [lo, hi] = intervals.pop();
+        const middle = (lo + hi) / 2, d = distance(middle);
+        if (d < bestDistance || (d === bestDistance && middle < bestS)) {
+          bestS = middle; bestDistance = d;
+        }
+        const radius = scale * (hi - lo) / 2;
+        if (radius > tolerance && d - radius < bestDistance - tolerance) {
+          intervals.push([middle, hi], [lo, middle]);
+        }
+      }
+      return bestS / control.totalLength;
+    };
+    const applyCheckpointVisualState = (newCheckpoint, oldCheckpoint) => {
+      if (manifest.interactionMode !== 'explore') return;
+      if (oldCheckpoint && oldCheckpoint.bindingId !== newCheckpoint.bindingId) {
+        const oldBindingRecord = bindings.get(oldCheckpoint.bindingId);
+        if (oldBindingRecord) {
+          for (const id of oldBindingRecord.binding.revealIds) hide(id);
+        }
+      }
+      const newBindingRecord = bindings.get(newCheckpoint.bindingId);
+      if (newBindingRecord) {
+        for (const id of newBindingRecord.binding.revealIds) show(id);
+      }
+    };
+    for (const ctrlRecord of continuousControls) {
+      positionHandleAt(ctrlRecord, ctrlRecord.spec.initialValue);
+      const initialCheckpoint = findActiveCheckpoint(ctrlRecord, ctrlRecord.spec.initialValue);
+      ctrlRecord.activeCheckpoint = initialCheckpoint;
+      applyCheckpointVisualState(initialCheckpoint, null);
+    }
     const report = (binding) => bridge('$bindingHandler', {bindingId:binding.bindingId, generationId:payload.identity.generationId});
     const queueRebuild = () => {
       if (rebuildQueued) return;
@@ -265,7 +415,9 @@ body{background:transparent}
       queueRebuild();
     };
     function rebuild() {
-      rebuildQueued = false; target.overlay.replaceChildren();
+      rebuildQueued = false;
+      if (continuousControls.some((control) => control.isDragging)) return;
+      target.overlay.replaceChildren();
       if (manifest.interactionMode !== 'steps') {
         for (const record of bindings.values()) {
           const rect = record.element.getBoundingClientRect();
@@ -280,6 +432,106 @@ body{background:transparent}
           if (record.binding.bindingId === selectedBindingId) button.classList.add('ava-selected');
           button.addEventListener('click', () => activate(record)); target.overlay.appendChild(button);
         }
+        for (const ctrlRecord of continuousControls) {
+          const rect = ctrlRecord.handleElement.getBoundingClientRect();
+          if (![rect.left,rect.top,rect.width,rect.height].every(Number.isFinite)) continue;
+          const button = document.createElement('button');
+          button.type = 'button'; button.className = 'ava-hit ava-control-handle';
+          button.setAttribute('aria-label', ctrlRecord.spec.accessibilityLabel);
+          const width = Math.max(44, rect.width); const height = Math.max(44, rect.height);
+          button.style.left = (rect.left + rect.width / 2 - width / 2) + 'px';
+          button.style.top = (rect.top + rect.height / 2 - height / 2) + 'px';
+          button.style.width = width + 'px'; button.style.height = height + 'px';
+
+          const updateButtonPosition = () => {
+            const newRect = ctrlRecord.handleElement.getBoundingClientRect();
+            const w = Math.max(44, newRect.width); const h = Math.max(44, newRect.height);
+            button.style.left = (newRect.left + newRect.width / 2 - w / 2) + 'px';
+            button.style.top = (newRect.top + newRect.height / 2 - h / 2) + 'px';
+          };
+
+          button.addEventListener('pointerdown', (e) => {
+            e.preventDefault();
+            button.setPointerCapture(e.pointerId);
+            ctrlRecord.pointerId = e.pointerId;
+            ctrlRecord.isDragging = true;
+            ctrlRecord.gestureStartValue = ctrlRecord.currentValue;
+            ctrlRecord.gestureStartCheckpoint = ctrlRecord.activeCheckpoint;
+          });
+
+          const move = (e) => {
+            if (!ctrlRecord.isDragging || ctrlRecord.pointerId !== e.pointerId) return;
+            e.preventDefault();
+            const t = projectPointerToTrack(ctrlRecord, e.clientX, e.clientY);
+            ctrlRecord.currentValue = t;
+            positionHandleAt(ctrlRecord, t);
+            updateButtonPosition();
+
+            const newCheckpoint = findActiveCheckpoint(ctrlRecord, t);
+            if (newCheckpoint !== ctrlRecord.activeCheckpoint) {
+              applyCheckpointVisualState(newCheckpoint, ctrlRecord.activeCheckpoint);
+              ctrlRecord.activeCheckpoint = newCheckpoint;
+            }
+          };
+
+          let pendingMove = null, animationFrame = null;
+          button.addEventListener('pointermove', (e) => {
+            if (!ctrlRecord.isDragging || ctrlRecord.pointerId !== e.pointerId) return;
+            pendingMove = e;
+            if (animationFrame === null) animationFrame = requestAnimationFrame(() => {
+              animationFrame = null;
+              const latest = pendingMove; pendingMove = null;
+              if (latest) move(latest);
+            });
+          });
+          const flushMove = () => {
+            if (animationFrame !== null) cancelAnimationFrame(animationFrame);
+            animationFrame = null;
+            const latest = pendingMove; pendingMove = null;
+            if (latest) move(latest);
+          };
+          const handlePointerRelease = (e) => {
+            if (!ctrlRecord.isDragging || ctrlRecord.pointerId !== e.pointerId) return;
+            flushMove();
+            ctrlRecord.currentValue = ctrlRecord.activeCheckpoint.value;
+            positionHandleAt(ctrlRecord, ctrlRecord.currentValue);
+            ctrlRecord.isDragging = false;
+            if (button.hasPointerCapture(e.pointerId)) button.releasePointerCapture(e.pointerId);
+            if (ctrlRecord.activeCheckpoint &&
+                (!ctrlRecord.gestureStartCheckpoint ||
+                 ctrlRecord.activeCheckpoint.bindingId !== ctrlRecord.gestureStartCheckpoint.bindingId)) {
+              const bindingRecord = bindings.get(ctrlRecord.activeCheckpoint.bindingId);
+              if (bindingRecord) {
+                selectedBindingId = ctrlRecord.activeCheckpoint.bindingId;
+                report(bindingRecord.binding);
+              }
+            }
+            queueRebuild();
+          };
+
+          const handlePointerCancel = (e) => {
+            if (!ctrlRecord.isDragging || ctrlRecord.pointerId !== e.pointerId) return;
+            if (animationFrame !== null) cancelAnimationFrame(animationFrame);
+            animationFrame = null; pendingMove = null;
+            ctrlRecord.isDragging = false;
+            if (button.hasPointerCapture(e.pointerId)) button.releasePointerCapture(e.pointerId);
+            const rollbackVal = ctrlRecord.gestureStartValue;
+            const rollbackCp = ctrlRecord.gestureStartCheckpoint;
+            ctrlRecord.currentValue = rollbackVal;
+            positionHandleAt(ctrlRecord, rollbackVal);
+            if (rollbackCp !== ctrlRecord.activeCheckpoint) {
+              applyCheckpointVisualState(rollbackCp, ctrlRecord.activeCheckpoint);
+              ctrlRecord.activeCheckpoint = rollbackCp;
+            }
+            updateButtonPosition();
+            queueRebuild();
+          };
+
+          button.addEventListener('pointerup', handlePointerRelease);
+          button.addEventListener('pointercancel', handlePointerCancel);
+          button.addEventListener('lostpointercapture', handlePointerCancel);
+          target.overlay.appendChild(button);
+        }
       }
       if (manifest.interactionMode === 'steps') {
         const controls = document.createElement('div'); controls.className = 'ava-step-controls';
@@ -292,7 +544,7 @@ body{background:transparent}
       }
     }
     if (manifest.interactionMode === 'steps') applyStep(1, false);
-    target.runtime = {svg, manifest, bindings, queueRebuild};
+    target.runtime = {svg, manifest, bindings, continuousControls, queueRebuild};
     queueRebuild();
   };
   new ResizeObserver(() => {
@@ -358,10 +610,12 @@ body{background:transparent}
         } catch (_) { fail('activeMountFailed', payload.identity); return false; }
       });
     },
-    presentCandidate(identity) {
+    presentCandidate(payload) {
+      const identity = payload.identity;
       return enqueueOperation(() => {
         if (!same(candidate.identity, identity)) { fail('candidatePresentationIdentityMismatch', identity); return false; }
-        showOnly(candidate);
+        if (payload.foreground) showOnly(candidate);
+        else showOnly(active);
         if (candidate.runtime) candidate.runtime.queueRebuild();
         requestAnimationFrame(() => requestAnimationFrame(() => {
           if (!isVisibleGeometryValid(candidate)) {
@@ -428,8 +682,8 @@ body{background:transparent}
       'window.avaCanvas.mountActive('
       '${jsonEncode(_documentPayload(document))},${jsonEncode(interactive)});';
 
-  String presentCandidateScript(AvaValidatedSvgCanvasDocument document) =>
-      _operation('presentCandidate', _identity(document));
+  String presentCandidateScript(AvaValidatedSvgCanvasDocument document, {bool foreground = true}) =>
+      _operation('presentCandidate', {'identity': _identity(document), 'foreground': foreground});
 
   String activateCandidateScript(
     AvaValidatedSvgCanvasDocument document, {

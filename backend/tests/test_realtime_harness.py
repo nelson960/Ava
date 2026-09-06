@@ -22,6 +22,7 @@ from ava_backend.realtime.memory import AuthoritativeMemorySnapshot
 from ava_backend.realtime.tool_contract import (
     CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
     INTERACTIVE_CANVAS_TOOL_NAME,
+    MANAGE_CANVAS_PRESENTATION_TOOL_NAME,
     InteractiveCanvasRequest,
 )
 
@@ -151,7 +152,7 @@ def test_harness_exposes_bounded_semantic_canvas_actions() -> None:
     assert harness.tool_contract_version == REALTIME_TOOL_CONTRACT_VERSION
     assert harness.reasoning_effort == "low"
     assert harness.tool_choice == "auto"
-    assert len(harness.tools) == 4
+    assert len(harness.tools) == 5
     tool = harness.tools[0]
     assert tool["name"] == INTERACTIVE_CANVAS_TOOL_NAME
     assert tool["type"] == "function"
@@ -178,15 +179,29 @@ def test_harness_exposes_bounded_semantic_canvas_actions() -> None:
     assert cancellation["parameters"]["type"] == "object"
     assert cancellation["parameters"]["additionalProperties"] is False
     assert cancellation["parameters"]["properties"] == {}
-    assert harness.tools[2]["name"] == "search_memory"
-    assert harness.tools[2]["parameters"]["required"] == ["query"]
-    assert set(harness.tools[2]["parameters"]["properties"]) == {
+    presentation = harness.tools[2]
+    assert presentation["name"] == MANAGE_CANVAS_PRESENTATION_TOOL_NAME
+    assert presentation["type"] == "function"
+    assert set(presentation["parameters"]["properties"]) == {
+        "operation",
+        "sceneId",
+        "direction",
+    }
+    assert presentation["parameters"]["required"] == ["operation"]
+    assert "canvas_presentation is authoritative" in harness.instructions
+    assert "visible=false means no" in harness.instructions
+    assert "Retained visuals" in harness.instructions
+    assert "available choices, not visibility claims" in harness.instructions
+    assert "generate only when a new/different visual" in harness.instructions
+    assert harness.tools[3]["name"] == "search_memory"
+    assert harness.tools[3]["parameters"]["required"] == ["query"]
+    assert set(harness.tools[3]["parameters"]["properties"]) == {
         "query",
         "fromDate",
         "toDate",
     }
-    assert harness.tools[3]["name"] == "get_current_time"
-    assert harness.tools[3]["parameters"]["properties"] == {}
+    assert harness.tools[4]["name"] == "get_current_time"
+    assert harness.tools[4]["parameters"]["properties"] == {}
     assert parameters["properties"]["brief"]["maxLength"] == 1000
     serialized = str(tool)
     assert "'title':" not in serialized
@@ -206,6 +221,7 @@ def test_harness_exposes_bounded_semantic_canvas_actions() -> None:
     assert [item["name"] for item in session["tools"]] == [
         INTERACTIVE_CANVAS_TOOL_NAME,
         CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
+        MANAGE_CANVAS_PRESENTATION_TOOL_NAME,
         "search_memory",
         "get_current_time",
     ]
@@ -397,9 +413,9 @@ def test_prompt_budget_and_canvas_context_remain_bounded() -> None:
     harness = _harness()
     budget = estimate_harness_token_budget(harness)
 
-    assert budget.instruction_characters < 7_000
-    assert budget.tool_schema_characters < 3_200
-    assert budget.estimated_fixed_tokens < 2_500
+    assert budget.instruction_characters < 8_000
+    assert budget.tool_schema_characters < 4_200
+    assert budget.estimated_fixed_tokens < 3_200
 
     canvas_context = (
         '<active_canvas trust="validated_scene_data" scene_id="water" '

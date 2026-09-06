@@ -1,3 +1,5 @@
+import 'dart:developer' as developer;
+
 import '../canvas/ava_svg_canvas_telemetry.dart';
 import '../canvas/ava_svg_canvas_session_host.dart';
 import '../models/ava_realtime_protocol.dart';
@@ -79,15 +81,39 @@ final class AvaRealtimeRuntimeFactoryV4 implements AvaRealtimeRuntimeBuilder {
       ),
     );
     trace.attachSession(bootstrap.sessionId);
+    await trace.measure(
+      'canvas.workspace.synchronize',
+      () => _canvasRestoreService.synchronizeWorkspace(
+        bootstrap: bootstrap,
+        manifest: _canvasHost.workspaceManifestJson(),
+      ),
+    );
     final restoredFocused = _canvasHost.presentedDocument;
     if (restoredFocused != null) {
-      await trace.measure(
-        'canvas.restore.backend',
-        () => _canvasRestoreService.restoreFocused(
-          bootstrap: bootstrap,
-          document: restoredFocused,
-        ),
-      );
+      try {
+        await trace.measure(
+          'canvas.restore.backend',
+          () => _canvasRestoreService.restoreFocused(
+            bootstrap: bootstrap,
+            document: restoredFocused,
+          ),
+        );
+      } catch (error, stackTrace) {
+        developer.log(
+          'canvas_restore_failed_non_terminal sessionId=${bootstrap.sessionId} error=$error',
+          name: 'ava.realtime',
+          error: error,
+          stackTrace: stackTrace,
+        );
+        trace.mark(
+          'canvas.restore.rejected',
+          fields: {
+            'error': '$error',
+            'sceneId': restoredFocused.descriptor.sceneId,
+          },
+        );
+        _canvasHost.clearPresentedFocus();
+      }
     }
     void canvasTelemetry(AvaSvgCanvasTelemetryEvent event) {
       trace.mark(
@@ -122,6 +148,8 @@ final class AvaRealtimeRuntimeFactoryV4 implements AvaRealtimeRuntimeBuilder {
         cancelRequestIdFactory: _cancelRequestIdFactory,
         canvasTelemetry: canvasTelemetry,
         retainedSceneRevision: _canvasHost.retainedSceneRevision,
+        turnContextSnapshot: _canvasHost.turnContextSnapshot,
+        canvasPresentationSnapshot: _canvasHost.presentationSnapshot,
         onCanvasClosed: _canvasHost.detach,
         trace: trace,
         onMicrophoneTrackChanged: onMicrophoneTrackChanged,
@@ -131,7 +159,9 @@ final class AvaRealtimeRuntimeFactoryV4 implements AvaRealtimeRuntimeBuilder {
         runtime.canvasController,
         initialRenderProfile: canvasRenderProfile,
         renderProfileUpdateSink: runtime.updateCanvasRenderProfile,
-        runtimeFocusSink: (document) => _canvasRestoreService.focusScene(
+        runtimeFocusSink: (document, focusRevision) =>
+            _canvasRestoreService.focusScene(
+          focusRevision: focusRevision,
           bootstrap: bootstrap,
           document: document,
         ),

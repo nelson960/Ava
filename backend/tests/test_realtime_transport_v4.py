@@ -18,7 +18,11 @@ from ava_backend.canvas.svg_document import (
 )
 from ava_backend.canvas.render_profile import CanvasRenderProfile
 from ava_backend.canvas.svg_session import SvgCanvasSessionState
-from ava_backend.canvas.svg_workspace import ActiveSvgCanvasScene
+from ava_backend.canvas.svg_workspace import (
+    ActiveSvgCanvasScene,
+    SvgCanvasWorkspace,
+    SvgCanvasWorkspaceStore,
+)
 from ava_backend.canvas.svg_specialist import (
     SvgCanvasSpecialistGeneration,
     SvgCanvasVisibleDraft,
@@ -760,3 +764,306 @@ def test_canvas_document_authorization_logs_content_free_failure(
     assert "canvas_document_authorization_failed" in caplog.text
     assert f"failure={failure.value}" in caplog.text
     assert credential not in caplog.text
+
+
+class _RealWorkspaceCoordinator(_Coordinator):
+    def __init__(self, workspace: SvgCanvasWorkspace, *, inherit_focus: bool = False) -> None:
+        super().__init__()
+        self.workspace = workspace
+        self.state = SvgCanvasSessionState(workspace=workspace, inherit_focus=inherit_focus)
+        self.restored_scene: ActiveSvgCanvasScene | None = None
+
+    def restore_focused_canvas(self, scene: ActiveSvgCanvasScene) -> None:
+        self.state.restore_focused(scene)
+        self.restored_scene = scene
+
+
+class _RealWorkspaceFactory:
+    def __init__(self, workspace_store: SvgCanvasWorkspaceStore) -> None:
+        self.workspace_store = workspace_store
+        self.coordinators: list[_RealWorkspaceCoordinator] = []
+
+    def create(
+        self,
+        *,
+        session_id: str,
+        request_id: str,
+        subject: str,
+        age_band: AgeBand,
+        timezone_id: str,
+        canvas_render_profile: CanvasRenderProfile | None = None,
+    ) -> RealtimeSessionCoordinatorV4:
+        workspace = self.workspace_store.workspace_for(subject)
+        coord = _RealWorkspaceCoordinator(workspace, inherit_focus=False)
+        self.coordinators.append(coord)
+        return coord
+
+
+def test_canvas_restore_across_consecutive_sessions_with_shared_store() -> None:
+    workspace_store = SvgCanvasWorkspaceStore()
+    factory = _RealWorkspaceFactory(workspace_store)
+    app = create_app(
+        Settings(
+            environment=AvaEnvironment.TEST,
+            realtime_session_token_secret=SecretStr("r" * 32),
+        ),
+        authoritative_memory=DevelopmentAuthoritativeMemoryStore(),
+        realtime_v4_coordinator_factory=factory,
+        svg_canvas_workspaces=workspace_store,
+    )
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" '
+        'data-ava-interaction-mode="explore">'
+        "<title>Explore the Moon's lunar cycle</title><desc>Moon phases</desc>"
+        '<circle id="moon" data-ava-binding="step-1" '
+        'data-ava-target="moon" aria-label="Moon" cx="50" cy="50" r="20"/>'
+        "</svg>"
+    )
+    validated = SvgDocumentValidator().validate(svg)
+    scene_id = "scene_eb29fcfd30725883"
+    scene_revision = 2
+    generation_id = "generation-900d84f56b5c4da99f867d933caa85ce"
+    source_turn_id = "turn-067e48290ee9405289b14de52b6d29ab"
+
+    with TestClient(app, base_url="https://127.0.0.1") as client:
+        # Session 1:
+        s1 = client.post(
+            "/v4/realtime/sessions",
+            headers={"X-Ava-Protocol-Version": "4"},
+            json={"protocolVersion": 4, "ageBand": "middleChildhood", "timezoneId": "UTC"},
+        ).json()
+        headers_s1 = {
+            "Content-Type": "application/octet-stream",
+            "X-Ava-Protocol-Version": "4",
+            "X-Ava-Canvas-Token": s1["canvasToken"],
+            "X-Ava-Generation-ID": generation_id,
+            "X-Ava-Source-Turn-ID": source_turn_id,
+            "X-Ava-Scene-ID": scene_id,
+            "X-Ava-Scene-Revision": str(scene_revision),
+            "X-Ava-SVG-SHA256": validated.svg_sha256,
+            "X-Ava-Manifest-SHA256": validated.manifest_sha256,
+        }
+        res1 = client.put(
+            f"/v4/realtime/sessions/{s1['sessionId']}/canvas-restore",
+            headers=headers_s1,
+            content=validated.svg_bytes,
+        )
+        assert res1.status_code == 204
+        coord_s1 = factory.coordinators[0]
+        assert len(coord_s1.workspace.scenes) == 1
+        assert coord_s1.state.focused_scene is not None
+        assert coord_s1.state.focused_scene.scene_id == scene_id
+
+        # Session 1 ends, Session 2 begins for the same subject on the same running server:
+        s2 = client.post(
+            "/v4/realtime/sessions",
+            headers={"X-Ava-Protocol-Version": "4"},
+            json={"protocolVersion": 4, "ageBand": "middleChildhood", "timezoneId": "UTC"},
+        ).json()
+        coord_s2 = factory.coordinators[1]
+        assert coord_s2.state.active is None
+
+        headers_s2 = dict(headers_s1)
+        headers_s2["X-Ava-Canvas-Token"] = s2["canvasToken"]
+
+        # Crucial live failure reproduction: previously this returned 422
+        # "The restored Canvas document is invalid." because self._scenes was not empty.
+        res2 = client.put(
+            f"/v4/realtime/sessions/{s2['sessionId']}/canvas-restore",
+            headers=headers_s2,
+            content=validated.svg_bytes,
+        )
+        assert res2.status_code == 204
+        # Assert no duplicate scenes in retained workspace:
+        assert coord_s1.workspace is coord_s2.workspace
+        assert len(coord_s1.workspace.scenes) == 1
+        assert coord_s2.state.focused_scene is not None
+        assert coord_s2.state.focused_scene.scene_id == scene_id
+        assert coord_s2.state.focused_scene.revision == scene_revision
+
+
+def test_speech_grounding_safety_when_canvas_restore_fails_on_fresh_session() -> None:
+    workspace_store = SvgCanvasWorkspaceStore()
+    factory = _RealWorkspaceFactory(workspace_store)
+    app = create_app(
+        Settings(
+            environment=AvaEnvironment.TEST,
+            realtime_session_token_secret=SecretStr("s" * 32),
+        ),
+        authoritative_memory=DevelopmentAuthoritativeMemoryStore(),
+        realtime_v4_coordinator_factory=factory,
+        svg_canvas_workspaces=workspace_store,
+    )
+    svg_a = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" '
+        'data-ava-interaction-mode="explore">'
+        "<title>Scene A: Water Cycle</title><desc>Water cycle</desc>"
+        '<circle id="water" data-ava-binding="water-binding" '
+        'data-ava-target="water" aria-label="Water" cx="50" cy="50" r="20"/>'
+        "</svg>"
+    )
+    val_a = SvgDocumentValidator().validate(svg_a)
+
+    with TestClient(app, base_url="https://127.0.0.1") as client:
+        # Session 1: populates Scene A
+        s1 = client.post(
+            "/v4/realtime/sessions",
+            headers={"X-Ava-Protocol-Version": "4"},
+            json={"protocolVersion": 4, "ageBand": "middleChildhood", "timezoneId": "UTC"},
+        ).json()
+        res1 = client.put(
+            f"/v4/realtime/sessions/{s1['sessionId']}/canvas-restore",
+            headers={
+                "Content-Type": "application/octet-stream",
+                "X-Ava-Protocol-Version": "4",
+                "X-Ava-Canvas-Token": s1["canvasToken"],
+                "X-Ava-Generation-ID": "gen-a",
+                "X-Ava-Source-Turn-ID": "turn-a",
+                "X-Ava-Scene-ID": "scene-a",
+                "X-Ava-Scene-Revision": "1",
+                "X-Ava-SVG-SHA256": val_a.svg_sha256,
+                "X-Ava-Manifest-SHA256": val_a.manifest_sha256,
+            },
+            content=val_a.svg_bytes,
+        )
+        assert res1.status_code == 204
+        coord1 = factory.coordinators[0]
+        assert coord1.state.focused_scene is not None
+        assert coord1.state.focused_scene.scene_id == "scene-a"
+
+        # Session 2 begins for the same subject:
+        s2 = client.post(
+            "/v4/realtime/sessions",
+            headers={"X-Ava-Protocol-Version": "4"},
+            json={"protocolVersion": 4, "ageBand": "middleChildhood", "timezoneId": "UTC"},
+        ).json()
+
+        coord2 = factory.coordinators[-1]
+        # Session 2 has no active focus at start (inherit_focus=False):
+        assert coord2.state.active is None
+        # Session 1's focused scene is NOT mutated:
+        assert coord1.state.focused_scene is not None
+        assert coord1.state.focused_scene.scene_id == "scene-a"
+
+        # Now client attempts to restore tampered/invalid Scene B into Session 2:
+        res2 = client.put(
+            f"/v4/realtime/sessions/{s2['sessionId']}/canvas-restore",
+            headers={
+                "Content-Type": "application/octet-stream",
+                "X-Ava-Protocol-Version": "4",
+                "X-Ava-Canvas-Token": s2["canvasToken"],
+                "X-Ava-Generation-ID": "gen-b",
+                "X-Ava-Source-Turn-ID": "turn-b",
+                "X-Ava-Scene-ID": "scene-b",
+                "X-Ava-Scene-Revision": "1",
+                "X-Ava-SVG-SHA256": "0" * 64,  # tampered hash
+                "X-Ava-Manifest-SHA256": "0" * 64,
+            },
+            content=val_a.svg_bytes,
+        )
+        assert res2.status_code == 422
+
+        # GROUNDING SAFETY: Restore failed, so Session 2's state.active MUST remain None!
+        # It must NOT fall back to Scene A!
+        assert coord2.state.active is None
+        # And Session 1's state was still never touched:
+        assert coord1.state.focused_scene is not None
+        assert coord1.state.focused_scene.scene_id == "scene-a"
+
+
+def test_canvas_restore_overlapping_sessions_with_shared_store() -> None:
+    workspace_store = SvgCanvasWorkspaceStore()
+    factory = _RealWorkspaceFactory(workspace_store)
+    app = create_app(
+        Settings(
+            environment=AvaEnvironment.TEST,
+            realtime_session_token_secret=SecretStr("o" * 32),
+        ),
+        authoritative_memory=DevelopmentAuthoritativeMemoryStore(),
+        realtime_v4_coordinator_factory=factory,
+        svg_canvas_workspaces=workspace_store,
+    )
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" '
+        'data-ava-interaction-mode="explore">'
+        "<title>Explore the Stars</title><desc>Constellations</desc>"
+        '<circle id="star" data-ava-binding="step-1" '
+        'data-ava-target="star" aria-label="Star" cx="50" cy="50" r="20"/>'
+        "</svg>"
+    )
+    validated = SvgDocumentValidator().validate(svg)
+    scene_id = "scene_star_123"
+    scene_revision = 1
+    generation_id = "generation-star-123"
+    source_turn_id = "turn-star-123"
+
+    with TestClient(app, base_url="https://127.0.0.1") as client:
+        # Session A:
+        s1 = client.post(
+            "/v4/realtime/sessions",
+            headers={"X-Ava-Protocol-Version": "4"},
+            json={"protocolVersion": 4, "ageBand": "middleChildhood", "timezoneId": "UTC"},
+        ).json()
+        res1 = client.put(
+            f"/v4/realtime/sessions/{s1['sessionId']}/canvas-restore",
+            headers={
+                "Content-Type": "application/octet-stream",
+                "X-Ava-Protocol-Version": "4",
+                "X-Ava-Canvas-Token": s1["canvasToken"],
+                "X-Ava-Generation-ID": generation_id,
+                "X-Ava-Source-Turn-ID": source_turn_id,
+                "X-Ava-Scene-ID": scene_id,
+                "X-Ava-Scene-Revision": str(scene_revision),
+                "X-Ava-SVG-SHA256": validated.svg_sha256,
+                "X-Ava-Manifest-SHA256": validated.manifest_sha256,
+            },
+            content=validated.svg_bytes,
+        )
+        assert res1.status_code == 204
+        coord_a = factory.coordinators[0]
+        assert coord_a.state.focused_scene is not None
+        assert coord_a.state.focused_scene.scene_id == scene_id
+
+        # Session B is created for the same subject WHILE Session A remains alive:
+        s2 = client.post(
+            "/v4/realtime/sessions",
+            headers={"X-Ava-Protocol-Version": "4"},
+            json={"protocolVersion": 4, "ageBand": "middleChildhood", "timezoneId": "UTC"},
+        ).json()
+        coord_b = factory.coordinators[1]
+
+        # REQUIREMENT 1: Session A still sees and uses Scene A
+        assert coord_a.state.focused_scene is not None
+        assert coord_a.state.focused_scene.scene_id == scene_id
+
+        # REQUIREMENT 2: Session B does NOT treat Scene A as accepted focus before its own restore
+        assert coord_b.state.active is None
+
+        # REQUIREMENT 3: Session B restore of valid local scene succeeds
+        res2 = client.put(
+            f"/v4/realtime/sessions/{s2['sessionId']}/canvas-restore",
+            headers={
+                "Content-Type": "application/octet-stream",
+                "X-Ava-Protocol-Version": "4",
+                "X-Ava-Canvas-Token": s2["canvasToken"],
+                "X-Ava-Generation-ID": generation_id,
+                "X-Ava-Source-Turn-ID": source_turn_id,
+                "X-Ava-Scene-ID": scene_id,
+                "X-Ava-Scene-Revision": str(scene_revision),
+                "X-Ava-SVG-SHA256": validated.svg_sha256,
+                "X-Ava-Manifest-SHA256": validated.manifest_sha256,
+            },
+            content=validated.svg_bytes,
+        )
+        assert res2.status_code == 204
+        assert coord_b.state.focused_scene is not None
+        assert coord_b.state.focused_scene.scene_id == scene_id
+
+        # REQUIREMENT 4: No duplicate retained scene
+        assert coord_a.workspace is coord_b.workspace
+        assert len(coord_a.workspace.scenes) == 1
+
+        # Close Session A:
+        # Verify Session B remains correct:
+        assert coord_b.state.focused_scene is not None
+        assert coord_b.state.focused_scene.scene_id == scene_id

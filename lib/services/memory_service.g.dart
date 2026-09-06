@@ -1322,6 +1322,29 @@ class $CanvasScenesTable extends CanvasScenes
       requiredDuringInsert: true,
       defaultConstraints:
           GeneratedColumn.constraintIsAlways('CHECK ("is_focused" IN (0, 1))'));
+  static const VerificationMeta _creationSequenceMeta =
+      const VerificationMeta('creationSequence');
+  @override
+  late final GeneratedColumn<int> creationSequence = GeneratedColumn<int>(
+      'creation_sequence', aliasedName, true,
+      type: DriftSqlType.int, requiredDuringInsert: false);
+  static const VerificationMeta _modificationSequenceMeta =
+      const VerificationMeta('modificationSequence');
+  @override
+  late final GeneratedColumn<int> modificationSequence = GeneratedColumn<int>(
+      'modification_sequence', aliasedName, true,
+      type: DriftSqlType.int, requiredDuringInsert: false);
+  static const VerificationMeta _titleMeta = const VerificationMeta('title');
+  @override
+  late final GeneratedColumn<String> title = GeneratedColumn<String>(
+      'title', aliasedName, true,
+      type: DriftSqlType.string, requiredDuringInsert: false);
+  static const VerificationMeta _summaryMeta =
+      const VerificationMeta('summary');
+  @override
+  late final GeneratedColumn<String> summary = GeneratedColumn<String>(
+      'summary', aliasedName, true,
+      type: DriftSqlType.string, requiredDuringInsert: false);
   @override
   List<GeneratedColumn> get $columns => [
         sceneId,
@@ -1338,7 +1361,11 @@ class $CanvasScenesTable extends CanvasScenes
         validatorVersion,
         manifestVersion,
         workspaceOrder,
-        isFocused
+        isFocused,
+        creationSequence,
+        modificationSequence,
+        title,
+        summary
       ];
   @override
   String get aliasedName => _alias ?? actualTableName;
@@ -1463,6 +1490,26 @@ class $CanvasScenesTable extends CanvasScenes
     } else if (isInserting) {
       context.missing(_isFocusedMeta);
     }
+    if (data.containsKey('creation_sequence')) {
+      context.handle(
+          _creationSequenceMeta,
+          creationSequence.isAcceptableOrUnknown(
+              data['creation_sequence']!, _creationSequenceMeta));
+    }
+    if (data.containsKey('modification_sequence')) {
+      context.handle(
+          _modificationSequenceMeta,
+          modificationSequence.isAcceptableOrUnknown(
+              data['modification_sequence']!, _modificationSequenceMeta));
+    }
+    if (data.containsKey('title')) {
+      context.handle(
+          _titleMeta, title.isAcceptableOrUnknown(data['title']!, _titleMeta));
+    }
+    if (data.containsKey('summary')) {
+      context.handle(_summaryMeta,
+          summary.isAcceptableOrUnknown(data['summary']!, _summaryMeta));
+    }
     return context;
   }
 
@@ -1503,6 +1550,14 @@ class $CanvasScenesTable extends CanvasScenes
           .read(DriftSqlType.int, data['${effectivePrefix}workspace_order'])!,
       isFocused: attachedDatabase.typeMapping
           .read(DriftSqlType.bool, data['${effectivePrefix}is_focused'])!,
+      creationSequence: attachedDatabase.typeMapping
+          .read(DriftSqlType.int, data['${effectivePrefix}creation_sequence']),
+      modificationSequence: attachedDatabase.typeMapping.read(
+          DriftSqlType.int, data['${effectivePrefix}modification_sequence']),
+      title: attachedDatabase.typeMapping
+          .read(DriftSqlType.string, data['${effectivePrefix}title']),
+      summary: attachedDatabase.typeMapping
+          .read(DriftSqlType.string, data['${effectivePrefix}summary']),
     );
   }
 
@@ -1529,6 +1584,10 @@ class StoredCanvasScene extends DataClass
   final String manifestVersion;
   final int workspaceOrder;
   final bool isFocused;
+  final int? creationSequence;
+  final int? modificationSequence;
+  final String? title;
+  final String? summary;
   const StoredCanvasScene(
       {required this.sceneId,
       required this.sceneRevision,
@@ -1544,7 +1603,11 @@ class StoredCanvasScene extends DataClass
       required this.validatorVersion,
       required this.manifestVersion,
       required this.workspaceOrder,
-      required this.isFocused});
+      required this.isFocused,
+      this.creationSequence,
+      this.modificationSequence,
+      this.title,
+      this.summary});
   @override
   Map<String, Expression> toColumns(bool nullToAbsent) {
     final map = <String, Expression>{};
@@ -1564,6 +1627,18 @@ class StoredCanvasScene extends DataClass
     map['manifest_version'] = Variable<String>(manifestVersion);
     map['workspace_order'] = Variable<int>(workspaceOrder);
     map['is_focused'] = Variable<bool>(isFocused);
+    if (!nullToAbsent || creationSequence != null) {
+      map['creation_sequence'] = Variable<int>(creationSequence);
+    }
+    if (!nullToAbsent || modificationSequence != null) {
+      map['modification_sequence'] = Variable<int>(modificationSequence);
+    }
+    if (!nullToAbsent || title != null) {
+      map['title'] = Variable<String>(title);
+    }
+    if (!nullToAbsent || summary != null) {
+      map['summary'] = Variable<String>(summary);
+    }
     return map;
   }
 
@@ -1584,6 +1659,17 @@ class StoredCanvasScene extends DataClass
       manifestVersion: Value(manifestVersion),
       workspaceOrder: Value(workspaceOrder),
       isFocused: Value(isFocused),
+      creationSequence: creationSequence == null && nullToAbsent
+          ? const Value.absent()
+          : Value(creationSequence),
+      modificationSequence: modificationSequence == null && nullToAbsent
+          ? const Value.absent()
+          : Value(modificationSequence),
+      title:
+          title == null && nullToAbsent ? const Value.absent() : Value(title),
+      summary: summary == null && nullToAbsent
+          ? const Value.absent()
+          : Value(summary),
     );
   }
 
@@ -1607,6 +1693,11 @@ class StoredCanvasScene extends DataClass
       manifestVersion: serializer.fromJson<String>(json['manifestVersion']),
       workspaceOrder: serializer.fromJson<int>(json['workspaceOrder']),
       isFocused: serializer.fromJson<bool>(json['isFocused']),
+      creationSequence: serializer.fromJson<int?>(json['creationSequence']),
+      modificationSequence:
+          serializer.fromJson<int?>(json['modificationSequence']),
+      title: serializer.fromJson<String?>(json['title']),
+      summary: serializer.fromJson<String?>(json['summary']),
     );
   }
   @override
@@ -1629,6 +1720,10 @@ class StoredCanvasScene extends DataClass
       'manifestVersion': serializer.toJson<String>(manifestVersion),
       'workspaceOrder': serializer.toJson<int>(workspaceOrder),
       'isFocused': serializer.toJson<bool>(isFocused),
+      'creationSequence': serializer.toJson<int?>(creationSequence),
+      'modificationSequence': serializer.toJson<int?>(modificationSequence),
+      'title': serializer.toJson<String?>(title),
+      'summary': serializer.toJson<String?>(summary),
     };
   }
 
@@ -1647,7 +1742,11 @@ class StoredCanvasScene extends DataClass
           String? validatorVersion,
           String? manifestVersion,
           int? workspaceOrder,
-          bool? isFocused}) =>
+          bool? isFocused,
+          Value<int?> creationSequence = const Value.absent(),
+          Value<int?> modificationSequence = const Value.absent(),
+          Value<String?> title = const Value.absent(),
+          Value<String?> summary = const Value.absent()}) =>
       StoredCanvasScene(
         sceneId: sceneId ?? this.sceneId,
         sceneRevision: sceneRevision ?? this.sceneRevision,
@@ -1665,6 +1764,14 @@ class StoredCanvasScene extends DataClass
         manifestVersion: manifestVersion ?? this.manifestVersion,
         workspaceOrder: workspaceOrder ?? this.workspaceOrder,
         isFocused: isFocused ?? this.isFocused,
+        creationSequence: creationSequence.present
+            ? creationSequence.value
+            : this.creationSequence,
+        modificationSequence: modificationSequence.present
+            ? modificationSequence.value
+            : this.modificationSequence,
+        title: title.present ? title.value : this.title,
+        summary: summary.present ? summary.value : this.summary,
       );
   StoredCanvasScene copyWithCompanion(CanvasScenesCompanion data) {
     return StoredCanvasScene(
@@ -1705,6 +1812,14 @@ class StoredCanvasScene extends DataClass
           ? data.workspaceOrder.value
           : this.workspaceOrder,
       isFocused: data.isFocused.present ? data.isFocused.value : this.isFocused,
+      creationSequence: data.creationSequence.present
+          ? data.creationSequence.value
+          : this.creationSequence,
+      modificationSequence: data.modificationSequence.present
+          ? data.modificationSequence.value
+          : this.modificationSequence,
+      title: data.title.present ? data.title.value : this.title,
+      summary: data.summary.present ? data.summary.value : this.summary,
     );
   }
 
@@ -1725,7 +1840,11 @@ class StoredCanvasScene extends DataClass
           ..write('validatorVersion: $validatorVersion, ')
           ..write('manifestVersion: $manifestVersion, ')
           ..write('workspaceOrder: $workspaceOrder, ')
-          ..write('isFocused: $isFocused')
+          ..write('isFocused: $isFocused, ')
+          ..write('creationSequence: $creationSequence, ')
+          ..write('modificationSequence: $modificationSequence, ')
+          ..write('title: $title, ')
+          ..write('summary: $summary')
           ..write(')'))
         .toString();
   }
@@ -1746,7 +1865,11 @@ class StoredCanvasScene extends DataClass
       validatorVersion,
       manifestVersion,
       workspaceOrder,
-      isFocused);
+      isFocused,
+      creationSequence,
+      modificationSequence,
+      title,
+      summary);
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
@@ -1765,7 +1888,11 @@ class StoredCanvasScene extends DataClass
           other.validatorVersion == this.validatorVersion &&
           other.manifestVersion == this.manifestVersion &&
           other.workspaceOrder == this.workspaceOrder &&
-          other.isFocused == this.isFocused);
+          other.isFocused == this.isFocused &&
+          other.creationSequence == this.creationSequence &&
+          other.modificationSequence == this.modificationSequence &&
+          other.title == this.title &&
+          other.summary == this.summary);
 }
 
 class CanvasScenesCompanion extends UpdateCompanion<StoredCanvasScene> {
@@ -1784,6 +1911,10 @@ class CanvasScenesCompanion extends UpdateCompanion<StoredCanvasScene> {
   final Value<String> manifestVersion;
   final Value<int> workspaceOrder;
   final Value<bool> isFocused;
+  final Value<int?> creationSequence;
+  final Value<int?> modificationSequence;
+  final Value<String?> title;
+  final Value<String?> summary;
   final Value<int> rowid;
   const CanvasScenesCompanion({
     this.sceneId = const Value.absent(),
@@ -1801,6 +1932,10 @@ class CanvasScenesCompanion extends UpdateCompanion<StoredCanvasScene> {
     this.manifestVersion = const Value.absent(),
     this.workspaceOrder = const Value.absent(),
     this.isFocused = const Value.absent(),
+    this.creationSequence = const Value.absent(),
+    this.modificationSequence = const Value.absent(),
+    this.title = const Value.absent(),
+    this.summary = const Value.absent(),
     this.rowid = const Value.absent(),
   });
   CanvasScenesCompanion.insert({
@@ -1819,6 +1954,10 @@ class CanvasScenesCompanion extends UpdateCompanion<StoredCanvasScene> {
     required String manifestVersion,
     required int workspaceOrder,
     required bool isFocused,
+    this.creationSequence = const Value.absent(),
+    this.modificationSequence = const Value.absent(),
+    this.title = const Value.absent(),
+    this.summary = const Value.absent(),
     this.rowid = const Value.absent(),
   })  : sceneId = Value(sceneId),
         sceneRevision = Value(sceneRevision),
@@ -1851,6 +1990,10 @@ class CanvasScenesCompanion extends UpdateCompanion<StoredCanvasScene> {
     Expression<String>? manifestVersion,
     Expression<int>? workspaceOrder,
     Expression<bool>? isFocused,
+    Expression<int>? creationSequence,
+    Expression<int>? modificationSequence,
+    Expression<String>? title,
+    Expression<String>? summary,
     Expression<int>? rowid,
   }) {
     return RawValuesInsertable({
@@ -1871,6 +2014,11 @@ class CanvasScenesCompanion extends UpdateCompanion<StoredCanvasScene> {
       if (manifestVersion != null) 'manifest_version': manifestVersion,
       if (workspaceOrder != null) 'workspace_order': workspaceOrder,
       if (isFocused != null) 'is_focused': isFocused,
+      if (creationSequence != null) 'creation_sequence': creationSequence,
+      if (modificationSequence != null)
+        'modification_sequence': modificationSequence,
+      if (title != null) 'title': title,
+      if (summary != null) 'summary': summary,
       if (rowid != null) 'rowid': rowid,
     });
   }
@@ -1891,6 +2039,10 @@ class CanvasScenesCompanion extends UpdateCompanion<StoredCanvasScene> {
       Value<String>? manifestVersion,
       Value<int>? workspaceOrder,
       Value<bool>? isFocused,
+      Value<int?>? creationSequence,
+      Value<int?>? modificationSequence,
+      Value<String?>? title,
+      Value<String?>? summary,
       Value<int>? rowid}) {
     return CanvasScenesCompanion(
       sceneId: sceneId ?? this.sceneId,
@@ -1909,6 +2061,10 @@ class CanvasScenesCompanion extends UpdateCompanion<StoredCanvasScene> {
       manifestVersion: manifestVersion ?? this.manifestVersion,
       workspaceOrder: workspaceOrder ?? this.workspaceOrder,
       isFocused: isFocused ?? this.isFocused,
+      creationSequence: creationSequence ?? this.creationSequence,
+      modificationSequence: modificationSequence ?? this.modificationSequence,
+      title: title ?? this.title,
+      summary: summary ?? this.summary,
       rowid: rowid ?? this.rowid,
     );
   }
@@ -1962,6 +2118,18 @@ class CanvasScenesCompanion extends UpdateCompanion<StoredCanvasScene> {
     if (isFocused.present) {
       map['is_focused'] = Variable<bool>(isFocused.value);
     }
+    if (creationSequence.present) {
+      map['creation_sequence'] = Variable<int>(creationSequence.value);
+    }
+    if (modificationSequence.present) {
+      map['modification_sequence'] = Variable<int>(modificationSequence.value);
+    }
+    if (title.present) {
+      map['title'] = Variable<String>(title.value);
+    }
+    if (summary.present) {
+      map['summary'] = Variable<String>(summary.value);
+    }
     if (rowid.present) {
       map['rowid'] = Variable<int>(rowid.value);
     }
@@ -1986,7 +2154,340 @@ class CanvasScenesCompanion extends UpdateCompanion<StoredCanvasScene> {
           ..write('manifestVersion: $manifestVersion, ')
           ..write('workspaceOrder: $workspaceOrder, ')
           ..write('isFocused: $isFocused, ')
+          ..write('creationSequence: $creationSequence, ')
+          ..write('modificationSequence: $modificationSequence, ')
+          ..write('title: $title, ')
+          ..write('summary: $summary, ')
           ..write('rowid: $rowid')
+          ..write(')'))
+        .toString();
+  }
+}
+
+class $CanvasWorkspacesTable extends CanvasWorkspaces
+    with TableInfo<$CanvasWorkspacesTable, StoredCanvasWorkspace> {
+  @override
+  final GeneratedDatabase attachedDatabase;
+  final String? _alias;
+  $CanvasWorkspacesTable(this.attachedDatabase, [this._alias]);
+  static const VerificationMeta _idMeta = const VerificationMeta('id');
+  @override
+  late final GeneratedColumn<int> id = GeneratedColumn<int>(
+      'id', aliasedName, false,
+      type: DriftSqlType.int, requiredDuringInsert: false);
+  static const VerificationMeta _workspaceEpochMeta =
+      const VerificationMeta('workspaceEpoch');
+  @override
+  late final GeneratedColumn<int> workspaceEpoch = GeneratedColumn<int>(
+      'workspace_epoch', aliasedName, false,
+      type: DriftSqlType.int, requiredDuringInsert: true);
+  static const VerificationMeta _workspaceRevisionMeta =
+      const VerificationMeta('workspaceRevision');
+  @override
+  late final GeneratedColumn<int> workspaceRevision = GeneratedColumn<int>(
+      'workspace_revision', aliasedName, false,
+      type: DriftSqlType.int, requiredDuringInsert: true);
+  static const VerificationMeta _nextCreationSequenceMeta =
+      const VerificationMeta('nextCreationSequence');
+  @override
+  late final GeneratedColumn<int> nextCreationSequence = GeneratedColumn<int>(
+      'next_creation_sequence', aliasedName, false,
+      type: DriftSqlType.int, requiredDuringInsert: true);
+  static const VerificationMeta _nextModificationSequenceMeta =
+      const VerificationMeta('nextModificationSequence');
+  @override
+  late final GeneratedColumn<int> nextModificationSequence =
+      GeneratedColumn<int>('next_modification_sequence', aliasedName, false,
+          type: DriftSqlType.int, requiredDuringInsert: true);
+  @override
+  List<GeneratedColumn> get $columns => [
+        id,
+        workspaceEpoch,
+        workspaceRevision,
+        nextCreationSequence,
+        nextModificationSequence
+      ];
+  @override
+  String get aliasedName => _alias ?? actualTableName;
+  @override
+  String get actualTableName => $name;
+  static const String $name = 'canvas_workspaces';
+  @override
+  VerificationContext validateIntegrity(
+      Insertable<StoredCanvasWorkspace> instance,
+      {bool isInserting = false}) {
+    final context = VerificationContext();
+    final data = instance.toColumns(true);
+    if (data.containsKey('id')) {
+      context.handle(_idMeta, id.isAcceptableOrUnknown(data['id']!, _idMeta));
+    }
+    if (data.containsKey('workspace_epoch')) {
+      context.handle(
+          _workspaceEpochMeta,
+          workspaceEpoch.isAcceptableOrUnknown(
+              data['workspace_epoch']!, _workspaceEpochMeta));
+    } else if (isInserting) {
+      context.missing(_workspaceEpochMeta);
+    }
+    if (data.containsKey('workspace_revision')) {
+      context.handle(
+          _workspaceRevisionMeta,
+          workspaceRevision.isAcceptableOrUnknown(
+              data['workspace_revision']!, _workspaceRevisionMeta));
+    } else if (isInserting) {
+      context.missing(_workspaceRevisionMeta);
+    }
+    if (data.containsKey('next_creation_sequence')) {
+      context.handle(
+          _nextCreationSequenceMeta,
+          nextCreationSequence.isAcceptableOrUnknown(
+              data['next_creation_sequence']!, _nextCreationSequenceMeta));
+    } else if (isInserting) {
+      context.missing(_nextCreationSequenceMeta);
+    }
+    if (data.containsKey('next_modification_sequence')) {
+      context.handle(
+          _nextModificationSequenceMeta,
+          nextModificationSequence.isAcceptableOrUnknown(
+              data['next_modification_sequence']!,
+              _nextModificationSequenceMeta));
+    } else if (isInserting) {
+      context.missing(_nextModificationSequenceMeta);
+    }
+    return context;
+  }
+
+  @override
+  Set<GeneratedColumn> get $primaryKey => {id};
+  @override
+  StoredCanvasWorkspace map(Map<String, dynamic> data, {String? tablePrefix}) {
+    final effectivePrefix = tablePrefix != null ? '$tablePrefix.' : '';
+    return StoredCanvasWorkspace(
+      id: attachedDatabase.typeMapping
+          .read(DriftSqlType.int, data['${effectivePrefix}id'])!,
+      workspaceEpoch: attachedDatabase.typeMapping
+          .read(DriftSqlType.int, data['${effectivePrefix}workspace_epoch'])!,
+      workspaceRevision: attachedDatabase.typeMapping.read(
+          DriftSqlType.int, data['${effectivePrefix}workspace_revision'])!,
+      nextCreationSequence: attachedDatabase.typeMapping.read(
+          DriftSqlType.int, data['${effectivePrefix}next_creation_sequence'])!,
+      nextModificationSequence: attachedDatabase.typeMapping.read(
+          DriftSqlType.int,
+          data['${effectivePrefix}next_modification_sequence'])!,
+    );
+  }
+
+  @override
+  $CanvasWorkspacesTable createAlias(String alias) {
+    return $CanvasWorkspacesTable(attachedDatabase, alias);
+  }
+}
+
+class StoredCanvasWorkspace extends DataClass
+    implements Insertable<StoredCanvasWorkspace> {
+  final int id;
+  final int workspaceEpoch;
+  final int workspaceRevision;
+  final int nextCreationSequence;
+  final int nextModificationSequence;
+  const StoredCanvasWorkspace(
+      {required this.id,
+      required this.workspaceEpoch,
+      required this.workspaceRevision,
+      required this.nextCreationSequence,
+      required this.nextModificationSequence});
+  @override
+  Map<String, Expression> toColumns(bool nullToAbsent) {
+    final map = <String, Expression>{};
+    map['id'] = Variable<int>(id);
+    map['workspace_epoch'] = Variable<int>(workspaceEpoch);
+    map['workspace_revision'] = Variable<int>(workspaceRevision);
+    map['next_creation_sequence'] = Variable<int>(nextCreationSequence);
+    map['next_modification_sequence'] = Variable<int>(nextModificationSequence);
+    return map;
+  }
+
+  CanvasWorkspacesCompanion toCompanion(bool nullToAbsent) {
+    return CanvasWorkspacesCompanion(
+      id: Value(id),
+      workspaceEpoch: Value(workspaceEpoch),
+      workspaceRevision: Value(workspaceRevision),
+      nextCreationSequence: Value(nextCreationSequence),
+      nextModificationSequence: Value(nextModificationSequence),
+    );
+  }
+
+  factory StoredCanvasWorkspace.fromJson(Map<String, dynamic> json,
+      {ValueSerializer? serializer}) {
+    serializer ??= driftRuntimeOptions.defaultSerializer;
+    return StoredCanvasWorkspace(
+      id: serializer.fromJson<int>(json['id']),
+      workspaceEpoch: serializer.fromJson<int>(json['workspaceEpoch']),
+      workspaceRevision: serializer.fromJson<int>(json['workspaceRevision']),
+      nextCreationSequence:
+          serializer.fromJson<int>(json['nextCreationSequence']),
+      nextModificationSequence:
+          serializer.fromJson<int>(json['nextModificationSequence']),
+    );
+  }
+  @override
+  Map<String, dynamic> toJson({ValueSerializer? serializer}) {
+    serializer ??= driftRuntimeOptions.defaultSerializer;
+    return <String, dynamic>{
+      'id': serializer.toJson<int>(id),
+      'workspaceEpoch': serializer.toJson<int>(workspaceEpoch),
+      'workspaceRevision': serializer.toJson<int>(workspaceRevision),
+      'nextCreationSequence': serializer.toJson<int>(nextCreationSequence),
+      'nextModificationSequence':
+          serializer.toJson<int>(nextModificationSequence),
+    };
+  }
+
+  StoredCanvasWorkspace copyWith(
+          {int? id,
+          int? workspaceEpoch,
+          int? workspaceRevision,
+          int? nextCreationSequence,
+          int? nextModificationSequence}) =>
+      StoredCanvasWorkspace(
+        id: id ?? this.id,
+        workspaceEpoch: workspaceEpoch ?? this.workspaceEpoch,
+        workspaceRevision: workspaceRevision ?? this.workspaceRevision,
+        nextCreationSequence: nextCreationSequence ?? this.nextCreationSequence,
+        nextModificationSequence:
+            nextModificationSequence ?? this.nextModificationSequence,
+      );
+  StoredCanvasWorkspace copyWithCompanion(CanvasWorkspacesCompanion data) {
+    return StoredCanvasWorkspace(
+      id: data.id.present ? data.id.value : this.id,
+      workspaceEpoch: data.workspaceEpoch.present
+          ? data.workspaceEpoch.value
+          : this.workspaceEpoch,
+      workspaceRevision: data.workspaceRevision.present
+          ? data.workspaceRevision.value
+          : this.workspaceRevision,
+      nextCreationSequence: data.nextCreationSequence.present
+          ? data.nextCreationSequence.value
+          : this.nextCreationSequence,
+      nextModificationSequence: data.nextModificationSequence.present
+          ? data.nextModificationSequence.value
+          : this.nextModificationSequence,
+    );
+  }
+
+  @override
+  String toString() {
+    return (StringBuffer('StoredCanvasWorkspace(')
+          ..write('id: $id, ')
+          ..write('workspaceEpoch: $workspaceEpoch, ')
+          ..write('workspaceRevision: $workspaceRevision, ')
+          ..write('nextCreationSequence: $nextCreationSequence, ')
+          ..write('nextModificationSequence: $nextModificationSequence')
+          ..write(')'))
+        .toString();
+  }
+
+  @override
+  int get hashCode => Object.hash(id, workspaceEpoch, workspaceRevision,
+      nextCreationSequence, nextModificationSequence);
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      (other is StoredCanvasWorkspace &&
+          other.id == this.id &&
+          other.workspaceEpoch == this.workspaceEpoch &&
+          other.workspaceRevision == this.workspaceRevision &&
+          other.nextCreationSequence == this.nextCreationSequence &&
+          other.nextModificationSequence == this.nextModificationSequence);
+}
+
+class CanvasWorkspacesCompanion extends UpdateCompanion<StoredCanvasWorkspace> {
+  final Value<int> id;
+  final Value<int> workspaceEpoch;
+  final Value<int> workspaceRevision;
+  final Value<int> nextCreationSequence;
+  final Value<int> nextModificationSequence;
+  const CanvasWorkspacesCompanion({
+    this.id = const Value.absent(),
+    this.workspaceEpoch = const Value.absent(),
+    this.workspaceRevision = const Value.absent(),
+    this.nextCreationSequence = const Value.absent(),
+    this.nextModificationSequence = const Value.absent(),
+  });
+  CanvasWorkspacesCompanion.insert({
+    this.id = const Value.absent(),
+    required int workspaceEpoch,
+    required int workspaceRevision,
+    required int nextCreationSequence,
+    required int nextModificationSequence,
+  })  : workspaceEpoch = Value(workspaceEpoch),
+        workspaceRevision = Value(workspaceRevision),
+        nextCreationSequence = Value(nextCreationSequence),
+        nextModificationSequence = Value(nextModificationSequence);
+  static Insertable<StoredCanvasWorkspace> custom({
+    Expression<int>? id,
+    Expression<int>? workspaceEpoch,
+    Expression<int>? workspaceRevision,
+    Expression<int>? nextCreationSequence,
+    Expression<int>? nextModificationSequence,
+  }) {
+    return RawValuesInsertable({
+      if (id != null) 'id': id,
+      if (workspaceEpoch != null) 'workspace_epoch': workspaceEpoch,
+      if (workspaceRevision != null) 'workspace_revision': workspaceRevision,
+      if (nextCreationSequence != null)
+        'next_creation_sequence': nextCreationSequence,
+      if (nextModificationSequence != null)
+        'next_modification_sequence': nextModificationSequence,
+    });
+  }
+
+  CanvasWorkspacesCompanion copyWith(
+      {Value<int>? id,
+      Value<int>? workspaceEpoch,
+      Value<int>? workspaceRevision,
+      Value<int>? nextCreationSequence,
+      Value<int>? nextModificationSequence}) {
+    return CanvasWorkspacesCompanion(
+      id: id ?? this.id,
+      workspaceEpoch: workspaceEpoch ?? this.workspaceEpoch,
+      workspaceRevision: workspaceRevision ?? this.workspaceRevision,
+      nextCreationSequence: nextCreationSequence ?? this.nextCreationSequence,
+      nextModificationSequence:
+          nextModificationSequence ?? this.nextModificationSequence,
+    );
+  }
+
+  @override
+  Map<String, Expression> toColumns(bool nullToAbsent) {
+    final map = <String, Expression>{};
+    if (id.present) {
+      map['id'] = Variable<int>(id.value);
+    }
+    if (workspaceEpoch.present) {
+      map['workspace_epoch'] = Variable<int>(workspaceEpoch.value);
+    }
+    if (workspaceRevision.present) {
+      map['workspace_revision'] = Variable<int>(workspaceRevision.value);
+    }
+    if (nextCreationSequence.present) {
+      map['next_creation_sequence'] = Variable<int>(nextCreationSequence.value);
+    }
+    if (nextModificationSequence.present) {
+      map['next_modification_sequence'] =
+          Variable<int>(nextModificationSequence.value);
+    }
+    return map;
+  }
+
+  @override
+  String toString() {
+    return (StringBuffer('CanvasWorkspacesCompanion(')
+          ..write('id: $id, ')
+          ..write('workspaceEpoch: $workspaceEpoch, ')
+          ..write('workspaceRevision: $workspaceRevision, ')
+          ..write('nextCreationSequence: $nextCreationSequence, ')
+          ..write('nextModificationSequence: $nextModificationSequence')
           ..write(')'))
         .toString();
   }
@@ -2001,12 +2502,19 @@ abstract class _$AppDatabase extends GeneratedDatabase {
   late final $LearningProgressEventsTable learningProgressEvents =
       $LearningProgressEventsTable(this);
   late final $CanvasScenesTable canvasScenes = $CanvasScenesTable(this);
+  late final $CanvasWorkspacesTable canvasWorkspaces =
+      $CanvasWorkspacesTable(this);
   @override
   Iterable<TableInfo<Table, Object?>> get allTables =>
       allSchemaEntities.whereType<TableInfo<Table, Object?>>();
   @override
-  List<DatabaseSchemaEntity> get allSchemaEntities =>
-      [studentProfiles, sessionHistory, learningProgressEvents, canvasScenes];
+  List<DatabaseSchemaEntity> get allSchemaEntities => [
+        studentProfiles,
+        sessionHistory,
+        learningProgressEvents,
+        canvasScenes,
+        canvasWorkspaces
+      ];
 }
 
 typedef $$StudentProfilesTableCreateCompanionBuilder = StudentProfilesCompanion
@@ -2636,6 +3144,10 @@ typedef $$CanvasScenesTableCreateCompanionBuilder = CanvasScenesCompanion
   required String manifestVersion,
   required int workspaceOrder,
   required bool isFocused,
+  Value<int?> creationSequence,
+  Value<int?> modificationSequence,
+  Value<String?> title,
+  Value<String?> summary,
   Value<int> rowid,
 });
 typedef $$CanvasScenesTableUpdateCompanionBuilder = CanvasScenesCompanion
@@ -2655,6 +3167,10 @@ typedef $$CanvasScenesTableUpdateCompanionBuilder = CanvasScenesCompanion
   Value<String> manifestVersion,
   Value<int> workspaceOrder,
   Value<bool> isFocused,
+  Value<int?> creationSequence,
+  Value<int?> modificationSequence,
+  Value<String?> title,
+  Value<String?> summary,
   Value<int> rowid,
 });
 
@@ -2717,6 +3233,20 @@ class $$CanvasScenesTableFilterComposer
 
   ColumnFilters<bool> get isFocused => $composableBuilder(
       column: $table.isFocused, builder: (column) => ColumnFilters(column));
+
+  ColumnFilters<int> get creationSequence => $composableBuilder(
+      column: $table.creationSequence,
+      builder: (column) => ColumnFilters(column));
+
+  ColumnFilters<int> get modificationSequence => $composableBuilder(
+      column: $table.modificationSequence,
+      builder: (column) => ColumnFilters(column));
+
+  ColumnFilters<String> get title => $composableBuilder(
+      column: $table.title, builder: (column) => ColumnFilters(column));
+
+  ColumnFilters<String> get summary => $composableBuilder(
+      column: $table.summary, builder: (column) => ColumnFilters(column));
 }
 
 class $$CanvasScenesTableOrderingComposer
@@ -2783,6 +3313,20 @@ class $$CanvasScenesTableOrderingComposer
 
   ColumnOrderings<bool> get isFocused => $composableBuilder(
       column: $table.isFocused, builder: (column) => ColumnOrderings(column));
+
+  ColumnOrderings<int> get creationSequence => $composableBuilder(
+      column: $table.creationSequence,
+      builder: (column) => ColumnOrderings(column));
+
+  ColumnOrderings<int> get modificationSequence => $composableBuilder(
+      column: $table.modificationSequence,
+      builder: (column) => ColumnOrderings(column));
+
+  ColumnOrderings<String> get title => $composableBuilder(
+      column: $table.title, builder: (column) => ColumnOrderings(column));
+
+  ColumnOrderings<String> get summary => $composableBuilder(
+      column: $table.summary, builder: (column) => ColumnOrderings(column));
 }
 
 class $$CanvasScenesTableAnnotationComposer
@@ -2838,6 +3382,18 @@ class $$CanvasScenesTableAnnotationComposer
 
   GeneratedColumn<bool> get isFocused =>
       $composableBuilder(column: $table.isFocused, builder: (column) => column);
+
+  GeneratedColumn<int> get creationSequence => $composableBuilder(
+      column: $table.creationSequence, builder: (column) => column);
+
+  GeneratedColumn<int> get modificationSequence => $composableBuilder(
+      column: $table.modificationSequence, builder: (column) => column);
+
+  GeneratedColumn<String> get title =>
+      $composableBuilder(column: $table.title, builder: (column) => column);
+
+  GeneratedColumn<String> get summary =>
+      $composableBuilder(column: $table.summary, builder: (column) => column);
 }
 
 class $$CanvasScenesTableTableManager extends RootTableManager<
@@ -2881,6 +3437,10 @@ class $$CanvasScenesTableTableManager extends RootTableManager<
             Value<String> manifestVersion = const Value.absent(),
             Value<int> workspaceOrder = const Value.absent(),
             Value<bool> isFocused = const Value.absent(),
+            Value<int?> creationSequence = const Value.absent(),
+            Value<int?> modificationSequence = const Value.absent(),
+            Value<String?> title = const Value.absent(),
+            Value<String?> summary = const Value.absent(),
             Value<int> rowid = const Value.absent(),
           }) =>
               CanvasScenesCompanion(
@@ -2899,6 +3459,10 @@ class $$CanvasScenesTableTableManager extends RootTableManager<
             manifestVersion: manifestVersion,
             workspaceOrder: workspaceOrder,
             isFocused: isFocused,
+            creationSequence: creationSequence,
+            modificationSequence: modificationSequence,
+            title: title,
+            summary: summary,
             rowid: rowid,
           ),
           createCompanionCallback: ({
@@ -2917,6 +3481,10 @@ class $$CanvasScenesTableTableManager extends RootTableManager<
             required String manifestVersion,
             required int workspaceOrder,
             required bool isFocused,
+            Value<int?> creationSequence = const Value.absent(),
+            Value<int?> modificationSequence = const Value.absent(),
+            Value<String?> title = const Value.absent(),
+            Value<String?> summary = const Value.absent(),
             Value<int> rowid = const Value.absent(),
           }) =>
               CanvasScenesCompanion.insert(
@@ -2935,6 +3503,10 @@ class $$CanvasScenesTableTableManager extends RootTableManager<
             manifestVersion: manifestVersion,
             workspaceOrder: workspaceOrder,
             isFocused: isFocused,
+            creationSequence: creationSequence,
+            modificationSequence: modificationSequence,
+            title: title,
+            summary: summary,
             rowid: rowid,
           ),
           withReferenceMapper: (p0) => p0
@@ -2959,6 +3531,184 @@ typedef $$CanvasScenesTableProcessedTableManager = ProcessedTableManager<
     ),
     StoredCanvasScene,
     PrefetchHooks Function()>;
+typedef $$CanvasWorkspacesTableCreateCompanionBuilder
+    = CanvasWorkspacesCompanion Function({
+  Value<int> id,
+  required int workspaceEpoch,
+  required int workspaceRevision,
+  required int nextCreationSequence,
+  required int nextModificationSequence,
+});
+typedef $$CanvasWorkspacesTableUpdateCompanionBuilder
+    = CanvasWorkspacesCompanion Function({
+  Value<int> id,
+  Value<int> workspaceEpoch,
+  Value<int> workspaceRevision,
+  Value<int> nextCreationSequence,
+  Value<int> nextModificationSequence,
+});
+
+class $$CanvasWorkspacesTableFilterComposer
+    extends Composer<_$AppDatabase, $CanvasWorkspacesTable> {
+  $$CanvasWorkspacesTableFilterComposer({
+    required super.$db,
+    required super.$table,
+    super.joinBuilder,
+    super.$addJoinBuilderToRootComposer,
+    super.$removeJoinBuilderFromRootComposer,
+  });
+  ColumnFilters<int> get id => $composableBuilder(
+      column: $table.id, builder: (column) => ColumnFilters(column));
+
+  ColumnFilters<int> get workspaceEpoch => $composableBuilder(
+      column: $table.workspaceEpoch,
+      builder: (column) => ColumnFilters(column));
+
+  ColumnFilters<int> get workspaceRevision => $composableBuilder(
+      column: $table.workspaceRevision,
+      builder: (column) => ColumnFilters(column));
+
+  ColumnFilters<int> get nextCreationSequence => $composableBuilder(
+      column: $table.nextCreationSequence,
+      builder: (column) => ColumnFilters(column));
+
+  ColumnFilters<int> get nextModificationSequence => $composableBuilder(
+      column: $table.nextModificationSequence,
+      builder: (column) => ColumnFilters(column));
+}
+
+class $$CanvasWorkspacesTableOrderingComposer
+    extends Composer<_$AppDatabase, $CanvasWorkspacesTable> {
+  $$CanvasWorkspacesTableOrderingComposer({
+    required super.$db,
+    required super.$table,
+    super.joinBuilder,
+    super.$addJoinBuilderToRootComposer,
+    super.$removeJoinBuilderFromRootComposer,
+  });
+  ColumnOrderings<int> get id => $composableBuilder(
+      column: $table.id, builder: (column) => ColumnOrderings(column));
+
+  ColumnOrderings<int> get workspaceEpoch => $composableBuilder(
+      column: $table.workspaceEpoch,
+      builder: (column) => ColumnOrderings(column));
+
+  ColumnOrderings<int> get workspaceRevision => $composableBuilder(
+      column: $table.workspaceRevision,
+      builder: (column) => ColumnOrderings(column));
+
+  ColumnOrderings<int> get nextCreationSequence => $composableBuilder(
+      column: $table.nextCreationSequence,
+      builder: (column) => ColumnOrderings(column));
+
+  ColumnOrderings<int> get nextModificationSequence => $composableBuilder(
+      column: $table.nextModificationSequence,
+      builder: (column) => ColumnOrderings(column));
+}
+
+class $$CanvasWorkspacesTableAnnotationComposer
+    extends Composer<_$AppDatabase, $CanvasWorkspacesTable> {
+  $$CanvasWorkspacesTableAnnotationComposer({
+    required super.$db,
+    required super.$table,
+    super.joinBuilder,
+    super.$addJoinBuilderToRootComposer,
+    super.$removeJoinBuilderFromRootComposer,
+  });
+  GeneratedColumn<int> get id =>
+      $composableBuilder(column: $table.id, builder: (column) => column);
+
+  GeneratedColumn<int> get workspaceEpoch => $composableBuilder(
+      column: $table.workspaceEpoch, builder: (column) => column);
+
+  GeneratedColumn<int> get workspaceRevision => $composableBuilder(
+      column: $table.workspaceRevision, builder: (column) => column);
+
+  GeneratedColumn<int> get nextCreationSequence => $composableBuilder(
+      column: $table.nextCreationSequence, builder: (column) => column);
+
+  GeneratedColumn<int> get nextModificationSequence => $composableBuilder(
+      column: $table.nextModificationSequence, builder: (column) => column);
+}
+
+class $$CanvasWorkspacesTableTableManager extends RootTableManager<
+    _$AppDatabase,
+    $CanvasWorkspacesTable,
+    StoredCanvasWorkspace,
+    $$CanvasWorkspacesTableFilterComposer,
+    $$CanvasWorkspacesTableOrderingComposer,
+    $$CanvasWorkspacesTableAnnotationComposer,
+    $$CanvasWorkspacesTableCreateCompanionBuilder,
+    $$CanvasWorkspacesTableUpdateCompanionBuilder,
+    (
+      StoredCanvasWorkspace,
+      BaseReferences<_$AppDatabase, $CanvasWorkspacesTable,
+          StoredCanvasWorkspace>
+    ),
+    StoredCanvasWorkspace,
+    PrefetchHooks Function()> {
+  $$CanvasWorkspacesTableTableManager(
+      _$AppDatabase db, $CanvasWorkspacesTable table)
+      : super(TableManagerState(
+          db: db,
+          table: table,
+          createFilteringComposer: () =>
+              $$CanvasWorkspacesTableFilterComposer($db: db, $table: table),
+          createOrderingComposer: () =>
+              $$CanvasWorkspacesTableOrderingComposer($db: db, $table: table),
+          createComputedFieldComposer: () =>
+              $$CanvasWorkspacesTableAnnotationComposer($db: db, $table: table),
+          updateCompanionCallback: ({
+            Value<int> id = const Value.absent(),
+            Value<int> workspaceEpoch = const Value.absent(),
+            Value<int> workspaceRevision = const Value.absent(),
+            Value<int> nextCreationSequence = const Value.absent(),
+            Value<int> nextModificationSequence = const Value.absent(),
+          }) =>
+              CanvasWorkspacesCompanion(
+            id: id,
+            workspaceEpoch: workspaceEpoch,
+            workspaceRevision: workspaceRevision,
+            nextCreationSequence: nextCreationSequence,
+            nextModificationSequence: nextModificationSequence,
+          ),
+          createCompanionCallback: ({
+            Value<int> id = const Value.absent(),
+            required int workspaceEpoch,
+            required int workspaceRevision,
+            required int nextCreationSequence,
+            required int nextModificationSequence,
+          }) =>
+              CanvasWorkspacesCompanion.insert(
+            id: id,
+            workspaceEpoch: workspaceEpoch,
+            workspaceRevision: workspaceRevision,
+            nextCreationSequence: nextCreationSequence,
+            nextModificationSequence: nextModificationSequence,
+          ),
+          withReferenceMapper: (p0) => p0
+              .map((e) => (e.readTable(table), BaseReferences(db, table, e)))
+              .toList(),
+          prefetchHooksCallback: null,
+        ));
+}
+
+typedef $$CanvasWorkspacesTableProcessedTableManager = ProcessedTableManager<
+    _$AppDatabase,
+    $CanvasWorkspacesTable,
+    StoredCanvasWorkspace,
+    $$CanvasWorkspacesTableFilterComposer,
+    $$CanvasWorkspacesTableOrderingComposer,
+    $$CanvasWorkspacesTableAnnotationComposer,
+    $$CanvasWorkspacesTableCreateCompanionBuilder,
+    $$CanvasWorkspacesTableUpdateCompanionBuilder,
+    (
+      StoredCanvasWorkspace,
+      BaseReferences<_$AppDatabase, $CanvasWorkspacesTable,
+          StoredCanvasWorkspace>
+    ),
+    StoredCanvasWorkspace,
+    PrefetchHooks Function()>;
 
 class $AppDatabaseManager {
   final _$AppDatabase _db;
@@ -2972,4 +3722,6 @@ class $AppDatabaseManager {
           _db, _db.learningProgressEvents);
   $$CanvasScenesTableTableManager get canvasScenes =>
       $$CanvasScenesTableTableManager(_db, _db.canvasScenes);
+  $$CanvasWorkspacesTableTableManager get canvasWorkspaces =>
+      $$CanvasWorkspacesTableTableManager(_db, _db.canvasWorkspaces);
 }

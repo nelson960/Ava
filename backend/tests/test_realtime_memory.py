@@ -333,6 +333,8 @@ def test_episode_digest_contains_only_ordered_bounded_semantic_material() -> Non
 
 async def test_v3_weekly_recap_is_bounded_factual_and_resettable() -> None:
     store = DevelopmentAuthoritativeMemoryStore()
+    occurred_at = datetime(2026, 9, 1, 6, tzinfo=UTC)
+    generated_at = datetime(2026, 9, 2, 6, tzinfo=UTC)
     await store.commit_delivered_turn(
         subject="child:123",
         expected_reset_revision=0,
@@ -341,12 +343,12 @@ async def test_v3_weekly_recap_is_bounded_factual_and_resettable() -> None:
         ),
         proposal=None,
         memory_id=None,
+        occurred_at=occurred_at,
     )
-    now = datetime(2026, 9, 2, 6, tzinfo=UTC)
     recap = await store.load_weekly_recap(
         subject="child:123",
         timezone_id="Asia/Kolkata",
-        generated_at=now,
+        generated_at=generated_at,
     )
     assert [record.summary for record in recap.records] == [
         "Talked about model airplanes."
@@ -357,7 +359,7 @@ async def test_v3_weekly_recap_is_bounded_factual_and_resettable() -> None:
     reset_recap = await store.load_weekly_recap(
         subject="child:123",
         timezone_id="Asia/Kolkata",
-        generated_at=now,
+        generated_at=generated_at,
     )
     assert reset_recap.records == []
     assert reset_recap.reset_revision == 1

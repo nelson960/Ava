@@ -94,7 +94,13 @@ def test_preload_ack_does_not_activate_candidate() -> None:
     assert candidate.status is SvgCandidateStatus.DOCUMENT_READY
     assert prepared.status is SvgCandidateStatus.PREPARED
     assert state.active is None
-    assert state.render_realtime_context() == ""
+    assert (
+        state.render_realtime_context()
+        == '<canvas_context trust="untrusted_model_generated_data">'
+        '<canvas_presentation trust="validated_current_state" visible="false"/>'
+        '<canvas_workspace synchronized="false"/>'
+        "</canvas_context>"
+    )
 
 
 def test_first_rendered_frame_is_the_only_activation_boundary() -> None:
@@ -235,7 +241,7 @@ def test_realtime_context_is_escaped_and_explicitly_untrusted() -> None:
     assert 'trust="untrusted_model_generated_data"' in context
     assert "<active_visual" in context
     assert active.generation_id not in context
-    assert active.scene_id not in context
+    assert f'scene_id="{active.scene_id}"' in context
     assert active.document.svg_sha256 not in context
     assert "Cloud &amp; rain" in context
     assert "&lt;gently&gt;" in context
@@ -275,7 +281,11 @@ def test_steps_interaction_records_typed_step_and_preserves_scene_identity() -> 
 
     assert recorded.interaction_mode == "steps"
     assert recorded.step_index == 2
-    assert (state.workspace.scene_count, state.active.scene_id, state.active.revision) == before
+    assert (
+        state.workspace.scene_count,
+        state.active.scene_id,
+        state.active.revision,
+    ) == before
     context = state.render_realtime_context()
     assert 'interaction_mode="steps"' in context
     assert '<last_interaction mode="steps" step_index="2">' in context
@@ -355,6 +365,7 @@ def test_interaction_context_survives_session_state_replacement() -> None:
     replacement = SvgCanvasSessionState(workspace=workspace)
 
     assert replacement.last_interaction is recorded
+    replacement.set_presentation_visible(True)
     assert "<target>Rain cloud</target>" in replacement.render_realtime_context()
 
 
@@ -390,3 +401,36 @@ def test_new_canvas_revision_clears_stale_interaction_context() -> None:
     assert revised.revision == active.revision + 1
     assert state.last_interaction is None
     assert "<last_interaction>" not in state.render_realtime_context()
+
+
+def test_session_state_with_inherit_focus_false_does_not_mutate_or_read_shared_workspace() -> (
+    None
+):
+    workspace = SvgCanvasWorkspace()
+    state_a = SvgCanvasSessionState(workspace=workspace, inherit_focus=False)
+    first = _generation("generation_1")
+    _prepare_and_schedule(state_a, first)
+    active_a = state_a.mark_presented(
+        generation_id=first.generation_id,
+        svg_sha256=first.document.svg_sha256,
+        manifest_sha256=first.document.manifest_sha256,
+        first_rendered_sample=4_800,
+    )
+    assert state_a.active is active_a
+
+    # Now Session B is created with the same workspace:
+    state_b = SvgCanvasSessionState(workspace=workspace, inherit_focus=False)
+    # Session A is completely unaffected:
+    assert state_a.active is active_a
+    # Session B starts with no active focus:
+    assert state_b.active is None
+    assert "<active_visual" not in state_b.render_realtime_context()
+
+    # Session B restores the scene:
+    state_b.restore_focused(active_a)
+    assert state_b.focused_scene is active_a
+    assert state_b.presentation_visible is False
+    assert state_b.active is None
+    state_b.set_presentation_visible(True)
+    assert state_b.active is active_a
+    assert len(workspace.scenes) == 1

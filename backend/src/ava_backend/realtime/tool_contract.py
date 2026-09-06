@@ -6,13 +6,14 @@ from enum import StrEnum
 import re
 from typing import Annotated
 
-from pydantic import Field, StringConstraints, model_validator
+from pydantic import AliasChoices, ConfigDict, Field, StringConstraints, model_validator
 
-from .common import NonEmptyText, RealtimeProtocolModel
+from .common import NonEmptyText, RealtimeProtocolModel, _to_camel
 
 
 INTERACTIVE_CANVAS_TOOL_NAME = "request_interactive_canvas"
 CANCEL_INTERACTIVE_CANVAS_TOOL_NAME = "cancel_interactive_canvas"
+MANAGE_CANVAS_PRESENTATION_TOOL_NAME = "manage_canvas_presentation"
 SEARCH_MEMORY_TOOL_NAME = "search_memory"
 GET_CURRENT_TIME_TOOL_NAME = "get_current_time"
 INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS = 1000
@@ -60,6 +61,71 @@ class InteractiveCanvasRequest(RealtimeProtocolModel):
 
 class InteractiveCanvasCancellationRequest(RealtimeProtocolModel):
     """Explicit semantic request to stop unpresented canvas work."""
+
+
+class ManageCanvasPresentationAction(StrEnum):
+    SHOW = "show"
+    HIDE = "hide"
+    NAVIGATE = "navigate"
+
+
+class ManageCanvasNavigationDirection(StrEnum):
+    NEXT = "next"
+    PREVIOUS = "previous"
+    FIRST = "first"
+    LAST = "last"
+
+
+class ManageCanvasPresentationStatus(StrEnum):
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+
+
+class ManageCanvasPresentationRequest(RealtimeProtocolModel):
+    model_config = ConfigDict(
+        alias_generator=_to_camel,
+        populate_by_name=True,
+        validate_by_name=True,
+        extra="forbid",
+        str_strip_whitespace=True,
+        use_enum_values=True,
+    )
+
+    operation: ManageCanvasPresentationAction = Field(
+        validation_alias=AliasChoices("operation", "action"),
+        serialization_alias="operation",
+        description="Use show for an exact scene, hide to close the panel, or navigate for deterministic workspace movement.",
+    )
+    scene_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=80,
+        description="The scene_id to show. Required for show and forbidden for hide or navigate.",
+    )
+    direction: ManageCanvasNavigationDirection | None = Field(
+        default=None,
+        description="Required only for navigate: next, previous, first, or last.",
+    )
+
+    @property
+    def action(self) -> ManageCanvasPresentationAction:
+        return ManageCanvasPresentationAction(self.operation)
+
+    @model_validator(mode="after")
+    def validate_action_fields(self) -> ManageCanvasPresentationRequest:
+        if self.operation == ManageCanvasPresentationAction.SHOW:
+            if not self.scene_id:
+                raise ValueError("scene_id is required when action is show")
+            if self.direction is not None:
+                raise ValueError("direction is forbidden when action is show")
+        elif self.operation == ManageCanvasPresentationAction.HIDE:
+            if self.scene_id is not None:
+                raise ValueError("scene_id is forbidden when action is hide")
+            if self.direction is not None:
+                raise ValueError("direction is forbidden when action is hide")
+        elif self.scene_id is not None or self.direction is None:
+            raise ValueError("navigate requires direction and forbids scene_id")
+        return self
 
 
 class SearchMemoryRequest(RealtimeProtocolModel):
@@ -210,6 +276,68 @@ class InteractiveCanvasCancellationToolOutputV4(RealtimeProtocolModel):
         return self
 
 
+class ManageCanvasPresentationToolOutputV4(RealtimeProtocolModel):
+    model_config = ConfigDict(
+        alias_generator=_to_camel,
+        populate_by_name=True,
+        validate_by_name=True,
+        extra="forbid",
+        str_strip_whitespace=True,
+        use_enum_values=True,
+    )
+
+    status: ManageCanvasPresentationStatus
+    operation: ManageCanvasPresentationAction = Field(
+        validation_alias=AliasChoices("operation", "action"),
+        serialization_alias="operation",
+    )
+    direction: ManageCanvasNavigationDirection | None = None
+    changed: bool = False
+    visible: bool | None = None
+    scene_id: str | None = Field(default=None, min_length=1, max_length=80)
+    scene_revision: int | None = Field(default=None, ge=1, le=10_001)
+    position: int | None = Field(default=None, ge=1, le=10)
+    total: int | None = Field(default=None, ge=0, le=10)
+    has_previous: bool | None = None
+    has_next: bool | None = None
+    workspace_epoch: int | None = Field(default=None, ge=0)
+    workspace_revision: int | None = Field(default=None, ge=0)
+    reason: Annotated[str, StringConstraints(max_length=240)] | None = None
+
+    @property
+    def action(self) -> ManageCanvasPresentationAction:
+        return ManageCanvasPresentationAction(self.operation)
+
+    @model_validator(mode="after")
+    def validate_atomic_status(self) -> ManageCanvasPresentationToolOutputV4:
+        if self.status == ManageCanvasPresentationStatus.ACCEPTED:
+            if self.reason is not None:
+                raise ValueError(
+                    "accepted canvas presentation output cannot include reason"
+                )
+            if (
+                self.operation == ManageCanvasPresentationAction.SHOW
+                and not self.scene_id
+            ):
+                raise ValueError("accepted show presentation output requires scene_id")
+            if (
+                self.operation == ManageCanvasPresentationAction.HIDE
+                and self.scene_id is not None
+            ):
+                raise ValueError(
+                    "accepted hide presentation output cannot include scene_id"
+                )
+            if (
+                self.operation == ManageCanvasPresentationAction.NAVIGATE
+                and self.direction is None
+            ):
+                raise ValueError("accepted navigate output requires direction")
+        else:
+            if not self.reason:
+                raise ValueError("rejected canvas presentation output requires reason")
+        return self
+
+
 class InteractiveCanvasToolOutput(RealtimeProtocolModel):
     status: InteractiveCanvasToolStatus
     scene_id: str | None = Field(default=None, min_length=1, max_length=80)
@@ -278,6 +406,34 @@ class RealtimeRejectedCanvasToolCall:
 
 
 @dataclass(frozen=True, slots=True)
+class RealtimeManageCanvasPresentationToolCall:
+    call_id: str
+    request: ManageCanvasPresentationRequest
+    provider_response_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not _CALL_ID.fullmatch(self.call_id):
+            raise ValueError("Realtime canvas call_id has an invalid format")
+        if self.provider_response_id is not None and not self.provider_response_id:
+            raise ValueError("Realtime provider response ID cannot be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeRejectedManageCanvasPresentationToolCall:
+    call_id: str
+    reason: str
+    provider_response_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not _CALL_ID.fullmatch(self.call_id):
+            raise ValueError("Realtime canvas call_id has an invalid format")
+        if not self.reason or len(self.reason) > 240:
+            raise ValueError("Realtime canvas rejection reason is invalid")
+        if self.provider_response_id is not None and not self.provider_response_id:
+            raise ValueError("Realtime provider response ID cannot be empty")
+
+
+@dataclass(frozen=True, slots=True)
 class RealtimeSearchMemoryToolCall:
     call_id: str
     request: SearchMemoryRequest
@@ -315,6 +471,8 @@ type RealtimeTurnEvent = (
     | RealtimeCanvasToolCall
     | RealtimeCancelCanvasToolCall
     | RealtimeRejectedCanvasToolCall
+    | RealtimeManageCanvasPresentationToolCall
+    | RealtimeRejectedManageCanvasPresentationToolCall
     | RealtimeSearchMemoryToolCall
     | RealtimeGetCurrentTimeToolCall
     | RealtimeRejectedUtilityToolCall

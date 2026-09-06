@@ -129,7 +129,8 @@ final class _RestoredWorkspacePersistence implements AvaCanvasPersistence {
       );
 
   @override
-  Future<void> persistActive(AvaValidatedSvgCanvasDocument document) async {}
+  Future<void> persistActive(AvaValidatedSvgCanvasDocument document,
+      {bool focused = true}) async {}
 
   @override
   Future<void> persistFocus(String sceneId) async {}
@@ -144,7 +145,8 @@ final class _FailingCanvasPersistence implements AvaCanvasPersistence {
       const AvaRestoredCanvasWorkspace(documents: [], focusedSceneId: null);
 
   @override
-  Future<void> persistActive(AvaValidatedSvgCanvasDocument document) =>
+  Future<void> persistActive(AvaValidatedSvgCanvasDocument document,
+          {bool focused = true}) =>
       Future<void>.error(StateError('deterministic persistence failure'));
 
   @override
@@ -347,6 +349,7 @@ void main() {
     controller.receiveGenerationStarted({
       'protocolVersion': 4,
       'event': 'canvasGenerationStarted',
+      'focusRevision': 0,
       'sessionId': 'session-1234',
       'sequence': 0,
       'revision': 1,
@@ -638,6 +641,7 @@ void main() {
     controller.receiveGenerationStarted({
       'protocolVersion': 4,
       'event': 'canvasGenerationStarted',
+      'focusRevision': 0,
       'sessionId': 'session-1234',
       'sequence': 3,
       'revision': 2,
@@ -1812,7 +1816,7 @@ void main() {
     host.dispose();
   });
 
-  testWidgets('locally restored canvas uses active renderer without ACKs',
+  testWidgets('locally restored canvas stays local until presentation ACK',
       (tester) async {
     final descriptor = document.descriptor;
     final restored = AvaValidatedSvgCanvasDocument.verify(
@@ -1860,6 +1864,15 @@ void main() {
     expect(controller.active?.document, same(restored));
     expect(commands, isEmpty);
 
+    view.onBinding(restored.manifest.bindings['select-cloud']!);
+
+    expect(commands, isEmpty);
+    expect(controller.lastIssue, isNull);
+
+    controller.acceptPresentedScene(
+      sceneId: restored.descriptor.sceneId,
+      focusRevision: 0,
+    );
     view.onBinding(restored.manifest.bindings['select-cloud']!);
 
     expect(commands, hasLength(1));
@@ -2001,6 +2014,7 @@ void main() {
     controller.receiveGenerationStarted({
       'protocolVersion': 4,
       'event': 'canvasGenerationStarted',
+      'focusRevision': 0,
       'sessionId': 'session-1234',
       'sequence': 0,
       'revision': 1,
@@ -2064,6 +2078,189 @@ void main() {
       () => controller.beginPlaybackClock('turn-clock'),
       throwsStateError,
     );
+    controller.dispose();
+  });
+
+  test('pending presentation drops ephemeral bindings without replay', () {
+    final commands = <AvaSvgCanvasClientCommand>[];
+    final testDoc = _interactionDocument(
+      mode: AvaSvgInteractionMode.explore,
+      bindingNames: ['A', 'B', 'C'],
+    );
+    final controller = AvaSvgCanvasController(
+      documents: _Loader(Future.value(testDoc)),
+      commandSink: commands.add,
+    );
+
+    controller.focusRetainedActive(testDoc,
+        focusRevision: 1, pendingSync: true);
+    expect(controller.semanticTransportState,
+        AvaSvgSemanticTransportState.pending);
+    expect(controller.activeFocusRevision, 1);
+
+    controller.reportBinding(testDoc.manifest.bindings['binding-A']!);
+    controller.reportBinding(testDoc.manifest.bindings['binding-B']!);
+    controller.reportBinding(testDoc.manifest.bindings['binding-C']!);
+
+    expect(controller.deferredSemanticCommandCount, 0);
+    expect(commands, isEmpty);
+
+    controller.completeFocusSync(
+      sceneId: testDoc.descriptor.sceneId,
+      focusRevision: 1,
+    );
+
+    expect(
+      controller.semanticTransportState,
+      AvaSvgSemanticTransportState.unaccepted,
+    );
+    expect(controller.deferredSemanticCommandCount, 0);
+    expect(commands, isEmpty);
+
+    controller.acceptPresentedScene(
+      sceneId: testDoc.descriptor.sceneId,
+      focusRevision: 1,
+    );
+    controller.reportBinding(testDoc.manifest.bindings['binding-A']!);
+    expect(commands, hasLength(1));
+    expect(commands.single.fields['interactionRevision'], 1);
+
+    controller.dispose();
+  });
+
+  test(
+      'focus sync failure transitions to unaccepted and suppresses subsequent wire emission',
+      () {
+    final commands = <AvaSvgCanvasClientCommand>[];
+    final testDoc = _interactionDocument(
+      mode: AvaSvgInteractionMode.explore,
+      bindingNames: ['A', 'B'],
+    );
+    final controller = AvaSvgCanvasController(
+      documents: _Loader(Future.value(testDoc)),
+      commandSink: commands.add,
+    );
+
+    controller.focusRetainedActive(testDoc,
+        focusRevision: 1, pendingSync: true);
+    controller.reportBinding(testDoc.manifest.bindings['binding-A']!);
+    expect(controller.deferredSemanticCommandCount, 0);
+
+    controller.failFocusSync(
+      sceneId: testDoc.descriptor.sceneId,
+      focusRevision: 1,
+      error: Exception('Network timeout'),
+    );
+
+    expect(controller.semanticTransportState,
+        AvaSvgSemanticTransportState.unaccepted);
+    expect(controller.deferredSemanticCommandCount, 0);
+    expect(commands, isEmpty);
+
+    controller.reportBinding(testDoc.manifest.bindings['binding-B']!);
+    expect(commands, isEmpty);
+    expect(controller.deferredSemanticCommandCount, 0);
+
+    controller.dispose();
+  });
+
+  test(
+      'focus fencing: late completion for prior focus revision cannot complete successor',
+      () {
+    final commands = <AvaSvgCanvasClientCommand>[];
+    final docB = _interactionDocument(
+      mode: AvaSvgInteractionMode.explore,
+      bindingNames: ['B1'],
+    );
+    final docC = _interactionDocument(
+      mode: AvaSvgInteractionMode.explore,
+      bindingNames: ['C1'],
+    );
+    final controller = AvaSvgCanvasController(
+      documents: _Loader(Future.value(docB)),
+      commandSink: commands.add,
+    );
+
+    controller.focusRetainedActive(docB, focusRevision: 1, pendingSync: true);
+    controller.focusRetainedActive(docC, focusRevision: 2, pendingSync: true);
+    controller.focusRetainedActive(docB, focusRevision: 3, pendingSync: true);
+
+    expect(controller.activeFocusRevision, 3);
+    expect(controller.semanticTransportState,
+        AvaSvgSemanticTransportState.pending);
+
+    controller.reportBinding(docB.manifest.bindings['binding-B1']!);
+    expect(controller.deferredSemanticCommandCount, 0);
+    expect(commands, isEmpty);
+
+    controller.completeFocusSync(
+      sceneId: docB.descriptor.sceneId,
+      focusRevision: 1,
+    );
+
+    expect(controller.semanticTransportState,
+        AvaSvgSemanticTransportState.pending);
+    expect(controller.deferredSemanticCommandCount, 0);
+    expect(commands, isEmpty);
+
+    controller.completeFocusSync(
+      sceneId: docB.descriptor.sceneId,
+      focusRevision: 3,
+    );
+
+    expect(
+      controller.semanticTransportState,
+      AvaSvgSemanticTransportState.unaccepted,
+    );
+    expect(controller.deferredSemanticCommandCount, 0);
+    expect(commands, isEmpty);
+
+    controller.acceptPresentedScene(
+      sceneId: docB.descriptor.sceneId,
+      focusRevision: 3,
+    );
+    controller.reportBinding(docB.manifest.bindings['binding-B1']!);
+    expect(commands, hasLength(1));
+
+    controller.dispose();
+  });
+
+  test('select-mode unavailable interactions are not replayed after acceptance',
+      () {
+    final commands = <AvaSvgCanvasClientCommand>[];
+    final testDoc = _interactionDocument(
+      mode: AvaSvgInteractionMode.select,
+      bindingNames: ['A', 'B'],
+    );
+    final controller = AvaSvgCanvasController(
+      documents: _Loader(Future.value(testDoc)),
+      commandSink: commands.add,
+    );
+
+    controller.focusRetainedActive(testDoc,
+        focusRevision: 1, pendingSync: true);
+
+    controller.reportBinding(testDoc.manifest.bindings['binding-A']!);
+    controller.reportBinding(testDoc.manifest.bindings['binding-A']!);
+    expect(controller.deferredSemanticCommandCount, 0);
+
+    controller.reportBinding(testDoc.manifest.bindings['binding-B']!);
+    expect(controller.deferredSemanticCommandCount, 0);
+
+    controller.completeFocusSync(
+      sceneId: testDoc.descriptor.sceneId,
+      focusRevision: 1,
+    );
+
+    expect(commands, isEmpty);
+    controller.acceptPresentedScene(
+      sceneId: testDoc.descriptor.sceneId,
+      focusRevision: 1,
+    );
+    controller.reportBinding(testDoc.manifest.bindings['binding-A']!);
+    expect(commands, hasLength(1));
+    expect(commands.single.fields['bindingId'], 'binding-A');
+
     controller.dispose();
   });
 }
@@ -2204,6 +2401,7 @@ void _announceGeneration(
   controller.receiveGenerationStarted({
     'protocolVersion': 4,
     'event': 'canvasGenerationStarted',
+    'focusRevision': 0,
     'sessionId': 'session-1234',
     'sequence': 0,
     'revision': 1,
@@ -2344,6 +2542,11 @@ List<Map<String, Object?>> _eventsForDocument(
       'revision': 3,
       ...identity,
       'firstRenderedSample': 4812,
+      'workspaceEpoch': 0,
+      'workspaceRevision': 1,
+      'creationSequence': 1,
+      'modificationSequence': 1,
+      'evictedSceneId': null,
     },
   ];
 }

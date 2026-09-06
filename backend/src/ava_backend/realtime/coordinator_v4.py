@@ -46,6 +46,7 @@ class ProtocolV4CanvasEventSink(SvgCanvasJobEventSink):
         generation_id: str,
         source_turn_id: str,
         operation: Literal["new", "reviseFocused"] = "new",
+        focus_revision: int = 0,
     ) -> None:
         await self._put(
             {
@@ -53,6 +54,7 @@ class ProtocolV4CanvasEventSink(SvgCanvasJobEventSink):
                 "generationId": generation_id,
                 "sourceTurnId": source_turn_id,
                 "operation": operation,
+                "focusRevision": focus_revision,
             }
         )
 
@@ -124,6 +126,11 @@ class ProtocolV4CanvasEventSink(SvgCanvasJobEventSink):
                 "firstRenderedSample": active.first_rendered_sample,
                 "svgSha256": active.document.svg_sha256,
                 "manifestSha256": active.document.manifest_sha256,
+                "workspaceEpoch": active.workspace_epoch or 0,
+                "workspaceRevision": active.workspace_revision or 1,
+                "creationSequence": active.creation_sequence or 1,
+                "modificationSequence": active.modification_sequence or 1,
+                "evictedSceneId": active.evicted_scene_id,
             }
         )
 
@@ -205,6 +212,40 @@ class ProtocolV4CanvasEventSink(SvgCanvasJobEventSink):
                 "bindingId": event.binding_id,
                 "rejectionCode": error.code,
                 "message": str(error)[:240],
+            }
+        )
+
+    async def presentation_changed(
+        self,
+        *,
+        visible: bool,
+        scene_id: str | None,
+        focus_revision: int | None,
+        source: Literal["user", "model", "restore", "system"],
+    ) -> None:
+        await self._put(
+            {
+                "event": "canvasPresentationChanged",
+                "visible": visible,
+                "sceneId": scene_id,
+                "focusRevision": focus_revision,
+                "source": source,
+            }
+        )
+
+    async def presentation_command(
+        self,
+        *,
+        command_id: str,
+        action: Literal["show", "hide"],
+        scene_id: str | None,
+    ) -> None:
+        await self._put(
+            {
+                "event": "canvasPresentationCommand",
+                "commandId": command_id,
+                "action": action,
+                "sceneId": scene_id,
             }
         )
 

@@ -33,7 +33,7 @@ Read the current source of truth:
 
 - [`AGENTS.md`](AGENTS.md)
 - [`docs/production_architecture.md`](docs/production_architecture.md)
-- [`docs/production_implementation_plan.md`](docs/production_implementation_plan.md)
+- [`docs/runtime_stabilization_rules.md`](docs/runtime_stabilization_rules.md)
 
 ## Repository status
 

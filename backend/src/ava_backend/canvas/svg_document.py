@@ -201,8 +201,13 @@ _ALLOWED_DATA_ATTRIBUTES: Final = frozenset(
         "data-ava-target",
         "data-ava-reveal",
         "data-ava-step",
+        "data-ava-control",
+        "data-ava-control-kind",
+        "data-ava-track",
+        "data-ava-checkpoints",
     }
 )
+_CONTROL_METADATA_ATTRIBUTES: Final = frozenset({"data-ava-control-kind", "data-ava-track", "data-ava-checkpoints"})
 _ALLOWED_STYLE_PROPERTIES: Final = frozenset(
     {
         "alignment-baseline",
@@ -332,6 +337,46 @@ class SvgValidationLimits:
     max_viewbox_extent: float = 10_000.0
 
 
+class SvgControlKind(StrEnum):
+    DRAG = "drag"
+    SLIDER = "slider"
+    TIMELINE = "timeline"
+
+
+@dataclass(frozen=True, slots=True)
+class SvgControlCheckpoint:
+    value: float
+    binding_id: str
+
+    def as_json(self) -> dict[str, object]:
+        return {
+            "bindingId": self.binding_id,
+            "value": self.value,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SvgContinuousControl:
+    control_id: str
+    kind: SvgControlKind
+    accessibility_label: str
+    handle_element_id: str
+    track_element_id: str
+    initial_value: float
+    checkpoints: tuple[SvgControlCheckpoint, ...]
+
+    def as_json(self) -> dict[str, object]:
+        return {
+            "accessibilityLabel": self.accessibility_label,
+            "checkpoints": [checkpoint.as_json() for checkpoint in self.checkpoints],
+            "controlId": self.control_id,
+            "handleElementId": self.handle_element_id,
+            "initialValue": self.initial_value,
+            "kind": self.kind.value,
+            "trackElementId": self.track_element_id,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class SvgInteractionBinding:
     binding_id: str
@@ -370,6 +415,7 @@ class ValidatedSvgDocument:
     named_objects: tuple[str, ...]
     view_box: tuple[float, float, float, float]
     bindings: Mapping[str, SvgInteractionBinding]
+    controls: Mapping[str, SvgContinuousControl]
 
 
 @dataclass(frozen=True, slots=True)
@@ -524,6 +570,8 @@ class SvgDocumentValidator:
         referenced_ids: set[str] = set()
         reference_graph: dict[str, set[str]] = defaultdict(set)
         bindings: dict[str, SvgInteractionBinding] = {}
+        controls: dict[str, SvgContinuousControl] = {}
+        rendered_node_ids: set[str] = set()
         title = ""
         description = ""
         visible_text_labels: list[str] = []
@@ -628,6 +676,8 @@ class SvgDocumentValidator:
                     self._fail("duplicateId", f"SVG id {element_id!r} is duplicated")
                 ids.add(element_id)
                 id_to_node[element_id] = element
+                if element_is_rendered:
+                    rendered_node_ids.add(element_id)
             reference_source = element_id or reference_owner
             for raw_name, value in attributes.items():
                 name = _local_attribute_name(raw_name)
@@ -776,6 +826,24 @@ class SvgDocumentValidator:
                     "SVG interaction metadata requires data-ava-binding",
                 )
 
+            control_id = attributes.get("data-ava-control")
+            if control_id is not None and require_final_authority:
+                control = self._control_from_element(element, element_id)
+                if control.control_id in controls:
+                    self._fail(
+                        "duplicateControl",
+                        f"control {control.control_id!r} is duplicated",
+                    )
+                controls[control.control_id] = control
+
+            elif require_final_authority and any(
+                name in attributes for name in _CONTROL_METADATA_ATTRIBUTES
+            ):
+                self._fail(
+                    "controlMetadataWithoutControl",
+                    "SVG continuous control metadata requires data-ava-control",
+                )
+
             children = list(element)
             for child_index, child in reversed(list(enumerate(children))):
                 child_owner = element_id or f"{reference_owner}/{child_index}"
@@ -809,6 +877,7 @@ class SvgDocumentValidator:
             if interaction_mode is None:  # pragma: no cover - checked above
                 raise RuntimeError("final SVG lost its interaction mode")
             self._validate_interaction_mode(interaction_mode, bindings)
+            self._validate_continuous_controls(controls, interaction_mode, bindings, ids, id_to_node, rendered_node_ids)
 
         background = root.attrib.get("data-ava-background")
         if (
@@ -840,6 +909,7 @@ class SvgDocumentValidator:
                     bindings.values(), key=lambda item: item.binding_id
                 )
             ],
+            **({"controls": [control.as_json() for control in sorted(controls.values(), key=lambda c: c.control_id)]} if controls else {}),
             "description": description,
             "interactionMode": interaction_mode,
             "manifestVersion": SVG_MANIFEST_VERSION,
@@ -877,6 +947,7 @@ class SvgDocumentValidator:
             named_objects=tuple(named_objects),
             view_box=view_box,
             bindings=MappingProxyType(bindings.copy()),
+            controls=MappingProxyType(controls.copy()),
         )
 
     def capability_manifest(self) -> dict[str, object]:
@@ -966,6 +1037,15 @@ class SvgDocumentValidator:
                     "omittedDefaultsToBindingElement": True,
                     "syntax": "identifierContract",
                 },
+            },
+            "controlsContract": {
+                "allowedKinds": [kind.value for kind in SvgControlKind],
+                "mode": "explore",
+                "handle": "id + data-ava-control + data-ava-control-kind + aria-label",
+                "track": "data-ava-track references a rendered path id",
+                "checkpoints": "data-ava-checkpoints: value=bindingId;value=bindingId, normalized [0,1], distinct values and bindings",
+                "initialValue": "first checkpoint in sorted normalized order",
+                "bounds": "controls use the document element bound; checkpoints use the existing binding bound",
             },
             "referencePolicy": {
                 "allowedNamespaces": [
@@ -1148,6 +1228,278 @@ class SvgDocumentValidator:
                 "interactionModeBindingsInvalid",
                 "steps bindings require unique contiguous indexes from 1",
             )
+
+    def _control_from_element(
+        self,
+        element: ET.Element,
+        element_id: str | None,
+    ) -> SvgContinuousControl:
+        attributes = element.attrib
+        element_name = _local_element_name(element.tag)
+        control_id = attributes["data-ava-control"]
+        self._validate_identifier(
+            control_id,
+            label="control id",
+            element_id=element_id,
+            element_name=element_name,
+            attribute="data-ava-control",
+        )
+        if element_id is None:
+            self._fail(
+                "controlHandleMissingId",
+                f"control {control_id!r} requires an element id on its handle element",
+                element_name=element_name,
+                attribute="id",
+            )
+        if "data-ava-binding" in attributes:
+            self._fail(
+                "controlHandleBindingConflict",
+                f"element {element_id!r} cannot declare both data-ava-control and data-ava-binding",
+                element_id=element_id,
+                element_name=element_name,
+            )
+        raw_label = attributes.get("aria-label", "")
+        accessibility_label = self._validate_semantic_text(
+            raw_label,
+            label=f"control {control_id!r} aria-label",
+            maximum=self._limits.max_binding_label_characters,
+            limit_name="maxControlLabelCharacters",
+        )
+        raw_kind = attributes.get("data-ava-control-kind")
+        if raw_kind not in {k.value for k in SvgControlKind}:
+            self._fail(
+                "controlKindInvalid",
+                f"control {control_id!r} kind {raw_kind!r} is invalid; must be one of {sorted(k.value for k in SvgControlKind)}",
+                element_id=element_id,
+                element_name=element_name,
+                attribute="data-ava-control-kind",
+                observed_value=raw_kind,
+            )
+        kind = SvgControlKind(raw_kind)
+        track_id = attributes.get("data-ava-track")
+        if track_id is None:
+            self._fail(
+                "controlTrackMissing",
+                f"control {control_id!r} requires data-ava-track",
+                element_id=element_id,
+                element_name=element_name,
+                attribute="data-ava-track",
+                limit_name="controlsContract",
+                limit_value="pathElementId",
+
+            )
+        self._validate_identifier(
+            track_id,
+            label="control track id",
+            element_id=element_id,
+            element_name=element_name,
+            attribute="data-ava-track",
+        )
+        raw_checkpoints = attributes.get("data-ava-checkpoints")
+        if not raw_checkpoints:
+            self._fail(
+                "controlCheckpointsInvalid",
+                f"control {control_id!r} requires data-ava-checkpoints",
+                element_id=element_id,
+                element_name=element_name,
+                attribute="data-ava-checkpoints",
+            )
+        checkpoints = self._parse_checkpoints(
+            raw_checkpoints,
+            control_id=control_id,
+            element_id=element_id,
+            element_name=element_name,
+        )
+        return SvgContinuousControl(
+            control_id=control_id,
+            kind=kind,
+            accessibility_label=accessibility_label,
+            handle_element_id=element_id,
+            track_element_id=track_id,
+            initial_value=checkpoints[0].value,
+            checkpoints=checkpoints,
+        )
+
+    def _parse_checkpoints(
+        self,
+        raw_checkpoints: str,
+        *,
+        control_id: str,
+        element_id: str | None,
+        element_name: str,
+    ) -> tuple[SvgControlCheckpoint, ...]:
+        items = raw_checkpoints.split(";")
+        if len(items) < 2:
+            self._fail(
+                "controlCheckpointsCountInvalid",
+                f"control {control_id!r} requires at least {2} checkpoints",
+                element_id=element_id,
+                element_name=element_name,
+                attribute="data-ava-checkpoints",
+                observed_value=len(items),
+                limit_name="minCheckpointsPerControl",
+                limit_value=2,
+            )
+        if len(items) > self._limits.max_bindings:
+            self._fail(
+                "controlCheckpointsCountInvalid",
+                f"control {control_id!r} exceeds checkpoint limit of {self._limits.max_bindings}",
+                element_id=element_id,
+                element_name=element_name,
+                attribute="data-ava-checkpoints",
+                observed_value=len(items),
+                limit_name="maxCheckpointsPerControl",
+                limit_value=self._limits.max_bindings,
+            )
+        parsed: list[SvgControlCheckpoint] = []
+        seen_values: list[float] = []
+        for index, item in enumerate(items):
+            if "=" not in item:
+                self._fail(
+                    "controlCheckpointsInvalid",
+                    f"control {control_id!r} checkpoint {item!r} must follow value=bindingId syntax",
+                    element_id=element_id,
+                    element_name=element_name,
+                    attribute="data-ava-checkpoints",
+                    observed_value=item,
+                )
+            parts = item.split("=")
+            if len(parts) != 2:
+                self._fail(
+                    "controlCheckpointsInvalid",
+                    f"control {control_id!r} checkpoint {item!r} must contain exactly one '=' separator",
+                    element_id=element_id,
+                    element_name=element_name,
+                    attribute="data-ava-checkpoints",
+                    observed_value=item,
+                )
+            val_text, binding_ref = parts[0].strip(), parts[1].strip()
+            if not val_text or not binding_ref:
+                self._fail(
+                    "controlCheckpointsInvalid",
+                    f"control {control_id!r} checkpoint {item!r} has empty value or bindingId",
+                    element_id=element_id,
+                    element_name=element_name,
+                    attribute="data-ava-checkpoints",
+                    observed_value=item,
+                )
+            try:
+                val = float(val_text)
+            except ValueError:
+                self._fail(
+                    "controlCheckpointInvalid",
+                    f"control {control_id!r} checkpoint value {val_text!r} is not a valid number",
+                    element_id=element_id,
+                    element_name=element_name,
+                    attribute="data-ava-checkpoints",
+                    observed_value=val_text,
+                )
+            if not math.isfinite(val) or val < 0.0 or val > 1.0:
+                self._fail(
+                    "controlCheckpointInvalid",
+                    f"control {control_id!r} checkpoint value {val} is outside [0.0, 1.0]",
+                    element_id=element_id,
+                    element_name=element_name,
+                    attribute="data-ava-checkpoints",
+                    observed_value=val,
+                )
+            self._validate_identifier(
+                binding_ref,
+                label=f"control {control_id!r} checkpoint[{index}] bindingId",
+                element_id=element_id,
+                element_name=element_name,
+                attribute="data-ava-checkpoints",
+            )
+            if any(
+                val == existing for existing in seen_values
+            ):
+                self._fail(
+                    "controlCheckpointDuplicateValue",
+                    f"control {control_id!r} contains duplicate checkpoint value {val}",
+                    element_id=element_id,
+                    element_name=element_name,
+                    attribute="data-ava-checkpoints",
+                    observed_value=val,
+                )
+            seen_values.append(val)
+            parsed.append(SvgControlCheckpoint(value=val, binding_id=binding_ref))
+        if len({cp.binding_id for cp in parsed}) != len(parsed):
+            self._fail("controlCheckpointDuplicateBinding", "control checkpoints must reference distinct bindings")
+        return tuple(sorted(parsed, key=lambda cp: cp.value))
+
+    def _validate_continuous_controls(
+        self,
+        controls: Mapping[str, SvgContinuousControl],
+        mode: SvgInteractionMode,
+        bindings: Mapping[str, SvgInteractionBinding],
+        ids: set[str],
+        id_to_node: Mapping[str, ET.Element],
+        rendered_node_ids: set[str],
+    ) -> None:
+        if not controls:
+            return
+        if mode != SvgInteractionMode.EXPLORE:
+            self._fail(
+                "interactionModeControlsForbidden",
+                f"continuous controls are forbidden in {mode.value} mode; only explore mode supports continuous controls",
+                observed_value=mode.value,
+            )
+        for control in controls.values():
+            if control.handle_element_id not in ids:
+                self._fail(
+                    "controlHandleMissing",
+                    f"control {control.control_id!r} handle {control.handle_element_id!r} is missing from document",
+                    element_id=control.handle_element_id,
+                )
+            if control.handle_element_id not in rendered_node_ids:
+                self._fail(
+                    "controlHandleNotRendered",
+                    f"control {control.control_id!r} handle {control.handle_element_id!r} must be in the rendered document hierarchy",
+                    element_id=control.handle_element_id,
+                )
+            if control.track_element_id not in ids:
+                self._fail(
+                    "controlTrackMissing",
+                    f"control {control.control_id!r} references unknown track {control.track_element_id!r}",
+                    element_id=control.handle_element_id,
+                    attribute="data-ava-track",
+                    observed_value=control.track_element_id,
+                    limit_name="controlsContract",
+                    limit_value="pathElementId",
+
+                )
+            track_node = id_to_node[control.track_element_id]
+            if _local_element_name(track_node.tag) != "path":
+                self._fail(
+                    "controlTrackInvalid",
+                    f"control {control.control_id!r} track {control.track_element_id!r} must be an SVG <path> element, found <{_local_element_name(track_node.tag)}>",
+                    element_id=control.handle_element_id,
+                    element_name=_local_element_name(track_node.tag),
+                    attribute="data-ava-track",
+                    observed_value=_local_element_name(track_node.tag),
+                    limit_name="controlsContract",
+                    limit_value="path",
+
+                )
+            track_d = (track_node.attrib.get("d") or "").strip()
+            if not track_d or not _PATH_COMMAND.search(track_d):
+                self._fail(
+                    "controlTrackInvalid",
+                    f"control {control.control_id!r} track {control.track_element_id!r} path data 'd' is missing or has no path commands",
+                    element_id=control.track_element_id,
+                    attribute="d",
+                    observed_value=track_d,
+                    limit_name="controlsContract",
+                    limit_value="valid path data d",
+
+                )
+            for cp in control.checkpoints:
+                if cp.binding_id not in bindings:
+                    self._fail(
+                        "controlCheckpointUnknownBinding",
+                        f"control {control.control_id!r} checkpoint references unknown binding {cp.binding_id!r}",
+                        observed_value=cp.binding_id,
+                    )
 
     def _validate_element_namespace(self, raw_name: str) -> None:
         namespace = _namespace(raw_name)

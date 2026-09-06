@@ -10,8 +10,9 @@ import 'package:ava/services/ava_canvas_persistence_service.dart';
 import 'package:ava/services/ava_svg_document_service.dart';
 import 'package:ava/services/memory_service.dart';
 import 'package:crypto/crypto.dart';
-import 'package:drift/drift.dart' show Value;
+import 'package:drift/drift.dart' show OrderingTerm, Value;
 import 'package:drift/native.dart';
+import 'package:flutter/foundation.dart' show FlutterError, FlutterErrorDetails;
 import 'package:flutter_test/flutter_test.dart';
 
 const _manifestJson =
@@ -32,7 +33,7 @@ void main() {
   });
 
   test('only canonical activation persists exact validated bytes', () async {
-    expect(database.schemaVersion, 4);
+    expect(database.schemaVersion, 5);
     final document = _document(scene: 1, revision: 1);
     final commands = <AvaSvgCanvasClientCommand>[];
     final controller = AvaSvgCanvasController(
@@ -48,6 +49,7 @@ void main() {
     controller.receiveGenerationStarted({
       'protocolVersion': 4,
       'event': 'canvasGenerationStarted',
+      'focusRevision': 0,
       'sessionId': 'session-persistence',
       'sequence': 0,
       'revision': 1,
@@ -85,6 +87,70 @@ void main() {
     host.dispose();
   });
 
+  test('schema four migration preserves order without inventing edits',
+      () async {
+    await database.close();
+    database = AppDatabase.forTesting(
+      NativeDatabase.memory(
+        setup: (raw) {
+          raw.execute('''
+            CREATE TABLE canvas_scenes (
+              scene_id TEXT NOT NULL PRIMARY KEY,
+              scene_revision INTEGER NOT NULL,
+              generation_id TEXT NOT NULL,
+              source_turn_id TEXT NOT NULL,
+              svg_bytes BLOB NOT NULL,
+              manifest_bytes BLOB NOT NULL,
+              svg_sha256 TEXT NOT NULL,
+              manifest_sha256 TEXT NOT NULL,
+              svg_byte_length INTEGER NOT NULL,
+              manifest_byte_length INTEGER NOT NULL,
+              renderer_capability_version TEXT NOT NULL,
+              validator_version TEXT NOT NULL,
+              manifest_version TEXT NOT NULL,
+              workspace_order INTEGER NOT NULL,
+              is_focused INTEGER NOT NULL
+            )
+          ''');
+          for (var index = 0; index < 3; index++) {
+            raw.execute(
+              'INSERT INTO canvas_scenes VALUES (?, 1, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, ?)',
+              [
+                'legacy-${index + 1}',
+                'generation-${index + 1}',
+                'turn-${index + 1}',
+                Uint8List.fromList([index]),
+                Uint8List.fromList([index]),
+                '0'.padLeft(64, '0'),
+                '1'.padLeft(64, '1'),
+                avaSvgRendererCapabilityVersion,
+                avaSvgValidatorVersion,
+                avaSvgManifestVersion,
+                index,
+                index == 1 ? 1 : 0,
+              ],
+            );
+          }
+          raw.execute('PRAGMA user_version = 4');
+        },
+      ),
+    );
+    repository = AvaCanvasPersistenceRepository(database);
+
+    final rows = await (database.select(database.canvasScenes)
+          ..orderBy([(row) => OrderingTerm.asc(row.workspaceOrder)]))
+        .get();
+    final workspace =
+        await database.select(database.canvasWorkspaces).getSingle();
+
+    expect(rows.map((row) => row.creationSequence), [1, 2, 3]);
+    expect(rows.map((row) => row.modificationSequence), [null, null, null]);
+    expect(workspace.workspaceEpoch, 0);
+    expect(workspace.workspaceRevision, 0);
+    expect(workspace.nextCreationSequence, 4);
+    expect(workspace.nextModificationSequence, 1);
+  });
+
   test('progressive draft is never persisted', () async {
     final document = _document(scene: 1, revision: 1);
     final draftBytes = Uint8List.fromList(document.svgBytes);
@@ -98,6 +164,7 @@ void main() {
     controller.receiveGenerationStarted({
       'protocolVersion': 4,
       'event': 'canvasGenerationStarted',
+      'focusRevision': 0,
       'sessionId': 'session-persistence',
       'sequence': 0,
       'revision': 1,
@@ -170,6 +237,37 @@ void main() {
       () => repository.persistActive(_document(scene: 5, revision: 1)),
       throwsA(isA<AvaCanvasPersistenceConflict>()),
     );
+  });
+
+  test('focused middle scene survives restart without becoming visible',
+      () async {
+    await repository.persistActive(_document(scene: 1, revision: 1));
+    await repository.persistActive(_document(scene: 2, revision: 1));
+    await repository.persistActive(
+      _document(scene: 3, revision: 1),
+      focused: false,
+    );
+
+    final host = AvaSvgCanvasSessionHost(persistence: repository);
+    await host.restoration;
+    final manifest = host.workspaceManifestJson();
+    final scenes = (manifest['scenes']! as List).cast<Map<String, Object?>>();
+
+    expect(
+      host.workspaceDocuments
+          .map((document) => document.descriptor.sceneId)
+          .toList(),
+      ['scene-1', 'scene-2', 'scene-3'],
+    );
+    expect(host.presentedDocument?.descriptor.sceneId, 'scene-2');
+    expect(manifest['focusedSceneId'], 'scene-2');
+    expect(
+      scenes.map((scene) => scene['sceneId']).toList(),
+      ['scene-1', 'scene-2', 'scene-3'],
+    );
+    expect(host.panelVisible, isFalse);
+
+    host.dispose();
   });
 
   test('restored revision four activates and persists revision five in place',
@@ -282,6 +380,65 @@ void main() {
     expect((await restarted.loadWorkspace()).documents, isEmpty);
   });
 
+  test('unexpected structural eviction is rejected without changing order',
+      () async {
+    for (var scene = 1; scene <= 10; scene++) {
+      await repository.persistActive(_document(scene: scene, revision: 1));
+    }
+    final host = AvaSvgCanvasSessionHost(persistence: repository);
+    await host.restoration;
+    final created = _document(scene: 11, revision: 1);
+    final controller = AvaSvgCanvasController(
+      documents: _DocumentLoader(created),
+      commandSink: (_) {},
+      retainedSceneRevision: host.retainedSceneRevision,
+    );
+    host.attach(controller);
+    final events = _events(created);
+    controller.beginPlaybackClock(created.descriptor.sourceTurnId);
+    controller.receiveGenerationStarted({
+      'protocolVersion': 4,
+      'event': 'canvasGenerationStarted',
+      'focusRevision': 0,
+      'sessionId': 'session-persistence',
+      'sequence': 0,
+      'revision': 1,
+      'generationId': created.descriptor.generationId,
+      'sourceTurnId': created.descriptor.sourceTurnId,
+      'operation': 'new',
+    });
+    await controller.receiveDocumentAvailable(events[0]);
+    controller.rendererPrepared();
+    controller.receivePresentationCue(events[1]);
+    controller.updateRenderedSample(
+      turnId: created.descriptor.sourceTurnId,
+      renderedSample: 4812,
+    );
+    controller.firstFramePresented();
+    events[2]['evictedSceneId'] = 'scene-2';
+    final priorFlutterErrorHandler = FlutterError.onError;
+    FlutterErrorDetails? capturedError;
+    FlutterError.onError = (details) => capturedError = details;
+
+    controller.receiveActivated(events[2]);
+    FlutterError.onError = priorFlutterErrorHandler;
+    expect(capturedError?.exception, isA<StateError>());
+    expect(
+      (capturedError?.exception as StateError).message,
+      contains('unexpected eviction'),
+    );
+    expect(
+      host.workspaceDocuments
+          .map((document) => document.descriptor.sceneId)
+          .toList(),
+      [for (var scene = 1; scene <= 10; scene++) 'scene-$scene'],
+    );
+
+    host.detach(controller);
+    controller.dispose();
+    host.dispose();
+  });
+
   test('clear workspace invalidates an in-flight persisted restore', () async {
     await repository.persistActive(_document(scene: 8, revision: 1));
     final restored = await repository.loadWorkspace();
@@ -328,7 +485,8 @@ final class _HeldCanvasPersistence implements AvaCanvasPersistence {
   Future<AvaRestoredCanvasWorkspace> loadWorkspace() => _load.future;
 
   @override
-  Future<void> persistActive(AvaValidatedSvgCanvasDocument document) async {
+  Future<void> persistActive(AvaValidatedSvgCanvasDocument document,
+      {bool focused = true}) async {
     persistedDocuments.add(document);
   }
 
@@ -345,7 +503,8 @@ final class _NeverCanvasPersistence implements AvaCanvasPersistence {
       Completer<AvaRestoredCanvasWorkspace>().future;
 
   @override
-  Future<void> persistActive(AvaValidatedSvgCanvasDocument document) async {}
+  Future<void> persistActive(AvaValidatedSvgCanvasDocument document,
+      {bool focused = true}) async {}
 
   @override
   Future<void> persistFocus(String sceneId) async {}
@@ -403,6 +562,7 @@ Future<void> _activateDocument(
   controller.receiveGenerationStarted({
     'protocolVersion': 4,
     'event': 'canvasGenerationStarted',
+    'focusRevision': 0,
     'sessionId': 'session-persistence',
     'sequence': 0,
     'revision': 1,

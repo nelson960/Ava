@@ -113,7 +113,7 @@ class _TestPersistence implements AvaCanvasPersistence {
         focusedSceneId: focusedSceneId,
       );
   @override
-  Future<void> persistActive(AvaValidatedSvgCanvasDocument document) async {}
+  Future<void> persistActive(AvaValidatedSvgCanvasDocument document, {bool focused = true}) async {}
   @override
   Future<void> persistFocus(String sceneId) async {}
   @override
@@ -368,6 +368,7 @@ void main() {
     controller.receiveGenerationStarted({
       'protocolVersion': 4,
       'event': 'canvasGenerationStarted',
+      'focusRevision': 0,
       'sessionId': 'session-1',
       'sequence': 1,
       'revision': 1,

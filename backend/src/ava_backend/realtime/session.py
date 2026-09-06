@@ -14,11 +14,16 @@ from enum import StrEnum
 from typing import Literal
 from uuid import uuid4
 
-from pydantic import field_validator
+from pydantic import Field, StringConstraints, field_validator, model_validator
+from typing_extensions import Annotated
 
 from ..canvas.render_profile import CanvasRenderProfile
 from ..canvas.svg_document import SvgDocumentValidator
-from ..canvas.svg_workspace import ActiveSvgCanvasScene
+from ..canvas.svg_workspace import (
+    ActiveSvgCanvasScene,
+    CanvasWorkspaceManifest,
+    CanvasWorkspaceManifestScene,
+)
 from ..protocol import AgeBand
 from .common import RealtimeProtocolModel
 from .provider_session import NegotiatedRealtimeCall
@@ -36,6 +41,77 @@ class AvaSessionCreateRequestV4(RealtimeProtocolModel):
     @classmethod
     def timezone_id_is_iana(cls, value: object) -> str:
         return validate_iana_timezone_id(value)
+
+
+class CanvasWorkspaceManifestSceneV4(RealtimeProtocolModel):
+    scene_id: Annotated[str, StringConstraints(min_length=1, max_length=96)]
+    scene_revision: int = Field(ge=1, le=10_001)
+    generation_id: Annotated[str, StringConstraints(min_length=1, max_length=96)]
+    source_turn_id: Annotated[str, StringConstraints(min_length=1, max_length=96)]
+    svg_sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+    manifest_sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+    svg_byte_length: int = Field(ge=1, le=512 * 1024)
+    manifest_byte_length: int = Field(ge=1, le=64 * 1024)
+    renderer_capability_version: Annotated[
+        str, StringConstraints(min_length=1, max_length=64)
+    ]
+    validator_version: Annotated[str, StringConstraints(min_length=1, max_length=64)]
+    manifest_version: Annotated[str, StringConstraints(min_length=1, max_length=64)]
+    creation_sequence: int = Field(ge=1)
+    modification_sequence: int | None = Field(default=None, ge=1)
+    title: Annotated[str, StringConstraints(max_length=160)]
+    summary: Annotated[str, StringConstraints(max_length=800)]
+
+    def to_workspace_scene(self) -> CanvasWorkspaceManifestScene:
+        return CanvasWorkspaceManifestScene(**self.model_dump())
+
+
+class CanvasWorkspaceManifestV4(RealtimeProtocolModel):
+    protocol_version: Literal[4]
+    workspace_epoch: int = Field(ge=0)
+    workspace_revision: int = Field(ge=0)
+    next_creation_sequence: int = Field(ge=1)
+    next_modification_sequence: int = Field(ge=1)
+    focused_scene_id: (
+        Annotated[str, StringConstraints(min_length=1, max_length=96)] | None
+    ) = None
+    scenes: list[CanvasWorkspaceManifestSceneV4] = Field(max_length=10)
+
+    @model_validator(mode="after")
+    def validate_high_water_marks(self) -> CanvasWorkspaceManifestV4:
+        scene_ids = [scene.scene_id for scene in self.scenes]
+        if len(scene_ids) != len(set(scene_ids)):
+            raise ValueError("canvas workspace scene IDs must be unique")
+        if self.focused_scene_id is not None and self.focused_scene_id not in scene_ids:
+            raise ValueError("focusedSceneId must identify a retained scene")
+        creation = [scene.creation_sequence for scene in self.scenes]
+        if len(creation) != len(set(creation)) or self.next_creation_sequence <= max(
+            creation, default=0
+        ):
+            raise ValueError("canvas workspace creation sequences are inconsistent")
+        if creation != sorted(creation):
+            raise ValueError("canvas workspace order must follow creationSequence")
+        modification = [
+            scene.modification_sequence
+            for scene in self.scenes
+            if scene.modification_sequence is not None
+        ]
+        if len(modification) != len(
+            set(modification)
+        ) or self.next_modification_sequence <= max(modification, default=0):
+            raise ValueError("canvas workspace modification sequences are inconsistent")
+        return self
+
+    def to_workspace_manifest(self) -> CanvasWorkspaceManifest:
+        return CanvasWorkspaceManifest(
+            protocol_version=self.protocol_version,
+            workspace_epoch=self.workspace_epoch,
+            workspace_revision=self.workspace_revision,
+            next_creation_sequence=self.next_creation_sequence,
+            next_modification_sequence=self.next_modification_sequence,
+            focused_scene_id=self.focused_scene_id,
+            scenes=tuple(scene.to_workspace_scene() for scene in self.scenes),
+        )
 
 
 class RealtimeSessionCapacityError(RuntimeError):
@@ -79,6 +155,7 @@ class _RealtimeSessionRecord:
     claimed: bool = False
     active_deadline: datetime | None = None
     canvas_restored: bool = False
+    canvas_workspace_synchronized: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,7 +455,7 @@ class RealtimeSessionRegistry:
         )
         token_digest = hashlib.sha256(token.encode("utf-8")).digest()
         async with self._lock:
-            self._require_canvas_restore_owner(
+            record = self._require_canvas_restore_owner(
                 session_id=session_id,
                 subject=subject,
                 token_digest=token_digest,
@@ -414,6 +491,37 @@ class RealtimeSessionRegistry:
             record.canvas_restored = True
         return scene
 
+    async def synchronize_canvas_workspace(
+        self,
+        *,
+        session_id: str,
+        token: str,
+        subject: str,
+        manifest: CanvasWorkspaceManifestV4,
+    ) -> bool:
+        """Authenticate and adopt the ordered recovery manifest pre-negotiation."""
+
+        now = self._now()
+        self._token_codec.verify(
+            token,
+            expected_session_id=session_id,
+            expected_scope="canvas",
+            now=now,
+        )
+        token_digest = hashlib.sha256(token.encode("utf-8")).digest()
+        async with self._lock:
+            record = self._require_canvas_restore_owner(
+                session_id=session_id,
+                subject=subject,
+                token_digest=token_digest,
+                now=now,
+            )
+            adopted = record.coordinator.synchronize_canvas_workspace(
+                manifest.to_workspace_manifest()
+            )
+            record.canvas_workspace_synchronized = True
+            return adopted
+
     def _require_canvas_restore_owner(
         self,
         *,
@@ -442,6 +550,7 @@ class RealtimeSessionRegistry:
     async def focus_canvas(
         self,
         *,
+        focus_revision: int,
         session_id: str,
         token: str,
         subject: str,
@@ -498,7 +607,7 @@ class RealtimeSessionRegistry:
             )
             coordinator = record.coordinator
 
-        await coordinator.focus_canvas(scene)
+        await coordinator.focus_canvas(scene, focus_revision=focus_revision)
 
         async with self._lock:
             current_record = self._records.get(session_id)
@@ -525,9 +634,7 @@ class RealtimeSessionRegistry:
             raise RealtimeSessionAuthenticationError(RealtimeSessionAuthFailure.UNKNOWN)
         if record.claimed:
             if record.active_deadline is None:
-                raise RuntimeError(
-                    "Claimed realtime session has no active deadline"
-                )
+                raise RuntimeError("Claimed realtime session has no active deadline")
             if record.active_deadline <= now:
                 raise RealtimeSessionAuthenticationError(
                     RealtimeSessionAuthFailure.EXPIRED

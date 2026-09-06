@@ -45,7 +45,12 @@
     "sceneRevision": 1,
     "firstRenderedSample": 4812,
     "svgSha256": "de5b2d4eefbfeaeb9e645080011eb1d7ee6d5fc4e266e831a607b29a75673d29",
-    "manifestSha256": "7edea9e743ba888a3ae9918addb1375ddd43b86a7bccaa820b9c59d08e678c3a"
+    "manifestSha256": "7edea9e743ba888a3ae9918addb1375ddd43b86a7bccaa820b9c59d08e678c3a",
+    "workspaceEpoch": 0,
+    "workspaceRevision": 1,
+    "creationSequence": 1,
+    "modificationSequence": 1,
+    "evictedSceneId": null
   },
   {
     "protocolVersion": 4,

@@ -56,6 +56,7 @@ class SpeechFailureCode(StrEnum):
     PLAYBACK_UNAVAILABLE = "playbackUnavailable"
     CANCELLED = "cancelled"
     INTERNAL = "internal"
+    TURN_CONTEXT_FAILED = "turnContextFailed"
 
 
 class SpeechFailureComponent(StrEnum):

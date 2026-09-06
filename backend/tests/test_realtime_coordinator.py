@@ -549,9 +549,9 @@ def _active_multi_binding_canvas_state() -> SvgCanvasSessionState:
 
 async def test_replacement_session_initial_context_contains_committed_canvas() -> None:
     workspace = SvgCanvasWorkspace()
-    first_state = _active_labeled_canvas_state(workspace)
-    expected_context = first_state.render_realtime_context()
+    _active_labeled_canvas_state(workspace)
     replacement_state = SvgCanvasSessionState(workspace=workspace)
+    expected_context = replacement_state.render_realtime_context()
     coordinator, realtime, _speech, _memory = _coordinator(
         canvas_state=replacement_state,
     )
@@ -2289,6 +2289,7 @@ async def test_context_build_telemetry_has_monotonic_identity_and_exact_counts(
             timezone_id="UTC",
             current_time_utc=datetime(2026, 9, 1, tzinfo=UTC),
             canvas_context=canvas_context,
+            active_visual_present=True,
         )
     )
     coordinator._log_dynamic_context_build(

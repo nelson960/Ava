@@ -1,676 +1,666 @@
-# Ava production architecture
+# Ava Production Architecture
 
-Status: locked target architecture  
+Status: Locked target architecture
 Protocol target: v4
-Last reviewed: 2026-08-21
+Audience: Architecture decisions, forensic analysis, coding agent implementation, and invariant review.
 
-This document describes the production system Ava is moving toward. It replaces
-the old lesson-turn, fixed-diagram, activity/progress, and NDJSON performance
-plans.
+This is the authoritative architectural source of truth for the Ava repository.
+It supersedes all prior implementation plans, lesson-based designs, and fixed
+diagram schemes.
 
-## 1. Product boundary
+---
 
-Ava is a realtime conversational character for children. Natural voice,
-personality continuity, interruption, and the sense that the avatar is present
-are the critical path. Explanations and drawings are capabilities inside that
-conversation, not separate modes.
+## 1. Product Boundary
 
-The runtime must provide:
+Ava is an avatar-first, realtime conversational character for children on iPhone
+and iPad; macOS is the primary development environment. Natural, gentle,
+low-latency conversation and a consistent, trusted personality are the primary
+value. Ava can explain, illustrate, and draw when helpful, but ordinary
+conversation is never forced into a structured lesson.
 
-- live child audio input;
-- one consistent Ava personality;
-- the selected ElevenLabs voice;
-- synchronized captions and stylized lip sync;
-- living idle and local touch/3D interaction;
-- an optional dynamic vector canvas;
-- bounded private memory and a weekly parent recap.
+### Core Experience
+- **Direct Engagement:** The application opens directly to Ava facing the child.
+  There is no splash screen delay, navigation bar, or permanent dashboard.
+- **Minimal Chrome:** Only a subtle settings control at top right and a
+  microphone toggle at bottom left appear over the view. Captions are optional
+  and rendered transparently near the lower edge.
+- **Dynamic Canvas:** The canvas is hidden unless a visual explanation helps.
+  When active, it occupies the lower half of the screen while Ava remains
+  visible and expressive in the upper half.
+- **Atmosphere and Avatar:** A calm visual base near `#BFC7C7` with a local
+  day/night background and interactive touch elements (sun, moon, clouds, stars).
+  Rendering targets smooth 60/120 Hz, interpolated locally; network events never
+  directly drive animation frames.
+- **Settings Scope:** Limited strictly to child name, date of birth (DOB),
+  captions toggle, factual weekly recap, and conversation reset. Developer,
+  provider, model, or motion controls are excluded.
 
-The runtime does not include an activity browser, lessons feed, games, scores,
-curriculum state, a general whiteboard editor, arbitrary code execution, or
-model-generated skeletal animation.
+### Non-Goals and Prohibitions
+Ava does not contain:
+- Feeds, tabs, activity catalogs, puzzles, scores, or streak counters;
+- Curriculum modes, mastery tracking, or teacher/chat mode toggles;
+- A generic freeform whiteboard editor or annotation system;
+- Model-generated executable code (JavaScript, HTML, or WebAssembly);
+- Model-generated raw skeletal animations or unconstrained motion scripts.
 
-## 2. System overview
+---
+
+## 2. Core Architecture and Topology
 
 ```mermaid
-flowchart LR
-    C["Flutter client<br/>avatar, mic, PCM, SVG canvas"] -->|"auth + SDP offer"| B["Ava backend"]
-    B -->|"SDP negotiation"| R["OpenAI Realtime<br/>gpt-realtime-2.1-mini"]
-    C <-->|"WebRTC child audio + realtime events"| R
-    B <-->|"server sideband<br/>prompt, tools, function deltas"| R
-    B <-->|"streamed text + audio/alignment"| E["ElevenLabs<br/>selected Ava voice"]
-    B <-->|"binary audio + control frames"| C
-    B -->|"separately authenticated exact SVG fetch"| C
-    B <-->|"delivered turns + bounded memory"| D["Postgres/Supabase adapter"]
-    B -->|"validated semantic canvas request"| S["OpenAI Responses canvas specialist<br/>gpt-5.6-sol"]
-    S -->|"complete authored SVG"| B
+flowchart TB
+    subgraph Client["Flutter Client (Presentation Plane)"]
+        UI["Avatar 3D, Touch, Living World"]
+        PCM["Native Audio Engine & Playback Service"]
+        SVG_REN["Direct SVG Canvas Renderer"]
+        WS["Workspace / Retained Documents"]
+    end
+
+    subgraph Backend["Ava Backend (Control Plane)"]
+        COORD["Realtime Coordinator"]
+        SESS["Session & Token Registry"]
+        VAL["Non-Mutating SVG Validator"]
+        STORE_ADAPT["Durable Persistence Adapter"]
+    end
+
+    subgraph Providers["External Providers"]
+        OAI_RT["OpenAI Realtime<br/>(Conversational Brain)"]
+        TTS["ElevenLabs Streaming TTS<br/>(Selected Ava Voice)"]
+        SPEC["Canvas Specialist<br/>(Visual Authorship)"]
+    end
+
+    subgraph Persistence["Authoritative Storage"]
+        DB[(PostgreSQL / Supabase)]
+    end
+
+    %% Client to Backend Control & Documents
+    Client -->|"1. Session Bootstrap (DOB Age Band)"| SESS
+    SESS -->|"Session ID + Scoped Tokens"| Client
+    Client <-->|"2. Authenticated Control WebSocket (JSON Control + Binary PCM)"| COORD
+    Client -->|"3. Scoped Document Lane (HTTP GET exact bytes)"| VAL
+
+    %% Media direct
+    Client <-->|"4. WebRTC Audio Track (Direct Child Mic)"| OAI_RT
+
+    %% Backend to Providers
+    COORD <-->|"5. Realtime Server Sideband (WS)"| OAI_RT
+    COORD -->|"6. Incremental Speech Phrases (WS)"| TTS
+    TTS -->|"PCM Stream + Alignment"| COORD
+    COORD -->|"7. Semantic Brief + SVG Revision"| SPEC
+    SPEC -->|"Authored UTF-8 SVG"| VAL
+
+    %% Backend to Persistence
+    COORD <-->|"8. Delivered Turns, Summaries, Reset"| STORE_ADAPT
+    STORE_ADAPT <--> DB
 ```
 
-There are two AI/voice provider accounts:
+### Communication Lanes
+1. **WebRTC Media Lane:** Child microphone audio flows directly between Flutter
+   and OpenAI Realtime over WebRTC. The backend negotiates the SDP offer/answer
+   and retains provider call ownership, keeping media off intermediate backend hops.
+2. **Realtime Sideband Lane:** A persistent WebSocket between the Ava backend
+   and OpenAI Realtime. Carries session configuration, prompts, tool definitions,
+   server VAD signals, assistant text deltas, and semantic function calls.
+3. **Ava Event WebSocket:** Authenticated bidirectional application channel
+   between backend and Flutter. Carries versioned JSON control frames and binary
+   24 kHz 16-bit mono PCM frames. SVG document bytes never share this ordered
+   audio lane.
+4. **Canvas Document Lane:** Independently authenticated HTTP endpoint
+   (`GET /v4/realtime/sessions/{sessionId}/canvas/documents/{generationId}`).
+   Flutter fetches validated SVG bytes using a short-lived bearer token scoped to
+   the session, generation, candidate, and content hash with `Cache-Control: no-store`.
+5. **TTS Input-Streaming Lane:** A dedicated streaming WebSocket between the Ava
+   backend and ElevenLabs for each complete, validated speech phrase, returning
+   raw PCM chunks and exact character/sample alignments.
 
-- OpenAI for Realtime conversation and strict on-demand canvas planning;
-- ElevenLabs for Ava's production voice.
+---
 
-The database and deployment platform require ordinary infrastructure
-credentials, but they are not additional conversation models.
+## 3. Authority and Ownership Model
 
-## 3. Why this split
+### Subsystem Responsibilities
+- **OpenAI Realtime:** Owns conversational reasoning and current semantic intent.
+  Consumes child audio, detects turns via server VAD, determines whether a
+  visual helps, selects tools semantically, and emits assistant speech text.
+  OpenAI audio generation is disabled; Realtime has no authority over Ava's voice.
+- **ElevenLabs:** Owns production voice synthesis and audio alignment only.
+  Operates on bounded speech phrases released by the backend. Has no semantic
+  authority over personality, memory, canvas, or avatar movement.
+- **Canvas Specialist:** Owns visual composition and SVG authorship only.
+  Receives a single resolved semantic brief; does not arbitrate child intent or
+  conversational state.
+- **Backend (Control Plane):** Owns lifecycle, session state, safety policy,
+  deterministic validation, cancellation, provider credentials, persistence,
+  budgets, and the authoritative record of delivered speech.
+- **Flutter / Device (Presentation Plane):** Owns microphone capture intent,
+  sample-accurate playback, avatar rendering and touch interaction, direct SVG
+  rendering, element hit testing, local continuous manipulation, and the local
+  canvas workspace. No network event directly drives an animation frame.
 
-OpenAI Realtime consumes speech directly, understands the conversational
-context, performs turn detection, and emits function calls. It is not asked to
-generate audio because Ava's approved voice is in ElevenLabs.
+### Hierarchy of Semantic Authority
+A rigid authority hierarchy prevents split-brain reasoning:
 
-ElevenLabs receives only validated assistant speech, streams voice audio and
-alignment, and has no authority over memory, personality, canvas behavior, or
-avatar movement.
+```mermaid
+flowchart TD
+    subgraph NewVisual["NEW Visual Request"]
+        C1["Current Child Intent (AUTHORITATIVE)"] --> SB1["Realtime Visual Brief"]
+        M1["Historical Memory / Context (Supporting Only)"] -.-> SB1
+        P1["Previous Canvas (Supporting Only)"] -.-> SB1
+        SB1 --> SPEC1["Canvas Specialist Request"]
+    end
 
-The backend is the control plane. It owns policy, session state, validation,
-cancellation, provider credentials, persistence, budgets, and the authoritative
-record of what the child actually heard.
+    subgraph ReviseVisual["REVISE FOCUSED / Deictic Request"]
+        C2["Current Child Instruction"] --> REQ2["Resolved Revision Intent"]
+        F2["Current Focused Canvas"] --> REQ2
+        REQ2 --> SPEC2["Canvas Specialist Request"]
+    end
+```
 
-Flutter is the realtime presentation plane. It owns microphone capture,
-sample-counted playback, avatar interpolation, touch, renderer-native SVG hit
-testing, lip sync, captions, and presentation acknowledgement. No network event
-drives a render frame.
+1. **For a NEW Explicit Visual Request:** Current child intent is strictly
+   authoritative. Historical memory, previous canvas documents, old turns, and
+   past interactions are supporting context only. The Realtime visual brief may
+   elaborate structure, relationships, and labels, but must never override or
+   substitute the child's explicit topic.
+2. **For a REVISE FOCUSED or Deictic Request:** The combination of
+   `CURRENT CHILD INSTRUCTION` and `CURRENT FOCUSED CANVAS` together define the
+   request.
+3. **No Keyword Routing:** Tool selection is semantic and contextual within
+   Realtime (`tool_choice=auto`). Application code never dispatches on trigger
+   words (e.g., "draw", "show").
+4. **Memory is Never Intent:** Memory provides historical background; it never
+   overrides an explicit in-session request.
 
-## 4. Connection topology
+### Asynchronous State and Identity Fencing
+Every piece of mutable asynchronous state has exactly one authoritative owner:
 
-### 4.1 Session creation
+| Entity | Authoritative Owner | Scope / Lifetime |
+|---|---|---|
+| Conversation Session | Backend Session Registry | Persistent across turns; bounded by expiry/close |
+| WebRTC Peer & Mic Track | Flutter Media Engine | Persistent across turns; destroyed only on session close |
+| Turn Lifecycle | Backend Realtime Coordinator | One child utterance to speech completion/interruption |
+| Provider Input Item | OpenAI Realtime | One committed provider conversation input item associated with one child utterance/transcription lifecycle |
+| Speech Synthesis & Protocol Delivery | Backend Speech Pipeline | Parses assistant text, streams ElevenLabs TTS requests, delivers audio protocol frames, accounts for delivered prefix |
+| Client Presentation State | Flutter Presentation Engine | Tracks currently accepted turn/stream presentation identity, viseme and caption presentation state |
+| Rendered Audio Sample Clock | Native Audio Engine (reported via Playback Service) | Monotonically counted audio samples per stream/turn; master presentation clock |
+| Canvas Generation | Backend Canvas Job Coordinator | One specialist execution; identified by `generationId` |
+| Canvas Candidate Lifecycle | Backend Canvas Session State | Mutable staging, preparation, cue scheduling, and activation of candidate document; identified by generation and content-hash tuple |
+| Canvas Scene & Revisions | Backend Canvas Workspace | Persistent session state; monotonic scene revision integer |
+| Local Canvas Workspace & Focus | Flutter Canvas Session Host | User-facing visual state; retains up to 10 scenes across turns |
+| Client Interaction Sequence | Flutter Canvas Controller | Monotonic interaction sequence incremented per user binding interaction on active scene |
+| Canonical Interaction Record | Backend Canvas Workspace | Validates sequence monotonicity and hashes; records canonical interaction into active scene history |
+| Memory Commit Epoch | Authoritative Memory Store | Increments per successful authoritative conversation reset |
 
+**Identity Rules:**
+- Consumers may retain an owner's identity token, but must never invent shadow
+  counters or assume parallel components remain synchronized.
+- Stale callbacks, late network packets, and cancelled tasks from older
+  identities are dropped; they must never mutate current state.
+- The latest intentional child action supersedes obsolete pending work; rapid
+  inputs must not build an execution backlog.
+
+---
+
+## 4. Realtime Conversation Lifecycle
+
+### Session Creation and Startup
 1. Flutter authenticates to the Ava backend.
-2. Flutter calls `POST /v4/realtime/sessions`.
-3. The backend returns an Ava session ID, protocol version, event-channel URL,
-   feature limits, and a short-lived session token.
-4. Flutter creates a WebRTC peer connection, attaches a disabled microphone
-   track,
-   and sends its SDP offer to
-   `POST /v4/realtime/sessions/{session_id}/webrtc`.
-5. The backend negotiates the offer with OpenAI Realtime using the server API
-   key, retains the provider call ID, attaches its sideband WebSocket, and
-   returns the SDP answer.
-6. During app startup, Flutter applies the answer, opens the authenticated
-   bidirectional event WebSocket, sends `clientReady`, and receives the
-   validated `listening` phase while the microphone track remains disabled.
-7. A microphone tap changes only the existing local track's enabled state.
-   Media then flows directly over WebRTC, avoiding bootstrap, SDP, ICE,
-   sideband setup, and an extra backend audio hop in the tap path.
+2. Flutter requests session creation (`POST /v4/realtime/sessions`) providing the
+   protocol version and an age band derived locally from stored DOB (exact DOB
+   and child name are never transmitted).
+3. Backend registers the session, generates an HMAC-authenticated session token,
+   and allocates WebRTC / WebSocket endpoints.
+4. Flutter initializes a WebRTC peer connection with a disabled local audio track
+   and submits its SDP offer (`POST /v4/realtime/sessions/{id}/webrtc`).
+5. Backend negotiates the offer directly with OpenAI Realtime, retains the
+   provider call ID, connects the sideband WebSocket, and returns the SDP answer.
+6. Flutter opens the Ava event WebSocket, issues `clientReady`, and transitions
+   to `listening` with capture disabled.
+7. Tapping the microphone toggles the existing track's enabled state; audio flows
+   immediately over WebRTC without connection setup or SDP renegotiation.
 
-The WebRTC peer, OpenAI sideband, and Ava event WebSocket remain open for a
-bounded conversation containing consecutive turns. Each turn has a fresh turn
-ID, request ID, stream ID, sequence/revision state machine, cancellation scope,
-and delivered-memory commit. Muting changes the existing track's enabled state;
-only conversation shutdown removes the sender, stops capture, and disposes the
-stream. A user pause retains the muted call for at most two minutes so resume
-does not renegotiate the provider connection. Expiry, reset, disposal, or a
-provider/transport failure releases it and never silently creates a replacement
-session.
+### Muting, Pausing, and Persistence
+- **Muting:** Only toggles the local WebRTC track enabled state. WebRTC, sideband,
+  and event channels remain fully active.
+- **Warm Window:** As an explicit product decision, a paused or muted conversation
+  is held open for up to two minutes to allow immediate, zero-latency resumption.
+- **Shutdown:** Explicit conversation reset, app disposal, or fatal connection
+  failure releases the provider call, terminates capturing, closes WebSockets,
+  and clears transient memory.
 
-Flutter tracks microphone intent separately from turn presentation phase.
-`planning`, `synthesizing`, `speaking`, and the brief boundary between turns do
-not imply that capture was disabled and must never change the microphone button
-into a new-session control.
+### Turn State Transitions
 
-The create request contains only protocol version and the age band derived
-locally from the stored DOB. It never contains the child name or exact DOB.
-The event token is HMAC-authenticated, short-lived, one-use, scoped to one
-opaque Ava session ID, and contains no child data. Canvas-document access uses
-a separate short-lived bearer scoped to one session, generation, candidate,
-and content hash. It is sent in an authorization header, never a URL. A claimed,
-expired, unknown, or mismatched token fails explicitly; reconnect creates a new
-Ava session rather than silently replaying the old turn.
+```text
+created -> connecting -> listening -> planning -> synthesizing -> speaking -> completed
+               |            |            |             |            |
+               +------------+------------+-------------+------------+---> cancelling -> cancelled
+               |
+               +---> failed
+```
 
-The backend configures the Realtime session over the sideband channel:
+- States are strictly owned by the backend Realtime Coordinator; Flutter mirrors
+  state without synthesizing transitions.
+- Microphone intent, turn phase, canvas lifecycle, and memory persistence are
+  independent. A failed turn or canvas rejection cannot alter microphone intent
+  or mute the child.
 
-- model: backend-configured `gpt-realtime-2.1-mini` initially;
-- input: child audio;
-- output modality: text only;
-- server VAD and interruption enabled;
-- explicit committed-turn input transcription for asynchronous memory;
-- one optional semantic canvas function with `tool_choice=auto` and parallel
-  calls off;
-- versioned Ava prompt harness and bounded context;
-- tool choice, output limits, and safety policy controlled server-side.
+---
 
-### 4.2 Ava event WebSocket and canvas document lane
+## 5. Speech, TTS, Playback, and Interruption
 
-The Ava event channel is not a provider socket exposed to Flutter. It is a
-versioned application protocol.
+### Phrase Parsing and Streaming Synthesis
+- Realtime emits natural assistant text deltas over the sideband.
+- The streaming phrase parser splits incoming text into complete grammatical
+  phrases at punctuation boundaries (falling back to whitespace for sentences
+  exceeding length bounds).
+- Each validated phrase immediately opens an ElevenLabs input-streaming
+  WebSocket. Audio is synthesized and streamed as 24 kHz mono 16-bit signed PCM.
+- The backend never waits for full turn completion before initiating speech.
 
-Server-to-client control frames are JSON. TTS audio frames are binary and carry
-an immediately preceding metadata frame containing:
+### Presentation Clock
+- Synthesized audio chunks are sent over the Ava event WebSocket with metadata
+  specifying stream ID, chunk sequence, sample offset, and byte length.
+- The native audio engine maintains the master rendered-sample clock, reported
+  back through the playback service.
+- Captions, VRM visemes (mapped deterministically from provider character/phoneme
+  alignments), avatar expressions, and canvas presentation cues are scheduled
+  strictly against the rendered-sample clock. Wall-clock timers are prohibited
+  on the presentation path.
 
-- protocol version;
-- Ava session ID;
-- turn ID;
-- audio stream ID;
-- chunk sequence;
-- sample offset;
-- byte length.
+### Interruption (Barge-In)
+When the child speaks while Ava is talking:
+1. Realtime server VAD detects speech; the backend emits `interruptRequested`.
+2. The client immediately stops queued audio cleanly and quickly, and reports
+   the exact final rendered sample index.
+3. Backend cancels the active Realtime response and closes the in-flight
+   ElevenLabs stream.
+4. Backend alignment maps the final rendered sample index to the exact text
+   offset heard by the child.
+5. Only the confirmed delivered prefix is written to the authoritative
+   conversation ledger. Unheard text is dropped.
+6. The backend reconciles provider conversation history (truncating the item via
+   Realtime API where supported or injecting explicit delivered-prefix context
+   on the subsequent turn) so future turns never assume unheard text was heard.
+7. Interruption is idempotent; late or stale audio frames cannot revive an
+   interrupted turn.
 
-Client-to-server frames include:
+---
 
-- `clientReady` once per conversation;
-- `playbackStarted`;
-- periodic bounded `playbackProgress`;
-- `playbackStopped`;
-- `canvasDocumentPrepared`;
-- `canvasPresented`;
-- `canvasInteraction`;
-- `cancelTurn`.
+## 6. Canvas Semantic Intent
 
-SVG never shares this socket's ordered PCM queue. `canvasGenerationStarted`
-announces accepted bounded Sol work so Flutter can show non-blocking drawing
-progress before a document exists. `canvasDocumentAvailable` then announces a
-bounded candidate and its hashes on the control socket. Flutter
-fetches the exact `image/svg+xml` bytes from the independently authenticated
-canvas-document endpoint with `Cache-Control: no-store`, verifies length and
-hash, and preloads the selected renderer. Lost fetch responses may retry while
-the scoped bearer and candidate remain valid; supersession, interruption,
-session close, or expiry cancels the document.
+### The Canvas Function Contract
+Realtime has access to one semantic canvas creation tool:
+```json
+{
+  "name": "request_interactive_canvas",
+  "description": "Request a visual canvas when a drawing, diagram, or interactive visual directly helps the child understand.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "operation": {
+        "type": "string",
+        "enum": ["new", "reviseFocused"],
+        "description": "Use new for a separate visual or different concept. Use reviseFocused only to modify the current focused visual."
+      },
+      "brief": {
+        "type": "string",
+        "maxLength": 1000,
+        "description": "Conversational purpose, essential objects, relationships, flow, labels, and interaction intent. Never include coordinates, SVG, styles, or code."
+      },
+      "interaction_mode": {
+        "type": "string",
+        "enum": ["none", "explore", "select", "steps"],
+        "description": "none for static visual, explore for tap/direct manipulation, select for choosing options, steps for ordered progression."
+      }
+    },
+    "required": ["operation", "brief", "interaction_mode"]
+  }
+}
+```
 
-App lifecycle, audio-route, and explicit close controls remain required release
-work; they are not represented as implemented protocol events yet.
+### Decoupled Execution
+1. Realtime calls `request_interactive_canvas`.
+2. The backend validates arguments, reserves budget/queue slots, and returns an
+   immediate `function_call_output` containing `status: "accepted"` and a new
+   `generationId` (or `status: "rejected"` with a bounded reason).
+3. Realtime immediately generates a short spoken continuation with tool calls
+   disabled, explaining what it is drawing. Realtime never waits for visual
+   generation to finish.
+4. If the child changes their mind before the canvas is ready, Realtime can invoke
+   `cancel_interactive_canvas` to abort pending generation cleanly.
 
-Every frame has a maximum size. Unknown frame types, invalid sequence numbers,
-or stale revisions are rejected rather than ignored.
+---
 
-## 5. Realtime turn lifecycle
+## 7. Canvas Generation and Validation
 
+### Specialist Execution
+- Model: Configured specialist model (`gpt-5.6-terra` medium reasoning effort in
+  current deployment).
+- Receives: Generation ID, age band, client render profile (viewport bounds,
+  touch target scales), semantic brief, interaction mode, and (for revisions)
+  the complete, unmodified active SVG document.
+- Returns: Exactly one complete UTF-8 encoded SVG document. Reasoning traces may
+  coexist in provider metadata, but Markdown wrappers, commentary, or multiple
+  payloads are strictly invalid.
+
+### Non-Mutating Validation
+The backend validates the SVG string without mutating it:
+- **Canonical Encoding:** The text is encoded to UTF-8 bytes exactly once. No
+  pretty-printing, whitespace stripping, entity expansion, or XML reserialization
+  is permitted. The resulting bytes and their SHA-256 hash are canonical.
+- **Safety Inspection:** A hardened parser inspects the document structure. It
+  strictly rejects DTDs, external entities, `<script>`, inline event handlers
+  (`onclick`, etc.), `<foreignObject>`, external URLs, CSS `@import`, and
+  unsupported CSS filters.
+- **Complexity and Resource Bounds:** Checks maximum byte size (384 KB limit),
+  path node complexity, nesting depth, and reference graphs (rejecting cycles or
+  exponential expansions in `<use>`, `clipPath`, or `mask`).
+- **Semantic Metadata Extraction:** Inspects semantic binding attributes, stable
+  element IDs, and direct-child `<title>` and `<desc>`. Generates a deterministic,
+  hash-bound interaction and accessibility manifest.
+- **Single Repair Boundary:** If validation fails, at most one repair call may
+  be made to the specialist containing deterministic error diagnostics. If the
+  repair fails, the canvas is rejected.
+
+---
+
+## 8. Canvas Workspace, Focus, and Presentation
+
+### Generation Lifetime vs. Speech Lifetime and Panel Presentation
+Accepted canvas generation is completely independent from speech presentation
+and client panel visibility:
+- Normal speech barge-in does **not** cancel accepted canvas work.
+- **Panel Dismiss $\neq$ Canvas Semantic Cancel:** Dismissing or hiding the
+  canvas panel on the client is purely local presentation state. Closing the
+  panel does not delete an active scene and does not cancel pending specialist
+  generation. A dismissed panel may be reopened at any time while generation
+  proceeds or after presentation completes.
+- Accepted canvas work terminates only upon:
+  1. Explicit semantic cancellation via Realtime tool call
+     (`cancel_interactive_canvas`);
+  2. Supersession by a newer accepted canvas generation;
+  3. Provider timeout, validation failure, or presentation failure;
+  4. Conversation session shutdown or reset.
+
+### Document Delivery and Activation Handshake
 ```mermaid
 sequenceDiagram
-    participant Child
-    participant App as Flutter
-    participant RT as OpenAI Realtime
-    participant Backend
-    participant TTS as ElevenLabs
-    participant Canvas as Responses canvas specialist
+    participant COORD as Backend Coordinator
+    participant APP as Flutter App
+    participant REN as Direct SVG Renderer
 
-    Child->>App: speaks
-    App->>RT: microphone audio over WebRTC
-    RT-->>Backend: assistant text deltas over sideband
-    Backend->>Backend: incrementally parse bounded speech phrases
-    Backend->>TTS: stream each validated phrase
-    opt semantic canvas function selected
-        RT-->>Backend: request_interactive_canvas call
-        Backend->>Backend: validate brief, budget, and queue capacity
-        Backend-->>RT: accepted generation ID or rejected function_call_output
-        RT-->>Backend: short continuation text
-        Backend->>Canvas: bounded brief + age band + current SVG
-        Canvas-->>Backend: complete authored SVG
-        Backend->>Backend: exact extraction + non-mutating validation
-        Backend-->>App: canvasDocumentAvailable control
-        App->>Backend: independent authenticated SVG fetch
-        App->>App: verify hash and preload renderer
-        App-->>Backend: canvasDocumentPrepared
-    end
-    TTS-->>Backend: PCM + alignment
-    Backend-->>App: control events + binary PCM
-    App->>App: sample-clock playback, captions, visemes
-    Backend-->>App: sample-anchored canvas/expression cues
-    App->>App: present prepared SVG at rendered sample
-    App-->>Backend: canvasPresented
-    Backend-->>App: canvasActivated
-    App-->>Backend: rendered sample progress
-    Backend->>Backend: persist delivered prefix and memory decisions
+    COORD->>APP: canvasDocumentAvailable (generationId, sceneId, SHA-256)
+    APP->>COORD: HTTP GET /documents/{id} (Scoped Bearer Token)
+    COORD-->>APP: Exact UTF-8 SVG Bytes
+    APP->>APP: Verify SHA-256 Hash
+    APP->>REN: Preload SVG Document
+    REN-->>APP: Preload Complete
+    APP->>COORD: canvasDocumentPrepared (generationId, SHA-256)
+    COORD->>APP: canvasPresent (cueSampleOffset)
+    APP->>REN: Present on Master Sample Cue
+    REN-->>APP: First Frame Rendered
+    APP->>COORD: canvasPresented (generationId, sceneRevision)
+    COORD->>APP: canvasActivated (sceneId, sceneRevision)
 ```
 
-### 5.1 Assistant text and the optional canvas function
+1. **Availability:** Backend emits `canvasDocumentAvailable` over the control socket.
+2. **Independent Fetch:** Flutter retrieves the document over the dedicated
+   HTTP lane and verifies its SHA-256 hash against the control frame.
+3. **Preload:** Flutter preloads the direct renderer and responds with
+   `canvasDocumentPrepared`.
+4. **Cue Scheduling:** The backend maps a speech phrase anchor to a rendered
+   audio sample offset and issues `canvasPresent`.
+5. **Presentation:** Flutter displays the candidate when the audio clock hits the
+   cue (or immediately if already passed) and sends `canvasPresented`.
+6. **Activation:** The backend marks the revision canonical and sends
+   `canvasActivated`. If presentation fails or times out, the prior active scene
+   is preserved.
 
-Realtime emits natural assistant text and may call one application-owned
-function, `request_interactive_canvas`. The provider uses `tool_choice=auto`
-with parallel calls disabled. A normal turn contains no function call. The
-model decides semantically from the full conversation; application code never
-routes on words such as “draw”, “show”, or “diagram”.
+### Durable Recovery, Canonical Session Workspace, and Focus Decoupling
+- **Durable Recovery Authority:** Flutter persists the complete bounded retained
+  workspace and immediate user-facing focus (up to 10 scenes). On startup this
+  state is authenticated recovery/bootstrap input, not permanent canonical
+  authority after backend adoption.
+- **Canonical Session Authority:** Before WebRTC negotiation, Flutter sends the
+  ordered metadata-only workspace manifest to
+  `PUT /v4/realtime/sessions/{sessionId}/canvas-workspace`, then restores the
+  focused scene's exact SVG through the existing document lane. Once adopted,
+  the backend owns canonical order, `workspaceEpoch`, `workspaceRevision`, and
+  creation/modification sequences; Flutter verifies and durably persists its
+  exact structural mutations.
+- **Immediate Local Presentation:** Switching retained scenes is an immediate
+  local visual action on the device that must never freeze, block, or wait for
+  active Ava speech, TTS synthesis, or model readiness.
+- **Independent Semantic Synchronization:**
+  ```text
+  User selects retained scene
+    -> Device visually focuses it immediately
+    -> Durable local focus state updates
+    -> Asynchronous notification updates backend Realtime context
+    -> Latest focus revision wins
+  ```
+- **Navigation Readiness:** Deterministic next/previous/first/last navigation is
+  unavailable until the complete manifest is accepted. Metadata-only scenes are
+  hydrated lazily through the existing exact-hash focus/content path and never
+  derive ordering from focus arrival.
+- **Grounding Invariant:** While local UI remains instantly responsive, before a
+  subsequent reasoning action uses canvas context (e.g., the child asking "what is
+  that part?"), the latest accepted focus must be authoritative. The backend
+  installs the authoritative focus into Realtime context before initiating
+  reasoning for subsequent turns.
 
-Assistant text is authoritative speech. A bounded streaming phrase parser
-releases complete sentences immediately and splits an unusually long sentence
-only at a safe whitespace boundary. Each released phrase is validated before
-ElevenLabs receives it. The parser never depends on JSON property order.
+---
 
-The optional function contains only:
+## 9. Canvas Interaction Model
+
+### Canonical Conversation Modes
+Interaction modes are strictly limited to four conversation-facing concepts:
+1. `NONE`: Purely static visual illustration.
+2. `EXPLORE`: Direct inspection and manipulation. Includes discrete tapping on
+   annotated parts as well as continuous controls (drag, slider, timeline).
+3. `SELECT`: Choosing one option among distinct visual alternatives.
+4. `STEPS`: Discrete, sequential progression with explicit Back/Next navigation.
+
+### Continuous Manipulation and Semantic Checkpoints
+Direct continuous manipulation (drag, slider, timeline) belongs to `EXPLORE`
+mode without inventing new conversation modes for each physical gesture:
+- **Local Frame-Rate Execution:** Pointer movement -> trusted client runtime ->
+  visual transform applied locally at display frame rate (60/120 Hz).
+- **No Raw Streaming:** Raw coordinates, pixel deltas, and continuous
+  floating-point values are never streamed to the backend or Realtime model.
+- **Bounded Semantic Checkpoints:** Continuous controls are bounded by
+  discrete, validated semantic checkpoints defined in visual metadata.
+- **Semantic Release to Binding:** Upon gesture release, the local runtime snaps
+  to the nearest validated checkpoint, which maps to an existing semantic
+  `bindingId`.
+- **Discrete Semantic Network Transmission:** The network communicates only the
+  resulting discrete semantic interaction (`bindingId`), never raw physical
+  motion.
+- **Format Decoupling:** The runtime contract requires only that client
+  continuous manipulation resolves to a discrete semantic binding ID on release.
+- **Inert SVG:** Provider SVG is inert static data. All interaction behavior,
+  touch hit testing, and visual state snapping are executed by trusted
+  application code.
+
+---
+
+## 10. Memory and Historical Retrieval
+
+### Delivered Ledger as Ground Truth
+The authoritative persistence store records only what the child actually
+experienced:
+- Delivered child and assistant speech turns;
+- Exact delivered text ranges (accounting for interruption);
+- Compact current-session summaries;
+- Allowlisted stable memory proposals backed by explicit turn provenance;
+- Read-time weekly topic/event records;
+- Tombstones and reset revision epochs.
+
+### Memory Retrieval Architecture
+Historical retrieval supplies supporting evidence, not autonomous reasoning:
 
 ```text
-request_interactive_canvas
-├── brief
-└── interactionGoal (optional)
+Eligible Subject / Reset Epoch Corpus
+  -> Lexical OR Candidate Retrieval
+  -> Corpus-Aware Continuous Ranking
+  -> Bounded Small Candidate Set (≤ 5 records)
+  -> OpenAI Realtime Evaluates Semantic Relevance
 ```
 
-The brief describes purpose, objects, relationships, flow, and essential labels.
-It is bounded to 600 characters; the optional interaction goal is bounded to
-160 characters. These limits align with the downstream specialist input rather
-than forcing ordinary semantic descriptions into an unrealistically small
-envelope.
-It never contains nodes, coordinates, paths, styles, scene IDs, revisions, SVG,
-or executable code. The backend validates the request and atomically reserves
-queue and spend capacity. It then sends exactly one `function_call_output` with
-the original call ID: either `accepted` with an application generation ID or a
-bounded rejection. Accepted means scheduled, never ready. Realtime continuation
-does not wait for Sol and must not claim the visual exists.
-
-If Realtime emits invalid arguments or the backend cannot reserve bounded work,
-the matching function output is rejected and speech continues. Later Sol,
-validation, document-fetch, renderer, presentation, interruption, or timeout
-failure produces a non-terminal `canvasRejected`, records the generation's
-bounded status for later context, and preserves the previous active scene.
-
-A successful or rejected optional canvas cannot invalidate already accepted
-speech, mute the microphone, or close the persistent conversation. After the
-immediate tool result, Realtime produces one short continuation with tool use
-disabled for that continuation, preventing recursive canvas calls.
-
-Memory proposals, summaries, avatar movement, and rendering details are not
-part of the live model response. The delivered sample ledger is authoritative;
-memory compaction happens independently after delivery and never gates speech.
-
-### 5.2 Turn phases
-
-The authoritative backend state machine is:
-
-```text
-created
--> connecting
--> listening
--> planning
--> synthesizing
--> speaking
--> completed
-
-Any non-terminal state
--> cancelling
--> cancelled
-
-Any non-terminal state
--> failed
-```
-
-Flutter mirrors these states but does not invent transitions. State changes are
-idempotent and revisioned.
-
-Connection, microphone intent, physical track state, turn state, canvas state,
-and memory state are independent. A failed turn cannot mute the WebRTC track or
-change the child's microphone choice. Only a genuine connection/media failure
-forces both off.
-
-Entering `speaking` is also the explicit end-of-synthesis boundary for the
-current PCM stream. Every `audioChunk` descriptor and its immediately following
-binary frame must arrive while the turn is `synthesizing`. Flutter rejects
-late audio after `speaking`; this lets native playback accept `finish` exactly
-once without racing a later append.
-
-## 6. Voice, alignment, and lip sync
-
-The first production format is signed 16-bit mono PCM at 24 kHz. It is larger
-than compressed audio but keeps playback accounting and lip-sync timing
-deterministic. Opus is a later optimization only after sample-accurate timing
-is proven across route changes.
-
-The backend opens one bounded ElevenLabs input-streaming WebSocket for each
-complete validated speech phrase. Phrase ownership is explicit, so an
-interruption closes the exact in-flight provider stream and no stale socket can
-revive later audio:
-
-1. authenticate with the selected voice/model/settings;
-2. send one complete validated phrase;
-3. flush that phrase immediately;
-4. decode provider audio;
-5. normalize alignment to text offsets and audio sample ranges;
-6. send binary PCM and normalized alignment to Flutter;
-7. close on phrase completion or cancel immediately on interruption/terminal
-   state.
-
-Character timing is not called phoneme timing. A deterministic alignment stage
-converts text/audio alignment into the VRM's supported viseme timeline. It may
-use a local/server phonemizer or forced aligner, but not another generative
-model. Unsupported or low-confidence phonemes resolve to a neutral mouth shape
-through an explicit mapping, not an unlabeled fallback.
-
-Flutter schedules:
-
-- audio from the native rendered-sample clock;
-- Ava captions from speech text offsets;
-- visemes from normalized phoneme/sample ranges;
-- expression/gaze/canvas cues from phrase anchors mapped to the same ranges.
-
-The current restrained avatar baseline remains: living idle, blink, eye
-contact, subtle expression, and lip sync. Touch remains independent.
-
-## 7. Barge-in and delivered speech
-
-External TTS makes interruption accounting essential.
-
-When Realtime reports that the child started speaking:
-
-1. the backend emits `interruptRequested`;
-2. Flutter applies a very short click-free fade and stops queued PCM;
-3. Flutter reports the final rendered sample index;
-4. the backend cancels the Realtime response and ElevenLabs stream;
-5. alignment maps the sample index to the last delivered text offset;
-6. pending canvas actions and unsaid segments are discarded;
-7. only the delivered Ava prefix is written to the conversation ledger.
-
-Provider conversation state is reconciled so a later response does not assume
-the unheard suffix was spoken. The backend deletes/replaces the interrupted
-provider item when the Realtime API permits it; otherwise the next model
-context explicitly states the delivered prefix and interruption. The backend
-ledger remains authoritative in either case.
-
-## 8. Dynamic SVG canvas
-
-### 8.1 Exact representation and validation
-
-Sol authors one complete static SVG document. The application model is a
-bounded exact document plus derived sidecars:
-
-```text
-SvgCanvasCandidate
-├── generationId
-├── base active scene/revision
-├── candidate scene/revision
-├── exact UTF-8 SVG bytes + SHA-256
-├── deterministic manifest bytes + SHA-256
-├── validator and renderer-capability versions
-├── viewBox and presentation metadata
-└── interaction/accessibility manifest
-```
-
-The backend extracts exactly one completed assistant `output_text` payload.
-Reasoning output items may coexist in the Responses object, but a refusal,
-additional assistant text payload, Markdown wrapper, incomplete response, or
-non-SVG document rejects the generation. The Unicode payload is UTF-8 encoded
-once. No whitespace stripping, Unicode/newline normalization, XML reserialization,
-attribute ordering, quote rewriting, or pretty printing is permitted.
-
-A hardened parser builds a separate inspection representation. It rejects
-DTDs/entities, provider scripts and handlers, `foreignObject`, external URLs,
-navigation, network content, unsupported CSS, invalid namespaces and IDs,
-non-finite data, unbounded XML/path/text/filter complexity, and cycles or
-excessive expansion through `use`, masks, clips, patterns, filters, and local
-references. The canonical capability manifest bounds both syntax and effective
-render-graph complexity.
-
-Runtime validation is safety, renderer compatibility, reference integrity,
-interaction integrity, accessibility, and resource bounds. It never changes
-the artwork or applies subjective composition rules. One bounded repair may
-send exact diagnostics back to Sol and require a complete replacement.
-
-### 8.2 Rendering and hit testing
-
-Flutter renders the canonical SVG directly. Renderer selection is gated by the
-frozen Sol corpus, pixel fidelity, required gradients/filters/clips/text,
-element-level hit testing, accessibility, Reduce Motion, frame/memory budgets,
-and iPhone/iPad/macOS consistency. Failure never switches automatically to the
-typed primitive renderer.
-
-Sol declares stable SVG element IDs and bounded `data-ava-*` binding metadata.
-The backend derives a deterministic hash-bound manifest without reconstructing
-the visual. The renderer returns the nearest validated binding element in paint
-order. If a direct Flutter renderer cannot provide element hit testing, the
-manifest must carry exact validated SVG-viewBox hit geometry. Flutter never
-guesses from labels or rebuilds the full SVG to recover geometry.
-
-Local presentation state may reveal, toggle, focus, drag, reset, select, or
-animate through fixed application-owned behavior. Provider code never runs.
-Compact hit areas expand to at least 44 physical points without changing the
-visible artwork. Repeated interactions restart their small local response and
-remain provider-free.
-
-### 8.3 Independent delivery and end-to-end activation
-
-SVG delivery uses an independently authenticated document lane so it cannot
-head-of-line block PCM. A control event announces candidate identity, exact
-length, hashes, capability version, and scoped document identity. Flutter
-fetches with an authorization header, verifies exact bytes, preloads the
-renderer, and returns `canvasDocumentPrepared` with the same generation and
-hash tuple.
-
-Prepared does not mean active. The coordinator chooses a validated speech
-phrase/segment anchor and maps it through ElevenLabs alignment and the
-delivered-text ledger to a rendered sample. Flutter presents the candidate at
-that cue, reports `canvasPresented` after a successful rendered frame, and
-waits for `canvasActivated` before sending semantic interactions for the new
-revision. Only the presented acknowledgement promotes the backend scene.
-
-At most one candidate generation may target a session at a time. Candidate
-prepare/activation uses compare-and-swap against its base active revision.
-Supersession, stale base, fetch or renderer failure, interruption, disconnect,
-timeout, or cancellation before presentation discards the candidate and leaves
-the previous active scene unchanged. If the cue sample already passed before
-preload completed, presentation is requested immediately.
-
-### 8.4 Session ownership and interactions
-
-Canvas state belongs to one persistent realtime conversation session, not to a
-child profile or the turn that requested it. Flutter retains the active SVG
-across turns and clears it for a new session. Closing the panel does not delete
-the active scene.
-
-Local reveal, toggle, reset, state, focus, and drag actions do not emit provider
-events. Semantic `explore`, `select`, and `submitOutcome` controls carry only
-session ID, scene ID, active scene revision, interaction revision, binding ID,
-and bound content identity. The backend resolves the label, description, and
-declared value from its canonical manifest. Client-authored text, coordinates,
-and values never enter model context.
-
-Scene and interaction revisions increase independently. A stale scene,
-mismatched SVG/manifest hash, unknown binding, or replay emits a non-terminal
-`interactionRejected` session event. It cannot fail a speaking turn, close the
-event socket, stop audio, or change microphone intent.
-
-Realtime receives only a bounded semantic view of the active presented scene
-and last validated semantic interaction. Title, description, and manifest text
-remain untrusted model-generated data: control characters are removed, fields
-are bounded and data-encoded, and the prompt explicitly forbids following any
-instructions found inside them. Realtime never receives SVG geometry.
-
-## 9. Memory and persistence
-
-The existing persistence adapter can be evolved rather than tied permanently
-to Supabase. The logical store needs:
-
-- authenticated installation/parent subject;
-- Ava session metadata;
-- child turn summary or transcript when available;
-- generated Ava segments;
-- delivered text range and terminal status;
-- validated stable-memory proposals with provenance;
-- current-session summary;
-- weekly topic/event summaries;
-- reset tombstone/audit metadata.
-
-Raw audio is not persisted by default. Raw transcripts are retained only for a
-defined short window and are excluded from normal logs. Long-term memory uses
-compact typed summaries.
-
-The provider receives:
-
-- derived age band;
-- short delivered-turn context;
-- approved stable interests/preferences;
-- current-session summary;
-- current canvas state only when needed.
-
-It does not receive the child's name, exact date of birth, database IDs,
-location, or parent account details.
-
-Conversation reset deletes conversation turns, summaries, and derived memory
-for that profile. It preserves the profile and app settings. Reset must cover
-both device cache and backend persistence and return a completion revision;
-local success without cloud success is an error.
-
-## 10. Authentication and child privacy
-
-The current loopback authenticator is development-only. Production needs:
-
-- a parent/installation identity flow;
-- short-lived backend access tokens;
-- refresh/revocation;
-- per-subject and per-device rate limits;
-- App Attest/DeviceCheck or equivalent abuse protection on Apple platforms;
-- deletion/export procedures;
-- a documented retention schedule and parental consent flow;
-- regional/privacy review before collecting child data.
-
-The existing server-side Supabase adapter is acceptable for the first
-deployment if authentication and row ownership are completed. The service-role
-key remains backend-only. A public client key, if used by Supabase Auth, is not
-a model-provider secret.
-
-## 11. Safety
-
-Safety is layered:
-
-- prompt and relationship policy;
-- bounded function schema;
-- input/output safety classification available through the same OpenAI
-  account when required;
-- backend rules for prohibited memory and canvas content;
-- provider safety/refusal events;
-- child-safe error and redirect language;
-- offline red-team and regression suites;
-- parent-accessible reset and data controls.
-
-The app must not imply that Ava is human, encourage secrets or exclusivity, or
-replace trusted adults. Immediate-danger responses should be calm and direct.
-Exact hotline content is locale-sensitive and must come from an approved
-locale-aware source when implemented.
-
-## 12. Failure behavior
-
-Failures are typed and visible in telemetry and UI state:
-
-- authentication/authorization failure;
-- WebRTC negotiation or sideband failure;
-- provider rate limit/timeout/unavailable;
-- malformed or unsafe tool arguments;
-- ElevenLabs connection/audio/alignment failure;
-- protocol sequence/revision failure;
-- canvas validation/render failure;
-- persistence failure;
-- playback/route failure;
-- cancellation timeout.
-
-There is no switch to platform TTS, canned model response, fixed diagram, or
-different voice. Optional components can fail independently:
-
-- invalid canvas: valid speech may continue, `canvasRejected` is emitted, and
-  the panel stays closed;
-- memory write failure: emit non-terminal `memoryPersistenceFailed`, then the
-  normal spoken terminal event; the app exposes a persistent retry-required
-  memory state without failing speech or media;
-- weekly recap failure: existing recap remains marked stale.
-
-## 13. Latency and backpressure
-
-Measure at least:
-
-- microphone-to-VAD-end;
-- VAD-end-to-first assistant-text delta;
-- first delta-to-first valid phrase;
-- valid segment-to-first TTS byte;
-- first TTS byte-to-first rendered sample;
-- speech/canvas cue drift;
-- interruption-to-silence;
-- total turn time.
-
-Targets are set after device measurements, not guessed in code. The first
-auditable goal is a median first-audio latency near natural conversational
-turn-taking and a consistently short interruption-to-silence time.
-
-All queues are bounded:
-
-- Realtime text/tool-event buffer;
-- TTS text queue;
-- decoded PCM ring buffer;
-- outbound event queue;
-- canvas generation queue;
-- canvas preload queue;
-- persistence retry queue.
-
-Backpressure pauses upstream text flushing or cancels the turn. It never grows
-memory without bound.
-
-## 14. Cost controls
-
-- Default to the mini Realtime model.
-- Keep the stable prompt/tool prefix identical to maximize provider caching.
-- Keep responses naturally short.
-- Do not send avatar frames, touch events, or render state to a model.
-- Call the canvas specialist only after Realtime semantically selects
-  `request_interactive_canvas`.
-- Cap audio duration, silence, response characters, canvas complexity, session
-  length, and daily account spend.
-- Evaluate Sol reasoning effort against the frozen representative visual corpus;
-  do not lower it without measured quality parity.
-- Cancel provider work immediately on disconnect or interruption.
-- Record per-turn provider usage and cost estimates by model/voice.
-- Gate live integration/evaluation tests behind an explicit spend flag.
-
-Current provider prices and model availability must be read from official
-documentation at deployment time; do not bake historical prices into product
-logic.
-
-## 15. Observability
-
-Structured telemetry uses session/turn/request IDs and phase timings. It may
-include:
-
-- model/voice configuration identifiers;
-- token/audio usage;
-- segment and canvas counts;
-- canvas generation state, exact byte count, hashes, validator/capability
-  versions, fetch/preload/presentation latency, and rejection codes;
-- validation error codes;
-- queue depth/high-water marks;
-- playback underruns and cue drift;
-- cancellation and reconnect results;
-- provider request IDs.
-
-It must not include API keys, raw audio, exact birth dates, full child names,
-raw SVG, semantic-brief contents, or unrestricted transcript text. Development
-content logging is opt-in, redacted, and disabled in release builds.
-
-The development backend also writes rotating JSON Lines diagnostics to
-`backend/.logs/ava-backend.jsonl` (or `AVA_DEVELOPMENT_LOG_PATH` when
-configured). Every turn failure carries a safe `failureId`, `component`,
-session ID, and turn ID so an on-screen failure can be correlated without
-showing child data. Canvas rejection and memory persistence warnings are turn
-events and must not close or mute the persistent conversation; only a genuine
-WebRTC, event-WebSocket, or media failure may tear it down.
-
-`/health/ready` reports the running build version and instance ID, a source
-revision/currentness check, protocol version, Realtime prompt version,
-Realtime tool-contract version, and canvas-specialist prompt version. A source
-tree changed after process startup reports `503 stale`, making an old backend
-process explicit instead of silently serving an obsolete prompt or schema.
-
-## 16. Deployment configuration
-
-Two provider secrets are required only for live provider integration:
-
-- `AVA_OPENAI_API_KEY`;
-- `AVA_ELEVENLABS_API_KEY`.
-
-Production also needs non-provider configuration:
-
-- exact ElevenLabs voice ID and model ID;
-- documented voice commercial-use approval;
-- database URL and server credential;
-- auth signing/verification configuration;
-- safety hash secret;
-- allowed origins/hosts;
-- rate and spend limits;
-- telemetry destination and redaction policy.
-
-No key is needed to build the protocol, fake session coordinator, canvas,
-renderer, state machine, cancellation tests, or local playback fixtures.
-
-## 17. Authoritative external references
-
-- [OpenAI Realtime guide](https://developers.openai.com/api/docs/guides/realtime)
-- [OpenAI Realtime function calling](https://developers.openai.com/api/docs/guides/realtime-conversations#function-calling)
-- [OpenAI Realtime server controls and sideband](https://developers.openai.com/api/docs/guides/realtime-server-controls)
-- [OpenAI gpt-realtime-2.1-mini](https://developers.openai.com/api/docs/models/gpt-realtime-2.1-mini)
-- [OpenAI gpt-5.6-sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol)
-- [OpenAI gpt-transcribe](https://developers.openai.com/api/docs/models/gpt-transcribe)
-- [OpenAI API pricing](https://developers.openai.com/api/docs/pricing)
-- [ElevenLabs realtime TTS WebSocket guide](https://elevenlabs.io/docs/eleven-api/guides/how-to/websockets/realtime-tts)
-- [ElevenLabs input-streaming TTS API](https://elevenlabs.io/docs/api-reference/text-to-speech/v-1-text-to-speech-voice-id-stream-input)
+1. **No Application Semantic Classifier:** Application code performs lexical
+   candidate matching and continuous ranking. It never acts as a binary semantic
+   classifier.
+2. **Continuous Ranking:** Candidates are ranked on a continuous scale; arbitrary
+   binary admission filters that drop relevant data are forbidden.
+3. **Reasoning Owns Relevance:** Realtime receives the top candidates via the
+   `search_memory` tool output and decides whether they apply to the conversation.
+4. **Subsystem Decoupling:** Memory retrieval failure or empty results must
+   never delay, degrade, or cancel active speech.
+
+### Conversation Reset and Weekly Recap
+- **Reset:** Initiated from settings. Executes an authenticated backend deletion
+  of turns, summaries, and derived memories, followed by a matching local cache
+  purge. Profile configuration, DOB, captions toggle, and avatar customization
+  are preserved.
+- **Weekly Recap:** A purely factual synthesis of stored topics and events. It
+  must never diagnose, score, evaluate academic mastery, or assign emotional
+  labels to the child.
+
+---
+
+## 11. Failure Isolation and Cancellation
+
+### Failure Independence Principles
+A failure in an optional subsystem must never retroactively fail or invalidate
+unrelated successful operations:
+- **Canvas Generation Failure ≠ Speech Failure:** If the specialist times out,
+  violates validation, or rejects generation, speech continues uninterrupted.
+  The backend emits a non-terminal `canvasRejected` event, and the canvas panel
+  remains closed or preserves the prior active scene.
+- **Memory Persistence Failure ≠ Speech Failure:** A database write failure
+  emits `memoryPersistenceFailed`. The turn completes normally on the presentation
+  plane and the child hears Ava's full response.
+- **Focus Sync Delay ≠ UI Freeze:** Latency in synchronizing canvas focus
+  with Realtime never freezes local workspace navigation.
+- **Renderer Failure ≠ Session Teardown:** A rendering exception in the SVG
+  view emits `canvasRuntimeFailed`, resets canvas state, and keeps the audio
+  session open.
+- **Stale Async Callback ≠ Fatal Error:** Late events arriving from
+  superseded turns or cancelled streams are dropped cleanly without tearing down
+  the persistent WebSocket connection.
+
+### Conceptual Failure Categories
+Runtime failures are categorized strictly by their boundary and mapped to
+typed subsystem categories rather than generic catch-alls:
+- **Authentication and Session Authorization:** Invalid, expired, or mismatched
+  session tokens and bearer credentials.
+- **Transport and Media Connectivity:** WebRTC ICE failure, media track loss,
+  or event WebSocket disconnection.
+- **Conversational Brain Protocol & Parser:** Malformed Realtime frames, schema
+  contract violations, or unrecoverable sideband protocol errors.
+- **Provider Availability & Capacity:** Upstream rate limits, HTTP 429/503 status,
+  or connection timeouts.
+- **Speech Synthesis & Streaming:** ElevenLabs WebSocket connection drops,
+  synthesis stalls, or alignment parse errors.
+- **Canvas Specialist & Validation:** Specialist generation timeout, output token
+  exhaustion, SVG schema/security rejection, or quality repair failure.
+- **Canvas Client Preparation & Presentation:** Scoped SVG document fetch failure,
+  renderer rasterization failure, or presentation cue sample expiration.
+- **Canvas State Machine & Synchronization:** Stale candidate transitions, content
+  hash mismatches, or out-of-order interaction revisions.
+- **Authoritative Persistence:** Database connectivity failure, pool timeouts,
+  constraint violations, or reset revision epoch mismatches.
+
+---
+
+## 12. Privacy and Security
+
+### Child Privacy Safeguards
+- **Zero Audio Persistence:** Raw child microphone audio is processed in memory
+  and never saved to disk or durable object storage.
+- **PII Exclusion:** The child's full name and exact date of birth are stored
+  exclusively on the local device. The backend receives only an age band (e.g.,
+  `child_5_7`).
+- **Telemetry Redaction:** Normal production logs must never contain raw speech
+  transcripts, child names, or SVG payloads. Diagnostic logs use anonymous
+  identifiers (`sessionId`, `turnId`, `failureId`).
+
+### Untrusted SVG Execution Boundary
+SVG documents authored by the specialist are treated as untrusted data:
+- Rendered in a sandbox prohibiting script execution, plugins, and network
+  requests.
+- Hardened validator blocks namespace abuse, remote image references, and
+  HTML embedding.
+- Canonical bytes are verified with SHA-256 before client presentation.
+
+---
+
+## 13. Resource, Cost, and Latency Principles
+
+### Latency Discipline
+- Fast audio start: Stream bounded speech phrases to ElevenLabs immediately.
+- Turn-taking latency: First-audio latency is engineered to approximate natural
+  human conversational turn-taking.
+- Interruption to silence: Minimizing interruption-to-silence latency is critical
+  to natural conversation; exact SLO targets are established through physical
+  device benchmarks across supported hardware, not assumed in code.
+
+### Cost Controls
+- Default model: `gpt-realtime-2.1-mini`.
+- Canvas specialist (`gpt-5.6-terra`) is called **only** when Realtime emits
+  `request_interactive_canvas`. No-canvas conversational turns incur zero visual
+  token spend.
+- Strict token output caps and generation timeouts on all provider calls.
+- Static prompt prefixes are kept byte-identical across requests to maximize
+  provider prompt caching.
+- Avatar motion, idle blinking, touch interactions, and continuous canvas
+  scrubbing require zero provider API calls.
+
+### Constant Classification
+Every threshold and limit in the codebase must belong to one of four defensible
+categories:
+1. **PROTOCOL:** Mandated by external protocol schemas (e.g., PCM 24 kHz mono
+   signed 16-bit audio, WebSocket framing).
+2. **PRODUCT:** Defined by explicit product requirements (e.g., maximum 10
+   retained canvas workspace scenes, 2-minute warm pause window).
+3. **SAFETY/RESOURCE:** Enforcing memory, token, or hardware bounds (e.g., 384 KB
+   SVG byte cap, 1000-character canvas brief, 20,000 max specialist output
+   tokens, max 5 search memory references).
+4. **ALGORITHMIC:** Deterministic mathematical rules (e.g., corpus-aware
+   continuous ranking weights in memory candidate retrieval).
+
+Arbitrary numbers introduced without categorization are prohibited.
+
+---
+
+## 14. Current Provider Configuration
+
+Architectural responsibility is strictly separated from deployment configuration.
+Provider model identifiers and voice settings are configuration parameters,
+not immutable architectural invariants.
+
+| Subsystem | Architectural Responsibility | Current Deployment Configuration |
+|---|---|---|
+| Conversational Brain | OpenAI Realtime (child audio input, text-only output, turn detection, tool calling) | Model: `gpt-realtime-2.1-mini`<br/>Server VAD enabled |
+| Voice Synthesis | ElevenLabs Realtime TTS (streaming WebSocket, normalized audio/character alignment) | Voice ID: `AVA_ELEVENLABS_VOICE_ID`<br/>Model ID: `AVA_ELEVENLABS_MODEL_ID`<br/>Format: `pcm_24000` (24 kHz 16-bit mono PCM) |
+| Input Transcription | OpenAI Realtime Sideband (committed child audio item transcription) | Model: `gpt-transcribe` |
+| Canvas Specialist | OpenAI Responses (visual SVG composition and authorship) | Model: `gpt-5.6-terra`<br/>Reasoning effort: `medium`, max output: 20,000 tokens |
+| Durable Store | Portable relational persistence store | PostgreSQL / Supabase adapter with pooled async connections |
+
+---
+
+## 15. Non-Goals and Forbidden Architectures
+
+The following designs have been explicitly rejected and must never be reintroduced:
+- **Two AI Planners:** Having a secondary model independently plan canvas or
+  activity steps outside Realtime's conversational context.
+- **Keyword-Based Routing:** Regex or string scanning on child text to trigger
+  visuals or change modes.
+- **Fixed Diagram Catalogs:** Hardcoded catalogs of diagrams, clip art, or
+  predefined templates.
+- **Executable UI Generation:** Asking models to produce Flutter code, HTML, CSS,
+  or JavaScript.
+- **Platform Speech Fallbacks:** Falling back to Apple Speech or device TTS on
+  provider failure (Ava fails visibly and cleanly).
+- **Coupled Lifetimes:** Tying canvas generation lifetime to speech playback
+  such that an interruption destroys an accepted visual.
+- **Raw Coordinate Streaming:** Sending high-frequency touch positions or slider
+  percentages over the network to Realtime.

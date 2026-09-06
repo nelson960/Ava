@@ -25,10 +25,11 @@ final class AvaSvgCanvasPanel extends StatelessWidget {
     final controller = host.controller;
     final liveActive = controller?.active?.document;
     final hasPending = controller?.hasPendingVisual ?? false;
+    final mayFocus = controller?.generationMayFocus ?? true;
     final isPendingNew =
-        hasPending && controller?.generation?.operation == 'new';
+        hasPending && mayFocus && controller?.generation?.operation == 'new';
     final active = isPendingNew ? null : (liveActive ?? host.presentedDocument);
-    final draft = controller?.draft?.document;
+    final draft = mayFocus ? controller?.draft?.document : null;
     final candidate = controller?.candidate?.document;
     if (active == null && !hasPending) return const SizedBox.shrink();
 
@@ -43,7 +44,6 @@ final class AvaSvgCanvasPanel extends StatelessWidget {
 
     final interactionsEnabled = liveActive != null &&
         focusSynchronized &&
-        !host.focusTransitionPending &&
         !hasPending &&
         !isMaskActive &&
         (controller?.activeRendererHealthy ?? false);
@@ -143,6 +143,8 @@ final class AvaSvgCanvasPanel extends StatelessWidget {
                     activeDocument: active,
                     draft: draft,
                     candidate: candidate,
+                    foregroundCandidate: mayFocus,
+                    onCandidateRetained: () => liveController()?.retainPreparedCandidate(),
                     presentCandidate:
                         liveController()?.shouldPresentCandidate ?? false,
                     interactionsEnabled: interactionsEnabled,

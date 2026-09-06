@@ -190,10 +190,12 @@ async def test_restored_focused_canvas_is_in_initial_provider_context() -> None:
         coordinator.restore_focused_canvas(restored)
         await coordinator.negotiate(offer_sdp=DETERMINISTIC_AUDIO_OFFER_SDP)
 
-        assert state.active is restored
+        assert state.focused_scene is restored
+        assert state.active is None
         assert len(realtime.prepared_session_updates) == 1
         instructions = realtime.prepared_session_updates[0]["session"]["instructions"]
         assert isinstance(instructions, str)
+        assert "<retained_visuals" in instructions
         assert state.render_realtime_context() in instructions
     finally:
         await coordinator.close()

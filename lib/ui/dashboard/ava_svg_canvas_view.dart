@@ -33,6 +33,8 @@ final class AvaSvgCanvasView extends StatefulWidget {
     required this.draft,
     required this.candidate,
     required this.presentCandidate,
+    this.foregroundCandidate = true,
+    this.onCandidateRetained,
     required this.interactionsEnabled,
     required this.onDraftPresented,
     required this.onCandidatePrepared,
@@ -46,6 +48,8 @@ final class AvaSvgCanvasView extends StatefulWidget {
   final AvaValidatedSvgCanvasDraft? draft;
   final AvaValidatedSvgCanvasDocument? candidate;
   final bool presentCandidate;
+  final bool foregroundCandidate;
+  final VoidCallback? onCandidateRetained;
   final bool interactionsEnabled;
   final ValueChanged<AvaValidatedSvgCanvasDraft> onDraftPresented;
   final ValueChanged<AvaValidatedSvgCanvasDocument> onCandidatePrepared;
@@ -481,6 +485,13 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
         'candidateSync.started',
         generationId: candidate.descriptor.generationId,
       );
+      if (!widget.foregroundCandidate) {
+        final retained = widget.onCandidateRetained;
+        if (retained == null) throw StateError('Background retention callback is unavailable.');
+        _presentedCandidateGenerationId = candidate.descriptor.generationId;
+        retained();
+        return;
+      }
       final identity = _candidateIdentity(candidate);
       await _evaluateUntilBridge(
         controller: controller,
@@ -508,7 +519,7 @@ class _AvaSvgCanvasViewState extends State<AvaSvgCanvasView> {
       final identity = _candidateIdentity(candidate);
       await _evaluateUntilBridge(
         controller: controller,
-        source: _renderer.presentCandidateScript(candidate),
+        source: _renderer.presentCandidateScript(candidate, foreground: widget.foregroundCandidate),
         settlements: _candidatePresentationSettlements,
         identity: identity,
         operation: 'candidate presentation',
