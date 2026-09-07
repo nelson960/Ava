@@ -65,6 +65,7 @@ class LiveRealtimeCoordinatorFactoryV4:
     ) -> RealtimeSessionCoordinatorV4:
         safety_id = self._safety_identifier(subject)
         realtime = OpenAIRealtimeProviderSession(
+            session_id=session_id,
             api_key=self._api_key,
             model=self._settings.openai_realtime_model,
             transcription_model=(self._settings.openai_realtime_transcription_model),

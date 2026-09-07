@@ -7,8 +7,10 @@ from builtins import anext
 import json
 import logging
 from collections import deque
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from types import MethodType
+from uuid import UUID
 
 import httpx
 import pytest
@@ -17,7 +19,9 @@ from websockets.frames import Close
 
 from ava_backend.canvas.svg_workspace import RecordedSvgCanvasInteraction
 from ava_backend.protocol import AgeBand
+from ava_backend.providers import openai_realtime_provider
 from ava_backend.providers.openai_realtime_provider import (
+    MAX_OPENAI_REALTIME_CLIENT_ITEM_ID_CHARS,
     OpenAIRealtimeProbeRequest,
     OpenAIRealtimeProtocolError,
     OpenAIRealtimeConnectionClosedError,
@@ -37,6 +41,7 @@ from ava_backend.realtime.memory import AuthoritativeMemorySnapshot
 from ava_backend.realtime.provider_session import (
     RealtimeContextInstallationStatus,
     RealtimeNegotiationResponseError,
+    RealtimeProviderInputEvent,
     RealtimeProviderResponseIncompleteError,
 )
 from ava_backend.realtime.tool_contract import (
@@ -90,6 +95,7 @@ async def test_sdp_negotiation_failure_logs_content_free_provider_metadata(
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         provider = OpenAIRealtimeProviderSession(
+            session_id="session-negotiation-test",
             api_key="sk-test-secret-must-not-be-logged",
             model="gpt-realtime-test",
             safety_identifier="test_child_0001",
@@ -519,6 +525,7 @@ def _channel(
         max_output_tokens=max_output_tokens,
         turn_timeout_seconds=5,
         provider_call_id=provider_call_id,
+        session_id="session-provider-test",
     )
     _TEST_CHANNELS.add(channel)
     return channel, socket
@@ -648,6 +655,81 @@ async def test_pending_input_is_admitted_by_item_id_at_next_turn_boundary() -> N
     assert admitted == ("item-barge-in",)
     assert await channel.child_transcript_for_turn("turn-b") == "What happens next?"
     assert await channel.child_transcript_for_turn("turn-a") is None
+    await channel.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_started_input_admission_precedes_item_observation_cleanly() -> (
+    None
+):
+    channel, socket = _channel(
+        [
+            {
+                "type": "input_audio_buffer.speech_started",
+                "item_id": "item-owner-before-commit",
+                "audio_start_ms": 120,
+            }
+        ]
+    )
+    await channel.start_receiver()
+    await socket.wait_received(1)
+
+    assert await channel.admit_pending_input_items(
+        turn_id="turn-owner-before-commit"
+    ) == ("item-owner-before-commit",)
+    assert (
+        channel.input_item_owner(item_id="item-owner-before-commit")
+        == "turn-owner-before-commit"
+    )
+    assert channel.conversation_ledger.item("item-owner-before-commit") is None
+    assert channel.session_health.provider_item_observation_complete is True
+
+    socket.push(
+        {
+            "type": "input_audio_buffer.committed",
+            "item_id": "item-owner-before-commit",
+        }
+    )
+    socket.push(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "item-owner-before-commit",
+            "transcript": "Where do rainbows come from?",
+            "usage": {
+                "type": "tokens",
+                "input_tokens": 8,
+                "input_token_details": {"text_tokens": 0, "audio_tokens": 8},
+                "output_tokens": 3,
+                "total_tokens": 11,
+            },
+        }
+    )
+    await socket.wait_received(3)
+
+    observed_started = await channel.next_input_event()
+    observed_committed = await channel.next_input_event()
+    assert observed_started == RealtimeProviderInputEvent(
+        event_type="input_audio_buffer.speech_started",
+        item_id="item-owner-before-commit",
+        audio_start_ms=120,
+    )
+    assert observed_committed == RealtimeProviderInputEvent(
+        event_type="input_audio_buffer.committed",
+        item_id="item-owner-before-commit",
+    )
+    item = channel.conversation_ledger.item("item-owner-before-commit")
+    assert item is not None
+    assert item.local_turn_id == "turn-owner-before-commit"
+    assert item.logical_group_id == "turn:turn-owner-before-commit"
+    assert item.input_transcription_usage is not None
+    assert item.input_transcription_usage.local_turn_id == "turn-owner-before-commit"
+    latest_transcription_usage = channel.session_health.latest_input_transcription_usage
+    assert latest_transcription_usage is not None
+    assert latest_transcription_usage.local_turn_id == "turn-owner-before-commit"
+    assert channel.session_health.provider_item_observation_complete is True
+    assert channel._receiver_error is None
+    assert channel._receiver_task is not None
+    assert channel._receiver_task.done() is False
     await channel.close()
 
 
@@ -1504,17 +1586,24 @@ async def test_cancel_preserves_transcription_progress_for_its_committed_item(
         "model": "gpt-realtime-test",
         "usageScope": "response",
         "providerCallId": "rtc_cancel_usage",
+        "sessionId": "session-provider-test",
         "responseId": RESPONSE_ID,
         "turnId": "turn-cancelled",
         "activeContextBuildId": "ctx-1",
         "inputTokens": 3,
         "cachedInputTokens": 2,
+        "uncachedInputTokens": 1,
         "inputTextTokens": 3,
         "inputAudioTokens": 0,
         "outputTokens": 0,
         "outputTextTokens": 0,
         "outputAudioTokens": 0,
         "totalTokens": 3,
+        "observedProviderItemCount": 1,
+        "responseCount": 2,
+        "responseCountComplete": True,
+        "functionCallCount": 0,
+        "continuationCount": 0,
     }
 
 
@@ -1980,34 +2069,48 @@ async def test_canvas_call_gets_one_output_then_tool_disabled_continuation(
             "model": "gpt-realtime-test",
             "usageScope": "response",
             "providerCallId": "rtc_usage_canvas",
+            "sessionId": "session-provider-test",
             "responseId": RESPONSE_ID,
             "turnId": "turn-canvas",
             "activeContextBuildId": "ctx-1",
             "inputTokens": 10,
             "cachedInputTokens": 2,
+            "uncachedInputTokens": 8,
             "inputTextTokens": 10,
             "inputAudioTokens": 0,
             "outputTokens": 4,
             "outputTextTokens": 4,
             "outputAudioTokens": 0,
             "totalTokens": 14,
+            "observedProviderItemCount": 0,
+            "responseCount": 2,
+            "responseCountComplete": True,
+            "functionCallCount": 0,
+            "continuationCount": 0,
         },
         {
             "provider": "openai",
             "model": "gpt-realtime-test",
             "usageScope": "response",
             "providerCallId": "rtc_usage_canvas",
+            "sessionId": "session-provider-test",
             "responseId": CONTINUATION_RESPONSE_ID,
             "turnId": "turn-canvas",
             "activeContextBuildId": "ctx-1",
             "inputTokens": 6,
             "cachedInputTokens": 2,
+            "uncachedInputTokens": 4,
             "inputTextTokens": 6,
             "inputAudioTokens": 0,
             "outputTokens": 3,
             "outputTextTokens": 3,
             "outputAudioTokens": 0,
             "totalTokens": 9,
+            "observedProviderItemCount": 0,
+            "responseCount": 2,
+            "responseCountComplete": True,
+            "functionCallCount": 0,
+            "continuationCount": 1,
         },
     ]
     for sentinel in (brief_sentinel, speech_sentinel, continuation_sentinel):
@@ -4582,4 +4685,446 @@ async def test_request_child_response_successful_readiness_commits_exactly_once(
         e for e in socket.sent if e.get("type") == "response.create"
     ]
     assert len(response_create_events_after) == 1
+    await channel.close()
+
+
+@pytest.mark.asyncio
+async def test_client_conversation_item_ids_are_unique_and_provider_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generated_uuids = iter([UUID(hex="1" * 32), UUID(hex="2" * 32)])
+    monkeypatch.setattr(
+        openai_realtime_provider,
+        "uuid4",
+        lambda: next(generated_uuids),
+    )
+    channel, socket = _channel([])
+    item = {
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "test input"}],
+    }
+
+    first_item_id = await channel._create_conversation_item(
+        turn_id="turn-client-item-1",
+        item=item,
+    )
+    second_item_id = await channel._create_conversation_item(
+        turn_id="turn-client-item-2",
+        item=item,
+    )
+
+    assert first_item_id
+    assert first_item_id.startswith("ava_")
+    assert len(first_item_id) == MAX_OPENAI_REALTIME_CLIENT_ITEM_ID_CHARS
+    assert len(second_item_id) <= MAX_OPENAI_REALTIME_CLIENT_ITEM_ID_CHARS
+    assert first_item_id != second_item_id
+    created_item_ids = [
+        event["item"]["id"]
+        for event in socket.sent
+        if event.get("type") == "conversation.item.create"
+    ]
+    assert created_item_ids == ["ava_" + "1" * 28, "ava_" + "2" * 28]
+    await channel.close()
+
+
+@pytest.mark.asyncio
+async def test_provider_ledger_and_health_follow_the_owned_tool_continuation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.openai_realtime")
+    arguments = json.dumps(
+        {
+            "operation": "new",
+            "brief": "Show the water cycle.",
+            "interactionMode": "none",
+        },
+        separators=(",", ":"),
+    )
+    initial_response = _canvas_response_events(arguments=arguments)
+    function_added = initial_response[2]["item"]
+    assert isinstance(function_added, dict)
+    function_added["id"] = "item-function-call"
+    done_response = initial_response[-1]["response"]
+    assert isinstance(done_response, dict)
+    output = done_response["output"]
+    assert isinstance(output, list)
+    assert isinstance(output[0], dict)
+    assert isinstance(output[1], dict)
+    output[0]["id"] = "item-assistant-preamble"
+    output[1]["id"] = "item-function-call"
+
+    channel, socket = _channel(
+        [
+            {
+                "type": "rate_limits.updated",
+                "rate_limits": [
+                    {
+                        "name": "tokens",
+                        "limit": 50_000,
+                        "remaining": 49_000,
+                        "reset_seconds": 1.5,
+                    },
+                    {
+                        "name": "requests",
+                        "limit": 300,
+                        "remaining": 299,
+                        "reset_seconds": 0.2,
+                    },
+                    {
+                        "name": "future_limit",
+                        "limit": 1,
+                        "remaining": 1,
+                        "reset_seconds": 0,
+                    },
+                ],
+            },
+            {
+                "type": "input_audio_buffer.committed",
+                "item_id": "item-child-input",
+            },
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "item-child-input",
+                "transcript": "",
+                "usage": {
+                    "type": "tokens",
+                    "input_tokens": 8,
+                    "input_token_details": {
+                        "text_tokens": 0,
+                        "audio_tokens": 8,
+                    },
+                    "output_tokens": 2,
+                    "total_tokens": 10,
+                },
+            },
+            *initial_response,
+        ],
+        provider_call_id="rtc-ledger-health",
+    )
+    iterator = channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-ledger-health",
+    ).__aiter__()
+
+    committed = await anext(iterator)
+    assert committed == RealtimeCommittedInput(
+        turn_id="turn-ledger-health",
+        item_id="item-child-input",
+    )
+    assert await channel.request_child_response(
+        turn_id=committed.turn_id,
+        item_id=committed.item_id,
+    )
+    assert await anext(iterator) == RealtimeSpeechTextDelta(
+        delta="I’ll show that clearly. "
+    )
+    call = await anext(iterator)
+    assert isinstance(call, RealtimeCanvasToolCall)
+    await channel.complete_canvas_tool(
+        turn_id="turn-ledger-health",
+        call_id=call.call_id,
+        output=InteractiveCanvasToolOutput.model_validate(
+            {
+                "status": "ready",
+                "sceneId": "water_cycle",
+                "revision": 1,
+                "summary": "A water-cycle scene is ready.",
+            }
+        ),
+    )
+    function_output_request = next(
+        event
+        for event in reversed(socket.sent)
+        if event.get("type") == "conversation.item.create"
+        and isinstance(event.get("item"), dict)
+        and event["item"].get("type") == "function_call_output"
+    )
+    function_output_item = function_output_request["item"]
+    assert isinstance(function_output_item, dict)
+    function_output_item_id = function_output_item["id"]
+    assert isinstance(function_output_item_id, str)
+    assert function_output_item_id.startswith("ava_")
+    assert len(function_output_item_id) <= MAX_OPENAI_REALTIME_CLIENT_ITEM_ID_CHARS
+    socket.push(
+        {
+            "type": "conversation.item.added",
+            "item": {
+                "id": function_output_item_id,
+                "type": "function_call_output",
+                "call_id": FUNCTION_CALL_ID,
+                "output": '{"status":"ready"}',
+            },
+        }
+    )
+    socket.push(
+        {
+            "type": "response.created",
+            "response": {"id": CONTINUATION_RESPONSE_ID},
+        }
+    )
+    socket.push(
+        {
+            "type": "response.output_item.added",
+            "response_id": CONTINUATION_RESPONSE_ID,
+            "item": {
+                "id": "item-assistant-continuation",
+                "type": "message",
+                "role": "assistant",
+            },
+        }
+    )
+    socket.push(
+        {
+            "type": "response.output_text.delta",
+            "response_id": CONTINUATION_RESPONSE_ID,
+            "item_id": "item-assistant-continuation",
+            "delta": "Here it is.",
+        }
+    )
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": CONTINUATION_RESPONSE_ID,
+                "status": "completed",
+                "output": [
+                    {
+                        "id": "item-assistant-continuation",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Here it is."}],
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 3,
+                    "total_tokens": 15,
+                    "input_token_details": {
+                        "cached_tokens": 5,
+                        "text_tokens": 12,
+                        "audio_tokens": 0,
+                    },
+                    "output_token_details": {
+                        "text_tokens": 3,
+                        "audio_tokens": 0,
+                    },
+                },
+            },
+        }
+    )
+
+    assert await anext(iterator) == RealtimeSpeechTextDelta(delta="Here it is.")
+    with pytest.raises(StopAsyncIteration):
+        await anext(iterator)
+
+    items = {item.provider_item_id: item for item in channel.conversation_ledger.items}
+    assert set(items) == {
+        "item-child-input",
+        "item-assistant-preamble",
+        "item-function-call",
+        function_output_item_id,
+        "item-assistant-continuation",
+    }
+    assert {item.local_turn_id for item in items.values()} == {"turn-ledger-health"}
+    assert {item.logical_group_id for item in items.values()} == {
+        "turn:turn-ledger-health"
+    }
+    assert items[function_output_item_id].dependency_call_id == FUNCTION_CALL_ID
+    assert items["item-assistant-continuation"].dependency_call_id == FUNCTION_CALL_ID
+    transcription_usage = items["item-child-input"].input_transcription_usage
+    assert transcription_usage is not None
+    assert transcription_usage.local_turn_id == "turn-ledger-health"
+    assert transcription_usage.input_tokens == 8
+    assert transcription_usage.input_audio_tokens == 8
+    assert transcription_usage.output_tokens == 2
+
+    health = channel.session_health
+    assert health.session_id == "session-provider-test"
+    assert health.provider_call_id == "rtc-ledger-health"
+    assert health.observed_provider_item_count == 5
+    assert health.provider_item_observation_complete is True
+    assert health.provider_inventory_authoritative is False
+    assert health.observability_degraded is False
+    assert health.response_count == 2
+    assert health.function_call_count == 1
+    assert health.continuation_count == 1
+    assert health.pending_response_count == 0
+    assert health.latest_usage is not None
+    assert health.latest_usage.provider_response_id == CONTINUATION_RESPONSE_ID
+    assert health.latest_usage.local_turn_id == "turn-ledger-health"
+    assert health.latest_usage.input_tokens == 12
+    assert health.latest_usage.cached_input_tokens == 5
+    assert health.latest_usage.uncached_input_tokens == 7
+    assert health.latest_usage.output_tokens == 3
+    continuation = channel.conversation_ledger.response(CONTINUATION_RESPONSE_ID)
+    assert continuation is not None
+    assert continuation.usage == health.latest_usage
+    assert health.tpm is not None and health.tpm.remaining == 49_000
+    assert health.rpm is not None and health.rpm.remaining == 299
+    assert [entry.name for entry in health.rate_limits] == [
+        "tokens",
+        "requests",
+        "future_limit",
+    ]
+
+    await channel.close()
+    assert channel.session_health.closed is True
+    assert channel.session_health.observed_provider_item_count == 0
+    closing_health = [
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage().startswith("openai_realtime_session_health")
+        and record.ava_context["reason"] == "sessionClosed"
+    ]
+    assert len(closing_health) == 1
+    assert closing_health[0]["closed"] is True
+    assert closing_health[0]["observedProviderItemCount"] == 0
+    assert closing_health[0]["providerInventoryAuthoritative"] is False
+
+
+@pytest.mark.asyncio
+async def test_provider_usage_without_cache_details_remains_unknown() -> None:
+    events = _text_response_events(
+        response_id="response-without-cache-details",
+        text="Cache details are optional.",
+        input_tokens=9,
+        output_tokens=4,
+    )
+    done = events[-1]["response"]
+    assert isinstance(done, dict)
+    usage = done["usage"]
+    assert isinstance(usage, dict)
+    usage.pop("input_token_details")
+    channel, _ = _channel(events)
+
+    received = await _collect_turn_events(channel, turn_id="turn-without-cache-details")
+
+    assert received == [RealtimeSpeechTextDelta(delta="Cache details are optional.")]
+    health = channel.session_health
+    assert health.latest_usage is not None
+    assert health.latest_usage.input_tokens == 9
+    assert health.latest_usage.cached_input_tokens is None
+    assert health.latest_usage.uncached_input_tokens is None
+    assert health.latest_usage.output_tokens == 4
+    assert health.latest_usage.total_tokens == 13
+    assert health.cumulative_cached_input_tokens is None
+    assert health.cumulative_uncached_input_tokens is None
+
+
+@pytest.mark.asyncio
+async def test_receiver_isolates_observability_failure_and_routes_the_event(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="ava_backend.openai_realtime")
+    channel, socket = _channel([], provider_call_id="rtc-observation-failure")
+    ledger = channel.conversation_ledger
+    original_observer = ledger.observe_provider_event
+    observation_count = 0
+
+    def fail_first_observation(
+        event: Mapping[str, object],
+        *,
+        observed_sequence: int,
+    ) -> None:
+        nonlocal observation_count
+        observation_count += 1
+        if observation_count == 1:
+            raise RuntimeError("provider-payload-sentinel-must-not-be-logged")
+        original_observer(event, observed_sequence=observed_sequence)
+
+    monkeypatch.setattr(ledger, "observe_provider_event", fail_first_observation)
+    socket.push(
+        {
+            "type": "input_audio_buffer.speech_started",
+            "item_id": "item-observation-failure",
+            "audio_start_ms": 12,
+        }
+    )
+
+    observed_input = await channel.next_input_event()
+    routed = await channel._receive_event(timeout_seconds=1)
+    socket.push(
+        {
+            "type": "input_audio_buffer.committed",
+            "item_id": "item-after-observation-failure",
+        }
+    )
+    observed_after_failure = await channel.next_input_event()
+    routed_after_failure = await channel._receive_event(timeout_seconds=1)
+
+    assert observed_input == RealtimeProviderInputEvent(
+        event_type="input_audio_buffer.speech_started",
+        item_id="item-observation-failure",
+        audio_start_ms=12,
+    )
+    assert routed["type"] == "input_audio_buffer.speech_started"
+    assert observed_after_failure == RealtimeProviderInputEvent(
+        event_type="input_audio_buffer.committed",
+        item_id="item-after-observation-failure",
+    )
+    assert routed_after_failure["type"] == "input_audio_buffer.committed"
+    assert channel._receiver_error is None
+    assert channel._receiver_task is not None
+    assert channel._receiver_task.done() is False
+    health = channel.session_health
+    assert health.observability_degraded is True
+    assert health.provider_item_observation_complete is False
+    assert health.response_count_complete is False
+    assert health.observed_provider_item_count == 1
+    warnings = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("openai_realtime_observability_degraded")
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].ava_context["operation"] == "observeProviderEvent"
+    assert warnings[0].ava_context["errorType"] == "RuntimeError"
+    assert "provider-payload-sentinel-must-not-be-logged" not in caplog.text
+    await channel.close()
+
+
+@pytest.mark.asyncio
+async def test_response_admission_observability_failure_cannot_own_or_fail_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response_id = "response-observation-admission-failure"
+    channel, _ = _channel(
+        _text_response_events(
+            response_id=response_id,
+            text="The provider lifecycle still completes.",
+        )
+    )
+
+    def fail_response_observation(
+        *,
+        provider_response_id: str,
+        local_turn_id: str,
+    ) -> None:
+        del provider_response_id, local_turn_id
+        raise RuntimeError("controlled observability admission failure")
+
+    monkeypatch.setattr(
+        channel.conversation_ledger,
+        "assign_response_owner",
+        fail_response_observation,
+    )
+
+    received = await _collect_turn_events(
+        channel,
+        turn_id="turn-observation-admission-failure",
+    )
+
+    assert received == [
+        RealtimeSpeechTextDelta(delta="The provider lifecycle still completes.")
+    ]
+    assert channel._response_owner_by_id[response_id] == (
+        "turn-observation-admission-failure"
+    )
+    observed_response = channel.conversation_ledger.response(response_id)
+    assert observed_response is not None
+    assert observed_response.local_turn_id is None
+    assert channel._receiver_error is None
+    assert channel.session_health.observability_degraded is True
     await channel.close()

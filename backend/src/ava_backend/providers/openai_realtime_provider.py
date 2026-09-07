@@ -38,6 +38,10 @@ from ..realtime.provider_session import (
     RealtimeCommittedInput,
     validate_sdp,
 )
+from ..realtime.provider_observability import (
+    ProviderConversationLedger,
+    SessionHealthSnapshot,
+)
 from ..realtime.tool_contract import (
     CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
     GET_CURRENT_TIME_TOOL_NAME,
@@ -79,7 +83,9 @@ MAX_PROVIDER_EVENTS_PER_TURN = 4096
 MAX_PROVIDER_ROUTER_EVENTS = 4096
 MAX_FUNCTION_ARGUMENT_BYTES = 256 * 1024
 MAX_PROVIDER_ERROR_BYTES = 64 * 1024
+MAX_OPENAI_REALTIME_CLIENT_ITEM_ID_CHARS = 32
 _SIDEBAND_SEQUENCE_FIELD = "__ava_sideband_sequence"
+_OPENAI_REALTIME_CLIENT_ITEM_ID_PREFIX = "ava_"
 _CANVAS_INTERACTION_RESPONSE_MAX_OUTPUT_TOKENS = 256
 _CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS = 512
 _MAX_CONSUMED_TERMINAL_RESPONSE_IDS = 64
@@ -310,9 +316,16 @@ class _OpenAIRealtimeEventChannel:
             DEFAULT_OPENAI_REALTIME_TRUNCATION_RETENTION_RATIO
         ),
         provider_call_id: str | None = None,
+        session_id: str | None = None,
     ) -> None:
         self._socket = socket
+        self._session_id = session_id
         self._provider_call_id = provider_call_id
+        self._observability = ProviderConversationLedger(
+            session_id=session_id,
+            provider_call_id=provider_call_id,
+        )
+        self._observability_warning_emitted = False
         self._model = model
         self._transcription_model = _required_name(
             transcription_model,
@@ -450,6 +463,87 @@ class _OpenAIRealtimeEventChannel:
             )
         return self._input_item_turn_ids[item_id]
 
+    @property
+    def conversation_ledger(self) -> ProviderConversationLedger:
+        return self._observability
+
+    @property
+    def session_health(self) -> SessionHealthSnapshot:
+        return self._observability.health_snapshot()
+
+    def _safe_observability_action(
+        self,
+        *,
+        operation: str,
+        action: Callable[[], object],
+    ) -> bool:
+        """Run optional observability without making it provider authority."""
+
+        try:
+            action()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self._record_observability_failure(operation=operation, error=error)
+            return False
+        return True
+
+    def _record_observability_failure(
+        self,
+        *,
+        operation: str,
+        error: Exception,
+    ) -> None:
+        degradation_error_type: str | None = None
+        try:
+            self._observability.mark_degraded()
+        except asyncio.CancelledError:
+            raise
+        except Exception as degradation_error:
+            degradation_error_type = type(degradation_error).__name__
+        if self._observability_warning_emitted:
+            return
+        self._observability_warning_emitted = True
+        LOGGER.warning(
+            "openai_realtime_observability_degraded session_id=%s "
+            "provider_call_id=%s operation=%s error_type=%s",
+            self._session_id,
+            self._provider_call_id,
+            operation,
+            type(error).__name__,
+            extra={
+                "ava_context": {
+                    "component": "realtimeObservability",
+                    "sessionId": self._session_id,
+                    "providerCallId": self._provider_call_id,
+                    "operation": operation,
+                    "errorType": type(error).__name__,
+                    "degradedStateErrorType": degradation_error_type,
+                    "sidebandSequence": self._sideband_event_sequence,
+                }
+            },
+        )
+
+    def _settle_observability_turn(self, *, turn_id: str) -> None:
+        self._safe_observability_action(
+            operation="settleTurn",
+            action=lambda: self._observability.settle_turn(local_turn_id=turn_id),
+        )
+
+    def _expect_observability_continuation(
+        self,
+        *,
+        turn_id: str,
+        call_id: str,
+    ) -> None:
+        self._safe_observability_action(
+            operation="expectContinuation",
+            action=lambda: self._observability.expect_continuation(
+                local_turn_id=turn_id,
+                function_call_id=call_id,
+            ),
+        )
+
     async def admit_pending_input_items(self, *, turn_id: str) -> tuple[str, ...]:
         """Explicitly associate pending provider input with an Ava turn."""
 
@@ -481,7 +575,16 @@ class _OpenAIRealtimeEventChannel:
                     continue
                 self._index_provider_identity(event)
                 self._observe_response_lifecycle(event)
+                self._safe_observability_action(
+                    operation="observeProviderEvent",
+                    action=lambda: self._observability.observe_provider_event(
+                        event,
+                        observed_sequence=self._sideband_event_sequence,
+                    ),
+                )
                 event_type = _event_type(event)
+                if event_type == "rate_limits.updated":
+                    self._log_session_health(reason="rateLimitsUpdated")
                 if event_type in _RESPONSE_DIAGNOSTIC_EVENT_TYPES:
                     response_id = _response_id_from_event(event)
                     _log_response_diagnostic(
@@ -734,20 +837,18 @@ class _OpenAIRealtimeEventChannel:
 
             trigger_started = monotonic()
             if normalized_text is not None:
-                await self._send_json(
-                    {
-                        "type": "conversation.item.create",
-                        "item": {
-                            "type": "message",
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "input_text",
-                                    "text": normalized_text,
-                                }
-                            ],
-                        },
-                    }
+                await self._create_conversation_item(
+                    turn_id=turn_id,
+                    item={
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": normalized_text,
+                            }
+                        ],
+                    },
                 )
                 await self._create_response(
                     turn_id=turn_id,
@@ -774,6 +875,7 @@ class _OpenAIRealtimeEventChannel:
             # even when we have not observed its response ID yet.
             if response_completed:
                 self._settled_turn_ids.add(turn_id)
+                self._settle_observability_turn(turn_id=turn_id)
                 self._active_turn_id = None
                 self._active_response_id = None
                 self._awaiting_response_trigger_turn_id = None
@@ -870,15 +972,14 @@ class _OpenAIRealtimeEventChannel:
             raise OpenAIRealtimeProtocolError(
                 "canvas tool completion does not match the pending call"
             )
-        await self._send_json(
-            {
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": output.model_dump_json(by_alias=True, exclude_none=True),
-                },
-            }
+        await self._create_conversation_item(
+            turn_id=turn_id,
+            dependency_call_id=call_id,
+            item={
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output.model_dump_json(by_alias=True, exclude_none=True),
+            },
         )
         response_payload: dict[str, object] = {
             "conversation": "auto",
@@ -890,7 +991,15 @@ class _OpenAIRealtimeEventChannel:
             ),
         }
 
-        await self._create_response(turn_id=turn_id, response=response_payload)
+        continuation_created = await self._create_response(
+            turn_id=turn_id,
+            response=response_payload,
+        )
+        if continuation_created:
+            self._expect_observability_continuation(
+                turn_id=turn_id,
+                call_id=call_id,
+            )
         _log_response_diagnostic(
             "openai_realtime_canvas_continuation_requested",
             event_type="response.create",
@@ -927,15 +1036,14 @@ class _OpenAIRealtimeEventChannel:
             raise OpenAIRealtimeProtocolError(
                 "canvas presentation tool completion does not match the pending call"
             )
-        await self._send_json(
-            {
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": output.model_dump_json(by_alias=True, exclude_none=True),
-                },
-            }
+        await self._create_conversation_item(
+            turn_id=turn_id,
+            dependency_call_id=call_id,
+            item={
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output.model_dump_json(by_alias=True, exclude_none=True),
+            },
         )
         response_payload: dict[str, object] = {
             "conversation": "auto",
@@ -958,6 +1066,11 @@ class _OpenAIRealtimeEventChannel:
             raise
         if not created:
             self._pending_canvas_control_continuation_call_id = None
+        else:
+            self._expect_observability_continuation(
+                turn_id=turn_id,
+                call_id=call_id,
+            )
         _log_response_diagnostic(
             "openai_realtime_canvas_presentation_continuation_requested",
             event_type="response.create",
@@ -993,15 +1106,14 @@ class _OpenAIRealtimeEventChannel:
             raise OpenAIRealtimeProtocolError(
                 "utility tool completion does not match the pending call"
             )
-        await self._send_json(
-            {
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": output.model_dump_json(by_alias=True, exclude_none=True),
-                },
-            }
+        await self._create_conversation_item(
+            turn_id=turn_id,
+            dependency_call_id=call_id,
+            item={
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output.model_dump_json(by_alias=True, exclude_none=True),
+            },
         )
         rejected = isinstance(output, RejectedUtilityToolOutputV4)
         response: dict[str, object] = {
@@ -1024,7 +1136,15 @@ class _OpenAIRealtimeEventChannel:
                     CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
                 }
             ]
-        await self._create_response(turn_id=turn_id, response=response)
+        continuation_created = await self._create_response(
+            turn_id=turn_id,
+            response=response,
+        )
+        if continuation_created:
+            self._expect_observability_continuation(
+                turn_id=turn_id,
+                call_id=call_id,
+            )
         self._completed_utility_call_ids.add(call_id)
         self._pending_utility_call_id = None
         self._interaction_response_readiness_changed.set()
@@ -1083,20 +1203,18 @@ class _OpenAIRealtimeEventChannel:
         self._awaiting_response_trigger_turn_id = None
         self._interaction_response_turn_id = turn_id
         self._interaction_response_readiness_changed.set()
-        await self._send_json(
-            {
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "message",
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": semantic_context,
-                        }
-                    ],
-                },
-            }
+        await self._create_conversation_item(
+            turn_id=turn_id,
+            item={
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": semantic_context,
+                    }
+                ],
+            },
         )
         await self._create_response(
             turn_id=turn_id,
@@ -1274,6 +1392,7 @@ class _OpenAIRealtimeEventChannel:
         if not turn_id.strip():
             raise ValueError("turn_id cannot be empty")
         if turn_id in self._cancelled_turn_ids:
+            self._settle_observability_turn(turn_id=turn_id)
             return
         if self._active_turn_id == turn_id:
             # A continuation response that has not produced response.created
@@ -1290,22 +1409,22 @@ class _OpenAIRealtimeEventChannel:
         )
         if cancelled_pending_utility:
             call_id = self._pending_utility_call_id
-            await self._send_json(
-                {
-                    "type": "conversation.item.create",
-                    "item": {
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": RejectedUtilityToolOutputV4(
-                            reason="The child interrupted this utility request."
-                        ).model_dump_json(by_alias=True),
-                    },
-                }
+            await self._create_conversation_item(
+                turn_id=turn_id,
+                dependency_call_id=call_id,
+                item={
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": RejectedUtilityToolOutputV4(
+                        reason="The child interrupted this utility request."
+                    ).model_dump_json(by_alias=True),
+                },
             )
             self._pending_utility_call_id = None
             self._active_response_id = None
             self._active_turn_id = None
             self._cancelled_turn_ids.add(turn_id)
+            self._settle_observability_turn(turn_id=turn_id)
             self._interaction_response_readiness_changed.set()
             return
         cancelled_pending_canvas = (
@@ -1315,22 +1434,19 @@ class _OpenAIRealtimeEventChannel:
         )
         if cancelled_pending_canvas:
             call_id = self._pending_canvas_call_id
-            await self._send_json(
-                {
-                    "type": "conversation.item.create",
-                    "item": {
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": InteractiveCanvasToolOutput.model_validate(
-                            {
-                                "status": "rejected",
-                                "reason": (
-                                    "The child interrupted this visual request."
-                                ),
-                            }
-                        ).model_dump_json(by_alias=True, exclude_none=True),
-                    },
-                }
+            await self._create_conversation_item(
+                turn_id=turn_id,
+                dependency_call_id=call_id,
+                item={
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": InteractiveCanvasToolOutput.model_validate(
+                        {
+                            "status": "rejected",
+                            "reason": "The child interrupted this visual request.",
+                        }
+                    ).model_dump_json(by_alias=True, exclude_none=True),
+                },
             )
             self._pending_canvas_call_id = None
             # The function-call response has already reached response.done and
@@ -1338,6 +1454,7 @@ class _OpenAIRealtimeEventChannel:
             self._active_response_id = None
             self._active_turn_id = None
             self._cancelled_turn_ids.add(turn_id)
+            self._settle_observability_turn(turn_id=turn_id)
             self._interaction_response_readiness_changed.set()
             return
         cancelled_pending_canvas_control = (
@@ -1347,32 +1464,34 @@ class _OpenAIRealtimeEventChannel:
         )
         if cancelled_pending_canvas_control:
             call_id = self._pending_canvas_control_call_id
-            await self._send_json(
-                {
-                    "type": "conversation.item.create",
-                    "item": {
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": ManageCanvasPresentationToolOutputV4(
-                            status=ManageCanvasPresentationStatus.REJECTED,
-                            operation=ManageCanvasPresentationAction.HIDE,
-                            reason=("The child interrupted this presentation request."),
-                        ).model_dump_json(by_alias=True, exclude_none=True),
-                    },
-                }
+            await self._create_conversation_item(
+                turn_id=turn_id,
+                dependency_call_id=call_id,
+                item={
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": ManageCanvasPresentationToolOutputV4(
+                        status=ManageCanvasPresentationStatus.REJECTED,
+                        operation=ManageCanvasPresentationAction.HIDE,
+                        reason="The child interrupted this presentation request.",
+                    ).model_dump_json(by_alias=True, exclude_none=True),
+                },
             )
             self._pending_canvas_control_call_id = None
             self._active_response_id = None
             self._active_turn_id = None
             self._cancelled_turn_ids.add(turn_id)
+            self._settle_observability_turn(turn_id=turn_id)
             self._interaction_response_readiness_changed.set()
             return
         if self._closed or self._active_turn_id != turn_id:
             self._cancelled_turn_ids.add(turn_id)
+            self._settle_observability_turn(turn_id=turn_id)
             self._interaction_response_readiness_changed.set()
             return
         await self._cancel_and_drain_active_response()
         self._cancelled_turn_ids.add(turn_id)
+        self._settle_observability_turn(turn_id=turn_id)
         self._interaction_response_readiness_changed.set()
 
     async def _cancel_and_drain_active_response(self) -> None:
@@ -1744,6 +1863,13 @@ class _OpenAIRealtimeEventChannel:
                 "OpenAI input item changed Ava turn ownership"
             )
         self._input_item_turn_ids[item_id] = turn_id
+        self._safe_observability_action(
+            operation="assignInputOwner",
+            action=lambda: self._observability.assign_input_owner(
+                provider_item_id=item_id,
+                local_turn_id=turn_id,
+            ),
+        )
         self._interaction_response_readiness_changed.set()
         outcome = self._input_transcription_outcomes.get(item_id)
         if outcome is not None:
@@ -1838,6 +1964,13 @@ class _OpenAIRealtimeEventChannel:
                 "OpenAI response lifecycle changed Ava turn ownership"
             )
         lifecycle.owner_turn_id = turn_id
+        self._safe_observability_action(
+            operation="assignResponseOwner",
+            action=lambda: self._observability.assign_response_owner(
+                provider_response_id=response_id,
+                local_turn_id=turn_id,
+            ),
+        )
         self._interaction_response_readiness_changed.set()
 
     def _response_terminal_observed(self, response_id: str) -> bool:
@@ -1985,6 +2118,31 @@ class _OpenAIRealtimeEventChannel:
         owner_turn_id: str,
         usage: OpenAIRealtimeUsage,
     ) -> None:
+        self._safe_observability_action(
+            operation="observeResponseUsage",
+            action=lambda: self._record_response_usage(
+                response_id=response_id,
+                owner_turn_id=owner_turn_id,
+                usage=usage,
+            ),
+        )
+
+    def _record_response_usage(
+        self,
+        *,
+        response_id: str,
+        owner_turn_id: str,
+        usage: OpenAIRealtimeUsage,
+    ) -> None:
+        self._observability.observe_usage(
+            provider_response_id=response_id,
+            local_turn_id=owner_turn_id,
+            input_tokens=usage.input_tokens,
+            cached_input_tokens=usage.cached_input_tokens,
+            output_tokens=usage.output_tokens,
+            total_tokens=usage.total_tokens,
+        )
+        health = self._observability.health_snapshot()
         LOGGER.info(
             "openai_realtime_usage",
             extra={
@@ -1993,17 +2151,165 @@ class _OpenAIRealtimeEventChannel:
                     "model": self._model,
                     "usageScope": "response",
                     "providerCallId": self._provider_call_id,
+                    "sessionId": health.session_id,
                     "responseId": response_id,
                     "turnId": owner_turn_id,
                     "activeContextBuildId": self._installed_context_build_id,
                     "inputTokens": usage.input_tokens,
                     "cachedInputTokens": usage.cached_input_tokens,
+                    "uncachedInputTokens": (
+                        health.latest_usage.uncached_input_tokens
+                        if health.latest_usage is not None
+                        else None
+                    ),
                     "inputTextTokens": usage.input_text_tokens,
                     "inputAudioTokens": usage.input_audio_tokens,
                     "outputTokens": usage.output_tokens,
                     "outputTextTokens": usage.output_text_tokens,
                     "outputAudioTokens": usage.output_audio_tokens,
                     "totalTokens": usage.total_tokens,
+                    "observedProviderItemCount": (health.observed_provider_item_count),
+                    "responseCount": health.response_count,
+                    "responseCountComplete": health.response_count_complete,
+                    "functionCallCount": health.function_call_count,
+                    "continuationCount": health.continuation_count,
+                }
+            },
+        )
+
+    def _log_session_health(self, *, reason: str) -> None:
+        self._safe_observability_action(
+            operation=f"logSessionHealth:{reason}",
+            action=lambda: self._record_session_health(reason=reason),
+        )
+
+    def _record_session_health(self, *, reason: str) -> None:
+        health = self._observability.health_snapshot()
+        LOGGER.info(
+            "openai_realtime_session_health session_id=%s reason=%s "
+            "observed_provider_item_count=%d response_count=%d",
+            health.session_id,
+            reason,
+            health.observed_provider_item_count,
+            health.response_count,
+            extra={
+                "ava_context": {
+                    "component": "realtimeProvider",
+                    "sessionId": health.session_id,
+                    "providerCallId": health.provider_call_id,
+                    "reason": reason,
+                    "uptimeSeconds": health.uptime_seconds,
+                    "closed": health.closed,
+                    "observedProviderItemCount": (health.observed_provider_item_count),
+                    "providerItemObservationComplete": (
+                        health.provider_item_observation_complete
+                    ),
+                    "providerInventoryAuthoritative": (
+                        health.provider_inventory_authoritative
+                    ),
+                    "observabilityDegraded": health.observability_degraded,
+                    "responseCount": health.response_count,
+                    "responseCountComplete": health.response_count_complete,
+                    "functionCallCount": health.function_call_count,
+                    "continuationCount": health.continuation_count,
+                    "pendingResponseCount": health.pending_response_count,
+                    "latestInputTokens": (
+                        health.latest_usage.input_tokens
+                        if health.latest_usage is not None
+                        else None
+                    ),
+                    "latestCachedInputTokens": (
+                        health.latest_usage.cached_input_tokens
+                        if health.latest_usage is not None
+                        else None
+                    ),
+                    "latestUncachedInputTokens": (
+                        health.latest_usage.uncached_input_tokens
+                        if health.latest_usage is not None
+                        else None
+                    ),
+                    "latestOutputTokens": (
+                        health.latest_usage.output_tokens
+                        if health.latest_usage is not None
+                        else None
+                    ),
+                    "latestTotalTokens": (
+                        health.latest_usage.total_tokens
+                        if health.latest_usage is not None
+                        else None
+                    ),
+                    "latestTranscriptionItemId": (
+                        health.latest_input_transcription_usage.provider_item_id
+                        if health.latest_input_transcription_usage is not None
+                        else None
+                    ),
+                    "latestTranscriptionTurnId": (
+                        health.latest_input_transcription_usage.local_turn_id
+                        if health.latest_input_transcription_usage is not None
+                        else None
+                    ),
+                    "latestTranscriptionUsageType": (
+                        health.latest_input_transcription_usage.usage_type
+                        if health.latest_input_transcription_usage is not None
+                        else None
+                    ),
+                    "latestTranscriptionInputTokens": (
+                        health.latest_input_transcription_usage.input_tokens
+                        if health.latest_input_transcription_usage is not None
+                        else None
+                    ),
+                    "latestTranscriptionInputTextTokens": (
+                        health.latest_input_transcription_usage.input_text_tokens
+                        if health.latest_input_transcription_usage is not None
+                        else None
+                    ),
+                    "latestTranscriptionInputAudioTokens": (
+                        health.latest_input_transcription_usage.input_audio_tokens
+                        if health.latest_input_transcription_usage is not None
+                        else None
+                    ),
+                    "latestTranscriptionOutputTokens": (
+                        health.latest_input_transcription_usage.output_tokens
+                        if health.latest_input_transcription_usage is not None
+                        else None
+                    ),
+                    "latestTranscriptionTotalTokens": (
+                        health.latest_input_transcription_usage.total_tokens
+                        if health.latest_input_transcription_usage is not None
+                        else None
+                    ),
+                    "latestTranscriptionDurationSeconds": (
+                        health.latest_input_transcription_usage.duration_seconds
+                        if health.latest_input_transcription_usage is not None
+                        else None
+                    ),
+                    "cumulativeInputTokens": health.cumulative_input_tokens,
+                    "cumulativeOutputTokens": health.cumulative_output_tokens,
+                    "cumulativeTotalTokens": health.cumulative_total_tokens,
+                    "cumulativeCachedInputTokens": (
+                        health.cumulative_cached_input_tokens
+                    ),
+                    "cumulativeUncachedInputTokens": (
+                        health.cumulative_uncached_input_tokens
+                    ),
+                    "rateLimitNames": tuple(entry.name for entry in health.rate_limits),
+                    "rateLimitSnapshotTruncated": (
+                        health.rate_limit_snapshot_truncated
+                    ),
+                    "tpmLimit": health.tpm.limit if health.tpm is not None else None,
+                    "tpmRemaining": (
+                        health.tpm.remaining if health.tpm is not None else None
+                    ),
+                    "tpmResetSeconds": (
+                        health.tpm.reset_seconds if health.tpm is not None else None
+                    ),
+                    "rpmLimit": health.rpm.limit if health.rpm is not None else None,
+                    "rpmRemaining": (
+                        health.rpm.remaining if health.rpm is not None else None
+                    ),
+                    "rpmResetSeconds": (
+                        health.rpm.reset_seconds if health.rpm is not None else None
+                    ),
                 }
             },
         )
@@ -2128,6 +2434,17 @@ class _OpenAIRealtimeEventChannel:
                 task.cancel()
             if task is not None:
                 await asyncio.gather(task, return_exceptions=True)
+            observability_closed = self._safe_observability_action(
+                operation="close",
+                action=self._observability.close,
+            )
+            self._log_session_health(
+                reason=(
+                    "sessionClosed"
+                    if observability_closed
+                    else "sessionObservabilityCloseFailed"
+                )
+            )
 
     async def _wait_for_session_updated(self) -> None:
         while True:
@@ -2906,6 +3223,39 @@ class _OpenAIRealtimeEventChannel:
             return None
         return self._recently_resolved_cancel_outcomes.pop(cancel_event_id, None)
 
+    async def _create_conversation_item(
+        self,
+        *,
+        turn_id: str,
+        item: Mapping[str, object],
+        dependency_call_id: str | None = None,
+    ) -> str:
+        """Create one provider item with an explicit, turn-owned identity."""
+
+        random_suffix_chars = (
+            MAX_OPENAI_REALTIME_CLIENT_ITEM_ID_CHARS
+            - len(_OPENAI_REALTIME_CLIENT_ITEM_ID_PREFIX)
+        )
+        provider_item_id = (
+            _OPENAI_REALTIME_CLIENT_ITEM_ID_PREFIX
+            + uuid4().hex[:random_suffix_chars]
+        )
+        await self._send_json(
+            {
+                "type": "conversation.item.create",
+                "item": {**item, "id": provider_item_id},
+            }
+        )
+        self._safe_observability_action(
+            operation="expectItemOwner",
+            action=lambda: self._observability.expect_item_owner(
+                provider_item_id=provider_item_id,
+                local_turn_id=turn_id,
+                dependency_call_id=dependency_call_id,
+            ),
+        )
+        return provider_item_id
+
     async def _send_json(self, payload: Mapping[str, object]) -> None:
         if self._closed:
             raise OpenAIRealtimeProtocolError(
@@ -3010,6 +3360,7 @@ class OpenAIRealtimeProviderSession:
     def __init__(
         self,
         *,
+        session_id: str,
         api_key: str,
         model: str,
         transcription_model: str = "gpt-transcribe",
@@ -3034,6 +3385,9 @@ class OpenAIRealtimeProviderSession:
         api_origin: str = DEFAULT_OPENAI_API_ORIGIN,
         realtime_websocket_url: str = DEFAULT_OPENAI_REALTIME_WEBSOCKET,
     ) -> None:
+        if not session_id.strip():
+            raise ValueError("session_id cannot be empty")
+        self._session_id = session_id
         self._api_key = _required_secret(api_key, "OpenAI API key")
         self._model = _required_name(model, "OpenAI Realtime model")
         self._transcription_model = _required_name(
@@ -3085,6 +3439,14 @@ class OpenAIRealtimeProviderSession:
     @property
     def last_response_id(self) -> str | None:
         return self._channel.last_response_id if self._channel is not None else None
+
+    @property
+    def conversation_ledger(self) -> ProviderConversationLedger | None:
+        return self._channel.conversation_ledger if self._channel is not None else None
+
+    @property
+    def session_health(self) -> SessionHealthSnapshot | None:
+        return self._channel.session_health if self._channel is not None else None
 
     async def negotiate(self, *, offer_sdp: str) -> NegotiatedRealtimeCall:
         if self._closed:
@@ -3201,6 +3563,7 @@ class OpenAIRealtimeProviderSession:
                 ),
                 truncation_retention_ratio=self._truncation_retention_ratio,
                 provider_call_id=call_id,
+                session_id=self._session_id,
             )
             await channel.start_receiver()
         except Exception as error:
