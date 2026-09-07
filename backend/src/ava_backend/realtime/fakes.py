@@ -210,14 +210,14 @@ class DeterministicRealtimePlanProvider:
         if self._input_item_turn_ids.get(item_id) != turn_id:
             raise RuntimeError("fake child response input owner mismatch")
         desired = self._desired_context_build_id
-        if (
-            desired is not None
-            and not self.is_context_acknowledged(desired)
-        ):
+        if desired is not None and not self.is_context_acknowledged(desired):
             if not permit_degraded_focus_grounding:
                 return False
         self.requested_child_responses.append((turn_id, item_id))
         return True
+
+    async def wait_until_response_admissible(self, *, turn_id: str) -> bool:
+        return not self.closed and turn_id not in self._settled_turn_ids
 
     async def negotiate(self, *, offer_sdp: str) -> NegotiatedRealtimeCall:
         if self.closed:

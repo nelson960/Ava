@@ -11,6 +11,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_OPENAI_REALTIME_TRUNCATION_POST_INSTRUCTIONS_TOKENS = 80_000
 DEFAULT_OPENAI_REALTIME_TRUNCATION_RETENTION_RATIO = 0.8
+DEFAULT_OPENAI_REALTIME_RATE_LIMIT_MAX_RECOVERY_ATTEMPTS = 2
+DEFAULT_OPENAI_REALTIME_RATE_LIMIT_MAX_RECOVERY_SECONDS = 30.0
+DEFAULT_OPENAI_REALTIME_RATE_LIMIT_FALLBACK_WAIT_SECONDS = 1.0
 
 
 class AvaEnvironment(StrEnum):
@@ -81,6 +84,21 @@ class Settings(BaseSettings):
         default=DEFAULT_OPENAI_REALTIME_TRUNCATION_RETENTION_RATIO,
         gt=0,
         lt=1,
+    )
+    openai_realtime_rate_limit_max_recovery_attempts: int = Field(
+        default=DEFAULT_OPENAI_REALTIME_RATE_LIMIT_MAX_RECOVERY_ATTEMPTS,
+        ge=1,
+        le=10,
+    )
+    openai_realtime_rate_limit_max_recovery_seconds: float = Field(
+        default=DEFAULT_OPENAI_REALTIME_RATE_LIMIT_MAX_RECOVERY_SECONDS,
+        ge=1,
+        le=300,
+    )
+    openai_realtime_rate_limit_fallback_wait_seconds: float = Field(
+        default=DEFAULT_OPENAI_REALTIME_RATE_LIMIT_FALLBACK_WAIT_SECONDS,
+        ge=0.05,
+        le=30,
     )
     openai_canvas_model: Literal["gpt-5.6-sol", "gpt-5.6-terra"] = "gpt-5.6-terra"
     openai_canvas_reasoning_effort: Literal["none", "low", "medium"] = "medium"

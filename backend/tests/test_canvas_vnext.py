@@ -948,6 +948,39 @@ async def test_synchronize_turn_context_waits_for_non_focus_context_ack() -> Non
 
 
 @pytest.mark.asyncio
+async def test_synchronize_turn_context_waits_for_resource_outside_focus_lock() -> None:
+    coordinator, provider, _, _, _, _ = await _create_real_coordinator()
+    turn_id = coordinator.turn_id
+    item_id = "item-resource-admission"
+    provider._input_item_turn_ids[item_id] = turn_id
+    attempts = 0
+    wait_observed = asyncio.Event()
+
+    async def request_child(
+        *, turn_id: str, item_id: str, permit_degraded_focus_grounding: bool = False
+    ) -> bool:
+        nonlocal attempts
+        attempts += 1
+        return attempts > 1
+
+    async def wait_for_resource(*, turn_id: str) -> bool:
+        assert not coordinator._focus_linearization_lock.locked()
+        wait_observed.set()
+        return True
+
+    provider.request_child_response = request_child
+    provider.wait_until_response_admissible = wait_for_resource
+    committed = RealtimeCommittedInput(turn_id, item_id)
+    coordinator._turn_context_sync_owner = committed
+
+    await coordinator._synchronize_turn_context(committed)
+
+    assert wait_observed.is_set()
+    assert attempts == 2
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
 async def test_synchronize_turn_context_latest_wins_across_wait() -> None:
     coordinator, provider, _, _, _, _ = await _create_real_coordinator()
     turn_id = coordinator.turn_id

@@ -7,7 +7,7 @@ from builtins import anext
 import json
 import logging
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from types import MethodType
 from uuid import UUID
@@ -383,6 +383,46 @@ def _text_response_events(
     ]
 
 
+def _rate_limited_response_events(
+    *,
+    response_id: str,
+    limit_kind: str = "tokens",
+) -> list[dict[str, object]]:
+    return [
+        {"type": "response.created", "response": {"id": response_id}},
+        {
+            "type": "response.done",
+            "response": {
+                "id": response_id,
+                "status": "failed",
+                "status_details": {
+                    "type": "failed",
+                    "error": {
+                        "type": limit_kind,
+                        "code": "rate_limit_exceeded",
+                    },
+                },
+                "output": [],
+            },
+        },
+    ]
+
+
+def _top_level_rate_limit_error(
+    *,
+    event_id: str | None,
+    limit_kind: str = "tokens",
+) -> dict[str, object]:
+    error: dict[str, object] = {
+        "type": limit_kind,
+        "code": "rate_limit_exceeded",
+        "message": "content-free deterministic rate limit",
+    }
+    if event_id is not None:
+        error["event_id"] = event_id
+    return {"type": "error", "error": error}
+
+
 def _canvas_response_events(
     *,
     arguments: str,
@@ -514,6 +554,10 @@ def _channel(
     *,
     max_output_tokens: int = 800,
     provider_call_id: str | None = None,
+    resource_capacity_waiter: (
+        Callable[[float, asyncio.Event], Awaitable[bool]] | None
+    ) = None,
+    rate_limit_max_recovery_attempts: int = 2,
 ) -> tuple[
     _OpenAIRealtimeEventChannel,
     _FakeRealtimeSocket,
@@ -526,6 +570,11 @@ def _channel(
         turn_timeout_seconds=5,
         provider_call_id=provider_call_id,
         session_id="session-provider-test",
+        resource_capacity_waiter=(
+            resource_capacity_waiter
+            or openai_realtime_provider._default_resource_capacity_waiter
+        ),
+        rate_limit_max_recovery_attempts=rate_limit_max_recovery_attempts,
     )
     _TEST_CHANNELS.add(channel)
     return channel, socket
@@ -5128,3 +5177,890 @@ async def test_response_admission_observability_failure_cannot_own_or_fail_turn(
     assert channel._receiver_error is None
     assert channel.session_health.observability_degraded is True
     await channel.close()
+
+
+@pytest.mark.asyncio
+async def test_low_tpm_defers_primary_response_until_provider_capacity_update() -> None:
+    socket_ref: _FakeRealtimeSocket | None = None
+
+    async def update_capacity(
+        wait_seconds: float,
+        changed: asyncio.Event,
+    ) -> bool:
+        assert 0 < wait_seconds <= 2
+        assert socket_ref is not None
+        assert not any(
+            event.get("type") == "response.create" for event in socket_ref.sent
+        )
+        previous_received = socket_ref.received_count
+        socket_ref.push(
+            {
+                "type": "rate_limits.updated",
+                "rate_limits": [
+                    {
+                        "name": "tokens",
+                        "limit": 50_000,
+                        "remaining": 40_000,
+                        "reset_seconds": 60,
+                    }
+                ],
+            }
+        )
+        await socket_ref.wait_received(previous_received + 1)
+        assert changed.is_set()
+        return True
+
+    channel, socket = _channel(
+        [
+            {
+                "type": "rate_limits.updated",
+                "rate_limits": [
+                    {
+                        "name": "tokens",
+                        "limit": 50_000,
+                        "remaining": 100,
+                        "reset_seconds": 2,
+                    }
+                ],
+            },
+            {"type": "input_audio_buffer.committed", "item_id": "item-low-tpm"},
+        ],
+        resource_capacity_waiter=update_capacity,
+    )
+    socket_ref = socket
+    channel._resource_governor.observe_actual_usage(
+        turn_id="turn-calibration",
+        input_tokens=2_000,
+        output_tokens=100,
+    )
+    iterator = channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-low-tpm",
+    ).__aiter__()
+    committed = await anext(iterator)
+    assert committed == RealtimeCommittedInput(
+        turn_id="turn-low-tpm", item_id="item-low-tpm"
+    )
+
+    assert not await channel.request_child_response(
+        turn_id="turn-low-tpm", item_id="item-low-tpm"
+    )
+    assert await channel.wait_until_response_admissible(turn_id="turn-low-tpm")
+    assert await channel.request_child_response(
+        turn_id="turn-low-tpm", item_id="item-low-tpm"
+    )
+    assert (
+        len([event for event in socket.sent if event.get("type") == "response.create"])
+        == 1
+    )
+    resource = channel.session_health.resource_governor
+    assert resource is not None
+    assert resource.resource_deferral_count == 1
+    await iterator.aclose()
+
+
+@pytest.mark.asyncio
+async def test_structured_rate_limit_retries_only_response_generation() -> None:
+    async def reset_elapsed(_: float, __: asyncio.Event) -> bool:
+        return False
+
+    channel, socket = _channel(
+        [
+            *_rate_limited_response_events(response_id="response-rate-limited"),
+            *_text_response_events(
+                response_id="response-recovered",
+                text="Recovered safely.",
+                input_tokens=900,
+                output_tokens=4,
+            ),
+        ],
+        resource_capacity_waiter=reset_elapsed,
+    )
+
+    events = [
+        event
+        async for event in channel.stream_turn(
+            harness=_harness(),
+            turn_id="turn-rate-limited",
+            text_input="Please answer once.",
+            response_max_output_tokens=400,
+        )
+    ]
+
+    assert events == [RealtimeSpeechTextDelta(delta="Recovered safely.")]
+    user_items = [
+        event
+        for event in socket.sent
+        if event.get("type") == "conversation.item.create"
+        and isinstance(event.get("item"), dict)
+        and event["item"].get("role") == "user"
+    ]
+    assert len(user_items) == 1
+    assert (
+        len([event for event in socket.sent if event.get("type") == "response.create"])
+        == 2
+    )
+    recovered = channel.conversation_ledger.response("response-recovered")
+    assert recovered is not None
+    assert recovered.local_turn_id == "turn-rate-limited"
+    resource = channel.session_health.resource_governor
+    assert resource is not None
+    assert resource.rate_limit_recovery_count == 1
+    assert resource.local_reserved_requests == 0
+
+
+@pytest.mark.parametrize("limit_kind", ["tokens", "requests"])
+@pytest.mark.asyncio
+async def test_rate_limit_fresh_insufficient_snapshot_waits_for_sufficient_truth(
+    limit_kind: str,
+) -> None:
+    wait_calls: asyncio.Queue[tuple[float, asyncio.Event]] = asyncio.Queue()
+    wait_results: asyncio.Queue[bool] = asyncio.Queue()
+
+    async def controlled_waiter(
+        wait_seconds: float,
+        changed: asyncio.Event,
+    ) -> bool:
+        await wait_calls.put((wait_seconds, changed))
+        return await wait_results.get()
+
+    channel, socket = _channel(
+        _rate_limited_response_events(
+            response_id=f"response-{limit_kind}-limited",
+            limit_kind=limit_kind,
+        ),
+        resource_capacity_waiter=controlled_waiter,
+    )
+
+    async def collect_turn() -> list[object]:
+        return [
+            event
+            async for event in channel.stream_turn(
+                harness=_harness(),
+                turn_id=f"turn-{limit_kind}-fresh-snapshot",
+                text_input="Use the exact response once.",
+                response_max_output_tokens=400,
+            )
+        ]
+
+    turn = asyncio.create_task(collect_turn())
+
+    _, first_changed = await wait_calls.get()
+    response_creates = [
+        event for event in socket.sent if event.get("type") == "response.create"
+    ]
+    assert len(response_creates) == 1
+    previous_received = socket.received_count
+    socket.push(
+        {
+            "type": "rate_limits.updated",
+            "rate_limits": [
+                {
+                    "name": limit_kind,
+                    "limit": 500_000 if limit_kind == "tokens" else 100,
+                    "remaining": 0,
+                    "reset_seconds": 60,
+                }
+            ],
+        }
+    )
+    await socket.wait_received(previous_received + 1)
+    assert first_changed.is_set()
+    await wait_results.put(True)
+
+    _, second_changed = await wait_calls.get()
+    assert (
+        len([event for event in socket.sent if event.get("type") == "response.create"])
+        == 1
+    )
+    previous_received = socket.received_count
+    socket.push(
+        {
+            "type": "rate_limits.updated",
+            "rate_limits": [
+                {
+                    "name": limit_kind,
+                    "limit": 500_000 if limit_kind == "tokens" else 100,
+                    "remaining": 500_000 if limit_kind == "tokens" else 10,
+                    "reset_seconds": 60,
+                }
+            ],
+        }
+    )
+    await socket.wait_received(previous_received + 1)
+    assert second_changed.is_set()
+    await wait_results.put(True)
+    await socket.wait_sent(3)
+    for event in _text_response_events(
+        response_id=f"response-{limit_kind}-recovered",
+        text="Recovered from fresh provider truth.",
+    ):
+        socket.push(event)
+
+    assert await turn == [
+        RealtimeSpeechTextDelta(delta="Recovered from fresh provider truth.")
+    ]
+    assert (
+        len([event for event in socket.sent if event.get("type") == "response.create"])
+        == 2
+    )
+
+
+@pytest.mark.asyncio
+async def test_correlated_top_level_rate_limit_retries_with_new_client_event_id() -> (
+    None
+):
+    async def reset_elapsed(_: float, __: asyncio.Event) -> bool:
+        return False
+
+    channel, socket = _channel([], resource_capacity_waiter=reset_elapsed)
+
+    async def collect_turn() -> list[object]:
+        return [
+            event
+            async for event in channel.stream_turn(
+                harness=_harness(),
+                turn_id="turn-correlated-top-level",
+                text_input="Send this input only once.",
+                response_max_output_tokens=400,
+            )
+        ]
+
+    turn = asyncio.create_task(collect_turn())
+    await socket.wait_sent(2)
+    first_create = next(
+        event for event in socket.sent if event.get("type") == "response.create"
+    )
+    first_event_id = first_create.get("event_id")
+    assert isinstance(first_event_id, str)
+    sent_before_error = len(socket.sent)
+    socket.push(_top_level_rate_limit_error(event_id=first_event_id))
+    await socket.wait_sent(sent_before_error + 1)
+    response_creates = [
+        event for event in socket.sent if event.get("type") == "response.create"
+    ]
+    assert len(response_creates) == 2
+    retry_event_id = response_creates[1].get("event_id")
+    assert isinstance(retry_event_id, str)
+    assert retry_event_id != first_event_id
+    assert len(first_event_id) == len(retry_event_id) == 32
+
+    # A late error for the rejected attempt is explicitly stale and cannot own
+    # the new attempt.
+    socket.push(_top_level_rate_limit_error(event_id=first_event_id))
+    for event in _text_response_events(
+        response_id="response-correlated-top-level-recovered",
+        text="Recovered once.",
+    ):
+        socket.push(event)
+
+    assert await turn == [RealtimeSpeechTextDelta(delta="Recovered once.")]
+    user_items = [
+        event
+        for event in socket.sent
+        if event.get("type") == "conversation.item.create"
+        and isinstance(event.get("item"), dict)
+        and event["item"].get("role") == "user"
+    ]
+    assert len(user_items) == 1
+
+
+@pytest.mark.asyncio
+async def test_correlated_top_level_rate_limit_after_function_output_retries_only_continuation() -> (
+    None
+):
+    async def reset_elapsed(_: float, __: asyncio.Event) -> bool:
+        return False
+
+    arguments = json.dumps(
+        {
+            "operation": "new",
+            "brief": "Show one triangle.",
+            "interactionMode": "none",
+        },
+        separators=(",", ":"),
+    )
+    channel, socket = _channel(
+        _canvas_response_events(arguments=arguments),
+        resource_capacity_waiter=reset_elapsed,
+    )
+    iterator = channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-correlated-continuation",
+        text_input="Draw one triangle.",
+        response_max_output_tokens=400,
+    ).__aiter__()
+    assert isinstance(await anext(iterator), RealtimeSpeechTextDelta)
+    call = await anext(iterator)
+    assert isinstance(call, RealtimeCanvasToolCall)
+    await channel.complete_canvas_tool(
+        turn_id="turn-correlated-continuation",
+        call_id=call.call_id,
+        output=InteractiveCanvasToolOutputV4.model_validate(
+            {"status": "accepted", "generationId": "generation-correlated"}
+        ),
+    )
+    response_creates = [
+        event for event in socket.sent if event.get("type") == "response.create"
+    ]
+    assert len(response_creates) == 2
+    continuation_event_id = response_creates[-1].get("event_id")
+    assert isinstance(continuation_event_id, str)
+    pending = asyncio.create_task(anext(iterator))
+    sent_before_error = len(socket.sent)
+    socket.push(_top_level_rate_limit_error(event_id=continuation_event_id))
+    await socket.wait_sent(sent_before_error + 1)
+    for event in _text_response_events(
+        response_id="response-correlated-continuation-recovered",
+        text="Continuation recovered once.",
+    ):
+        socket.push(event)
+    assert await pending == RealtimeSpeechTextDelta(
+        delta="Continuation recovered once."
+    )
+    with pytest.raises(StopAsyncIteration):
+        await anext(iterator)
+    function_outputs = [
+        event
+        for event in socket.sent
+        if event.get("type") == "conversation.item.create"
+        and isinstance(event.get("item"), dict)
+        and event["item"].get("type") == "function_call_output"
+    ]
+    assert len(function_outputs) == 1
+    assert (
+        len([event for event in socket.sent if event.get("type") == "response.create"])
+        == 3
+    )
+
+
+@pytest.mark.parametrize("error_event_id", [None, "mismatched-response-create"])
+@pytest.mark.asyncio
+async def test_uncorrelated_top_level_rate_limit_does_not_retry_or_wedge_session(
+    error_event_id: str | None,
+) -> None:
+    channel, socket = _channel([])
+
+    async def collect_old_turn() -> list[object]:
+        return [
+            event
+            async for event in channel.stream_turn(
+                harness=_harness(),
+                turn_id="turn-uncorrelated-rate-limit",
+                text_input="Do not replay this input.",
+                response_max_output_tokens=400,
+            )
+        ]
+
+    old_turn = asyncio.create_task(collect_old_turn())
+    await socket.wait_sent(2)
+    socket.push(_top_level_rate_limit_error(event_id=error_event_id))
+    with pytest.raises(
+        RealtimeProviderResponseIncompleteError,
+        match="uncorrelated_rate_limit",
+    ):
+        await old_turn
+    assert (
+        len([event for event in socket.sent if event.get("type") == "response.create"])
+        == 1
+    )
+    resource = channel.session_health.resource_governor
+    assert resource is not None
+    assert resource.local_reserved_requests == 0
+    assert resource.deferred_turn_id is None
+    assert channel._active_response_request is None
+
+    for event in _text_response_events(
+        response_id=f"response-after-uncorrelated-{error_event_id}",
+        text="The later turn remains usable.",
+    ):
+        socket.push(event)
+    later = [
+        event
+        async for event in channel.stream_turn(
+            harness=_harness(),
+            turn_id=f"turn-after-uncorrelated-{error_event_id}",
+            text_input="Start a later turn.",
+            response_max_output_tokens=400,
+        )
+    ]
+    assert later == [RealtimeSpeechTextDelta(delta="The later turn remains usable.")]
+
+
+@pytest.mark.parametrize("limit_kind", ["tokens", "requests"])
+@pytest.mark.asyncio
+async def test_continuation_rechecks_latest_provider_capacity_without_replay(
+    limit_kind: str,
+) -> None:
+    waiter_entered = asyncio.Event()
+    permit_retry = asyncio.Event()
+
+    async def controlled_waiter(_: float, __: asyncio.Event) -> bool:
+        waiter_entered.set()
+        await permit_retry.wait()
+        return True
+
+    arguments = json.dumps(
+        {
+            "operation": "new",
+            "brief": "Show one triangle.",
+            "interactionMode": "none",
+        },
+        separators=(",", ":"),
+    )
+    channel, socket = _channel(
+        _canvas_response_events(arguments=arguments),
+        resource_capacity_waiter=controlled_waiter,
+    )
+    iterator = channel.stream_turn(
+        harness=_harness(),
+        turn_id=f"turn-{limit_kind}-continuation-capacity",
+        text_input="Draw one triangle.",
+        response_max_output_tokens=400,
+    ).__aiter__()
+    assert isinstance(await anext(iterator), RealtimeSpeechTextDelta)
+    call = await anext(iterator)
+    assert isinstance(call, RealtimeCanvasToolCall)
+
+    previous_received = socket.received_count
+    socket.push(
+        {
+            "type": "rate_limits.updated",
+            "rate_limits": [
+                {
+                    "name": limit_kind,
+                    "limit": 50_000 if limit_kind == "tokens" else 100,
+                    "remaining": 1 if limit_kind == "tokens" else 0,
+                    "reset_seconds": 60,
+                }
+            ],
+        }
+    )
+    await socket.wait_received(previous_received + 1)
+    completion = asyncio.create_task(
+        channel.complete_canvas_tool(
+            turn_id=f"turn-{limit_kind}-continuation-capacity",
+            call_id=call.call_id,
+            output=InteractiveCanvasToolOutputV4.model_validate(
+                {"status": "accepted", "generationId": "generation-capacity"}
+            ),
+        )
+    )
+    await waiter_entered.wait()
+    function_outputs = [
+        event
+        for event in socket.sent
+        if event.get("type") == "conversation.item.create"
+        and isinstance(event.get("item"), dict)
+        and event["item"].get("type") == "function_call_output"
+    ]
+    assert len(function_outputs) == 1
+    assert (
+        len([event for event in socket.sent if event.get("type") == "response.create"])
+        == 1
+    )
+
+    previous_received = socket.received_count
+    socket.push(
+        {
+            "type": "rate_limits.updated",
+            "rate_limits": [
+                {
+                    "name": limit_kind,
+                    "limit": 50_000 if limit_kind == "tokens" else 100,
+                    "remaining": 50_000 if limit_kind == "tokens" else 10,
+                    "reset_seconds": 60,
+                }
+            ],
+        }
+    )
+    await socket.wait_received(previous_received + 1)
+    permit_retry.set()
+    await completion
+    assert (
+        len([event for event in socket.sent if event.get("type") == "response.create"])
+        == 2
+    )
+    for event in _text_response_events(
+        response_id=f"response-{limit_kind}-continuation",
+        text="Continuation admitted once.",
+    ):
+        socket.push(event)
+    assert await anext(iterator) == RealtimeSpeechTextDelta(
+        delta="Continuation admitted once."
+    )
+    with pytest.raises(StopAsyncIteration):
+        await anext(iterator)
+    assert (
+        len(
+            [
+                event
+                for event in socket.sent
+                if event.get("type") == "conversation.item.create"
+                and isinstance(event.get("item"), dict)
+                and event["item"].get("type") == "function_call_output"
+            ]
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_memory_exact_output_defers_continuation_without_duplicate_output() -> (
+    None
+):
+    waiter_entered = asyncio.Event()
+
+    async def wait_for_snapshot(_: float, changed: asyncio.Event) -> bool:
+        waiter_entered.set()
+        await changed.wait()
+        return True
+
+    channel, socket = _channel(
+        _canvas_response_events(
+            arguments=json.dumps(
+                {"query": "a bounded historical detail"}, separators=(",", ":")
+            ),
+            function_name=SEARCH_MEMORY_TOOL_NAME,
+            preamble="",
+        ),
+        resource_capacity_waiter=wait_for_snapshot,
+    )
+    iterator = channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-search-output-capacity",
+        text_input="Remember our earlier conversation.",
+        response_max_output_tokens=400,
+    ).__aiter__()
+    call = await anext(iterator)
+    assert isinstance(call, RealtimeSearchMemoryToolCall)
+
+    output = SearchMemoryToolOutputV4.model_validate(
+        {
+            "status": "available",
+            "references": [
+                {
+                    "sourceKind": "rawEvent",
+                    "timezoneIds": ["UTC"],
+                    "text": f"memory-reference-{index}-" + ("x" * 1_175),
+                }
+                for index in range(5)
+            ],
+        }
+    )
+    serialized_output = output.model_dump_json(by_alias=True, exclude_none=True)
+    output_utf8_bytes = len(serialized_output.encode("utf-8"))
+    assert output_utf8_bytes > 5_000
+
+    previous_received = socket.received_count
+    socket.push(
+        {
+            "type": "rate_limits.updated",
+            "rate_limits": [
+                {
+                    "name": "tokens",
+                    "limit": 40_000,
+                    "remaining": 10_000,
+                    "reset_seconds": 60,
+                }
+            ],
+        }
+    )
+    await socket.wait_received(previous_received + 1)
+    completion = asyncio.create_task(
+        channel.complete_utility_tool(
+            turn_id="turn-search-output-capacity",
+            call_id=call.call_id,
+            output=output,
+            harness=_harness(),
+        )
+    )
+    await waiter_entered.wait()
+
+    function_outputs = [
+        event
+        for event in socket.sent
+        if event.get("type") == "conversation.item.create"
+        and isinstance(event.get("item"), dict)
+        and event["item"].get("type") == "function_call_output"
+    ]
+    assert len(function_outputs) == 1
+    assert function_outputs[0]["item"]["output"] == serialized_output
+    assert (
+        len([event for event in socket.sent if event.get("type") == "response.create"])
+        == 1
+    )
+    resource = channel.session_health.resource_governor
+    assert resource is not None
+    expected_input = 10 + 4 + output_utf8_bytes
+    assert resource.estimated_logical_turn_responses == 2
+    assert resource.estimated_logical_turn_tokens == (
+        (expected_input + 512) + (expected_input + 512 + 512)
+    )
+
+    previous_received = socket.received_count
+    socket.push(
+        {
+            "type": "rate_limits.updated",
+            "rate_limits": [
+                {
+                    "name": "tokens",
+                    "limit": 40_000,
+                    "remaining": 40_000,
+                    "reset_seconds": 60,
+                }
+            ],
+        }
+    )
+    await socket.wait_received(previous_received + 1)
+    await completion
+    assert (
+        len([event for event in socket.sent if event.get("type") == "response.create"])
+        == 2
+    )
+    assert (
+        len(
+            [
+                event
+                for event in socket.sent
+                if event.get("type") == "conversation.item.create"
+                and isinstance(event.get("item"), dict)
+                and event["item"].get("type") == "function_call_output"
+            ]
+        )
+        == 1
+    )
+
+    for event in _text_response_events(
+        response_id="response-search-output-capacity",
+        text="I found the bounded reference.",
+    ):
+        socket.push(event)
+    assert await anext(iterator) == RealtimeSpeechTextDelta(
+        delta="I found the bounded reference."
+    )
+    with pytest.raises(StopAsyncIteration):
+        await anext(iterator)
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_canvas_continuation_does_not_duplicate_tool_work() -> None:
+    async def reset_elapsed(_: float, __: asyncio.Event) -> bool:
+        return False
+
+    arguments = json.dumps(
+        {
+            "operation": "new",
+            "brief": "Show one triangle.",
+            "interactionMode": "none",
+        },
+        separators=(",", ":"),
+    )
+    initial = _canvas_response_events(arguments=arguments)
+    channel, socket = _channel(
+        [
+            *initial,
+            *_rate_limited_response_events(response_id="response-continuation-limited"),
+            *_text_response_events(
+                response_id="response-continuation-recovered",
+                text="Here it is.",
+                input_tokens=1_200,
+                output_tokens=4,
+            ),
+        ],
+        resource_capacity_waiter=reset_elapsed,
+    )
+    iterator = channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-tool-rate-limit",
+        text_input="Draw a triangle.",
+        response_max_output_tokens=400,
+    ).__aiter__()
+
+    assert await anext(iterator) == RealtimeSpeechTextDelta(
+        delta="I’ll show that clearly. "
+    )
+    call = await anext(iterator)
+    assert isinstance(call, RealtimeCanvasToolCall)
+    await channel.complete_canvas_tool(
+        turn_id="turn-tool-rate-limit",
+        call_id=call.call_id,
+        output=InteractiveCanvasToolOutputV4.model_validate(
+            {"status": "accepted", "generationId": "generation-rate-limit"}
+        ),
+    )
+    assert await anext(iterator) == RealtimeSpeechTextDelta(delta="Here it is.")
+    with pytest.raises(StopAsyncIteration):
+        await anext(iterator)
+
+    function_outputs = [
+        event
+        for event in socket.sent
+        if event.get("type") == "conversation.item.create"
+        and isinstance(event.get("item"), dict)
+        and event["item"].get("type") == "function_call_output"
+    ]
+    assert len(function_outputs) == 1
+    assert (
+        len([event for event in socket.sent if event.get("type") == "response.create"])
+        == 3
+    )
+    recovered = channel.conversation_ledger.response("response-continuation-recovered")
+    assert recovered is not None
+    assert recovered.local_turn_id == "turn-tool-rate-limit"
+    assert recovered.continuation_of_call_id == FUNCTION_CALL_ID
+
+
+@pytest.mark.asyncio
+async def test_interruption_during_rate_limit_wait_prevents_stale_retry() -> None:
+    waiter_entered = asyncio.Event()
+
+    async def blocked_waiter(_: float, changed: asyncio.Event) -> bool:
+        waiter_entered.set()
+        await changed.wait()
+        return True
+
+    channel, socket = _channel(
+        _rate_limited_response_events(response_id="response-interrupted"),
+        resource_capacity_waiter=blocked_waiter,
+    )
+    iterator = channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-interrupted-recovery",
+        text_input="Do not replay me.",
+        response_max_output_tokens=400,
+    ).__aiter__()
+    pending = asyncio.create_task(anext(iterator))
+    await waiter_entered.wait()
+
+    await channel.cancel(turn_id="turn-interrupted-recovery")
+    with pytest.raises(StopAsyncIteration):
+        await pending
+
+    assert (
+        len([event for event in socket.sent if event.get("type") == "response.create"])
+        == 1
+    )
+    assert (
+        len(
+            [
+                event
+                for event in socket.sent
+                if event.get("type") == "conversation.item.create"
+            ]
+        )
+        == 1
+    )
+    resource = channel.session_health.resource_governor
+    assert resource is not None
+    assert resource.local_reserved_requests == 0
+    assert resource.deferred_turn_id is None
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_primary_admission_defer_releases_reservation() -> (
+    None
+):
+    waiter_entered = asyncio.Event()
+
+    async def blocked_waiter(_: float, changed: asyncio.Event) -> bool:
+        waiter_entered.set()
+        await changed.wait()
+        return True
+
+    channel, socket = _channel(
+        [
+            {
+                "type": "rate_limits.updated",
+                "rate_limits": [
+                    {
+                        "name": "tokens",
+                        "limit": 50_000,
+                        "remaining": 0,
+                        "reset_seconds": 2,
+                    }
+                ],
+            },
+            {
+                "type": "input_audio_buffer.committed",
+                "item_id": "item-deferred-cancel",
+            },
+        ],
+        resource_capacity_waiter=blocked_waiter,
+    )
+    channel._resource_governor.observe_actual_usage(
+        turn_id="turn-calibration",
+        input_tokens=1_000,
+        output_tokens=100,
+    )
+    iterator = channel.stream_turn(
+        harness=_harness(), turn_id="turn-deferred-cancel"
+    ).__aiter__()
+    committed = await anext(iterator)
+    assert isinstance(committed, RealtimeCommittedInput)
+    assert not await channel.request_child_response(
+        turn_id=committed.turn_id,
+        item_id=committed.item_id,
+    )
+    waiting = asyncio.create_task(
+        channel.wait_until_response_admissible(turn_id=committed.turn_id)
+    )
+    await waiter_entered.wait()
+
+    await channel.cancel(turn_id=committed.turn_id)
+    assert await waiting is False
+    assert not any(event.get("type") == "response.create" for event in socket.sent)
+    resource = channel.session_health.resource_governor
+    assert resource is not None
+    assert resource.local_reserved_requests == 0
+    assert resource.deferred_turn_id is None
+    await iterator.aclose()
+
+
+@pytest.mark.asyncio
+async def test_repeated_rate_limits_exhaust_bound_without_wedging_next_turn() -> None:
+    async def reset_elapsed(_: float, __: asyncio.Event) -> bool:
+        return False
+
+    channel, socket = _channel(
+        [
+            *_rate_limited_response_events(response_id="response-limited-1"),
+            *_rate_limited_response_events(response_id="response-limited-2"),
+        ],
+        resource_capacity_waiter=reset_elapsed,
+        rate_limit_max_recovery_attempts=1,
+    )
+    iterator = channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-exhausted",
+        text_input="Try once.",
+        response_max_output_tokens=400,
+    ).__aiter__()
+
+    with pytest.raises(
+        RealtimeProviderResponseIncompleteError,
+        match="rate_limit_recovery_exhausted",
+    ):
+        await anext(iterator)
+    exhausted = channel.session_health.resource_governor
+    assert exhausted is not None
+    assert exhausted.state.value == "providerUnavailable"
+    assert exhausted.local_reserved_requests == 0
+    assert channel._active_response_request is None
+    assert channel._resource_deferred_turn_id is None
+
+    for event in _text_response_events(
+        response_id="response-next-turn",
+        text="The next turn works.",
+    ):
+        socket.push(event)
+    next_events = [
+        event
+        async for event in channel.stream_turn(
+            harness=_harness(),
+            turn_id="turn-after-exhaustion",
+            text_input="New turn.",
+            response_max_output_tokens=400,
+        )
+    ]
+    assert next_events == [RealtimeSpeechTextDelta(delta="The next turn works.")]

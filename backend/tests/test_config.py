@@ -42,6 +42,9 @@ def test_development_configuration_does_not_hide_missing_model_key() -> None:
     assert settings.openai_realtime_vad_silence_duration_ms == 450
     assert settings.openai_realtime_truncation_post_instructions_tokens == 80_000
     assert settings.openai_realtime_truncation_retention_ratio == 0.8
+    assert settings.openai_realtime_rate_limit_max_recovery_attempts == 2
+    assert settings.openai_realtime_rate_limit_max_recovery_seconds == 30
+    assert settings.openai_realtime_rate_limit_fallback_wait_seconds == 1
     assert settings.openai_canvas_timeout_seconds == 90
     assert settings.openai_canvas_first_progress_timeout_seconds == 40
     assert settings.openai_canvas_stream_stall_timeout_seconds == 15
@@ -65,9 +68,12 @@ def test_development_configuration_does_not_hide_missing_model_key() -> None:
         ("openai_realtime_truncation_retention_ratio", 0),
         ("openai_realtime_truncation_retention_ratio", 1),
         ("openai_realtime_truncation_retention_ratio", 1.1),
+        ("openai_realtime_rate_limit_max_recovery_attempts", 0),
+        ("openai_realtime_rate_limit_max_recovery_seconds", 0),
+        ("openai_realtime_rate_limit_fallback_wait_seconds", 0),
     ],
 )
-def test_realtime_truncation_configuration_rejects_nonsensical_values(
+def test_realtime_runtime_configuration_rejects_nonsensical_values(
     field: str,
     value: object,
 ) -> None:

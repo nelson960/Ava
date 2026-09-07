@@ -716,6 +716,7 @@ class DeterministicRealtimeSessionCoordinator:
                             desired_build_id,
                         )
 
+                wait_for_resource_admission = False
                 async with self._focus_linearization_lock:
                     if (
                         self._closed
@@ -743,16 +744,23 @@ class DeterministicRealtimeSessionCoordinator:
                         permit_degraded_focus_grounding=focus_grounding_degraded,
                     )
                     if committed_response is False:
-                        continue
-                    LOGGER.info(
-                        "realtime_child_response_committed session_id=%s turn_id=%s "
-                        "item_id=%s active_context_build_id=%s",
-                        self._session_id,
-                        committed.turn_id,
-                        committed.item_id,
-                        self._realtime.active_context_build_id,
+                        wait_for_resource_admission = True
+                    else:
+                        LOGGER.info(
+                            "realtime_child_response_committed session_id=%s turn_id=%s "
+                            "item_id=%s active_context_build_id=%s",
+                            self._session_id,
+                            committed.turn_id,
+                            committed.item_id,
+                            self._realtime.active_context_build_id,
+                        )
+                        return
+                if wait_for_resource_admission:
+                    still_current = await self._realtime.wait_until_response_admissible(
+                        turn_id=committed.turn_id
                     )
-                    return
+                    if not still_current:
+                        return
         finally:
             if self._turn_context_sync_owner is committed:
                 self._turn_context_sync_owner = None

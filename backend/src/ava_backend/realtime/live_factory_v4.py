@@ -89,6 +89,15 @@ class LiveRealtimeCoordinatorFactoryV4:
             truncation_retention_ratio=(
                 self._settings.openai_realtime_truncation_retention_ratio
             ),
+            rate_limit_max_recovery_attempts=(
+                self._settings.openai_realtime_rate_limit_max_recovery_attempts
+            ),
+            rate_limit_max_recovery_seconds=(
+                self._settings.openai_realtime_rate_limit_max_recovery_seconds
+            ),
+            rate_limit_fallback_wait_seconds=(
+                self._settings.openai_realtime_rate_limit_fallback_wait_seconds
+            ),
         )
         specialist: SvgCanvasSpecialist = OpenAISvgCanvasSpecialist(
             self._settings,

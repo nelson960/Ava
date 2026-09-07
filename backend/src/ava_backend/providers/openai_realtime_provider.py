@@ -5,7 +5,7 @@ import json
 import logging
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from time import monotonic
 from typing import Protocol, TypeVar
 from urllib.parse import quote, urlsplit
@@ -19,6 +19,9 @@ from websockets.asyncio.client import connect as connect_websocket
 
 from ..canvas.svg_workspace import RecordedSvgCanvasInteraction
 from ..config import (
+    DEFAULT_OPENAI_REALTIME_RATE_LIMIT_FALLBACK_WAIT_SECONDS,
+    DEFAULT_OPENAI_REALTIME_RATE_LIMIT_MAX_RECOVERY_ATTEMPTS,
+    DEFAULT_OPENAI_REALTIME_RATE_LIMIT_MAX_RECOVERY_SECONDS,
     DEFAULT_OPENAI_REALTIME_TRUNCATION_POST_INSTRUCTIONS_TOKENS,
     DEFAULT_OPENAI_REALTIME_TRUNCATION_RETENTION_RATIO,
 )
@@ -40,7 +43,14 @@ from ..realtime.provider_session import (
 )
 from ..realtime.provider_observability import (
     ProviderConversationLedger,
+    ProviderRateLimitObservation,
     SessionHealthSnapshot,
+)
+from ..realtime.resource_governor import (
+    RateLimitWindow,
+    ResourceAdmissionAction,
+    ResourceAdmissionDecision,
+    ResourceGovernor,
 )
 from ..realtime.tool_contract import (
     CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
@@ -86,6 +96,8 @@ MAX_PROVIDER_ERROR_BYTES = 64 * 1024
 MAX_OPENAI_REALTIME_CLIENT_ITEM_ID_CHARS = 32
 _SIDEBAND_SEQUENCE_FIELD = "__ava_sideband_sequence"
 _OPENAI_REALTIME_CLIENT_ITEM_ID_PREFIX = "ava_"
+_OPENAI_REALTIME_RESPONSE_CREATE_EVENT_ID_PREFIX = "ava_resp_"
+_OPENAI_REALTIME_RESPONSE_CREATE_EVENT_ID_CHARS = 32
 _CANVAS_INTERACTION_RESPONSE_MAX_OUTPUT_TOKENS = 256
 _CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS = 512
 _MAX_CONSUMED_TERMINAL_RESPONSE_IDS = 64
@@ -194,9 +206,27 @@ class _ResponseLifecycle:
     settled: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _ResponseRequest:
+    turn_id: str
+    payload: dict[str, object]
+    output_token_limits: tuple[int, ...]
+    input_growth_token_limits: tuple[int, ...]
+    initial_input_growth_tokens: int
+    client_event_id: str
+    prior_client_event_ids: tuple[str, ...] = ()
+    continuation_call_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _StructuredRateLimitFailure:
+    limit_kind: str | None
+
+
 _MAX_OUTSTANDING_CANCEL_OUTCOMES = 64
 _MAX_RECENTLY_RESOLVED_CANCEL_OUTCOMES = 32
 _MAX_RESPONSE_LIFECYCLES = 64
+_MAX_TOOL_CAPABLE_RESPONSE_CHAIN = 3
 
 
 class OpenAIRealtimeOutputValidationError(OpenAIRealtimeProtocolError):
@@ -271,6 +301,19 @@ RealtimeWebSocketConnector = Callable[
     [str, Mapping[str, str], float, int],
     Awaitable[RealtimeWebSocket],
 ]
+ResourceCapacityWaiter = Callable[[float, asyncio.Event], Awaitable[bool]]
+
+
+async def _default_resource_capacity_waiter(
+    wait_seconds: float,
+    changed: asyncio.Event,
+) -> bool:
+    try:
+        async with asyncio.timeout(wait_seconds):
+            await changed.wait()
+        return True
+    except TimeoutError:
+        return False
 
 
 async def _default_websocket_connector(
@@ -317,6 +360,18 @@ class _OpenAIRealtimeEventChannel:
         ),
         provider_call_id: str | None = None,
         session_id: str | None = None,
+        rate_limit_max_recovery_attempts: int = (
+            DEFAULT_OPENAI_REALTIME_RATE_LIMIT_MAX_RECOVERY_ATTEMPTS
+        ),
+        rate_limit_max_recovery_seconds: float = (
+            DEFAULT_OPENAI_REALTIME_RATE_LIMIT_MAX_RECOVERY_SECONDS
+        ),
+        rate_limit_fallback_wait_seconds: float = (
+            DEFAULT_OPENAI_REALTIME_RATE_LIMIT_FALLBACK_WAIT_SECONDS
+        ),
+        resource_capacity_waiter: ResourceCapacityWaiter = (
+            _default_resource_capacity_waiter
+        ),
     ) -> None:
         self._socket = socket
         self._session_id = session_id
@@ -326,6 +381,17 @@ class _OpenAIRealtimeEventChannel:
             provider_call_id=provider_call_id,
         )
         self._observability_warning_emitted = False
+        self._resource_governor = ResourceGovernor(
+            max_recovery_attempts=rate_limit_max_recovery_attempts,
+            max_recovery_seconds=rate_limit_max_recovery_seconds,
+            fallback_wait_seconds=rate_limit_fallback_wait_seconds,
+        )
+        self._resource_capacity_waiter = resource_capacity_waiter
+        self._resource_capacity_changed = asyncio.Event()
+        self._resource_deferred_turn_id: str | None = None
+        self._pending_primary_admission_wait_seconds: float | None = None
+        self._resource_recovery_probe_turn_id: str | None = None
+        self._active_response_request: _ResponseRequest | None = None
         self._model = model
         self._transcription_model = _required_name(
             transcription_model,
@@ -469,7 +535,14 @@ class _OpenAIRealtimeEventChannel:
 
     @property
     def session_health(self) -> SessionHealthSnapshot:
-        return self._observability.health_snapshot()
+        health = self._observability.health_snapshot()
+        return replace(
+            health,
+            resource_governor=self._resource_governor.snapshot(
+                tpm=_rate_limit_window(health.tpm),
+                rpm=_rate_limit_window(health.rpm),
+            ),
+        )
 
     def _safe_observability_action(
         self,
@@ -525,10 +598,31 @@ class _OpenAIRealtimeEventChannel:
         )
 
     def _settle_observability_turn(self, *, turn_id: str) -> None:
+        self._resource_governor.release_turn(turn_id=turn_id)
+        if (
+            self._active_response_request is not None
+            and self._active_response_request.turn_id == turn_id
+        ):
+            self._active_response_request = None
         self._safe_observability_action(
             operation="settleTurn",
             action=lambda: self._observability.settle_turn(local_turn_id=turn_id),
         )
+
+    def _resource_rate_limit_windows(
+        self,
+    ) -> tuple[RateLimitWindow | None, RateLimitWindow | None]:
+        try:
+            health = self._observability.health_snapshot()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self._record_observability_failure(
+                operation="readRateLimitSnapshot",
+                error=error,
+            )
+            return None, None
+        return _rate_limit_window(health.tpm), _rate_limit_window(health.rpm)
 
     def _expect_observability_continuation(
         self,
@@ -584,6 +678,7 @@ class _OpenAIRealtimeEventChannel:
                 )
                 event_type = _event_type(event)
                 if event_type == "rate_limits.updated":
+                    self._resource_capacity_changed.set()
                     self._log_session_health(reason="rateLimitsUpdated")
                 if event_type in _RESPONSE_DIAGNOSTIC_EVENT_TYPES:
                     response_id = _response_id_from_event(event)
@@ -701,7 +796,7 @@ class _OpenAIRealtimeEventChannel:
         lifecycle.terminal_observed = True
         lifecycle.terminal_status = terminal_status
         lifecycle.terminal_sideband_sequence = terminal_sequence
-        lifecycle.terminal_usage = _parse_usage(event)
+        lifecycle.terminal_usage = _parse_optional_usage(event)
 
     def _index_input_lifecycle(self, event: Mapping[str, object]) -> None:
         event_type = _event_type(event)
@@ -859,6 +954,16 @@ class _OpenAIRealtimeEventChannel:
                         "max_output_tokens": response_max_output_tokens
                         or self._max_output_tokens,
                     },
+                    output_token_limits=(
+                        response_max_output_tokens or self._max_output_tokens,
+                        *(
+                            min(
+                                _CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS,
+                                self._max_output_tokens,
+                            ),
+                        )
+                        * (_MAX_TOOL_CAPABLE_RESPONSE_CHAIN - 1),
+                    ),
                 )
 
             async for event in self._stream_semantic_turn(
@@ -870,9 +975,9 @@ class _OpenAIRealtimeEventChannel:
             response_completed = True
         finally:
             # An interrupted/erroring async generator deliberately retains the
-            # turn boundary until cancel() drains the provider response. In
-            # particular, response.created may already be queued on the wire
-            # even when we have not observed its response ID yet.
+            # turn and reservation boundary until cancel() drains the provider
+            # response. In particular, response.created may already be queued
+            # on the wire even when we have not observed its response ID yet.
             if response_completed:
                 self._settled_turn_ids.add(turn_id)
                 self._settle_observability_turn(turn_id=turn_id)
@@ -882,8 +987,17 @@ class _OpenAIRealtimeEventChannel:
                 self._interaction_response_readiness_changed.set()
 
     async def _create_response_locked(
-        self, *, turn_id: str, response: dict[str, object]
-    ) -> bool:
+        self,
+        *,
+        turn_id: str,
+        response: dict[str, object],
+        output_token_limits: tuple[int, ...],
+        input_growth_token_limits: tuple[int, ...] = (),
+        initial_input_growth_tokens: int = 0,
+        recovery_probe: bool = False,
+        continuation_call_id: str | None = None,
+        retry_request: _ResponseRequest | None = None,
+    ) -> tuple[bool, ResourceAdmissionDecision | None]:
         if (
             self._closed
             or self._active_turn_id != turn_id
@@ -891,18 +1005,120 @@ class _OpenAIRealtimeEventChannel:
             or self._active_response_id is not None
             or self._response_create_pending
         ):
-            return False
+            return False, None
+        tpm, rpm = self._resource_rate_limit_windows()
+        decision = self._resource_governor.admit(
+            turn_id=turn_id,
+            output_token_limits=output_token_limits,
+            input_growth_token_limits=input_growth_token_limits,
+            initial_input_growth_tokens=initial_input_growth_tokens,
+            tpm=tpm,
+            rpm=rpm,
+            recovery_probe=recovery_probe,
+        )
+        self._safe_observability_action(
+            operation="logResourceAdmission",
+            action=lambda: self._log_resource_decision(
+                turn_id=turn_id,
+                decision=decision,
+            ),
+        )
+        if decision.action is ResourceAdmissionAction.DEFER:
+            return False, decision
+        if retry_request is not None:
+            if (
+                retry_request.turn_id != turn_id
+                or retry_request.payload != response
+                or retry_request.output_token_limits != output_token_limits
+                or retry_request.input_growth_token_limits != input_growth_token_limits
+                or retry_request.initial_input_growth_tokens
+                != initial_input_growth_tokens
+                or retry_request.continuation_call_id != continuation_call_id
+            ):
+                raise OpenAIRealtimeProtocolError(
+                    "rate-limit retry changed its response-create request"
+                )
+            prior_client_event_ids = (
+                *retry_request.prior_client_event_ids,
+                retry_request.client_event_id,
+            )
+        else:
+            prior_client_event_ids = ()
+        client_event_id = _new_response_create_event_id()
         self._response_create_pending = True
-        await self._send_json({"type": "response.create", "response": response})
-        return True
+        self._active_response_request = _ResponseRequest(
+            turn_id=turn_id,
+            payload=dict(response),
+            output_token_limits=output_token_limits,
+            input_growth_token_limits=input_growth_token_limits,
+            initial_input_growth_tokens=initial_input_growth_tokens,
+            client_event_id=client_event_id,
+            prior_client_event_ids=prior_client_event_ids,
+            continuation_call_id=continuation_call_id,
+        )
+        try:
+            await self._send_json(
+                {
+                    "type": "response.create",
+                    "event_id": client_event_id,
+                    "response": response,
+                }
+            )
+        except BaseException:
+            self._response_create_pending = False
+            self._active_response_request = None
+            self._resource_governor.release_turn(turn_id=turn_id)
+            raise
+        return True, decision
 
     async def _create_response(
-        self, *, turn_id: str, response: dict[str, object]
+        self,
+        *,
+        turn_id: str,
+        response: dict[str, object],
+        output_token_limits: tuple[int, ...],
+        input_growth_token_limits: tuple[int, ...] = (),
+        initial_input_growth_tokens: int = 0,
+        continuation_call_id: str | None = None,
     ) -> bool:
-        async with self._response_create_lock:
-            return await self._create_response_locked(
-                turn_id=turn_id, response=response
-            )
+        recovery_probe = False
+        while True:
+            self._resource_capacity_changed.clear()
+            async with self._response_create_lock:
+                created, decision = await self._create_response_locked(
+                    turn_id=turn_id,
+                    response=response,
+                    output_token_limits=output_token_limits,
+                    input_growth_token_limits=input_growth_token_limits,
+                    initial_input_growth_tokens=initial_input_growth_tokens,
+                    recovery_probe=recovery_probe,
+                    continuation_call_id=continuation_call_id,
+                )
+            if created or decision is None:
+                return created
+            wait_seconds = decision.wait_seconds
+            if wait_seconds is None:
+                raise AssertionError("deferred admission omitted its wait duration")
+            self._resource_deferred_turn_id = turn_id
+            try:
+                capacity_changed = await self._resource_capacity_waiter(
+                    wait_seconds,
+                    self._resource_capacity_changed,
+                )
+            finally:
+                if self._resource_deferred_turn_id == turn_id:
+                    self._resource_deferred_turn_id = None
+            if (
+                self._closed
+                or self._active_turn_id != turn_id
+                or turn_id in self._cancelled_turn_ids
+            ):
+                self._resource_governor.release_turn(turn_id=turn_id)
+                return False
+            # A timeout is the provider-observed reset boundary (or the
+            # configured fallback when reset data is absent). Permit exactly
+            # one bounded recovery probe; a fresh snapshot is re-evaluated.
+            recovery_probe = not capacity_changed
 
     async def request_child_response(
         self,
@@ -915,37 +1131,96 @@ class _OpenAIRealtimeEventChannel:
             raise OpenAIRealtimeProtocolError(
                 "child response input item has invalid turn owner"
             )
+        response = {
+            "output_modalities": ["text"],
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+            "max_output_tokens": self._max_output_tokens,
+        }
+        continuation_limit = min(
+            _CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS,
+            self._max_output_tokens,
+        )
+        output_token_limits = (
+            self._max_output_tokens,
+            *(continuation_limit,) * (_MAX_TOOL_CAPABLE_RESPONSE_CHAIN - 1),
+        )
+        recovery_probe = self._resource_recovery_probe_turn_id == turn_id
+        self._resource_capacity_changed.clear()
         async with self._response_create_lock:
             if item_id in self._committed_response_items:
                 return True
             desired = self._desired_context
-            if desired is not None and desired[2] != self._installed_context_build_id:
-                if desired[2] not in self._installed_context_build_ids:
-                    if not permit_degraded_focus_grounding:
-                        return False
-                    LOGGER.warning(
-                        "openai_child_response_fallback_context turn_id=%s desired_build_id=%s installed_build_id=%s",
-                        turn_id,
-                        desired[2],
-                        self._installed_context_build_id,
-                    )
-            sent = await self._create_response_locked(
+            if (
+                desired is not None
+                and desired[2] != self._installed_context_build_id
+                and desired[2] not in self._installed_context_build_ids
+            ):
+                if not permit_degraded_focus_grounding:
+                    return False
+                LOGGER.warning(
+                    "openai_child_response_fallback_context turn_id=%s desired_build_id=%s installed_build_id=%s",
+                    turn_id,
+                    desired[2],
+                    self._installed_context_build_id,
+                )
+            sent, decision = await self._create_response_locked(
                 turn_id=turn_id,
-                response={
-                    "output_modalities": ["text"],
-                    "tool_choice": "auto",
-                    "parallel_tool_calls": False,
-                    "max_output_tokens": self._max_output_tokens,
-                },
+                response=response,
+                output_token_limits=output_token_limits,
+                recovery_probe=recovery_probe,
             )
-            if not sent:
-                return False
-            self._committed_response_items.add(item_id)
-            # Input retention already bounds item ownership to the last 64 entries.
-            self._committed_response_items.intersection_update(
-                self._input_item_turn_ids
+            if sent:
+                self._resource_recovery_probe_turn_id = None
+                self._pending_primary_admission_wait_seconds = None
+                self._resource_deferred_turn_id = None
+                self._committed_response_items.add(item_id)
+                # Input retention already bounds item ownership to the last 64 entries.
+                self._committed_response_items.intersection_update(
+                    self._input_item_turn_ids
+                )
+                return True
+        if decision is None:
+            return False
+        wait_seconds = decision.wait_seconds
+        if wait_seconds is None:
+            raise AssertionError("deferred admission omitted its wait duration")
+        self._resource_deferred_turn_id = turn_id
+        self._pending_primary_admission_wait_seconds = wait_seconds
+        return False
+
+    async def wait_until_response_admissible(self, *, turn_id: str) -> bool:
+        """Wait outside coordinator focus ownership for provider capacity."""
+
+        if self._resource_deferred_turn_id != turn_id:
+            return (
+                not self._closed
+                and self._active_turn_id == turn_id
+                and turn_id not in self._cancelled_turn_ids
             )
-            return True
+        wait_seconds = self._pending_primary_admission_wait_seconds
+        if wait_seconds is None:
+            raise OpenAIRealtimeProtocolError(
+                "deferred response admission lost its bounded wait"
+            )
+        try:
+            capacity_changed = await self._resource_capacity_waiter(
+                wait_seconds,
+                self._resource_capacity_changed,
+            )
+        finally:
+            if self._resource_deferred_turn_id == turn_id:
+                self._resource_deferred_turn_id = None
+            self._pending_primary_admission_wait_seconds = None
+        if (
+            self._closed
+            or self._active_turn_id != turn_id
+            or turn_id in self._cancelled_turn_ids
+        ):
+            self._resource_governor.release_turn(turn_id=turn_id)
+            return False
+        self._resource_recovery_probe_turn_id = None if capacity_changed else turn_id
+        return True
 
     async def complete_canvas_tool(
         self,
@@ -972,15 +1247,24 @@ class _OpenAIRealtimeEventChannel:
             raise OpenAIRealtimeProtocolError(
                 "canvas tool completion does not match the pending call"
             )
+        serialized_output = output.model_dump_json(
+            by_alias=True,
+            exclude_none=True,
+        )
         await self._create_conversation_item(
             turn_id=turn_id,
             dependency_call_id=call_id,
             item={
                 "type": "function_call_output",
                 "call_id": call_id,
-                "output": output.model_dump_json(by_alias=True, exclude_none=True),
+                "output": serialized_output,
             },
         )
+        # The function output is already created before resource admission for
+        # its continuation. Record that certainty now so interruption cannot
+        # create or execute the tool output a second time while admission waits.
+        self._completed_canvas_call_ids.add(call_id)
+        self._pending_canvas_call_id = None
         response_payload: dict[str, object] = {
             "conversation": "auto",
             "output_modalities": ["text"],
@@ -994,6 +1278,14 @@ class _OpenAIRealtimeEventChannel:
         continuation_created = await self._create_response(
             turn_id=turn_id,
             response=response_payload,
+            output_token_limits=(
+                min(
+                    _CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS,
+                    self._max_output_tokens,
+                ),
+            ),
+            initial_input_growth_tokens=_utf8_token_upper_bound(serialized_output),
+            continuation_call_id=call_id,
         )
         if continuation_created:
             self._expect_observability_continuation(
@@ -1009,8 +1301,6 @@ class _OpenAIRealtimeEventChannel:
             active_response_id=self._active_response_id,
             call_id=call_id,
         )
-        self._completed_canvas_call_ids.add(call_id)
-        self._pending_canvas_call_id = None
         self._interaction_response_readiness_changed.set()
 
     async def complete_manage_canvas_presentation_tool(
@@ -1036,15 +1326,21 @@ class _OpenAIRealtimeEventChannel:
             raise OpenAIRealtimeProtocolError(
                 "canvas presentation tool completion does not match the pending call"
             )
+        serialized_output = output.model_dump_json(
+            by_alias=True,
+            exclude_none=True,
+        )
         await self._create_conversation_item(
             turn_id=turn_id,
             dependency_call_id=call_id,
             item={
                 "type": "function_call_output",
                 "call_id": call_id,
-                "output": output.model_dump_json(by_alias=True, exclude_none=True),
+                "output": serialized_output,
             },
         )
+        self._completed_canvas_control_call_ids.add(call_id)
+        self._pending_canvas_control_call_id = None
         response_payload: dict[str, object] = {
             "conversation": "auto",
             "output_modalities": ["text"],
@@ -1060,6 +1356,14 @@ class _OpenAIRealtimeEventChannel:
             created = await self._create_response(
                 turn_id=turn_id,
                 response=response_payload,
+                output_token_limits=(
+                    min(
+                        _CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS,
+                        self._max_output_tokens,
+                    ),
+                ),
+                initial_input_growth_tokens=_utf8_token_upper_bound(serialized_output),
+                continuation_call_id=call_id,
             )
         except BaseException:
             self._pending_canvas_control_continuation_call_id = None
@@ -1080,8 +1384,6 @@ class _OpenAIRealtimeEventChannel:
             active_response_id=self._active_response_id,
             call_id=call_id,
         )
-        self._completed_canvas_control_call_ids.add(call_id)
-        self._pending_canvas_control_call_id = None
         self._interaction_response_readiness_changed.set()
 
     async def complete_utility_tool(
@@ -1106,15 +1408,21 @@ class _OpenAIRealtimeEventChannel:
             raise OpenAIRealtimeProtocolError(
                 "utility tool completion does not match the pending call"
             )
+        serialized_output = output.model_dump_json(
+            by_alias=True,
+            exclude_none=True,
+        )
         await self._create_conversation_item(
             turn_id=turn_id,
             dependency_call_id=call_id,
             item={
                 "type": "function_call_output",
                 "call_id": call_id,
-                "output": output.model_dump_json(by_alias=True, exclude_none=True),
+                "output": serialized_output,
             },
         )
+        self._completed_utility_call_ids.add(call_id)
+        self._pending_utility_call_id = None
         rejected = isinstance(output, RejectedUtilityToolOutputV4)
         response: dict[str, object] = {
             "conversation": "auto",
@@ -1139,14 +1447,23 @@ class _OpenAIRealtimeEventChannel:
         continuation_created = await self._create_response(
             turn_id=turn_id,
             response=response,
+            output_token_limits=(
+                (
+                    min(
+                        _CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS,
+                        self._max_output_tokens,
+                    ),
+                )
+                * (1 if rejected else 2)
+            ),
+            initial_input_growth_tokens=_utf8_token_upper_bound(serialized_output),
+            continuation_call_id=call_id,
         )
         if continuation_created:
             self._expect_observability_continuation(
                 turn_id=turn_id,
                 call_id=call_id,
             )
-        self._completed_utility_call_ids.add(call_id)
-        self._pending_utility_call_id = None
         self._interaction_response_readiness_changed.set()
 
     def _canvas_interaction_response_readiness(
@@ -1224,6 +1541,7 @@ class _OpenAIRealtimeEventChannel:
                 "tool_choice": "none",
                 "max_output_tokens": _CANVAS_INTERACTION_RESPONSE_MAX_OUTPUT_TOKENS,
             },
+            output_token_limits=(_CANVAS_INTERACTION_RESPONSE_MAX_OUTPUT_TOKENS,),
         )
         _log_response_diagnostic(
             "openai_realtime_canvas_interaction_response_requested",
@@ -1393,6 +1711,24 @@ class _OpenAIRealtimeEventChannel:
             raise ValueError("turn_id cannot be empty")
         if turn_id in self._cancelled_turn_ids:
             self._settle_observability_turn(turn_id=turn_id)
+            return
+        if self._resource_deferred_turn_id == turn_id:
+            # No response is active while admission/recovery is deferred. The
+            # wait is cancellable and this explicit wake prevents a stale
+            # retry from firing after the authoritative turn is interrupted.
+            self._cancelled_turn_ids.add(turn_id)
+            self._resource_governor.release_turn(turn_id=turn_id)
+            self._resource_capacity_changed.set()
+            self._pending_primary_admission_wait_seconds = None
+            self._resource_recovery_probe_turn_id = None
+            self._active_response_request = None
+            self._response_create_pending = False
+            if self._active_turn_id == turn_id:
+                self._active_turn_id = None
+            if self._awaiting_response_trigger_turn_id == turn_id:
+                self._awaiting_response_trigger_turn_id = None
+            self._settle_observability_turn(turn_id=turn_id)
+            self._interaction_response_readiness_changed.set()
             return
         if self._active_turn_id == turn_id:
             # A continuation response that has not produced response.created
@@ -1964,6 +2300,12 @@ class _OpenAIRealtimeEventChannel:
                 "OpenAI response lifecycle changed Ava turn ownership"
             )
         lifecycle.owner_turn_id = turn_id
+        request = self._active_response_request
+        if request is not None and request.turn_id == turn_id:
+            self._resource_governor.bind_provider_response(
+                turn_id=turn_id,
+                provider_response_id=response_id,
+            )
         self._safe_observability_action(
             operation="assignResponseOwner",
             action=lambda: self._observability.assign_response_owner(
@@ -2068,6 +2410,8 @@ class _OpenAIRealtimeEventChannel:
         turn_id: str,
         consumer_phase: str,
         usage: OpenAIRealtimeUsage | None = None,
+        usage_required: bool = True,
+        reconcile_resources: bool = True,
     ) -> None:
         owner = self._response_owner_by_id.get(response_id)
         if owner is None or owner != turn_id:
@@ -2078,7 +2422,11 @@ class _OpenAIRealtimeEventChannel:
             raise OpenAIRealtimeProtocolError(
                 "OpenAI terminal response was consumed more than once"
             )
-        reported_usage = usage or _parse_usage(event)
+        reported_usage = usage or _parse_optional_usage(event)
+        if reported_usage is None and usage_required:
+            raise OpenAIRealtimeProtocolError(
+                "OpenAI Realtime terminal response omitted usage"
+            )
         self._consumed_terminal_response_owner_by_id[response_id] = owner
         _retain_latest(
             self._consumed_terminal_response_owner_by_id,
@@ -2105,11 +2453,31 @@ class _OpenAIRealtimeEventChannel:
             active_turn_id=self._active_turn_id,
             active_response_id=self._active_response_id,
         )
-        self._log_response_usage(
-            response_id=response_id,
-            owner_turn_id=owner,
-            usage=reported_usage,
-        )
+        if reported_usage is not None:
+            if reconcile_resources:
+                request = self._active_response_request
+                if request is not None and request.turn_id == turn_id:
+                    self._resource_governor.reconcile_response(
+                        turn_id=turn_id,
+                        provider_response_id=response_id,
+                        input_tokens=reported_usage.input_tokens,
+                        output_tokens=reported_usage.output_tokens,
+                    )
+                    self._active_response_request = None
+                else:
+                    # Existing ownership fences may observe a provider-created
+                    # response in tests or legacy callers. Its actual usage can
+                    # still calibrate estimates without inventing a reservation.
+                    self._resource_governor.observe_actual_usage(
+                        turn_id=turn_id,
+                        input_tokens=reported_usage.input_tokens,
+                        output_tokens=reported_usage.output_tokens,
+                    )
+            self._log_response_usage(
+                response_id=response_id,
+                owner_turn_id=owner,
+                usage=reported_usage,
+            )
 
     def _log_response_usage(
         self,
@@ -2184,7 +2552,8 @@ class _OpenAIRealtimeEventChannel:
         )
 
     def _record_session_health(self, *, reason: str) -> None:
-        health = self._observability.health_snapshot()
+        health = self.session_health
+        resource = health.resource_governor
         LOGGER.info(
             "openai_realtime_session_health session_id=%s reason=%s "
             "observed_provider_item_count=%d response_count=%d",
@@ -2310,9 +2679,287 @@ class _OpenAIRealtimeEventChannel:
                     "rpmResetSeconds": (
                         health.rpm.reset_seconds if health.rpm is not None else None
                     ),
+                    "resourceGovernorState": (
+                        str(resource.state) if resource is not None else None
+                    ),
+                    "admissionDecision": (
+                        str(resource.admission_decision)
+                        if resource is not None
+                        and resource.admission_decision is not None
+                        else None
+                    ),
+                    "admissionReason": (
+                        str(resource.admission_reason)
+                        if resource is not None
+                        and resource.admission_reason is not None
+                        else None
+                    ),
+                    "localReservedTokens": (
+                        resource.local_reserved_tokens if resource is not None else 0
+                    ),
+                    "localReservedRequests": (
+                        resource.local_reserved_requests if resource is not None else 0
+                    ),
+                    "estimatedLogicalTurnTokens": (
+                        resource.estimated_logical_turn_tokens
+                        if resource is not None
+                        else None
+                    ),
+                    "estimatedLogicalTurnResponses": (
+                        resource.estimated_logical_turn_responses
+                        if resource is not None
+                        else None
+                    ),
+                    "deferredTurnId": (
+                        resource.deferred_turn_id if resource is not None else None
+                    ),
+                    "recoveryAttempt": (
+                        resource.recovery_attempt if resource is not None else 0
+                    ),
+                    "recoveryDeadlineSecondsRemaining": (
+                        resource.recovery_deadline_seconds_remaining
+                        if resource is not None
+                        else None
+                    ),
+                    "rateLimitRecoveryCount": (
+                        resource.rate_limit_recovery_count
+                        if resource is not None
+                        else 0
+                    ),
+                    "resourceDeferralCount": (
+                        resource.resource_deferral_count if resource is not None else 0
+                    ),
                 }
             },
         )
+
+    def _log_resource_decision(
+        self,
+        *,
+        turn_id: str,
+        decision: ResourceAdmissionDecision,
+    ) -> None:
+        health = self.session_health
+        resource = health.resource_governor
+        LOGGER.info(
+            "openai_realtime_resource_admission session_id=%s turn_id=%s "
+            "decision=%s reason=%s estimated_responses=%d",
+            self._session_id,
+            turn_id,
+            decision.action,
+            decision.reason,
+            decision.estimate.estimated_responses,
+            extra={
+                "ava_context": {
+                    "component": "realtimeResourceGovernor",
+                    "sessionId": self._session_id,
+                    "providerCallId": self._provider_call_id,
+                    "turnId": turn_id,
+                    "state": str(decision.state),
+                    "admissionDecision": str(decision.action),
+                    "admissionReason": str(decision.reason),
+                    "estimatedLogicalTurnTokens": (decision.estimate.estimated_tokens),
+                    "estimatedLogicalTurnResponses": (
+                        decision.estimate.estimated_responses
+                    ),
+                    "providerTpmRemaining": (
+                        health.tpm.remaining if health.tpm is not None else None
+                    ),
+                    "providerRpmRemaining": (
+                        health.rpm.remaining if health.rpm is not None else None
+                    ),
+                    "localReservedTokens": (
+                        resource.local_reserved_tokens if resource is not None else 0
+                    ),
+                    "localReservedRequests": (
+                        resource.local_reserved_requests if resource is not None else 0
+                    ),
+                    "waitSeconds": decision.wait_seconds,
+                }
+            },
+        )
+
+    async def _recover_rate_limited_response(
+        self,
+        *,
+        event: Mapping[str, object],
+        turn_id: str,
+        response_id: str,
+        consumer_phase: str,
+        limit_kind: str | None,
+    ) -> bool:
+        request = self._active_response_request
+        if request is None or request.turn_id != turn_id:
+            raise OpenAIRealtimeProtocolError(
+                "rate-limited response lost its explicit request owner"
+            )
+        usage = _parse_optional_usage(event)
+        self._mark_response_terminal_consumed(
+            event,
+            response_id=response_id,
+            turn_id=turn_id,
+            consumer_phase=consumer_phase,
+            usage=usage,
+            usage_required=False,
+            reconcile_resources=False,
+        )
+        if usage is not None:
+            self._resource_governor.observe_actual_usage(
+                turn_id=turn_id,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+            )
+        self._active_response_id = None
+        self._response_create_pending = False
+        return await self._recover_owned_rate_limited_request(
+            turn_id=turn_id,
+            failed_response_id=response_id,
+            limit_kind=limit_kind,
+        )
+
+    async def _recover_owned_rate_limited_request(
+        self,
+        *,
+        turn_id: str,
+        failed_response_id: str | None,
+        limit_kind: str | None,
+    ) -> bool:
+        request = self._active_response_request
+        if request is None or request.turn_id != turn_id:
+            raise OpenAIRealtimeProtocolError(
+                "rate-limited response lost its explicit request owner"
+            )
+        if not self._resource_governor.mark_rate_limited(turn_id=turn_id):
+            self._active_response_request = None
+            self._settled_turn_ids.add(turn_id)
+            self._active_turn_id = None
+            self._awaiting_response_trigger_turn_id = None
+            self._interaction_response_turn_id = None
+            self._interaction_response_readiness_changed.set()
+            self._safe_observability_action(
+                operation="settleTurn",
+                action=lambda: self._observability.settle_turn(local_turn_id=turn_id),
+            )
+            self._log_session_health(reason="rateLimitRecoveryExhausted")
+            raise RealtimeProviderResponseIncompleteError(
+                reason="rate_limit_recovery_exhausted"
+            )
+
+        while True:
+            # Arm the change signal before reading the current snapshot so an
+            # update racing with this read cannot be cleared and mistaken for
+            # a timeout/reset-boundary wakeup.
+            self._resource_capacity_changed.clear()
+            tpm, rpm = self._resource_rate_limit_windows()
+            wait_seconds = self._resource_governor.recovery_wait_seconds(
+                limit_kind=limit_kind,
+                tpm=tpm,
+                rpm=rpm,
+            )
+            resource = self._resource_governor.snapshot(tpm=tpm, rpm=rpm)
+            LOGGER.warning(
+                "openai_realtime_rate_limit_deferred session_id=%s turn_id=%s "
+                "response_id=%s limit_kind=%s wait_seconds=%.3f",
+                self._session_id,
+                turn_id,
+                failed_response_id,
+                limit_kind,
+                wait_seconds,
+                extra={
+                    "ava_context": {
+                        "component": "realtimeResourceGovernor",
+                        "sessionId": self._session_id,
+                        "providerCallId": self._provider_call_id,
+                        "turnId": turn_id,
+                        "providerResponseId": failed_response_id,
+                        "responseCreateEventId": request.client_event_id,
+                        "limitKind": limit_kind,
+                        "waitSeconds": wait_seconds,
+                        "recoveryAttempt": resource.recovery_attempt,
+                    }
+                },
+            )
+            self._resource_deferred_turn_id = turn_id
+            try:
+                capacity_changed = await self._resource_capacity_waiter(
+                    wait_seconds,
+                    self._resource_capacity_changed,
+                )
+            finally:
+                if self._resource_deferred_turn_id == turn_id:
+                    self._resource_deferred_turn_id = None
+            if (
+                self._closed
+                or self._active_turn_id != turn_id
+                or turn_id in self._cancelled_turn_ids
+            ):
+                self._resource_governor.release_turn(turn_id=turn_id)
+                self._active_response_request = None
+                return False
+
+            continuation_call_id = request.continuation_call_id
+            async with self._response_create_lock:
+                created, decision = await self._create_response_locked(
+                    turn_id=turn_id,
+                    response=request.payload,
+                    output_token_limits=request.output_token_limits,
+                    input_growth_token_limits=request.input_growth_token_limits,
+                    initial_input_growth_tokens=(request.initial_input_growth_tokens),
+                    recovery_probe=not capacity_changed,
+                    continuation_call_id=continuation_call_id,
+                    retry_request=request,
+                )
+            if created:
+                self._resource_governor.begin_recovery(turn_id=turn_id)
+                if continuation_call_id is not None:
+                    self._expect_observability_continuation(
+                        turn_id=turn_id,
+                        call_id=continuation_call_id,
+                    )
+                self._log_session_health(reason="rateLimitRecoverySubmitted")
+                return True
+            if decision is None:
+                self._resource_governor.release_turn(turn_id=turn_id)
+                self._active_response_request = None
+                return False
+            # A fresh provider snapshot must pass ordinary admission. If it is
+            # still insufficient, stay in this bounded recovery episode and
+            # wait for another snapshot/reset without submitting an attempt.
+            request = self._active_response_request or request
+
+    def _settle_uncorrelated_rate_limit(self, *, turn_id: str) -> None:
+        request = self._active_response_request
+        LOGGER.warning(
+            "openai_realtime_uncorrelated_rate_limit turn_id=%s "
+            "response_create_event_id=%s",
+            turn_id,
+            request.client_event_id if request is not None else None,
+            extra={
+                "ava_context": {
+                    "component": "realtimeResourceGovernor",
+                    "sessionId": self._session_id,
+                    "providerCallId": self._provider_call_id,
+                    "turnId": turn_id,
+                    "responseCreateEventId": (
+                        request.client_event_id if request is not None else None
+                    ),
+                    "classification": "uncorrelatedRateLimitNoRetry",
+                }
+            },
+        )
+        self._response_create_pending = False
+        self._active_response_request = None
+        self._resource_deferred_turn_id = None
+        self._pending_primary_admission_wait_seconds = None
+        self._resource_recovery_probe_turn_id = None
+        self._settled_turn_ids.add(turn_id)
+        if self._active_turn_id == turn_id:
+            self._active_turn_id = None
+        self._active_response_id = None
+        self._awaiting_response_trigger_turn_id = None
+        self._interaction_response_turn_id = None
+        self._settle_observability_turn(turn_id=turn_id)
+        self._interaction_response_readiness_changed.set()
 
     def _validate_input_transcription_progress(
         self,
@@ -2426,6 +3073,7 @@ class _OpenAIRealtimeEventChannel:
         self._awaiting_response_trigger_turn_id = None
         self._interaction_response_turn_id = None
         self._interaction_response_readiness_changed.set()
+        self._resource_capacity_changed.set()
         try:
             await self._socket.close(code=1000, reason="Ava session closed")
         finally:
@@ -2434,6 +3082,11 @@ class _OpenAIRealtimeEventChannel:
                 task.cancel()
             if task is not None:
                 await asyncio.gather(task, return_exceptions=True)
+            self._resource_governor.close()
+            self._active_response_request = None
+            self._resource_deferred_turn_id = None
+            self._pending_primary_admission_wait_seconds = None
+            self._resource_recovery_probe_turn_id = None
             observability_closed = self._safe_observability_action(
                 operation="close",
                 action=self._observability.close,
@@ -2484,6 +3137,7 @@ class _OpenAIRealtimeEventChannel:
             function_item_count = 0
             response_created_at: float | None = None
             first_text_delta_observed = False
+            semantic_output_observed = False
 
             while True:
                 event = await self._receive_event(
@@ -2531,6 +3185,48 @@ class _OpenAIRealtimeEventChannel:
                             turn_id,
                         )
                         continue
+                    if _provider_error_code(event) == "rate_limit_exceeded":
+                        request = self._active_response_request
+                        error_event_id = _provider_error_event_id(event)
+                        if (
+                            request is not None
+                            and error_event_id in request.prior_client_event_ids
+                        ):
+                            LOGGER.info(
+                                "openai_realtime_stale_rate_limit_error_ignored "
+                                "turn_id=%s error_event_id=%s "
+                                "active_response_create_event_id=%s",
+                                turn_id,
+                                error_event_id,
+                                request.client_event_id,
+                            )
+                            continue
+                        retry_safe = (
+                            request is not None
+                            and error_event_id == request.client_event_id
+                            and response_id is None
+                            and self._active_response_id is None
+                            and not semantic_output_observed
+                        )
+                        if retry_safe:
+                            self._response_create_pending = False
+                            recovered = await self._recover_owned_rate_limited_request(
+                                turn_id=turn_id,
+                                failed_response_id=None,
+                                limit_kind=_top_level_rate_limit_kind(event),
+                            )
+                            if not recovered:
+                                return
+                            response_expected = True
+                            break
+                        # Without an exact client-event match Ava cannot replay
+                        # the response. End only this local turn through the
+                        # existing non-terminal incomplete path and leave the
+                        # persistent session available for a later turn.
+                        self._settle_uncorrelated_rate_limit(turn_id=turn_id)
+                        raise RealtimeProviderResponseIncompleteError(
+                            reason="uncorrelated_rate_limit"
+                        )
                     raise _provider_error(event)
 
                 if event_type == "input_audio_buffer.committed":
@@ -2647,6 +3343,7 @@ class _OpenAIRealtimeEventChannel:
                     self._active_response_id = candidate_response_id
                     delta = _required_string(event, "delta", allow_empty=True)
                     if delta:
+                        semantic_output_observed = True
                         if self.last_first_delta_ms is None:
                             self.last_first_delta_ms = (
                                 monotonic() - trigger_started
@@ -2689,6 +3386,7 @@ class _OpenAIRealtimeEventChannel:
                             "OpenAI canvas interaction response attempted a tool call"
                         )
                     function_item_count += 1
+                    semantic_output_observed = True
                     if function_item_count > 1 or canvas_called or tool_steps_used >= 2:
                         raise OpenAIRealtimeProtocolError(
                             "OpenAI emitted an unexpected additional function call"
@@ -2733,6 +3431,8 @@ class _OpenAIRealtimeEventChannel:
                     response_id = candidate_response_id
                     self._active_response_id = candidate_response_id
                     argument_parts.append(delta)
+                    if delta:
+                        semantic_output_observed = True
                     if (
                         len("".join(argument_parts).encode("utf-8"))
                         > self._max_argument_bytes
@@ -2779,6 +3479,49 @@ class _OpenAIRealtimeEventChannel:
                     continue
 
                 if event_type == "response.done":
+                    rate_limit_failure = _structured_rate_limit_failure(event)
+                    if rate_limit_failure is not None:
+                        failed_response = _mapping(
+                            event.get("response"), "response.done response"
+                        )
+                        completed_response_id = _required_string(
+                            failed_response,
+                            "id",
+                        )
+                        failed_output = failed_response.get("output")
+                        safe_empty_output = (
+                            failed_output is None
+                            or failed_output == ()
+                            or (isinstance(failed_output, list) and not failed_output)
+                        )
+                        if (
+                            semantic_output_observed
+                            or not safe_empty_output
+                            or (
+                                response_id is not None
+                                and completed_response_id != response_id
+                            )
+                        ):
+                            # A response with semantic output is not replay-safe;
+                            # preserve the existing terminal failure behavior.
+                            _validate_semantic_response_done(
+                                event,
+                                expected_response_id=response_id,
+                            )
+                            raise AssertionError("failed response validation returned")
+                        recovered = await self._recover_rate_limited_response(
+                            event=event,
+                            turn_id=turn_id,
+                            response_id=completed_response_id,
+                            consumer_phase=(
+                                "canvasContinuation" if continuation else "turnResponse"
+                            ),
+                            limit_kind=rate_limit_failure.limit_kind,
+                        )
+                        if not recovered:
+                            return
+                        response_expected = True
+                        break
                     try:
                         response, completed_response_id = (
                             _validate_semantic_response_done(
@@ -3232,13 +3975,11 @@ class _OpenAIRealtimeEventChannel:
     ) -> str:
         """Create one provider item with an explicit, turn-owned identity."""
 
-        random_suffix_chars = (
-            MAX_OPENAI_REALTIME_CLIENT_ITEM_ID_CHARS
-            - len(_OPENAI_REALTIME_CLIENT_ITEM_ID_PREFIX)
+        random_suffix_chars = MAX_OPENAI_REALTIME_CLIENT_ITEM_ID_CHARS - len(
+            _OPENAI_REALTIME_CLIENT_ITEM_ID_PREFIX
         )
         provider_item_id = (
-            _OPENAI_REALTIME_CLIENT_ITEM_ID_PREFIX
-            + uuid4().hex[:random_suffix_chars]
+            _OPENAI_REALTIME_CLIENT_ITEM_ID_PREFIX + uuid4().hex[:random_suffix_chars]
         )
         await self._send_json(
             {
@@ -3378,6 +4119,15 @@ class OpenAIRealtimeProviderSession:
         truncation_retention_ratio: float = (
             DEFAULT_OPENAI_REALTIME_TRUNCATION_RETENTION_RATIO
         ),
+        rate_limit_max_recovery_attempts: int = (
+            DEFAULT_OPENAI_REALTIME_RATE_LIMIT_MAX_RECOVERY_ATTEMPTS
+        ),
+        rate_limit_max_recovery_seconds: float = (
+            DEFAULT_OPENAI_REALTIME_RATE_LIMIT_MAX_RECOVERY_SECONDS
+        ),
+        rate_limit_fallback_wait_seconds: float = (
+            DEFAULT_OPENAI_REALTIME_RATE_LIMIT_FALLBACK_WAIT_SECONDS
+        ),
         http_client: httpx.AsyncClient | None = None,
         websocket_connector: RealtimeWebSocketConnector = (
             _default_websocket_connector
@@ -3420,6 +4170,9 @@ class OpenAIRealtimeProviderSession:
         self._truncation_retention_ratio = _validated_truncation_retention_ratio(
             truncation_retention_ratio
         )
+        self._rate_limit_max_recovery_attempts = rate_limit_max_recovery_attempts
+        self._rate_limit_max_recovery_seconds = rate_limit_max_recovery_seconds
+        self._rate_limit_fallback_wait_seconds = rate_limit_fallback_wait_seconds
         self._api_origin = _validated_origin(api_origin, scheme="https")
         self._realtime_websocket_url = _validated_websocket_url(realtime_websocket_url)
         self._http_client = http_client or httpx.AsyncClient(
@@ -3564,6 +4317,13 @@ class OpenAIRealtimeProviderSession:
                 truncation_retention_ratio=self._truncation_retention_ratio,
                 provider_call_id=call_id,
                 session_id=self._session_id,
+                rate_limit_max_recovery_attempts=(
+                    self._rate_limit_max_recovery_attempts
+                ),
+                rate_limit_max_recovery_seconds=(self._rate_limit_max_recovery_seconds),
+                rate_limit_fallback_wait_seconds=(
+                    self._rate_limit_fallback_wait_seconds
+                ),
             )
             await channel.start_receiver()
         except Exception as error:
@@ -3633,6 +4393,11 @@ class OpenAIRealtimeProviderSession:
             turn_id=turn_id,
             item_id=item_id,
             permit_degraded_focus_grounding=permit_degraded_focus_grounding,
+        )
+
+    async def wait_until_response_admissible(self, *, turn_id: str) -> bool:
+        return await self._require_channel().wait_until_response_admissible(
+            turn_id=turn_id
         )
 
     async def wait_for_context(self, *, build_id: str) -> None:
@@ -4318,6 +5083,30 @@ def _validate_semantic_response_done(
     return response, response_id
 
 
+def _structured_rate_limit_failure(
+    event: Mapping[str, object],
+) -> _StructuredRateLimitFailure | None:
+    """Recognize only the provider's structured terminal rate-limit shape."""
+
+    response = _optional_mapping(event.get("response"))
+    if response.get("status") != "failed":
+        return None
+    status_details = _optional_mapping(response.get("status_details"))
+    if status_details.get("type") != "failed":
+        return None
+    error = _optional_mapping(status_details.get("error"))
+    if error.get("code") != "rate_limit_exceeded":
+        return None
+    limit_kind_value = error.get("type")
+    limit_kind = (
+        limit_kind_value
+        if isinstance(limit_kind_value, str)
+        and limit_kind_value in {"tokens", "requests"}
+        else None
+    )
+    return _StructuredRateLimitFailure(limit_kind=limit_kind)
+
+
 def _response_output(response: Mapping[str, object]) -> list[object]:
     output = response.get("output")
     if output is None and response.get("status") == "cancelled":
@@ -4400,6 +5189,44 @@ def _parse_usage(event: Mapping[str, object]) -> OpenAIRealtimeUsage:
     )
 
 
+def _parse_optional_usage(
+    event: Mapping[str, object],
+) -> OpenAIRealtimeUsage | None:
+    response = _mapping(event.get("response"), "response.done response")
+    if response.get("usage") is None:
+        return None
+    return _parse_usage(event)
+
+
+def _rate_limit_window(
+    observation: ProviderRateLimitObservation | None,
+) -> RateLimitWindow | None:
+    if observation is None:
+        return None
+    return RateLimitWindow(
+        limit=observation.limit,
+        remaining=observation.remaining,
+        reset_seconds=observation.reset_seconds,
+        observed_at=observation.observed_at,
+    )
+
+
+def _new_response_create_event_id() -> str:
+    suffix_characters = _OPENAI_REALTIME_RESPONSE_CREATE_EVENT_ID_CHARS - len(
+        _OPENAI_REALTIME_RESPONSE_CREATE_EVENT_ID_PREFIX
+    )
+    return (
+        _OPENAI_REALTIME_RESPONSE_CREATE_EVENT_ID_PREFIX
+        + uuid4().hex[:suffix_characters]
+    )
+
+
+def _utf8_token_upper_bound(serialized_input: str) -> int:
+    """Bound tokenizer-free provider input growth by exact serialized bytes."""
+
+    return len(serialized_input.encode("utf-8"))
+
+
 def _provider_error(event: Mapping[str, object]) -> OpenAIRealtimeProviderError:
     error = _optional_mapping(event.get("error"))
     code = error.get("code") if isinstance(error.get("code"), str) else "unknown"
@@ -4417,6 +5244,20 @@ def _provider_error_code(event: Mapping[str, object]) -> str:
     error = _optional_mapping(event.get("error"))
     code = error.get("code")
     return code if isinstance(code, str) and code else "unknown"
+
+
+def _provider_error_event_id(event: Mapping[str, object]) -> str | None:
+    error = _optional_mapping(event.get("error"))
+    event_id = error.get("event_id")
+    return event_id if isinstance(event_id, str) and event_id else None
+
+
+def _top_level_rate_limit_kind(event: Mapping[str, object]) -> str | None:
+    error = _optional_mapping(event.get("error"))
+    limit_kind = error.get("type")
+    if isinstance(limit_kind, str) and limit_kind in {"tokens", "requests"}:
+        return limit_kind
+    return None
 
 
 async def _read_bounded_response(

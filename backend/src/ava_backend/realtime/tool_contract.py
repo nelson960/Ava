@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 import re
 from typing import Annotated
@@ -18,6 +18,17 @@ SEARCH_MEMORY_TOOL_NAME = "search_memory"
 GET_CURRENT_TIME_TOOL_NAME = "get_current_time"
 INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS = 1000
 CANVAS_MODEL_SAFE_REJECTION_REASON = "visualUnavailable"
+SEARCH_MEMORY_MAX_REFERENCES = 5
+SEARCH_MEMORY_SOURCE_KIND_MAX_CHARACTERS = 32
+SEARCH_MEMORY_MAX_TIMEZONE_IDS = 32
+SEARCH_MEMORY_TIMEZONE_ID_MAX_CHARACTERS = 64
+SEARCH_MEMORY_REFERENCE_TEXT_MAX_CHARACTERS = 1_200
+SEARCH_MEMORY_REASON_MAX_CHARACTERS = 160
+CURRENT_TIME_ISO_MAX_CHARACTERS = 64
+CURRENT_TIME_WEEKDAY_MAX_CHARACTERS = 16
+CURRENT_TIME_TIMEZONE_MAX_CHARACTERS = 64
+UTILITY_REJECTION_REASON_MAX_CHARACTERS = 160
+CANVAS_TOOL_OUTPUT_REASON_MAX_CHARACTERS = 240
 _CALL_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
@@ -162,13 +173,22 @@ class SearchMemoryToolStatus(StrEnum):
 
 
 class SearchMemoryReferenceV4(RealtimeProtocolModel):
-    source_kind: Annotated[NonEmptyText, StringConstraints(max_length=32)]
+    source_kind: Annotated[
+        NonEmptyText,
+        StringConstraints(max_length=SEARCH_MEMORY_SOURCE_KIND_MAX_CHARACTERS),
+    ]
     started_at: datetime | None = None
     ended_at: datetime | None = None
-    timezone_ids: list[Annotated[NonEmptyText, StringConstraints(max_length=64)]] = (
-        Field(max_length=32)
-    )
-    text: Annotated[NonEmptyText, StringConstraints(max_length=1_200)]
+    timezone_ids: list[
+        Annotated[
+            NonEmptyText,
+            StringConstraints(max_length=SEARCH_MEMORY_TIMEZONE_ID_MAX_CHARACTERS),
+        ]
+    ] = Field(max_length=SEARCH_MEMORY_MAX_TIMEZONE_IDS)
+    text: Annotated[
+        NonEmptyText,
+        StringConstraints(max_length=SEARCH_MEMORY_REFERENCE_TEXT_MAX_CHARACTERS),
+    ]
 
     @model_validator(mode="after")
     def time_range_is_atomic(self) -> SearchMemoryReferenceV4:
@@ -185,9 +205,15 @@ class SearchMemoryReferenceV4(RealtimeProtocolModel):
 class SearchMemoryToolOutputV4(RealtimeProtocolModel):
     status: SearchMemoryToolStatus
     references: list[SearchMemoryReferenceV4] = Field(
-        default_factory=list, max_length=5
+        default_factory=list, max_length=SEARCH_MEMORY_MAX_REFERENCES
     )
-    reason: Annotated[str, StringConstraints(max_length=160)] | None = None
+    reason: (
+        Annotated[
+            str,
+            StringConstraints(max_length=SEARCH_MEMORY_REASON_MAX_CHARACTERS),
+        ]
+        | None
+    ) = None
 
     @model_validator(mode="after")
     def result_shape_matches_status(self) -> SearchMemoryToolOutputV4:
@@ -212,15 +238,27 @@ class CurrentTimeDaypart(StrEnum):
 
 
 class GetCurrentTimeToolOutputV4(RealtimeProtocolModel):
-    local_iso_date_time: Annotated[NonEmptyText, StringConstraints(max_length=64)]
-    weekday: Annotated[NonEmptyText, StringConstraints(max_length=16)]
+    local_iso_date_time: Annotated[
+        NonEmptyText,
+        StringConstraints(max_length=CURRENT_TIME_ISO_MAX_CHARACTERS),
+    ]
+    weekday: Annotated[
+        NonEmptyText,
+        StringConstraints(max_length=CURRENT_TIME_WEEKDAY_MAX_CHARACTERS),
+    ]
     daypart: CurrentTimeDaypart
-    timezone_id: Annotated[NonEmptyText, StringConstraints(max_length=64)]
+    timezone_id: Annotated[
+        NonEmptyText,
+        StringConstraints(max_length=CURRENT_TIME_TIMEZONE_MAX_CHARACTERS),
+    ]
 
 
 class RejectedUtilityToolOutputV4(RealtimeProtocolModel):
     status: Annotated[str, StringConstraints(pattern="^rejected$")] = "rejected"
-    reason: Annotated[NonEmptyText, StringConstraints(max_length=160)]
+    reason: Annotated[
+        NonEmptyText,
+        StringConstraints(max_length=UTILITY_REJECTION_REASON_MAX_CHARACTERS),
+    ]
 
 
 type RealtimeUtilityToolOutputV4 = (
@@ -243,7 +281,13 @@ class InteractiveCanvasToolOutputV4(RealtimeProtocolModel):
 
     status: InteractiveCanvasToolStatusV4
     generation_id: str | None = Field(default=None, min_length=1, max_length=64)
-    reason: Annotated[str, StringConstraints(max_length=240)] | None = None
+    reason: (
+        Annotated[
+            str,
+            StringConstraints(max_length=CANVAS_TOOL_OUTPUT_REASON_MAX_CHARACTERS),
+        ]
+        | None
+    ) = None
 
     @model_validator(mode="after")
     def status_fields_are_atomic(self) -> InteractiveCanvasToolOutputV4:
@@ -264,7 +308,13 @@ class InteractiveCanvasCancellationToolOutputV4(RealtimeProtocolModel):
     """Immediate result for an explicit cancellation of pending canvas work."""
 
     status: InteractiveCanvasToolStatusV4
-    reason: Annotated[str, StringConstraints(max_length=240)] | None = None
+    reason: (
+        Annotated[
+            str,
+            StringConstraints(max_length=CANVAS_TOOL_OUTPUT_REASON_MAX_CHARACTERS),
+        ]
+        | None
+    ) = None
 
     @model_validator(mode="after")
     def status_fields_are_atomic(self) -> InteractiveCanvasCancellationToolOutputV4:
@@ -302,7 +352,13 @@ class ManageCanvasPresentationToolOutputV4(RealtimeProtocolModel):
     has_next: bool | None = None
     workspace_epoch: int | None = Field(default=None, ge=0)
     workspace_revision: int | None = Field(default=None, ge=0)
-    reason: Annotated[str, StringConstraints(max_length=240)] | None = None
+    reason: (
+        Annotated[
+            str,
+            StringConstraints(max_length=CANVAS_TOOL_OUTPUT_REASON_MAX_CHARACTERS),
+        ]
+        | None
+    ) = None
 
     @property
     def action(self) -> ManageCanvasPresentationAction:
@@ -363,6 +419,78 @@ class InteractiveCanvasToolOutput(RealtimeProtocolModel):
             ):
                 raise ValueError("rejected canvas output cannot include scene fields")
         return self
+
+
+def _serialized_tool_output_utf8_bytes(output: RealtimeProtocolModel) -> int:
+    return len(output.model_dump_json(by_alias=True, exclude_none=True).encode("utf-8"))
+
+
+def _maximum_search_memory_output_utf8_bytes() -> int:
+    # U+0001 forces JSON's longest six-byte character escape, so this concrete
+    # valid model measures the contract's conservative UTF-8 serialization bound
+    # without introducing a tokenizer or an unrelated policy constant.
+    escaped = "\u0001"
+    reference = SearchMemoryReferenceV4.model_validate(
+        {
+            "sourceKind": escaped * SEARCH_MEMORY_SOURCE_KIND_MAX_CHARACTERS,
+            "startedAt": datetime.max.replace(tzinfo=UTC),
+            "endedAt": datetime.max.replace(tzinfo=UTC),
+            "timezoneIds": [
+                escaped * SEARCH_MEMORY_TIMEZONE_ID_MAX_CHARACTERS
+                for _ in range(SEARCH_MEMORY_MAX_TIMEZONE_IDS)
+            ],
+            "text": escaped * SEARCH_MEMORY_REFERENCE_TEXT_MAX_CHARACTERS,
+        }
+    )
+    return _serialized_tool_output_utf8_bytes(
+        SearchMemoryToolOutputV4(
+            status=SearchMemoryToolStatus.AVAILABLE,
+            references=[reference] * SEARCH_MEMORY_MAX_REFERENCES,
+        )
+    )
+
+
+MAX_SEARCH_MEMORY_TOOL_OUTPUT_UTF8_BYTES = _maximum_search_memory_output_utf8_bytes()
+MAX_TERMINAL_TOOL_OUTPUT_UTF8_BYTES = max(
+    _serialized_tool_output_utf8_bytes(
+        InteractiveCanvasToolOutputV4(
+            status=InteractiveCanvasToolStatusV4.REJECTED,
+            reason="\u0001" * CANVAS_TOOL_OUTPUT_REASON_MAX_CHARACTERS,
+        )
+    ),
+    _serialized_tool_output_utf8_bytes(
+        InteractiveCanvasCancellationToolOutputV4(
+            status=InteractiveCanvasToolStatusV4.REJECTED,
+            reason="\u0001" * CANVAS_TOOL_OUTPUT_REASON_MAX_CHARACTERS,
+        )
+    ),
+    _serialized_tool_output_utf8_bytes(
+        ManageCanvasPresentationToolOutputV4(
+            status=ManageCanvasPresentationStatus.REJECTED,
+            operation=ManageCanvasPresentationAction.HIDE,
+            reason="\u0001" * CANVAS_TOOL_OUTPUT_REASON_MAX_CHARACTERS,
+        )
+    ),
+)
+MAX_PRIMARY_TOOL_OUTPUT_UTF8_BYTES = max(
+    MAX_SEARCH_MEMORY_TOOL_OUTPUT_UTF8_BYTES,
+    MAX_TERMINAL_TOOL_OUTPUT_UTF8_BYTES,
+    _serialized_tool_output_utf8_bytes(
+        GetCurrentTimeToolOutputV4.model_validate(
+            {
+                "localIsoDateTime": "\u0001" * CURRENT_TIME_ISO_MAX_CHARACTERS,
+                "weekday": "\u0001" * CURRENT_TIME_WEEKDAY_MAX_CHARACTERS,
+                "daypart": CurrentTimeDaypart.AFTERNOON,
+                "timezoneId": "\u0001" * CURRENT_TIME_TIMEZONE_MAX_CHARACTERS,
+            }
+        )
+    ),
+    _serialized_tool_output_utf8_bytes(
+        RejectedUtilityToolOutputV4(
+            reason="\u0001" * UTILITY_REJECTION_REASON_MAX_CHARACTERS
+        )
+    ),
+)
 
 
 @dataclass(frozen=True, slots=True)

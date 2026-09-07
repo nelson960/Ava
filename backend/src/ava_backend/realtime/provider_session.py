@@ -132,6 +132,10 @@ class RealtimeProviderSession(Protocol):
         permit_degraded_focus_grounding: bool = False,
     ) -> bool: ...
 
+    async def wait_until_response_admissible(self, *, turn_id: str) -> bool:
+        """Wait for resource admission without holding coordinator state locks."""
+        ...
+
     async def wait_for_context(self, *, build_id: str) -> None: ...
 
     @property

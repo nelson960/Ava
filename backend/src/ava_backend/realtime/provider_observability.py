@@ -8,6 +8,8 @@ from math import isfinite
 from time import monotonic
 from typing import Literal
 
+from .resource_governor import ResourceGovernorSnapshot
+
 
 # SAFETY/RESOURCE: observability must remain bounded even if a provider session
 # outlives the expected warm conversation window. Saturation is exposed rather
@@ -105,6 +107,7 @@ class SessionHealthSnapshot:
     rate_limit_snapshot_truncated: bool
     tpm: ProviderRateLimitObservation | None
     rpm: ProviderRateLimitObservation | None
+    resource_governor: ResourceGovernorSnapshot | None = None
 
 
 class ProviderConversationLedger:
