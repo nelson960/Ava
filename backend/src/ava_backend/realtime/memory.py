@@ -37,6 +37,12 @@ MAX_DIALOGUE_FRAME_RECENT_ENTITIES = 8
 MAX_DIALOGUE_FRAME_CANVAS_REFERENCES = 4
 MAX_DIALOGUE_FRAME_TOOL_REFERENCES = 4
 MAX_DIALOGUE_FRAME_UTF8_BYTES = 3_200
+MAX_SEMANTIC_JOURNAL_EVENTS_PER_PROPOSAL = 4
+MAX_SEMANTIC_JOURNAL_KEY_CHARACTERS = 96
+MAX_SEMANTIC_JOURNAL_SUMMARY_CHARACTERS = 240
+MAX_SEMANTIC_JOURNAL_CANVAS_REFERENCES = 4
+MAX_SEMANTIC_JOURNAL_SUPERSEDES_EVENT_IDS = 4
+MAX_SEMANTIC_MEMORY_PROPOSAL_UTF8_BYTES = 4_096
 
 if MAX_WEEKLY_RECORDS > RAW_RETENTION_LOW_WATER:
     raise RuntimeError(
@@ -64,6 +70,18 @@ class DialogueFrameSourceTurnMissingError(RuntimeError):
 
 class DialogueFrameUpdateConflictError(RuntimeError):
     """One source turn attempted two different frame replacements."""
+
+
+class SemanticMemorySourceTurnMissingError(RuntimeError):
+    """A semantic proposal referenced a turn that is not durably committed."""
+
+
+class SemanticMemoryProposalConflictError(RuntimeError):
+    """One source turn attempted two different semantic proposals."""
+
+
+class SemanticJournalConflictError(RuntimeError):
+    """A Journal proposal conflicts with durable identity or lineage state."""
 
 
 class MemoryProposalKind(StrEnum):
@@ -395,6 +413,162 @@ class DialogueFrameUpdateDecision(RealtimeProtocolModel):
     frame: DialogueFrame
 
 
+class SemanticJournalEventFamily(StrEnum):
+    USER_PREFERENCE = "userPreference"
+    AVA_COMMITMENT = "avaCommitment"
+    USER_FACT = "userFact"
+    CANVAS_REFERENCE = "canvasReference"
+
+
+SemanticJournalKey = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=MAX_SEMANTIC_JOURNAL_KEY_CHARACTERS,
+        pattern=r"^[a-z][a-z0-9._:-]{0,95}$",
+    ),
+]
+SemanticJournalSummary = Annotated[
+    NonEmptyText,
+    StringConstraints(max_length=MAX_SEMANTIC_JOURNAL_SUMMARY_CHARACTERS),
+]
+
+
+class SemanticJournalCanvasReference(RealtimeProtocolModel):
+    scene_id: ProtocolIdentifier
+    scene_revision: int = Field(ge=1, le=10_001)
+    relation: DialogueFrameText | None = None
+
+    @model_validator(mode="after")
+    def relation_is_safe(self) -> SemanticJournalCanvasReference:
+        if self.relation is not None:
+            _reject_control_characters(self.relation)
+        return self
+
+
+class SemanticJournalEventProposal(RealtimeProtocolModel):
+    family: SemanticJournalEventFamily
+    semantic_key: SemanticJournalKey
+    summary: SemanticJournalSummary
+    canonical_canvas_references: tuple[SemanticJournalCanvasReference, ...] = Field(
+        default=(), max_length=MAX_SEMANTIC_JOURNAL_CANVAS_REFERENCES
+    )
+    supersedes_event_ids: tuple[ProtocolIdentifier, ...] = Field(
+        default=(), max_length=MAX_SEMANTIC_JOURNAL_SUPERSEDES_EVENT_IDS
+    )
+
+    @model_validator(mode="after")
+    def event_is_mechanically_bounded(self) -> SemanticJournalEventProposal:
+        _reject_control_characters(self.summary)
+        canvas_identities = [
+            (reference.scene_id, reference.scene_revision, reference.relation)
+            for reference in self.canonical_canvas_references
+        ]
+        if len(canvas_identities) != len(set(canvas_identities)):
+            raise ValueError("canonicalCanvasReferences cannot contain duplicates")
+        if len(self.supersedes_event_ids) != len(set(self.supersedes_event_ids)):
+            raise ValueError("supersedesEventIds cannot contain duplicates")
+        return self
+
+
+class SemanticMemoryProposal(RealtimeProtocolModel):
+    dialogue_frame_update: DialogueFrameUpdate | None = None
+    journal_events: tuple[SemanticJournalEventProposal, ...] = Field(
+        default=(), max_length=MAX_SEMANTIC_JOURNAL_EVENTS_PER_PROPOSAL
+    )
+
+    @model_validator(mode="after")
+    def proposal_is_bounded_and_unambiguous(self) -> SemanticMemoryProposal:
+        if self.dialogue_frame_update is None and not self.journal_events:
+            raise ValueError(
+                "semantic memory proposal requires a DialogueFrame update or "
+                "Journal event"
+            )
+        identities = [
+            semantic_journal_identity_key(event.family, event.semantic_key)
+            for event in self.journal_events
+        ]
+        if len(identities) != len(set(identities)):
+            raise ValueError(
+                "journalEvents cannot contain duplicate semantic identities"
+            )
+        byte_count = len(_canonical_model_json(self).encode("utf-8"))
+        if byte_count > MAX_SEMANTIC_MEMORY_PROPOSAL_UTF8_BYTES:
+            raise ValueError(
+                "semantic memory proposal exceeds "
+                f"{MAX_SEMANTIC_MEMORY_PROPOSAL_UTF8_BYTES} UTF-8 bytes"
+            )
+        return self
+
+
+class SemanticJournalEventRecord(RealtimeProtocolModel):
+    event_id: ProtocolIdentifier
+    subject: Annotated[NonEmptyText, StringConstraints(max_length=256)]
+    reset_revision: int = Field(ge=0)
+    family: SemanticJournalEventFamily
+    semantic_key: SemanticJournalKey
+    summary: SemanticJournalSummary
+    identity_key: Annotated[NonEmptyText, StringConstraints(max_length=128)]
+    fingerprint: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+    canonical_canvas_references: tuple[SemanticJournalCanvasReference, ...] = Field(
+        default=(), max_length=MAX_SEMANTIC_JOURNAL_CANVAS_REFERENCES
+    )
+    created_at: datetime
+
+    @model_validator(mode="after")
+    def record_is_coherent(self) -> SemanticJournalEventRecord:
+        _validate_subject(self.subject)
+        if self.created_at.tzinfo is None:
+            raise ValueError("semantic Journal createdAt must be timezone-aware")
+        expected_identity = semantic_journal_identity_key(
+            self.family, self.semantic_key
+        )
+        if self.identity_key != expected_identity:
+            raise ValueError("semantic Journal identityKey is not canonical")
+        return self
+
+
+class SemanticJournalEventDisposition(StrEnum):
+    CREATED = "created"
+    DEDUPLICATED = "deduplicated"
+
+
+class SemanticJournalEventResult(RealtimeProtocolModel):
+    disposition: SemanticJournalEventDisposition
+    event: SemanticJournalEventRecord
+
+
+class SemanticMemoryCommitStatus(StrEnum):
+    APPLIED = "applied"
+    IDEMPOTENT = "idempotent"
+    STALE = "stale"
+
+
+class SemanticMemoryCommitDecision(RealtimeProtocolModel):
+    status: SemanticMemoryCommitStatus
+    dialogue_frame: DialogueFrame
+    journal_results: tuple[SemanticJournalEventResult, ...] = Field(
+        max_length=MAX_SEMANTIC_JOURNAL_EVENTS_PER_PROPOSAL
+    )
+
+
+def _semantic_memory_decision(
+    status: SemanticMemoryCommitStatus,
+    frame: DialogueFrame,
+    results: Sequence[SemanticJournalEventResult],
+) -> SemanticMemoryCommitDecision:
+    return SemanticMemoryCommitDecision.model_validate(
+        {
+            "status": status,
+            "dialogueFrame": frame.model_dump(mode="json", by_alias=True),
+            "journalResults": [
+                result.model_dump(mode="json", by_alias=True) for result in results
+            ],
+        }
+    )
+
+
 _DIALOGUE_FRAME_TEXT_FIELDS = (
     "active_topics",
     "active_goals",
@@ -421,6 +595,107 @@ def canonical_dialogue_frame_update_fingerprint(
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def semantic_journal_identity_key(
+    family: SemanticJournalEventFamily | str,
+    semantic_key: str,
+) -> str:
+    """Derive identity only from the authority-supplied typed family and key."""
+
+    family_value = str(family)
+    if family_value not in {member.value for member in SemanticJournalEventFamily}:
+        raise ValueError("semantic Journal family is invalid")
+    if not re.fullmatch(r"[a-z][a-z0-9._:-]{0,95}", semantic_key):
+        raise ValueError("semantic Journal semanticKey is invalid")
+    return f"{family_value}:{semantic_key}"
+
+
+def canonical_semantic_journal_event_fingerprint(
+    event: SemanticJournalEventProposal,
+) -> str:
+    """Hash immutable event content; supersession lineage is deliberately excluded."""
+
+    validated = SemanticJournalEventProposal.model_validate(
+        event.model_dump(mode="json", by_alias=True)
+    )
+    payload = {
+        "canonicalCanvasReferences": [
+            reference.model_dump(mode="json", by_alias=True)
+            for reference in validated.canonical_canvas_references
+        ],
+        "family": validated.family,
+        "semanticKey": validated.semantic_key,
+        "summary": validated.summary,
+    }
+    return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+
+
+def canonical_semantic_memory_proposal_fingerprint(
+    proposal: SemanticMemoryProposal,
+) -> str:
+    """Hash the whole proposal, including frame CAS and supersession lineage."""
+
+    validated = SemanticMemoryProposal.model_validate(
+        proposal.model_dump(mode="json", by_alias=True)
+    )
+    return hashlib.sha256(
+        _canonical_json_bytes(validated.model_dump(mode="json", by_alias=True))
+    ).hexdigest()
+
+
+def semantic_journal_created_event_id(
+    *,
+    subject: str,
+    reset_revision: int,
+    source_turn_id: str,
+    identity_key: str,
+    event_fingerprint: str,
+) -> str:
+    """Return a deterministic backend-owned ID for one created occurrence."""
+
+    normalized_subject = _validate_subject(subject)
+    validated_revision = _validate_reset_revision(
+        reset_revision, field_name="reset_revision"
+    )
+    validated_source_turn_id = _validate_protocol_identifier(
+        source_turn_id, field_name="source_turn_id"
+    )
+    family, separator, semantic_key = identity_key.partition(":")
+    if (
+        not separator
+        or semantic_journal_identity_key(family, semantic_key) != identity_key
+    ):
+        raise ValueError("semantic Journal identity key is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", event_fingerprint):
+        raise ValueError("semantic Journal event fingerprint is invalid")
+    digest = hashlib.sha256(
+        _canonical_json_bytes(
+            {
+                "eventFingerprint": event_fingerprint,
+                "identityKey": identity_key,
+                "resetRevision": validated_revision,
+                "sourceTurnId": validated_source_turn_id,
+                "subject": normalized_subject,
+            }
+        )
+    ).hexdigest()
+    return f"sje-{digest[:60]}"
+
+
+def _canonical_model_json(model: RealtimeProtocolModel) -> str:
+    return _canonical_json_bytes(model.model_dump(mode="json", by_alias=True)).decode(
+        "utf-8"
+    )
+
+
+def _canonical_json_bytes(payload: object) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
 
 
 def _canonical_dialogue_frame_state_json(frame: DialogueFrameState) -> str:
@@ -528,6 +803,15 @@ class AuthoritativeMemoryStore(Protocol):
         update: DialogueFrameUpdate,
     ) -> DialogueFrameUpdateDecision: ...
 
+    async def apply_semantic_memory_proposal(
+        self,
+        *,
+        subject: str,
+        expected_reset_revision: int,
+        source_turn_id: str,
+        proposal: SemanticMemoryProposal,
+    ) -> SemanticMemoryCommitDecision: ...
+
     async def search_memory_candidates(
         self,
         *,
@@ -568,6 +852,147 @@ class StoredDeliveredConversationEvent:
     turn: DeliveredConversationTurn
 
 
+@dataclass(frozen=True, slots=True)
+class _SemanticMemoryReceipt:
+    proposal_fingerprint: str
+    event_results: tuple[tuple[str, SemanticJournalEventDisposition], ...]
+    resulting_frame_revision: int
+    applied_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedSemanticJournalEvent:
+    proposal: SemanticJournalEventProposal
+    record: SemanticJournalEventRecord
+    disposition: SemanticJournalEventDisposition
+
+
+def _prepare_semantic_journal_batch(
+    *,
+    subject: str,
+    reset_revision: int,
+    source_turn_id: str,
+    proposals: Sequence[SemanticJournalEventProposal],
+    events: dict[str, SemanticJournalEventRecord],
+    superseded_event_ids: set[str],
+    event_subjects: dict[str, str],
+    created_at: datetime,
+) -> tuple[_PreparedSemanticJournalEvent, ...]:
+    """Prevalidate a complete Journal batch without mutating durable state."""
+
+    active_by_identity: dict[str, SemanticJournalEventRecord] = {}
+    for record in events.values():
+        if record.event_id in superseded_event_ids:
+            continue
+        if record.identity_key in active_by_identity:
+            raise SemanticJournalConflictError(
+                "semantic Journal contains multiple active events for one identity"
+            )
+        active_by_identity[record.identity_key] = record
+    claimed_targets: set[str] = set()
+    prepared: list[_PreparedSemanticJournalEvent] = []
+    for event_proposal in proposals:
+        identity_key = semantic_journal_identity_key(
+            event_proposal.family, event_proposal.semantic_key
+        )
+        fingerprint = canonical_semantic_journal_event_fingerprint(event_proposal)
+        active = active_by_identity.get(identity_key)
+        if active is not None and active.fingerprint == fingerprint:
+            disposition = SemanticJournalEventDisposition.DEDUPLICATED
+            record = active
+        else:
+            disposition = SemanticJournalEventDisposition.CREATED
+            event_id = semantic_journal_created_event_id(
+                subject=subject,
+                reset_revision=reset_revision,
+                source_turn_id=source_turn_id,
+                identity_key=identity_key,
+                event_fingerprint=fingerprint,
+            )
+            if event_id in events:
+                raise SemanticJournalConflictError(
+                    "created semantic Journal occurrence ID already exists"
+                )
+            record = SemanticJournalEventRecord.model_validate(
+                {
+                    "eventId": event_id,
+                    "subject": subject,
+                    "resetRevision": reset_revision,
+                    "family": event_proposal.family,
+                    "semanticKey": event_proposal.semantic_key,
+                    "summary": event_proposal.summary,
+                    "identityKey": identity_key,
+                    "fingerprint": fingerprint,
+                    "canonicalCanvasReferences": [
+                        reference.model_dump(mode="json", by_alias=True)
+                        for reference in event_proposal.canonical_canvas_references
+                    ],
+                    "createdAt": created_at,
+                }
+            )
+        if disposition == SemanticJournalEventDisposition.DEDUPLICATED and (
+            event_proposal.supersedes_event_ids
+        ):
+            raise SemanticJournalConflictError(
+                "a deduplicated event cannot add supersession lineage"
+            )
+        for target_id in event_proposal.supersedes_event_ids:
+            if target_id == record.event_id:
+                raise SemanticJournalConflictError(
+                    "semantic Journal event cannot supersede itself"
+                )
+            if target_id in claimed_targets:
+                raise SemanticJournalConflictError(
+                    "one active event cannot be superseded twice in a proposal"
+                )
+            target = events.get(target_id)
+            if target is None:
+                owner = event_subjects.get(target_id)
+                reason = (
+                    "belongs to another subject"
+                    if owner is not None and owner != subject
+                    else "does not exist in the current reset revision"
+                )
+                raise SemanticJournalConflictError(
+                    f"superseded semantic Journal event {reason}"
+                )
+            if target.reset_revision != reset_revision:
+                raise SemanticJournalConflictError(
+                    "superseded semantic Journal event belongs to another reset "
+                    "revision"
+                )
+            if target_id in superseded_event_ids:
+                raise SemanticJournalConflictError(
+                    "superseded semantic Journal event is not active"
+                )
+            claimed_targets.add(target_id)
+        if active is not None and active.fingerprint != fingerprint:
+            if active.event_id not in event_proposal.supersedes_event_ids:
+                raise SemanticJournalConflictError(
+                    "active semantic identity has different content and requires "
+                    "explicit supersession"
+                )
+        prepared.append(
+            _PreparedSemanticJournalEvent(
+                proposal=event_proposal,
+                record=record,
+                disposition=disposition,
+            )
+        )
+    asserted_event_ids = {item.record.event_id for item in prepared}
+    superseded_in_proposal = {
+        target_id
+        for item in prepared
+        for target_id in item.proposal.supersedes_event_ids
+    }
+    if asserted_event_ids.intersection(superseded_in_proposal):
+        raise SemanticJournalConflictError(
+            "one proposal cannot both assert and supersede the same semantic "
+            "Journal event"
+        )
+    return tuple(prepared)
+
+
 class DevelopmentAuthoritativeMemoryStore:
     """Deterministic development store for realtime coordinator tests."""
 
@@ -592,6 +1017,18 @@ class DevelopmentAuthoritativeMemoryStore:
         self._dialogue_frame_receipts: defaultdict[str, dict[str, tuple[str, int]]] = (
             defaultdict(dict)
         )
+        self._semantic_journal_events: defaultdict[
+            str, dict[str, SemanticJournalEventRecord]
+        ] = defaultdict(dict)
+        self._semantic_journal_sources: defaultdict[str, defaultdict[str, set[str]]] = (
+            defaultdict(lambda: defaultdict(set))
+        )
+        self._semantic_journal_supersessions: defaultdict[
+            str, defaultdict[str, set[str]]
+        ] = defaultdict(lambda: defaultdict(set))
+        self._semantic_memory_receipts: defaultdict[
+            str, dict[str, _SemanticMemoryReceipt]
+        ] = defaultdict(dict)
         self._max_memories_per_subject = max_memories_per_subject
         self._lock = asyncio.Lock()
 
@@ -735,6 +1172,60 @@ class DevelopmentAuthoritativeMemoryStore:
         source_turn_id: str,
         update: DialogueFrameUpdate,
     ) -> DialogueFrameUpdateDecision:
+        validated_update = DialogueFrameUpdate.model_validate(
+            update.model_dump(mode="json", by_alias=True)
+        )
+        proposal = SemanticMemoryProposal.model_validate(
+            {
+                "dialogueFrameUpdate": validated_update.model_dump(
+                    mode="json", by_alias=True
+                )
+            }
+        )
+        try:
+            decision = await self._apply_semantic_memory_proposal(
+                subject=subject,
+                expected_reset_revision=expected_reset_revision,
+                source_turn_id=source_turn_id,
+                proposal=proposal,
+                allow_m1_frame_retry=True,
+            )
+        except SemanticMemorySourceTurnMissingError as error:
+            raise DialogueFrameSourceTurnMissingError(str(error)) from error
+        except SemanticMemoryProposalConflictError as error:
+            raise DialogueFrameUpdateConflictError(str(error)) from error
+        return DialogueFrameUpdateDecision.model_validate(
+            {
+                "status": decision.status,
+                "frame": decision.dialogue_frame.model_dump(mode="json", by_alias=True),
+            }
+        )
+
+    async def apply_semantic_memory_proposal(
+        self,
+        *,
+        subject: str,
+        expected_reset_revision: int,
+        source_turn_id: str,
+        proposal: SemanticMemoryProposal,
+    ) -> SemanticMemoryCommitDecision:
+        return await self._apply_semantic_memory_proposal(
+            subject=subject,
+            expected_reset_revision=expected_reset_revision,
+            source_turn_id=source_turn_id,
+            proposal=proposal,
+            allow_m1_frame_retry=False,
+        )
+
+    async def _apply_semantic_memory_proposal(
+        self,
+        *,
+        subject: str,
+        expected_reset_revision: int,
+        source_turn_id: str,
+        proposal: SemanticMemoryProposal,
+        allow_m1_frame_retry: bool,
+    ) -> SemanticMemoryCommitDecision:
         normalized_subject = _validate_subject(subject)
         validated_expected_reset_revision = _validate_reset_revision(
             expected_reset_revision,
@@ -743,10 +1234,12 @@ class DevelopmentAuthoritativeMemoryStore:
         validated_source_turn_id = _validate_protocol_identifier(
             source_turn_id, field_name="source_turn_id"
         )
-        validated_update = DialogueFrameUpdate.model_validate(
-            update.model_dump(mode="json", by_alias=True)
+        validated_proposal = SemanticMemoryProposal.model_validate(
+            proposal.model_dump(mode="json", by_alias=True)
         )
-        fingerprint = canonical_dialogue_frame_update_fingerprint(validated_update)
+        proposal_fingerprint = canonical_semantic_memory_proposal_fingerprint(
+            validated_proposal
+        )
 
         async with self._lock:
             current_reset_revision = self._reset_revisions[normalized_subject]
@@ -759,50 +1252,182 @@ class DevelopmentAuthoritativeMemoryStore:
                 validated_source_turn_id
                 not in self._committed_turn_ids[normalized_subject]
             ):
-                raise DialogueFrameSourceTurnMissingError(
-                    "DialogueFrame source turn is not durably committed"
+                raise SemanticMemorySourceTurnMissingError(
+                    "semantic memory source turn is not durably committed"
                 )
             current_frame = self._dialogue_frames.get(
                 normalized_subject, DialogueFrame()
             )
-            receipt = self._dialogue_frame_receipts[normalized_subject].get(
+            receipt = self._semantic_memory_receipts[normalized_subject].get(
                 validated_source_turn_id
             )
             if receipt is not None:
-                receipt_fingerprint, _applied_revision = receipt
-                if receipt_fingerprint != fingerprint:
-                    raise DialogueFrameUpdateConflictError(
+                if receipt.proposal_fingerprint != proposal_fingerprint:
+                    frame_update = validated_proposal.dialogue_frame_update
+                    frame_receipt = self._dialogue_frame_receipts[
+                        normalized_subject
+                    ].get(validated_source_turn_id)
+                    is_exact_m1_retry = (
+                        allow_m1_frame_retry
+                        and frame_update is not None
+                        and not validated_proposal.journal_events
+                        and frame_receipt is not None
+                        and frame_receipt[0]
+                        == canonical_dialogue_frame_update_fingerprint(frame_update)
+                    )
+                    if not is_exact_m1_retry:
+                        raise SemanticMemoryProposalConflictError(
+                            "source turn already applied a different semantic memory "
+                            "proposal"
+                        )
+                    return _semantic_memory_decision(
+                        SemanticMemoryCommitStatus.IDEMPOTENT,
+                        current_frame,
+                        (),
+                    )
+                return self._semantic_memory_decision_from_receipt(
+                    subject=normalized_subject,
+                    receipt=receipt,
+                    frame=current_frame,
+                )
+
+            frame_update = validated_proposal.dialogue_frame_update
+            legacy_frame_receipt = self._dialogue_frame_receipts[
+                normalized_subject
+            ].get(validated_source_turn_id)
+            if legacy_frame_receipt is not None:
+                frame_fingerprint = (
+                    canonical_dialogue_frame_update_fingerprint(frame_update)
+                    if frame_update is not None
+                    else None
+                )
+                if (
+                    frame_fingerprint != legacy_frame_receipt[0]
+                    or validated_proposal.journal_events
+                ):
+                    raise SemanticMemoryProposalConflictError(
                         "source turn already applied a different DialogueFrame update"
                     )
-                return DialogueFrameUpdateDecision.model_validate(
-                    {
-                        "status": DialogueFrameUpdateStatus.IDEMPOTENT,
-                        "frame": current_frame.model_dump(mode="json", by_alias=True),
-                    }
+                migrated_receipt = _SemanticMemoryReceipt(
+                    proposal_fingerprint=proposal_fingerprint,
+                    event_results=(),
+                    resulting_frame_revision=legacy_frame_receipt[1],
+                    applied_at=datetime.now(UTC),
                 )
-            if validated_update.base_revision != current_frame.revision:
-                return DialogueFrameUpdateDecision.model_validate(
-                    {
-                        "status": DialogueFrameUpdateStatus.STALE,
-                        "frame": current_frame.model_dump(mode="json", by_alias=True),
-                    }
+                self._semantic_memory_receipts[normalized_subject][
+                    validated_source_turn_id
+                ] = migrated_receipt
+                return self._semantic_memory_decision_from_receipt(
+                    subject=normalized_subject,
+                    receipt=migrated_receipt,
+                    frame=current_frame,
                 )
-            replacement = DialogueFrame.model_validate(
-                {
-                    **validated_update.frame.model_dump(mode="json", by_alias=True),
-                    "revision": current_frame.revision + 1,
-                }
+
+            if (
+                frame_update is not None
+                and frame_update.base_revision != current_frame.revision
+            ):
+                return _semantic_memory_decision(
+                    SemanticMemoryCommitStatus.STALE, current_frame, ()
+                )
+
+            prepared = _prepare_semantic_journal_batch(
+                subject=normalized_subject,
+                reset_revision=current_reset_revision,
+                source_turn_id=validated_source_turn_id,
+                proposals=validated_proposal.journal_events,
+                events=self._semantic_journal_events[normalized_subject],
+                superseded_event_ids=set(
+                    self._semantic_journal_supersessions[normalized_subject]
+                ),
+                event_subjects={
+                    event_id: event_subject
+                    for event_subject, subject_events in (
+                        self._semantic_journal_events.items()
+                    )
+                    for event_id in subject_events
+                },
+                created_at=datetime.now(UTC),
             )
-            self._dialogue_frames[normalized_subject] = replacement
-            self._dialogue_frame_receipts[normalized_subject][
+            replacement = current_frame
+            if frame_update is not None:
+                replacement = DialogueFrame.model_validate(
+                    {
+                        **frame_update.frame.model_dump(mode="json", by_alias=True),
+                        "revision": current_frame.revision + 1,
+                    }
+                )
+
+            # Every check above is side-effect free. Mutations below cannot fail.
+            if frame_update is not None:
+                self._dialogue_frames[normalized_subject] = replacement
+                self._dialogue_frame_receipts[normalized_subject][
+                    validated_source_turn_id
+                ] = (
+                    canonical_dialogue_frame_update_fingerprint(frame_update),
+                    replacement.revision,
+                )
+            event_results: list[SemanticJournalEventResult] = []
+            for item in prepared:
+                record = item.record
+                if item.disposition == SemanticJournalEventDisposition.CREATED:
+                    self._semantic_journal_events[normalized_subject][
+                        record.event_id
+                    ] = record
+                self._semantic_journal_sources[normalized_subject][record.event_id].add(
+                    validated_source_turn_id
+                )
+                for target_id in item.proposal.supersedes_event_ids:
+                    self._semantic_journal_supersessions[normalized_subject][
+                        target_id
+                    ].add(record.event_id)
+                event_results.append(
+                    SemanticJournalEventResult.model_validate(
+                        {
+                            "disposition": item.disposition,
+                            "event": record.model_dump(mode="json", by_alias=True),
+                        }
+                    )
+                )
+            semantic_receipt = _SemanticMemoryReceipt(
+                proposal_fingerprint=proposal_fingerprint,
+                event_results=tuple(
+                    (result.event.event_id, result.disposition)
+                    for result in event_results
+                ),
+                resulting_frame_revision=replacement.revision,
+                applied_at=datetime.now(UTC),
+            )
+            self._semantic_memory_receipts[normalized_subject][
                 validated_source_turn_id
-            ] = (fingerprint, replacement.revision)
-            return DialogueFrameUpdateDecision.model_validate(
+            ] = semantic_receipt
+            return _semantic_memory_decision(
+                SemanticMemoryCommitStatus.APPLIED,
+                replacement,
+                event_results,
+            )
+
+    def _semantic_memory_decision_from_receipt(
+        self,
+        *,
+        subject: str,
+        receipt: _SemanticMemoryReceipt,
+        frame: DialogueFrame,
+    ) -> SemanticMemoryCommitDecision:
+        results = [
+            SemanticJournalEventResult.model_validate(
                 {
-                    "status": DialogueFrameUpdateStatus.APPLIED,
-                    "frame": replacement.model_dump(mode="json", by_alias=True),
+                    "disposition": disposition,
+                    "event": self._semantic_journal_events[subject][
+                        event_id
+                    ].model_dump(mode="json", by_alias=True),
                 }
             )
+            for event_id, disposition in receipt.event_results
+        ]
+        return _semantic_memory_decision(
+            SemanticMemoryCommitStatus.IDEMPOTENT, frame, results
+        )
 
     async def search_memory_candidates(
         self,
@@ -1007,6 +1632,10 @@ class DevelopmentAuthoritativeMemoryStore:
             self._committed_turn_ids.pop(normalized_subject, None)
             self._dialogue_frames.pop(normalized_subject, None)
             self._dialogue_frame_receipts.pop(normalized_subject, None)
+            self._semantic_journal_events.pop(normalized_subject, None)
+            self._semantic_journal_sources.pop(normalized_subject, None)
+            self._semantic_journal_supersessions.pop(normalized_subject, None)
+            self._semantic_memory_receipts.pop(normalized_subject, None)
             self._reset_revisions[normalized_subject] += 1
             return ConversationResetReceipt.model_validate(
                 {

@@ -71,14 +71,18 @@ from .memory import (
     DeliveredInputKind,
     DeliveredTurnTerminal,
     DialogueFrame,
+    DialogueFrameCanvasReference,
     DialogueFrameUpdate,
     DialogueFrameUpdateDecision,
-    DialogueFrameUpdateStatus,
     MemoryResetRevisionMismatchError,
     MemoryProposalDecision,
     MemorySearchCandidate,
     MemoryCandidateSourceKind,
-    canonical_dialogue_frame_update_fingerprint,
+    SemanticMemoryCommitDecision,
+    SemanticMemoryCommitStatus,
+    SemanticMemoryProposal,
+    SemanticJournalCanvasReference,
+    canonical_semantic_memory_proposal_fingerprint,
 )
 from .provider_session import (
     NegotiatedRealtimeCall,
@@ -204,12 +208,31 @@ class _CapturedMemoryCommit:
     transcript_waiter: Awaitable[str | None] | None
     warm_refresh_revision: int
     dialogue_frame_update: DialogueFrameUpdate | None = None
+    semantic_memory_proposal: SemanticMemoryProposal | None = None
+
+    def __post_init__(self) -> None:
+        proposal = self.semantic_memory_proposal
+        update = self.dialogue_frame_update
+        if proposal is None and update is not None:
+            proposal = SemanticMemoryProposal.model_validate(
+                {"dialogueFrameUpdate": update.model_dump(mode="json", by_alias=True)}
+            )
+            object.__setattr__(self, "semantic_memory_proposal", proposal)
+        elif proposal is not None:
+            proposal_update = proposal.dialogue_frame_update
+            if update is not None and proposal_update != update:
+                raise ValueError(
+                    "captured semantic proposal and DialogueFrame compatibility "
+                    "view disagree"
+                )
+            if update is None and proposal_update is not None:
+                object.__setattr__(self, "dialogue_frame_update", proposal_update)
 
 
 @dataclass(frozen=True, slots=True)
-class _StagedDialogueFrameUpdate:
+class _StagedSemanticMemoryProposal:
     turn_id: str
-    update: DialogueFrameUpdate
+    proposal: SemanticMemoryProposal
     fingerprint: str
 
 
@@ -310,7 +333,9 @@ class DeterministicRealtimeSessionCoordinator:
         self._memory_snapshot: AuthoritativeMemorySnapshot | None = None
         self._memory_reset_revision: int | None = None
         self._dialogue_frame = DialogueFrame()
-        self._staged_dialogue_frame_update: _StagedDialogueFrameUpdate | None = None
+        self._staged_semantic_memory_proposal: _StagedSemanticMemoryProposal | None = (
+            None
+        )
         self._harness: RealtimeHarness | None = None
         self._pending_harness: RealtimeHarness | None = None
         self._pending_focus_revision: int | None = None
@@ -419,41 +444,72 @@ class DeterministicRealtimeSessionCoordinator:
         turn_id: str,
         update: DialogueFrameUpdate,
     ) -> None:
-        """Stage one transport-neutral semantic replacement for the exact turn."""
+        """Retain the M1 frame-only seam through the unified M2 owner."""
 
-        if turn_id != self._turn_id or self._terminal:
-            raise CoordinatorStateError(
-                "DialogueFrame update must belong to the active current turn"
-            )
-        if self._memory_reset_revision is None:
-            raise CoordinatorStateError(
-                "DialogueFrame update cannot stage before memory bootstrap"
-            )
         validated = DialogueFrameUpdate.model_validate(
             update.model_dump(mode="json", by_alias=True)
         )
-        self._validate_dialogue_frame_canvas_references(validated)
-        fingerprint = canonical_dialogue_frame_update_fingerprint(validated)
-        existing = self._staged_dialogue_frame_update
+        self.stage_semantic_memory_proposal(
+            turn_id=turn_id,
+            proposal=SemanticMemoryProposal.model_validate(
+                {
+                    "dialogueFrameUpdate": validated.model_dump(
+                        mode="json", by_alias=True
+                    )
+                }
+            ),
+        )
+
+    def stage_semantic_memory_proposal(
+        self,
+        *,
+        turn_id: str,
+        proposal: SemanticMemoryProposal,
+    ) -> None:
+        """Stage one immutable transport-neutral proposal for the exact turn."""
+
+        if turn_id != self._turn_id or self._terminal:
+            raise CoordinatorStateError(
+                "semantic memory proposal must belong to the active current turn"
+            )
+        if self._memory_reset_revision is None:
+            raise CoordinatorStateError(
+                "semantic memory proposal cannot stage before memory bootstrap"
+            )
+        validated = SemanticMemoryProposal.model_validate(
+            proposal.model_dump(mode="json", by_alias=True)
+        )
+        self._validate_semantic_memory_canvas_references(validated)
+        fingerprint = canonical_semantic_memory_proposal_fingerprint(validated)
+        existing = self._staged_semantic_memory_proposal
         if existing is not None:
             if existing.turn_id == turn_id and existing.fingerprint == fingerprint:
                 return
             raise CoordinatorStateError(
-                "current turn already staged a different DialogueFrame update"
+                "current turn already staged a different semantic memory proposal"
             )
-        self._staged_dialogue_frame_update = _StagedDialogueFrameUpdate(
+        self._staged_semantic_memory_proposal = _StagedSemanticMemoryProposal(
             turn_id=turn_id,
-            update=DialogueFrameUpdate.model_validate(
+            proposal=SemanticMemoryProposal.model_validate(
                 validated.model_dump(mode="json", by_alias=True)
             ),
             fingerprint=fingerprint,
         )
 
-    def _validate_dialogue_frame_canvas_references(
-        self, update: DialogueFrameUpdate
+    def _validate_semantic_memory_canvas_references(
+        self, proposal: SemanticMemoryProposal
     ) -> None:
         workspace = self._canvas_jobs.state.workspace
-        for reference in update.frame.relevant_canvas_references:
+        references: list[
+            DialogueFrameCanvasReference | SemanticJournalCanvasReference
+        ] = []
+        if proposal.dialogue_frame_update is not None:
+            references.extend(
+                proposal.dialogue_frame_update.frame.relevant_canvas_references
+            )
+        for event in proposal.journal_events:
+            references.extend(event.canonical_canvas_references)
+        for reference in references:
             scene = workspace.scene(reference.scene_id)
             manifest_scene = workspace.manifest_scene(reference.scene_id)
             canonical_revision = (
@@ -467,7 +523,7 @@ class DeterministicRealtimeSessionCoordinator:
             )
             if canonical_revision != reference.scene_revision:
                 raise CoordinatorStateError(
-                    "DialogueFrame Canvas reference is not a canonical retained "
+                    "semantic memory Canvas reference is not a canonical retained "
                     "scene revision"
                 )
 
@@ -873,7 +929,7 @@ class DeterministicRealtimeSessionCoordinator:
             self._warm_refresh_revision += 1
             self._warm_memories = ()
             self._dialogue_frame = DialogueFrame()
-            self._staged_dialogue_frame_update = None
+            self._staged_semantic_memory_proposal = None
             await self._canvas_jobs.reset_conversation()
             self._recent_live_echo_suppression_turn_ids.clear()
             self._last_memory_decision = None
@@ -2036,7 +2092,7 @@ class DeterministicRealtimeSessionCoordinator:
         self._memory_commit_sequence += 1
         self._latest_memory_commit_sequence = self._memory_commit_sequence
         self._last_memory_decision = None
-        self._staged_dialogue_frame_update = None
+        self._staged_semantic_memory_proposal = None
         self._turn_id = turn_id_factory()
         self._request_id = request_id_factory()
         self._stream_id = stream_id_factory()
@@ -4203,13 +4259,16 @@ class DeterministicRealtimeSessionCoordinator:
         self._latest_memory_commit_sequence = sequence
         self._warm_refresh_revision += 1
         warm_refresh_revision = self._warm_refresh_revision
-        staged_frame = self._staged_dialogue_frame_update
-        dialogue_frame_update: DialogueFrameUpdate | None = None
-        if staged_frame is not None and staged_frame.turn_id == turn_id:
-            dialogue_frame_update = DialogueFrameUpdate.model_validate(
-                staged_frame.update.model_dump(mode="json", by_alias=True)
+        staged_semantic_memory = self._staged_semantic_memory_proposal
+        semantic_memory_proposal: SemanticMemoryProposal | None = None
+        if (
+            staged_semantic_memory is not None
+            and staged_semantic_memory.turn_id == turn_id
+        ):
+            semantic_memory_proposal = SemanticMemoryProposal.model_validate(
+                staged_semantic_memory.proposal.model_dump(mode="json", by_alias=True)
             )
-            self._staged_dialogue_frame_update = None
+            self._staged_semantic_memory_proposal = None
         payload = _CapturedMemoryCommit(
             sequence=sequence,
             turn_id=turn_id,
@@ -4225,7 +4284,7 @@ class DeterministicRealtimeSessionCoordinator:
             terminal=terminal,
             transcript_waiter=transcript_waiter,
             warm_refresh_revision=warm_refresh_revision,
-            dialogue_frame_update=dialogue_frame_update,
+            semantic_memory_proposal=semantic_memory_proposal,
         )
         self._memory_commit_tasks[turn_id] = asyncio.create_task(
             self._run_memory_commit(payload=payload),
@@ -4342,15 +4401,29 @@ class DeterministicRealtimeSessionCoordinator:
             self._recent_live_echo_suppression_turn_ids.append(payload.turn_id)
             if payload.sequence == self._latest_memory_commit_sequence:
                 self._last_memory_decision = decision
-            frame_decision: DialogueFrameUpdateDecision | None = None
-            if payload.dialogue_frame_update is not None:
-                frame_decision = await self._apply_dialogue_frame_update(
+            semantic_decision: SemanticMemoryCommitDecision | None = None
+            semantic_proposal = payload.semantic_memory_proposal
+            prior_local_frame = self.dialogue_frame
+            if semantic_proposal is not None:
+                semantic_decision = await self._apply_semantic_memory_proposal(
                     payload=payload
                 )
+            authoritative_frame_changed = (
+                semantic_decision is not None
+                and payload.expected_reset_revision == self._memory_reset_revision
+                and semantic_decision.dialogue_frame != prior_local_frame
+            )
             await self._refresh_warm_memory(
                 payload=payload,
                 turn=turn,
-                force_context_refresh=frame_decision is not None,
+                force_context_refresh=(
+                    semantic_decision is not None
+                    and semantic_proposal is not None
+                    and (
+                        semantic_proposal.dialogue_frame_update is not None
+                        or authoritative_frame_changed
+                    )
+                ),
             )
         except asyncio.CancelledError:
             raise
@@ -4390,49 +4463,79 @@ class DeterministicRealtimeSessionCoordinator:
         *,
         payload: _CapturedMemoryCommit,
     ) -> DialogueFrameUpdateDecision | None:
-        update = payload.dialogue_frame_update
-        if update is None:
+        """Compatibility view for focused M1 tests and callers."""
+
+        decision = await self._apply_semantic_memory_proposal(payload=payload)
+        if decision is None:
             return None
+        return DialogueFrameUpdateDecision.model_validate(
+            {
+                "status": decision.status,
+                "frame": decision.dialogue_frame.model_dump(mode="json", by_alias=True),
+            }
+        )
+
+    async def _apply_semantic_memory_proposal(
+        self,
+        *,
+        payload: _CapturedMemoryCommit,
+    ) -> SemanticMemoryCommitDecision | None:
+        proposal = payload.semantic_memory_proposal
+        if proposal is None:
+            return None
+        update = proposal.dialogue_frame_update
         started = monotonic()
+        proposal_fingerprint = canonical_semantic_memory_proposal_fingerprint(proposal)
+        base_revision = update.base_revision if update is not None else None
         LOGGER.info(
-            "dialogue_frame_update_started session_id=%s turn_id=%s "
-            "reset_revision=%d base_frame_revision=%d",
+            "semantic_memory_commit_started session_id=%s turn_id=%s "
+            "reset_revision=%d proposal_fingerprint_prefix=%s "
+            "base_frame_revision=%s proposed_journal_event_count=%d",
             self._session_id,
             payload.turn_id,
             payload.expected_reset_revision,
-            update.base_revision,
+            proposal_fingerprint[:12],
+            base_revision,
+            len(proposal.journal_events),
         )
         try:
-            self._validate_dialogue_frame_canvas_references(update)
-            decision = await self._memory.apply_dialogue_frame_update(
+            self._validate_semantic_memory_canvas_references(proposal)
+            decision = await self._memory.apply_semantic_memory_proposal(
                 subject=self._subject,
                 expected_reset_revision=payload.expected_reset_revision,
                 source_turn_id=payload.turn_id,
-                update=update,
+                proposal=proposal,
             )
         except asyncio.CancelledError:
             raise
         except Exception as error:
             duration_ms = max(0.0, (monotonic() - started) * 1000)
             LOGGER.warning(
-                "dialogue_frame_update_failed session_id=%s turn_id=%s "
-                "reset_revision=%d base_frame_revision=%d duration_ms=%.2f "
-                "error_type=%s",
+                "semantic_memory_commit_failed session_id=%s turn_id=%s "
+                "reset_revision=%d proposal_fingerprint_prefix=%s "
+                "base_frame_revision=%s proposed_journal_event_count=%d "
+                "duration_ms=%.2f error_type=%s reason_category=%s",
                 self._session_id,
                 payload.turn_id,
                 payload.expected_reset_revision,
-                update.base_revision,
+                proposal_fingerprint[:12],
+                base_revision,
+                len(proposal.journal_events),
                 duration_ms,
                 type(error).__name__,
+                _memory_failure_reason_category(error),
                 extra={
                     "ava_context": {
                         "sessionId": self._session_id,
                         "turnId": payload.turn_id,
                         "resetRevision": payload.expected_reset_revision,
-                        "baseFrameRevision": update.base_revision,
+                        "proposalFingerprintPrefix": proposal_fingerprint[:12],
+                        "baseFrameRevision": base_revision,
+                        "proposedJournalEventCount": len(proposal.journal_events),
                         "status": "failed",
                         "durationMs": duration_ms,
                         "errorType": type(error).__name__,
+                        "reasonCategory": _memory_failure_reason_category(error),
                     }
                 },
             )
@@ -4441,34 +4544,50 @@ class DeterministicRealtimeSessionCoordinator:
         status = str(decision.status)
         event_suffix = (
             "completed"
-            if decision.status == DialogueFrameUpdateStatus.APPLIED
+            if decision.status == SemanticMemoryCommitStatus.APPLIED
             else status
         )
         if payload.expected_reset_revision == self._memory_reset_revision:
-            self._dialogue_frame = decision.frame
+            self._dialogue_frame = decision.dialogue_frame
+        created_count = sum(
+            result.disposition == "created" for result in decision.journal_results
+        )
+        deduplicated_count = sum(
+            result.disposition == "deduplicated" for result in decision.journal_results
+        )
         log = (
             LOGGER.info
-            if decision.status != DialogueFrameUpdateStatus.STALE
+            if decision.status != SemanticMemoryCommitStatus.STALE
             else LOGGER.warning
         )
         log(
-            "dialogue_frame_update_%s session_id=%s turn_id=%s "
-            "reset_revision=%d base_frame_revision=%d "
-            "resulting_frame_revision=%d duration_ms=%.2f",
+            "semantic_memory_commit_%s session_id=%s turn_id=%s "
+            "reset_revision=%d proposal_fingerprint_prefix=%s "
+            "base_frame_revision=%s resulting_frame_revision=%d "
+            "proposed_journal_event_count=%d created_journal_event_count=%d "
+            "deduplicated_journal_event_count=%d duration_ms=%.2f",
             event_suffix,
             self._session_id,
             payload.turn_id,
             payload.expected_reset_revision,
-            update.base_revision,
-            decision.frame.revision,
+            proposal_fingerprint[:12],
+            base_revision,
+            decision.dialogue_frame.revision,
+            len(proposal.journal_events),
+            created_count,
+            deduplicated_count,
             duration_ms,
             extra={
                 "ava_context": {
                     "sessionId": self._session_id,
                     "turnId": payload.turn_id,
                     "resetRevision": payload.expected_reset_revision,
-                    "baseFrameRevision": update.base_revision,
-                    "resultingFrameRevision": decision.frame.revision,
+                    "proposalFingerprintPrefix": proposal_fingerprint[:12],
+                    "baseFrameRevision": base_revision,
+                    "resultingFrameRevision": decision.dialogue_frame.revision,
+                    "proposedJournalEventCount": len(proposal.journal_events),
+                    "createdJournalEventCount": created_count,
+                    "deduplicatedJournalEventCount": deduplicated_count,
                     "status": status,
                     "durationMs": duration_ms,
                 }

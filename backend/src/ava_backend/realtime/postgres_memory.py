@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from collections.abc import Sequence
 from typing import AsyncIterator, cast
 
 from psycopg import AsyncConnection, Error as PsycopgError, errors
@@ -33,6 +34,14 @@ from .memory import (
     MemorySearchCandidate,
     MemoryResetRevisionMismatchError,
     MemoryProposalDecision,
+    SemanticJournalEventDisposition,
+    SemanticJournalEventRecord,
+    SemanticJournalEventResult,
+    SemanticMemoryCommitDecision,
+    SemanticMemoryCommitStatus,
+    SemanticMemoryProposal,
+    SemanticMemoryProposalConflictError,
+    SemanticMemorySourceTurnMissingError,
     StoredDeliveredConversationEvent,
     WeeklyConversationRecap,
     WeeklyConversationRecord,
@@ -45,8 +54,14 @@ from .memory import (
     _validate_weekly_summary,
     build_conversation_episodes,
     canonical_dialogue_frame_update_fingerprint,
+    canonical_semantic_journal_event_fingerprint,
+    canonical_semantic_memory_proposal_fingerprint,
     current_local_week_utc_bounds,
     evaluate_delivered_turn_memory_proposal,
+    semantic_journal_created_event_id,
+    semantic_journal_identity_key,
+    _prepare_semantic_journal_batch,
+    _semantic_memory_decision,
     _validate_optional_summary,
     _validate_protocol_identifier,
 )
@@ -109,19 +124,19 @@ class PostgresAuthoritativeMemoryStore:
                     """
                     select version
                     from ava_private.schema_migrations
-                    where name = 'realtime_memory_v7'
+                    where name = 'realtime_memory_v8'
                     """
                 )
                 row = await cursor.fetchone()
         except (PsycopgError, PoolTimeout) as error:
             await self._pool.close()
             raise PostgresMemoryStoreError(
-                "PostgreSQL memory is unavailable or its v7 migration is missing"
+                "PostgreSQL memory is unavailable or its v8 migration is missing"
             ) from error
         if row is None or cast(int, row["version"]) != 1:
             await self._pool.close()
             raise PostgresMemoryStoreError(
-                "PostgreSQL memory schema realtime_memory_v7 version 1 is required"
+                "PostgreSQL memory schema realtime_memory_v8 version 1 is required"
             )
         self._opened = True
 
@@ -370,6 +385,57 @@ class PostgresAuthoritativeMemoryStore:
         source_turn_id: str,
         update: DialogueFrameUpdate,
     ) -> DialogueFrameUpdateDecision:
+        validated_update = DialogueFrameUpdate.model_validate(
+            update.model_dump(mode="json", by_alias=True)
+        )
+        proposal = SemanticMemoryProposal.model_validate(
+            {
+                "dialogueFrameUpdate": validated_update.model_dump(
+                    mode="json", by_alias=True
+                )
+            }
+        )
+        try:
+            decision = await self._apply_semantic_memory_proposal(
+                subject=subject,
+                expected_reset_revision=expected_reset_revision,
+                source_turn_id=source_turn_id,
+                proposal=proposal,
+                allow_m1_frame_retry=True,
+            )
+        except SemanticMemorySourceTurnMissingError as error:
+            raise DialogueFrameSourceTurnMissingError(str(error)) from error
+        except SemanticMemoryProposalConflictError as error:
+            raise DialogueFrameUpdateConflictError(str(error)) from error
+        return _dialogue_frame_decision(
+            DialogueFrameUpdateStatus(decision.status), decision.dialogue_frame
+        )
+
+    async def apply_semantic_memory_proposal(
+        self,
+        *,
+        subject: str,
+        expected_reset_revision: int,
+        source_turn_id: str,
+        proposal: SemanticMemoryProposal,
+    ) -> SemanticMemoryCommitDecision:
+        return await self._apply_semantic_memory_proposal(
+            subject=subject,
+            expected_reset_revision=expected_reset_revision,
+            source_turn_id=source_turn_id,
+            proposal=proposal,
+            allow_m1_frame_retry=False,
+        )
+
+    async def _apply_semantic_memory_proposal(
+        self,
+        *,
+        subject: str,
+        expected_reset_revision: int,
+        source_turn_id: str,
+        proposal: SemanticMemoryProposal,
+        allow_m1_frame_retry: bool,
+    ) -> SemanticMemoryCommitDecision:
         normalized_subject = _validate_subject(subject)
         validated_expected_reset_revision = _validate_reset_revision(
             expected_reset_revision,
@@ -378,10 +444,12 @@ class PostgresAuthoritativeMemoryStore:
         validated_source_turn_id = _validate_dialogue_frame_source_turn_id(
             source_turn_id
         )
-        validated_update = DialogueFrameUpdate.model_validate(
-            update.model_dump(mode="json", by_alias=True)
+        validated_proposal = SemanticMemoryProposal.model_validate(
+            proposal.model_dump(mode="json", by_alias=True)
         )
-        fingerprint = canonical_dialogue_frame_update_fingerprint(validated_update)
+        proposal_fingerprint = canonical_semantic_memory_proposal_fingerprint(
+            validated_proposal
+        )
 
         async with self._connection() as connection:
             async with connection.transaction():
@@ -397,23 +465,6 @@ class PostgresAuthoritativeMemoryStore:
                 current_frame = await self._load_dialogue_frame(
                     connection, normalized_subject
                 )
-                receipt_cursor = await connection.execute(
-                    """
-                    select update_fingerprint
-                    from ava_private.dialogue_frame_receipts
-                    where subject = %s and source_turn_id = %s
-                    """,
-                    (normalized_subject, validated_source_turn_id),
-                )
-                receipt = await receipt_cursor.fetchone()
-                if receipt is not None:
-                    if receipt["update_fingerprint"] != fingerprint:
-                        raise DialogueFrameUpdateConflictError(
-                            "source turn already applied a different DialogueFrame update"
-                        )
-                    return _dialogue_frame_decision(
-                        DialogueFrameUpdateStatus.IDEMPOTENT, current_frame
-                    )
                 source_cursor = await connection.execute(
                     """
                     select 1 as durable
@@ -423,56 +474,317 @@ class PostgresAuthoritativeMemoryStore:
                     (normalized_subject, validated_source_turn_id),
                 )
                 if await source_cursor.fetchone() is None:
-                    raise DialogueFrameSourceTurnMissingError(
-                        "DialogueFrame source turn is not durably committed"
+                    raise SemanticMemorySourceTurnMissingError(
+                        "semantic memory source turn is not durably committed"
                     )
-                if validated_update.base_revision != current_frame.revision:
-                    return _dialogue_frame_decision(
-                        DialogueFrameUpdateStatus.STALE, current_frame
-                    )
-                replacement = DialogueFrame.model_validate(
-                    {
-                        **validated_update.frame.model_dump(mode="json", by_alias=True),
-                        "revision": current_frame.revision + 1,
-                    }
-                )
-                await connection.execute(
+
+                receipt_cursor = await connection.execute(
                     """
-                    update ava_private.memory_state
-                    set dialogue_frame_revision = %s,
-                        dialogue_frame_payload = %s,
-                        dialogue_frame_last_source_turn_id = %s,
-                        updated_at = now()
-                    where subject = %s
+                    select proposal_fingerprint, result_event_ids,
+                           result_dispositions, resulting_frame_revision
+                    from ava_private.semantic_memory_receipts
+                    where subject = %s and source_turn_id = %s
                     """,
-                    (
-                        replacement.revision,
-                        Jsonb(
-                            validated_update.frame.model_dump(
-                                mode="json", by_alias=True
+                    (normalized_subject, validated_source_turn_id),
+                )
+                receipt = await receipt_cursor.fetchone()
+                if receipt is not None:
+                    if receipt["proposal_fingerprint"] != proposal_fingerprint:
+                        frame_update = validated_proposal.dialogue_frame_update
+                        frame_receipt_cursor = await connection.execute(
+                            """
+                            select update_fingerprint
+                            from ava_private.dialogue_frame_receipts
+                            where subject = %s and source_turn_id = %s
+                            """,
+                            (normalized_subject, validated_source_turn_id),
+                        )
+                        frame_receipt = await frame_receipt_cursor.fetchone()
+                        is_exact_m1_retry = (
+                            allow_m1_frame_retry
+                            and frame_update is not None
+                            and not validated_proposal.journal_events
+                            and frame_receipt is not None
+                            and frame_receipt["update_fingerprint"]
+                            == canonical_dialogue_frame_update_fingerprint(frame_update)
+                        )
+                        if not is_exact_m1_retry:
+                            raise SemanticMemoryProposalConflictError(
+                                "source turn already applied a different semantic "
+                                "memory proposal"
                             )
-                        ),
-                        validated_source_turn_id,
-                        normalized_subject,
-                    ),
-                )
-                await connection.execute(
+                        return _semantic_memory_decision(
+                            SemanticMemoryCommitStatus.IDEMPOTENT,
+                            current_frame,
+                            (),
+                        )
+                    receipt_results = await self._load_semantic_result_events(
+                        connection,
+                        subject=normalized_subject,
+                        event_ids=cast(list[str], receipt["result_event_ids"]),
+                        dispositions=cast(list[str], receipt["result_dispositions"]),
+                    )
+                    return _semantic_memory_decision(
+                        SemanticMemoryCommitStatus.IDEMPOTENT,
+                        current_frame,
+                        receipt_results,
+                    )
+
+                frame_update = validated_proposal.dialogue_frame_update
+                legacy_receipt_cursor = await connection.execute(
                     """
-                    insert into ava_private.dialogue_frame_receipts (
-                      subject, source_turn_id, base_revision, applied_revision,
-                      update_fingerprint
-                    ) values (%s, %s, %s, %s, %s)
+                    select update_fingerprint, applied_revision
+                    from ava_private.dialogue_frame_receipts
+                    where subject = %s and source_turn_id = %s
                     """,
-                    (
-                        normalized_subject,
-                        validated_source_turn_id,
-                        validated_update.base_revision,
-                        replacement.revision,
-                        fingerprint,
-                    ),
+                    (normalized_subject, validated_source_turn_id),
                 )
-                return _dialogue_frame_decision(
-                    DialogueFrameUpdateStatus.APPLIED, replacement
+                legacy_receipt = await legacy_receipt_cursor.fetchone()
+                if legacy_receipt is not None:
+                    frame_fingerprint = (
+                        canonical_dialogue_frame_update_fingerprint(frame_update)
+                        if frame_update is not None
+                        else None
+                    )
+                    if (
+                        frame_fingerprint != legacy_receipt["update_fingerprint"]
+                        or validated_proposal.journal_events
+                    ):
+                        raise SemanticMemoryProposalConflictError(
+                            "source turn already applied a different DialogueFrame "
+                            "update"
+                        )
+                    await self._insert_semantic_memory_receipt(
+                        connection,
+                        subject=normalized_subject,
+                        source_turn_id=validated_source_turn_id,
+                        reset_revision=current_reset_revision,
+                        proposal_fingerprint=proposal_fingerprint,
+                        resulting_frame_revision=cast(
+                            int, legacy_receipt["applied_revision"]
+                        ),
+                        results=(),
+                    )
+                    return _semantic_memory_decision(
+                        SemanticMemoryCommitStatus.IDEMPOTENT,
+                        current_frame,
+                        (),
+                    )
+
+                if (
+                    frame_update is not None
+                    and frame_update.base_revision != current_frame.revision
+                ):
+                    return _semantic_memory_decision(
+                        SemanticMemoryCommitStatus.STALE, current_frame, ()
+                    )
+
+                identity_keys = [
+                    semantic_journal_identity_key(event.family, event.semantic_key)
+                    for event in validated_proposal.journal_events
+                ]
+                proposed_event_ids = [
+                    semantic_journal_created_event_id(
+                        subject=normalized_subject,
+                        reset_revision=current_reset_revision,
+                        source_turn_id=validated_source_turn_id,
+                        identity_key=identity_key,
+                        event_fingerprint=(
+                            canonical_semantic_journal_event_fingerprint(event)
+                        ),
+                    )
+                    for identity_key, event in zip(
+                        identity_keys,
+                        validated_proposal.journal_events,
+                        strict=True,
+                    )
+                ]
+                proposed_target_ids = [
+                    target_id
+                    for event in validated_proposal.journal_events
+                    for target_id in event.supersedes_event_ids
+                ]
+                validation_event_ids = list(
+                    dict.fromkeys([*proposed_event_ids, *proposed_target_ids])
+                )
+                events = await self._load_semantic_event_records(
+                    connection,
+                    subject=normalized_subject,
+                    reset_revision=current_reset_revision,
+                    identity_keys=identity_keys,
+                    event_ids=validation_event_ids,
+                )
+                superseded_event_ids: set[str] = set()
+                if events:
+                    superseded_cursor = await connection.execute(
+                        """
+                        select superseded_event_id
+                        from ava_private.semantic_journal_supersessions
+                        where subject = %s and reset_revision = %s
+                          and superseded_event_id = any(%s)
+                        """,
+                        (
+                            normalized_subject,
+                            current_reset_revision,
+                            list(events),
+                        ),
+                    )
+                    superseded_event_ids = {
+                        cast(str, row["superseded_event_id"])
+                        for row in await superseded_cursor.fetchall()
+                    }
+                event_subjects: dict[str, str] = {}
+                if proposed_target_ids:
+                    owner_cursor = await connection.execute(
+                        """
+                        select event_id, subject
+                        from ava_private.semantic_journal_events
+                        where event_id = any(%s)
+                        """,
+                        (proposed_target_ids,),
+                    )
+                    event_subjects = {
+                        cast(str, row["event_id"]): cast(str, row["subject"])
+                        for row in await owner_cursor.fetchall()
+                    }
+                created_at = datetime.now(UTC)
+                prepared = _prepare_semantic_journal_batch(
+                    subject=normalized_subject,
+                    reset_revision=current_reset_revision,
+                    source_turn_id=validated_source_turn_id,
+                    proposals=validated_proposal.journal_events,
+                    events=events,
+                    superseded_event_ids=superseded_event_ids,
+                    event_subjects=event_subjects,
+                    created_at=created_at,
+                )
+
+                replacement = current_frame
+                if frame_update is not None:
+                    replacement = DialogueFrame.model_validate(
+                        {
+                            **frame_update.frame.model_dump(mode="json", by_alias=True),
+                            "revision": current_frame.revision + 1,
+                        }
+                    )
+                    await connection.execute(
+                        """
+                        update ava_private.memory_state
+                        set dialogue_frame_revision = %s,
+                            dialogue_frame_payload = %s,
+                            dialogue_frame_last_source_turn_id = %s,
+                            updated_at = now()
+                        where subject = %s
+                        """,
+                        (
+                            replacement.revision,
+                            Jsonb(
+                                frame_update.frame.model_dump(
+                                    mode="json", by_alias=True
+                                )
+                            ),
+                            validated_source_turn_id,
+                            normalized_subject,
+                        ),
+                    )
+                    await connection.execute(
+                        """
+                        insert into ava_private.dialogue_frame_receipts (
+                          subject, source_turn_id, base_revision, applied_revision,
+                          update_fingerprint
+                        ) values (%s, %s, %s, %s, %s)
+                        """,
+                        (
+                            normalized_subject,
+                            validated_source_turn_id,
+                            frame_update.base_revision,
+                            replacement.revision,
+                            canonical_dialogue_frame_update_fingerprint(frame_update),
+                        ),
+                    )
+
+                results: list[SemanticJournalEventResult] = []
+                for item in prepared:
+                    record = item.record
+                    if item.disposition == SemanticJournalEventDisposition.CREATED:
+                        await connection.execute(
+                            """
+                            insert into ava_private.semantic_journal_events (
+                              event_id, subject, reset_revision, family,
+                              semantic_key, summary, identity_key, fingerprint,
+                              canonical_canvas_references, created_at
+                            ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (
+                                record.event_id,
+                                normalized_subject,
+                                current_reset_revision,
+                                record.family,
+                                record.semantic_key,
+                                record.summary,
+                                record.identity_key,
+                                record.fingerprint,
+                                Jsonb(
+                                    [
+                                        reference.model_dump(mode="json", by_alias=True)
+                                        for reference in (
+                                            record.canonical_canvas_references
+                                        )
+                                    ]
+                                ),
+                                record.created_at,
+                            ),
+                        )
+                    await connection.execute(
+                        """
+                        insert into ava_private.semantic_journal_event_sources (
+                          subject, reset_revision, event_id, source_turn_id
+                        ) values (%s, %s, %s, %s)
+                        on conflict do nothing
+                        """,
+                        (
+                            normalized_subject,
+                            current_reset_revision,
+                            record.event_id,
+                            validated_source_turn_id,
+                        ),
+                    )
+                    for target_id in item.proposal.supersedes_event_ids:
+                        await connection.execute(
+                            """
+                            insert into ava_private.semantic_journal_supersessions (
+                              subject, reset_revision, superseded_event_id,
+                              superseding_event_id
+                            ) values (%s, %s, %s, %s)
+                            """,
+                            (
+                                normalized_subject,
+                                current_reset_revision,
+                                target_id,
+                                record.event_id,
+                            ),
+                        )
+                    results.append(
+                        SemanticJournalEventResult.model_validate(
+                            {
+                                "disposition": item.disposition,
+                                "event": record.model_dump(mode="json", by_alias=True),
+                            }
+                        )
+                    )
+                await self._insert_semantic_memory_receipt(
+                    connection,
+                    subject=normalized_subject,
+                    source_turn_id=validated_source_turn_id,
+                    reset_revision=current_reset_revision,
+                    proposal_fingerprint=proposal_fingerprint,
+                    resulting_frame_revision=replacement.revision,
+                    results=results,
+                )
+                return _semantic_memory_decision(
+                    SemanticMemoryCommitStatus.APPLIED,
+                    replacement,
+                    results,
                 )
 
     async def search_memory_candidates(
@@ -819,6 +1131,14 @@ class PostgresAuthoritativeMemoryStore:
                     (normalized_subject,),
                 )
                 await connection.execute(
+                    "delete from ava_private.semantic_memory_receipts where subject = %s",
+                    (normalized_subject,),
+                )
+                await connection.execute(
+                    "delete from ava_private.semantic_journal_events where subject = %s",
+                    (normalized_subject,),
+                )
+                await connection.execute(
                     "delete from ava_private.stable_memories where subject = %s",
                     (normalized_subject,),
                 )
@@ -929,6 +1249,107 @@ class PostgresAuthoritativeMemoryStore:
                 "PostgreSQL memory subject disappeared while loading DialogueFrame"
             )
         return _dialogue_frame_from_state_row(row)
+
+    @staticmethod
+    async def _load_semantic_event_records(
+        connection: AsyncConnection[dict[str, object]],
+        *,
+        subject: str,
+        reset_revision: int,
+        identity_keys: Sequence[str],
+        event_ids: Sequence[str],
+    ) -> dict[str, SemanticJournalEventRecord]:
+        if not identity_keys and not event_ids:
+            return {}
+        cursor = await connection.execute(
+            """
+            select event_id, subject, reset_revision, family, semantic_key,
+                   summary, identity_key, fingerprint,
+                   canonical_canvas_references, created_at
+            from ava_private.semantic_journal_events
+            where subject = %s and reset_revision = %s
+              and (identity_key = any(%s) or event_id = any(%s))
+            """,
+            (subject, reset_revision, list(identity_keys), list(event_ids)),
+        )
+        records = (
+            _semantic_journal_record_from_row(row) for row in await cursor.fetchall()
+        )
+        return {record.event_id: record for record in records}
+
+    @staticmethod
+    async def _load_semantic_result_events(
+        connection: AsyncConnection[dict[str, object]],
+        *,
+        subject: str,
+        event_ids: list[str],
+        dispositions: list[str],
+    ) -> list[SemanticJournalEventResult]:
+        if len(event_ids) != len(dispositions):
+            raise PostgresMemoryStoreError(
+                "semantic memory receipt result metadata is inconsistent"
+            )
+        if not event_ids:
+            return []
+        cursor = await connection.execute(
+            """
+            select event_id, subject, reset_revision, family, semantic_key,
+                   summary, identity_key, fingerprint,
+                   canonical_canvas_references, created_at
+            from ava_private.semantic_journal_events
+            where subject = %s and event_id = any(%s)
+            """,
+            (subject, event_ids),
+        )
+        records = {
+            record.event_id: record
+            for record in (
+                _semantic_journal_record_from_row(row)
+                for row in await cursor.fetchall()
+            )
+        }
+        if set(records) != set(event_ids):
+            raise PostgresMemoryStoreError(
+                "semantic memory receipt references a missing Journal event"
+            )
+        return [
+            SemanticJournalEventResult.model_validate(
+                {
+                    "disposition": disposition,
+                    "event": records[event_id].model_dump(mode="json", by_alias=True),
+                }
+            )
+            for event_id, disposition in zip(event_ids, dispositions, strict=True)
+        ]
+
+    @staticmethod
+    async def _insert_semantic_memory_receipt(
+        connection: AsyncConnection[dict[str, object]],
+        *,
+        subject: str,
+        source_turn_id: str,
+        reset_revision: int,
+        proposal_fingerprint: str,
+        resulting_frame_revision: int,
+        results: Sequence[SemanticJournalEventResult],
+    ) -> None:
+        await connection.execute(
+            """
+            insert into ava_private.semantic_memory_receipts (
+              subject, source_turn_id, reset_revision, proposal_fingerprint,
+              result_event_ids, result_dispositions, resulting_frame_revision
+            ) values (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                subject,
+                source_turn_id,
+                reset_revision,
+                proposal_fingerprint,
+                [result.event.event_id for result in results],
+                [result.disposition for result in results],
+                resulting_frame_revision,
+            ),
+        )
 
     @staticmethod
     async def _store_memory_decision(
@@ -1101,29 +1522,6 @@ class PostgresAuthoritativeMemoryStore:
             """,
             (subject, subject, MAX_EPISODES),
         )
-        await connection.execute(
-            """
-            delete from ava_private.turn_receipts as receipt
-            where receipt.subject = %s
-              and receipt.committed_at < %s
-              and not exists (
-                select 1 from ava_private.delivered_turns as turn
-                where turn.subject = receipt.subject
-                  and turn.turn_id = receipt.turn_id
-              )
-              and not exists (
-                select 1 from ava_private.stable_memories as memory
-                where memory.subject = receipt.subject
-                  and memory.source_turn_id = receipt.turn_id
-              )
-              and not exists (
-                select 1 from ava_private.conversation_episodes as episode
-                where episode.subject = receipt.subject
-                  and receipt.turn_id = any(episode.source_turn_ids)
-              )
-            """,
-            (subject, episode_threshold),
-        )
 
 
 def _rejected_decision(reason: str) -> MemoryProposalDecision:
@@ -1148,6 +1546,30 @@ def _dialogue_frame_from_state_row(
         )
     revision = row.get("dialogue_frame_revision", 0)
     return DialogueFrame.model_validate({**payload, "revision": revision})
+
+
+def _semantic_journal_record_from_row(
+    row: dict[str, object],
+) -> SemanticJournalEventRecord:
+    references = row.get("canonical_canvas_references", [])
+    if not isinstance(references, list):
+        raise PostgresMemoryStoreError(
+            "PostgreSQL semantic Journal Canvas references are not a JSON array"
+        )
+    return SemanticJournalEventRecord.model_validate(
+        {
+            "eventId": row["event_id"],
+            "subject": row["subject"],
+            "resetRevision": row["reset_revision"],
+            "family": row["family"],
+            "semanticKey": row["semantic_key"],
+            "summary": row["summary"],
+            "identityKey": row["identity_key"],
+            "fingerprint": row["fingerprint"],
+            "canonicalCanvasReferences": references,
+            "createdAt": row["created_at"],
+        }
+    )
 
 
 def _dialogue_frame_decision(

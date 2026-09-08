@@ -87,7 +87,7 @@ def _bare_coordinator(
     coordinator._memory = memory or DevelopmentAuthoritativeMemoryStore()
     coordinator._memory_reset_revision = 0
     coordinator._dialogue_frame = DialogueFrame()
-    coordinator._staged_dialogue_frame_update = None
+    coordinator._staged_semantic_memory_proposal = None
     coordinator._canvas_jobs = _ResettableCanvasJobs(workspace or _Workspace())  # type: ignore[assignment]
     coordinator._canvas_context_lock = asyncio.Lock()
     coordinator._warm_refresh_revision = 0
@@ -123,7 +123,7 @@ def test_canvas_references_require_exact_canonical_retained_revision() -> None:
     coordinator.stage_dialogue_frame_update(
         turn_id="turn-1", update=_update("Moon", canvas=("scene-moon", 3))
     )
-    coordinator._staged_dialogue_frame_update = None
+    coordinator._staged_semantic_memory_proposal = None
     with pytest.raises(CoordinatorStateError, match="canonical retained"):
         coordinator.stage_dialogue_frame_update(
             turn_id="turn-1", update=_update("Moon", canvas=("scene-moon", 2))
@@ -162,9 +162,9 @@ async def test_schedule_captures_exact_staged_update_without_cross_turn_leak() -
 
     assert captured[0].turn_id == "turn-1"
     assert captured[0].dialogue_frame_update == _update("Moon")
-    assert coordinator._staged_dialogue_frame_update is None
+    assert coordinator._staged_semantic_memory_proposal is None
     coordinator._turn_id = "turn-2"
-    assert coordinator._staged_dialogue_frame_update is None
+    assert coordinator._staged_semantic_memory_proposal is None
 
 
 def _payload(
@@ -290,11 +290,11 @@ async def test_memory_reset_clears_staged_and_current_frame() -> None:
     await coordinator.memory_reset(reset_revision=1)
 
     assert coordinator.dialogue_frame == DialogueFrame()
-    assert coordinator._staged_dialogue_frame_update is None
+    assert coordinator._staged_semantic_memory_proposal is None
 
 
 class _FrameFailingMemory(DevelopmentAuthoritativeMemoryStore):
-    async def apply_dialogue_frame_update(self, **kwargs):  # type: ignore[no-untyped-def]
+    async def apply_semantic_memory_proposal(self, **kwargs):  # type: ignore[no-untyped-def]
         del kwargs
         raise RuntimeError("injected DialogueFrame failure")
 
