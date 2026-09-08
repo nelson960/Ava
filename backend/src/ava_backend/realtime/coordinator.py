@@ -70,10 +70,15 @@ from .memory import (
     DeliveredConversationTurn,
     DeliveredInputKind,
     DeliveredTurnTerminal,
+    DialogueFrame,
+    DialogueFrameUpdate,
+    DialogueFrameUpdateDecision,
+    DialogueFrameUpdateStatus,
     MemoryResetRevisionMismatchError,
     MemoryProposalDecision,
     MemorySearchCandidate,
     MemoryCandidateSourceKind,
+    canonical_dialogue_frame_update_fingerprint,
 )
 from .provider_session import (
     NegotiatedRealtimeCall,
@@ -198,6 +203,14 @@ class _CapturedMemoryCommit:
     terminal: DeliveredTurnTerminal
     transcript_waiter: Awaitable[str | None] | None
     warm_refresh_revision: int
+    dialogue_frame_update: DialogueFrameUpdate | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _StagedDialogueFrameUpdate:
+    turn_id: str
+    update: DialogueFrameUpdate
+    fingerprint: str
 
 
 @dataclass(slots=True)
@@ -296,6 +309,8 @@ class DeterministicRealtimeSessionCoordinator:
         self._canvas_context_lock = asyncio.Lock()
         self._memory_snapshot: AuthoritativeMemorySnapshot | None = None
         self._memory_reset_revision: int | None = None
+        self._dialogue_frame = DialogueFrame()
+        self._staged_dialogue_frame_update: _StagedDialogueFrameUpdate | None = None
         self._harness: RealtimeHarness | None = None
         self._pending_harness: RealtimeHarness | None = None
         self._pending_focus_revision: int | None = None
@@ -391,6 +406,70 @@ class DeterministicRealtimeSessionCoordinator:
     @property
     def last_memory_decision(self) -> MemoryProposalDecision | None:
         return self._last_memory_decision
+
+    @property
+    def dialogue_frame(self) -> DialogueFrame:
+        return DialogueFrame.model_validate(
+            self._dialogue_frame.model_dump(mode="json", by_alias=True)
+        )
+
+    def stage_dialogue_frame_update(
+        self,
+        *,
+        turn_id: str,
+        update: DialogueFrameUpdate,
+    ) -> None:
+        """Stage one transport-neutral semantic replacement for the exact turn."""
+
+        if turn_id != self._turn_id or self._terminal:
+            raise CoordinatorStateError(
+                "DialogueFrame update must belong to the active current turn"
+            )
+        if self._memory_reset_revision is None:
+            raise CoordinatorStateError(
+                "DialogueFrame update cannot stage before memory bootstrap"
+            )
+        validated = DialogueFrameUpdate.model_validate(
+            update.model_dump(mode="json", by_alias=True)
+        )
+        self._validate_dialogue_frame_canvas_references(validated)
+        fingerprint = canonical_dialogue_frame_update_fingerprint(validated)
+        existing = self._staged_dialogue_frame_update
+        if existing is not None:
+            if existing.turn_id == turn_id and existing.fingerprint == fingerprint:
+                return
+            raise CoordinatorStateError(
+                "current turn already staged a different DialogueFrame update"
+            )
+        self._staged_dialogue_frame_update = _StagedDialogueFrameUpdate(
+            turn_id=turn_id,
+            update=DialogueFrameUpdate.model_validate(
+                validated.model_dump(mode="json", by_alias=True)
+            ),
+            fingerprint=fingerprint,
+        )
+
+    def _validate_dialogue_frame_canvas_references(
+        self, update: DialogueFrameUpdate
+    ) -> None:
+        workspace = self._canvas_jobs.state.workspace
+        for reference in update.frame.relevant_canvas_references:
+            scene = workspace.scene(reference.scene_id)
+            manifest_scene = workspace.manifest_scene(reference.scene_id)
+            canonical_revision = (
+                scene.revision
+                if scene is not None
+                else (
+                    manifest_scene.scene_revision
+                    if manifest_scene is not None
+                    else None
+                )
+            )
+            if canonical_revision != reference.scene_revision:
+                raise CoordinatorStateError(
+                    "DialogueFrame Canvas reference is not a canonical retained "
+                    "scene revision"
+                )
 
     @property
     def last_error(self) -> Exception | None:
@@ -791,9 +870,11 @@ class DeterministicRealtimeSessionCoordinator:
             if current is not None and reset_revision <= current:
                 return
             self._memory_reset_revision = reset_revision
-            await self._canvas_jobs.reset_conversation()
             self._warm_refresh_revision += 1
             self._warm_memories = ()
+            self._dialogue_frame = DialogueFrame()
+            self._staged_dialogue_frame_update = None
+            await self._canvas_jobs.reset_conversation()
             self._recent_live_echo_suppression_turn_ids.clear()
             self._last_memory_decision = None
             if self._harness is not None and not self._closed:
@@ -819,6 +900,7 @@ class DeterministicRealtimeSessionCoordinator:
             )
             self._memory_snapshot = snapshot
             self._memory_reset_revision = snapshot.reset_revision
+            self._dialogue_frame = snapshot.dialogue_frame
             LOGGER.info(
                 "realtime_stage session_id=%s request_id=%s stage=memory.load "
                 "elapsed_ms=%.2f",
@@ -837,6 +919,7 @@ class DeterministicRealtimeSessionCoordinator:
                 current_time_utc=bootstrap_current_time_utc,
                 bootstrap_turns=tuple(snapshot.delivered_turns),
                 warm_memories=self._warm_memories,
+                dialogue_frame=self._dialogue_frame,
                 canvas_context=self._current_canvas_context(),
                 active_visual_present=(
                     self._canvas_jobs.state.presentation_visible
@@ -1953,6 +2036,7 @@ class DeterministicRealtimeSessionCoordinator:
         self._memory_commit_sequence += 1
         self._latest_memory_commit_sequence = self._memory_commit_sequence
         self._last_memory_decision = None
+        self._staged_dialogue_frame_update = None
         self._turn_id = turn_id_factory()
         self._request_id = request_id_factory()
         self._stream_id = stream_id_factory()
@@ -2079,6 +2163,7 @@ class DeterministicRealtimeSessionCoordinator:
             current_time_utc=self._current_time_factory(),
             bootstrap_turns=(),
             warm_memories=self._warm_memories,
+            dialogue_frame=self._dialogue_frame,
             canvas_context=self._current_canvas_context(),
             active_visual_present=active_visual_present,
         )
@@ -2096,7 +2181,8 @@ class DeterministicRealtimeSessionCoordinator:
             "realtime_dynamic_context_built session_id=%s reason=%s "
             "context_build_id=%s final_utf8_bytes=%d estimated_tokens=%d "
             "bootstrap_turn_count=%d warm_reference_count=%d "
-            "canvas_included=%s included_references=%d omitted_references=%d",
+            "canvas_included=%s included_references=%d omitted_references=%d "
+            "dialogue_frame_revision=%d dialogue_frame_included=%s",
             self._session_id,
             reason,
             context.build_id,
@@ -2107,6 +2193,8 @@ class DeterministicRealtimeSessionCoordinator:
             context.canvas_included,
             context.included_memory_references,
             context.omitted_memory_references,
+            context.dialogue_frame_revision,
+            context.dialogue_frame_included,
             extra={
                 "ava_context": {
                     "sessionId": self._session_id,
@@ -2119,6 +2207,8 @@ class DeterministicRealtimeSessionCoordinator:
                     "canvasIncluded": context.canvas_included,
                     "includedReferenceCount": context.included_memory_references,
                     "omittedReferenceCount": context.omitted_memory_references,
+                    "dialogueFrameRevision": context.dialogue_frame_revision,
+                    "dialogueFrameIncluded": context.dialogue_frame_included,
                 }
             },
         )
@@ -4113,6 +4203,13 @@ class DeterministicRealtimeSessionCoordinator:
         self._latest_memory_commit_sequence = sequence
         self._warm_refresh_revision += 1
         warm_refresh_revision = self._warm_refresh_revision
+        staged_frame = self._staged_dialogue_frame_update
+        dialogue_frame_update: DialogueFrameUpdate | None = None
+        if staged_frame is not None and staged_frame.turn_id == turn_id:
+            dialogue_frame_update = DialogueFrameUpdate.model_validate(
+                staged_frame.update.model_dump(mode="json", by_alias=True)
+            )
+            self._staged_dialogue_frame_update = None
         payload = _CapturedMemoryCommit(
             sequence=sequence,
             turn_id=turn_id,
@@ -4128,6 +4225,7 @@ class DeterministicRealtimeSessionCoordinator:
             terminal=terminal,
             transcript_waiter=transcript_waiter,
             warm_refresh_revision=warm_refresh_revision,
+            dialogue_frame_update=dialogue_frame_update,
         )
         self._memory_commit_tasks[turn_id] = asyncio.create_task(
             self._run_memory_commit(payload=payload),
@@ -4244,7 +4342,16 @@ class DeterministicRealtimeSessionCoordinator:
             self._recent_live_echo_suppression_turn_ids.append(payload.turn_id)
             if payload.sequence == self._latest_memory_commit_sequence:
                 self._last_memory_decision = decision
-            await self._refresh_warm_memory(payload=payload, turn=turn)
+            frame_decision: DialogueFrameUpdateDecision | None = None
+            if payload.dialogue_frame_update is not None:
+                frame_decision = await self._apply_dialogue_frame_update(
+                    payload=payload
+                )
+            await self._refresh_warm_memory(
+                payload=payload,
+                turn=turn,
+                force_context_refresh=frame_decision is not None,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -4278,11 +4385,103 @@ class DeterministicRealtimeSessionCoordinator:
             if self._memory_commit_tasks.get(payload.turn_id) is task:
                 self._memory_commit_tasks.pop(payload.turn_id, None)
 
+    async def _apply_dialogue_frame_update(
+        self,
+        *,
+        payload: _CapturedMemoryCommit,
+    ) -> DialogueFrameUpdateDecision | None:
+        update = payload.dialogue_frame_update
+        if update is None:
+            return None
+        started = monotonic()
+        LOGGER.info(
+            "dialogue_frame_update_started session_id=%s turn_id=%s "
+            "reset_revision=%d base_frame_revision=%d",
+            self._session_id,
+            payload.turn_id,
+            payload.expected_reset_revision,
+            update.base_revision,
+        )
+        try:
+            self._validate_dialogue_frame_canvas_references(update)
+            decision = await self._memory.apply_dialogue_frame_update(
+                subject=self._subject,
+                expected_reset_revision=payload.expected_reset_revision,
+                source_turn_id=payload.turn_id,
+                update=update,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            duration_ms = max(0.0, (monotonic() - started) * 1000)
+            LOGGER.warning(
+                "dialogue_frame_update_failed session_id=%s turn_id=%s "
+                "reset_revision=%d base_frame_revision=%d duration_ms=%.2f "
+                "error_type=%s",
+                self._session_id,
+                payload.turn_id,
+                payload.expected_reset_revision,
+                update.base_revision,
+                duration_ms,
+                type(error).__name__,
+                extra={
+                    "ava_context": {
+                        "sessionId": self._session_id,
+                        "turnId": payload.turn_id,
+                        "resetRevision": payload.expected_reset_revision,
+                        "baseFrameRevision": update.base_revision,
+                        "status": "failed",
+                        "durationMs": duration_ms,
+                        "errorType": type(error).__name__,
+                    }
+                },
+            )
+            return None
+        duration_ms = max(0.0, (monotonic() - started) * 1000)
+        status = str(decision.status)
+        event_suffix = (
+            "completed"
+            if decision.status == DialogueFrameUpdateStatus.APPLIED
+            else status
+        )
+        if payload.expected_reset_revision == self._memory_reset_revision:
+            self._dialogue_frame = decision.frame
+        log = (
+            LOGGER.info
+            if decision.status != DialogueFrameUpdateStatus.STALE
+            else LOGGER.warning
+        )
+        log(
+            "dialogue_frame_update_%s session_id=%s turn_id=%s "
+            "reset_revision=%d base_frame_revision=%d "
+            "resulting_frame_revision=%d duration_ms=%.2f",
+            event_suffix,
+            self._session_id,
+            payload.turn_id,
+            payload.expected_reset_revision,
+            update.base_revision,
+            decision.frame.revision,
+            duration_ms,
+            extra={
+                "ava_context": {
+                    "sessionId": self._session_id,
+                    "turnId": payload.turn_id,
+                    "resetRevision": payload.expected_reset_revision,
+                    "baseFrameRevision": update.base_revision,
+                    "resultingFrameRevision": decision.frame.revision,
+                    "status": status,
+                    "durationMs": duration_ms,
+                }
+            },
+        )
+        return decision
+
     async def _refresh_warm_memory(
         self,
         *,
         payload: _CapturedMemoryCommit,
         turn: DeliveredConversationTurn,
+        force_context_refresh: bool = False,
     ) -> None:
         revision = payload.warm_refresh_revision
         LOGGER.info(
@@ -4308,6 +4507,12 @@ class DeterministicRealtimeSessionCoordinator:
                 revision,
                 _memory_failure_reason_category(error),
             )
+            if (
+                force_context_refresh
+                and payload.expected_reset_revision == self._memory_reset_revision
+                and revision == self._warm_refresh_revision
+            ):
+                await self._refresh_post_commit_context(payload=payload, turn=turn)
             return
         if (
             payload.expected_reset_revision != self._memory_reset_revision
@@ -4358,6 +4563,14 @@ class DeterministicRealtimeSessionCoordinator:
                 }
             },
         )
+        await self._refresh_post_commit_context(payload=payload, turn=turn)
+
+    async def _refresh_post_commit_context(
+        self,
+        *,
+        payload: _CapturedMemoryCommit,
+        turn: DeliveredConversationTurn,
+    ) -> None:
         reason = (
             DynamicContextBuildReason.CANVAS_INTERACTION_COMMITTED
             if turn.canvas_interaction is not None

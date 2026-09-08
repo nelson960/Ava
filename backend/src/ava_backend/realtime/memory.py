@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import re
+import unicodedata
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -29,6 +31,12 @@ MAX_WEEKLY_RECORDS = 64
 MAX_SESSION_SUMMARY_CHARACTERS = 1_200
 MAX_CHILD_TURN_SUMMARY_CHARACTERS = 240
 MINIMUM_STABLE_MEMORY_CONFIDENCE = 0.8
+MAX_DIALOGUE_FRAME_ITEM_CHARACTERS = 160
+MAX_DIALOGUE_FRAME_LIST_ITEMS = 4
+MAX_DIALOGUE_FRAME_RECENT_ENTITIES = 8
+MAX_DIALOGUE_FRAME_CANVAS_REFERENCES = 4
+MAX_DIALOGUE_FRAME_TOOL_REFERENCES = 4
+MAX_DIALOGUE_FRAME_UTF8_BYTES = 3_200
 
 if MAX_WEEKLY_RECORDS > RAW_RETENTION_LOW_WATER:
     raise RuntimeError(
@@ -48,6 +56,14 @@ class MemoryResetRevisionMismatchError(RuntimeError):
         super().__init__("stale-session memory write rejected after conversation reset")
         self.expected_reset_revision = expected_reset_revision
         self.current_reset_revision = current_reset_revision
+
+
+class DialogueFrameSourceTurnMissingError(RuntimeError):
+    """A frame update referenced a turn that is not durably committed."""
+
+
+class DialogueFrameUpdateConflictError(RuntimeError):
+    """One source turn attempted two different frame replacements."""
 
 
 class MemoryProposalKind(StrEnum):
@@ -274,9 +290,178 @@ class ConversationResetReceipt(RealtimeProtocolModel):
         return self
 
 
+DialogueFrameText = Annotated[
+    NonEmptyText,
+    StringConstraints(max_length=MAX_DIALOGUE_FRAME_ITEM_CHARACTERS),
+]
+
+
+class DialogueFrameCanvasReference(RealtimeProtocolModel):
+    scene_id: ProtocolIdentifier
+    scene_revision: int = Field(ge=1, le=10_001)
+    relation: DialogueFrameText
+
+    @model_validator(mode="after")
+    def semantic_text_is_safe(self) -> DialogueFrameCanvasReference:
+        _reject_control_characters(self.relation)
+        return self
+
+
+class DialogueFrameState(RealtimeProtocolModel):
+    """Bounded semantic working state supplied by an external authority."""
+
+    active_topics: tuple[DialogueFrameText, ...] = Field(
+        default=(), max_length=MAX_DIALOGUE_FRAME_LIST_ITEMS
+    )
+    active_goals: tuple[DialogueFrameText, ...] = Field(
+        default=(), max_length=MAX_DIALOGUE_FRAME_LIST_ITEMS
+    )
+    unresolved_questions: tuple[DialogueFrameText, ...] = Field(
+        default=(), max_length=MAX_DIALOGUE_FRAME_LIST_ITEMS
+    )
+    current_referents: tuple[DialogueFrameText, ...] = Field(
+        default=(), max_length=MAX_DIALOGUE_FRAME_LIST_ITEMS
+    )
+    recent_entities: tuple[DialogueFrameText, ...] = Field(
+        default=(), max_length=MAX_DIALOGUE_FRAME_RECENT_ENTITIES
+    )
+    ava_commitments: tuple[DialogueFrameText, ...] = Field(
+        default=(), max_length=MAX_DIALOGUE_FRAME_LIST_ITEMS
+    )
+    explicit_user_preferences: tuple[DialogueFrameText, ...] = Field(
+        default=(), max_length=MAX_DIALOGUE_FRAME_LIST_ITEMS
+    )
+    temporary_interaction_preferences: tuple[DialogueFrameText, ...] = Field(
+        default=(), max_length=MAX_DIALOGUE_FRAME_LIST_ITEMS
+    )
+    relevant_canvas_references: tuple[DialogueFrameCanvasReference, ...] = Field(
+        default=(), max_length=MAX_DIALOGUE_FRAME_CANVAS_REFERENCES
+    )
+    recent_tool_references: tuple[DialogueFrameText, ...] = Field(
+        default=(), max_length=MAX_DIALOGUE_FRAME_TOOL_REFERENCES
+    )
+
+    @model_validator(mode="after")
+    def frame_is_mechanically_bounded(self) -> DialogueFrameState:
+        for field_name in _DIALOGUE_FRAME_TEXT_FIELDS:
+            values = getattr(self, field_name)
+            normalized_values: set[str] = set()
+            for value in values:
+                _reject_control_characters(value)
+                normalized = value.casefold()
+                if normalized in normalized_values:
+                    raise ValueError(
+                        f"{field_name} cannot contain case-normalized duplicates"
+                    )
+                normalized_values.add(normalized)
+        canvas_identities: set[tuple[str, int, str]] = set()
+        for reference in self.relevant_canvas_references:
+            identity = (
+                reference.scene_id.casefold(),
+                reference.scene_revision,
+                reference.relation.casefold(),
+            )
+            if identity in canvas_identities:
+                raise ValueError(
+                    "relevant_canvas_references cannot contain exact duplicates"
+                )
+            canvas_identities.add(identity)
+        byte_count = len(_canonical_dialogue_frame_state_json(self).encode("utf-8"))
+        if byte_count > MAX_DIALOGUE_FRAME_UTF8_BYTES:
+            raise ValueError(
+                "DialogueFrame serialized payload exceeds "
+                f"{MAX_DIALOGUE_FRAME_UTF8_BYTES} UTF-8 bytes"
+            )
+        return self
+
+
+class DialogueFrame(DialogueFrameState):
+    revision: int = Field(default=0, ge=0)
+
+
+class DialogueFrameUpdate(RealtimeProtocolModel):
+    base_revision: int = Field(ge=0)
+    frame: DialogueFrameState
+
+
+class DialogueFrameUpdateStatus(StrEnum):
+    APPLIED = "applied"
+    IDEMPOTENT = "idempotent"
+    STALE = "stale"
+
+
+class DialogueFrameUpdateDecision(RealtimeProtocolModel):
+    status: DialogueFrameUpdateStatus
+    frame: DialogueFrame
+
+
+_DIALOGUE_FRAME_TEXT_FIELDS = (
+    "active_topics",
+    "active_goals",
+    "unresolved_questions",
+    "current_referents",
+    "recent_entities",
+    "ava_commitments",
+    "explicit_user_preferences",
+    "temporary_interaction_preferences",
+    "recent_tool_references",
+)
+
+
+def canonical_dialogue_frame_update_fingerprint(
+    update: DialogueFrameUpdate,
+) -> str:
+    validated = DialogueFrameUpdate.model_validate(
+        update.model_dump(mode="json", by_alias=True)
+    )
+    payload = json.dumps(
+        validated.model_dump(mode="json", by_alias=True),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _canonical_dialogue_frame_state_json(frame: DialogueFrameState) -> str:
+    payload = {
+        alias: getattr(frame, field_name)
+        for field_name, alias in _DIALOGUE_FRAME_STATE_FIELDS
+    }
+    return json.dumps(
+        payload,
+        default=lambda value: value.model_dump(mode="json", by_alias=True),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+_DIALOGUE_FRAME_STATE_FIELDS = (
+    ("active_topics", "activeTopics"),
+    ("active_goals", "activeGoals"),
+    ("unresolved_questions", "unresolvedQuestions"),
+    ("current_referents", "currentReferents"),
+    ("recent_entities", "recentEntities"),
+    ("ava_commitments", "avaCommitments"),
+    ("explicit_user_preferences", "explicitUserPreferences"),
+    ("temporary_interaction_preferences", "temporaryInteractionPreferences"),
+    ("relevant_canvas_references", "relevantCanvasReferences"),
+    ("recent_tool_references", "recentToolReferences"),
+)
+
+
+def _reject_control_characters(value: str) -> None:
+    if any(unicodedata.category(character) == "Cc" for character in value):
+        raise ValueError(
+            "DialogueFrame semantic text cannot contain control characters"
+        )
+
+
 class AuthoritativeMemorySnapshot(RealtimeProtocolModel):
     age_band: AgeBand
     reset_revision: int = Field(ge=0)
+    dialogue_frame: DialogueFrame = Field(default_factory=DialogueFrame)
     current_session_summary: (
         Annotated[str, StringConstraints(min_length=1, max_length=1_200)] | None
     )
@@ -333,6 +518,15 @@ class AuthoritativeMemoryStore(Protocol):
         occurred_at: datetime | None = None,
         timezone_id: str = "UTC",
     ) -> MemoryProposalDecision: ...
+
+    async def apply_dialogue_frame_update(
+        self,
+        *,
+        subject: str,
+        expected_reset_revision: int,
+        source_turn_id: str,
+        update: DialogueFrameUpdate,
+    ) -> DialogueFrameUpdateDecision: ...
 
     async def search_memory_candidates(
         self,
@@ -394,6 +588,10 @@ class DevelopmentAuthoritativeMemoryStore:
         self._summaries: dict[str, str] = {}
         self._committed_turn_ids: defaultdict[str, set[str]] = defaultdict(set)
         self._reset_revisions: defaultdict[str, int] = defaultdict(int)
+        self._dialogue_frames: dict[str, DialogueFrame] = {}
+        self._dialogue_frame_receipts: defaultdict[str, dict[str, tuple[str, int]]] = (
+            defaultdict(dict)
+        )
         self._max_memories_per_subject = max_memories_per_subject
         self._lock = asyncio.Lock()
 
@@ -418,6 +616,9 @@ class DevelopmentAuthoritativeMemoryStore:
                 {
                     "ageBand": age_band,
                     "resetRevision": self._reset_revisions[normalized_subject],
+                    "dialogueFrame": self._dialogue_frames.get(
+                        normalized_subject, DialogueFrame()
+                    ).model_dump(mode="json", by_alias=True),
                     "currentSessionSummary": self._summaries.get(normalized_subject),
                     "deliveredTurns": [
                         event.turn.model_dump(mode="json", by_alias=True)
@@ -525,6 +726,83 @@ class DevelopmentAuthoritativeMemoryStore:
             )
             self._committed_turn_ids[normalized_subject].add(validated_turn.turn_id)
         return decision
+
+    async def apply_dialogue_frame_update(
+        self,
+        *,
+        subject: str,
+        expected_reset_revision: int,
+        source_turn_id: str,
+        update: DialogueFrameUpdate,
+    ) -> DialogueFrameUpdateDecision:
+        normalized_subject = _validate_subject(subject)
+        validated_expected_reset_revision = _validate_reset_revision(
+            expected_reset_revision,
+            field_name="expected_reset_revision",
+        )
+        validated_source_turn_id = _validate_protocol_identifier(
+            source_turn_id, field_name="source_turn_id"
+        )
+        validated_update = DialogueFrameUpdate.model_validate(
+            update.model_dump(mode="json", by_alias=True)
+        )
+        fingerprint = canonical_dialogue_frame_update_fingerprint(validated_update)
+
+        async with self._lock:
+            current_reset_revision = self._reset_revisions[normalized_subject]
+            if current_reset_revision != validated_expected_reset_revision:
+                raise MemoryResetRevisionMismatchError(
+                    expected_reset_revision=validated_expected_reset_revision,
+                    current_reset_revision=current_reset_revision,
+                )
+            if (
+                validated_source_turn_id
+                not in self._committed_turn_ids[normalized_subject]
+            ):
+                raise DialogueFrameSourceTurnMissingError(
+                    "DialogueFrame source turn is not durably committed"
+                )
+            current_frame = self._dialogue_frames.get(
+                normalized_subject, DialogueFrame()
+            )
+            receipt = self._dialogue_frame_receipts[normalized_subject].get(
+                validated_source_turn_id
+            )
+            if receipt is not None:
+                receipt_fingerprint, _applied_revision = receipt
+                if receipt_fingerprint != fingerprint:
+                    raise DialogueFrameUpdateConflictError(
+                        "source turn already applied a different DialogueFrame update"
+                    )
+                return DialogueFrameUpdateDecision.model_validate(
+                    {
+                        "status": DialogueFrameUpdateStatus.IDEMPOTENT,
+                        "frame": current_frame.model_dump(mode="json", by_alias=True),
+                    }
+                )
+            if validated_update.base_revision != current_frame.revision:
+                return DialogueFrameUpdateDecision.model_validate(
+                    {
+                        "status": DialogueFrameUpdateStatus.STALE,
+                        "frame": current_frame.model_dump(mode="json", by_alias=True),
+                    }
+                )
+            replacement = DialogueFrame.model_validate(
+                {
+                    **validated_update.frame.model_dump(mode="json", by_alias=True),
+                    "revision": current_frame.revision + 1,
+                }
+            )
+            self._dialogue_frames[normalized_subject] = replacement
+            self._dialogue_frame_receipts[normalized_subject][
+                validated_source_turn_id
+            ] = (fingerprint, replacement.revision)
+            return DialogueFrameUpdateDecision.model_validate(
+                {
+                    "status": DialogueFrameUpdateStatus.APPLIED,
+                    "frame": replacement.model_dump(mode="json", by_alias=True),
+                }
+            )
 
     async def search_memory_candidates(
         self,
@@ -727,6 +1005,8 @@ class DevelopmentAuthoritativeMemoryStore:
             self._memories.pop(normalized_subject, None)
             self._summaries.pop(normalized_subject, None)
             self._committed_turn_ids.pop(normalized_subject, None)
+            self._dialogue_frames.pop(normalized_subject, None)
+            self._dialogue_frame_receipts.pop(normalized_subject, None)
             self._reset_revisions[normalized_subject] += 1
             return ConversationResetReceipt.model_validate(
                 {
@@ -1150,6 +1430,14 @@ def _validate_reset_revision(value: int, *, field_name: str) -> int:
     return value
 
 
+def _validate_protocol_identifier(value: str, *, field_name: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[A-Za-z][A-Za-z0-9._:-]{0,63}", value
+    ):
+        raise ValueError(f"{field_name} must be a protocol identifier")
+    return value
+
+
 def _validate_subject(subject: str) -> str:
     if not subject or subject != subject.strip():
         raise ValueError(
@@ -1181,6 +1469,9 @@ def bounded_snapshot(
         {
             "ageBand": snapshot.age_band,
             "resetRevision": snapshot.reset_revision,
+            "dialogueFrame": snapshot.dialogue_frame.model_dump(
+                mode="json", by_alias=True
+            ),
             "currentSessionSummary": snapshot.current_session_summary,
             "deliveredTurns": [
                 turn.model_dump(mode="json", by_alias=True)

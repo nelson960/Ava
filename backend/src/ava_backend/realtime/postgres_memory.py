@@ -6,6 +6,7 @@ from typing import AsyncIterator, cast
 
 from psycopg import AsyncConnection, Error as PsycopgError, errors
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from ..protocol import AgeBand
@@ -23,6 +24,12 @@ from .memory import (
     ConversationResetReceipt,
     DeliveredConversationTurn,
     DeliveredInputKind,
+    DialogueFrame,
+    DialogueFrameSourceTurnMissingError,
+    DialogueFrameUpdate,
+    DialogueFrameUpdateConflictError,
+    DialogueFrameUpdateDecision,
+    DialogueFrameUpdateStatus,
     MemorySearchCandidate,
     MemoryResetRevisionMismatchError,
     MemoryProposalDecision,
@@ -37,9 +44,11 @@ from .memory import (
     _validate_subject,
     _validate_weekly_summary,
     build_conversation_episodes,
+    canonical_dialogue_frame_update_fingerprint,
     current_local_week_utc_bounds,
     evaluate_delivered_turn_memory_proposal,
     _validate_optional_summary,
+    _validate_protocol_identifier,
 )
 from .timezone import validate_iana_timezone_id
 
@@ -100,19 +109,19 @@ class PostgresAuthoritativeMemoryStore:
                     """
                     select version
                     from ava_private.schema_migrations
-                    where name = 'realtime_memory_v6'
+                    where name = 'realtime_memory_v7'
                     """
                 )
                 row = await cursor.fetchone()
         except (PsycopgError, PoolTimeout) as error:
             await self._pool.close()
             raise PostgresMemoryStoreError(
-                "PostgreSQL memory is unavailable or its v6 migration is missing"
+                "PostgreSQL memory is unavailable or its v7 migration is missing"
             ) from error
         if row is None or cast(int, row["version"]) != 1:
             await self._pool.close()
             raise PostgresMemoryStoreError(
-                "PostgreSQL memory schema realtime_memory_v6 version 1 is required"
+                "PostgreSQL memory schema realtime_memory_v7 version 1 is required"
             )
         self._opened = True
 
@@ -145,7 +154,8 @@ class PostgresAuthoritativeMemoryStore:
                 )
                 state_cursor = await connection.execute(
                     """
-                    select current_session_summary, reset_revision
+                    select current_session_summary, reset_revision,
+                           dialogue_frame_revision, dialogue_frame_payload
                     from ava_private.memory_state
                     where subject = %s
                     """,
@@ -189,6 +199,9 @@ class PostgresAuthoritativeMemoryStore:
             {
                 "ageBand": age_band,
                 "resetRevision": (state["reset_revision"] if state is not None else 0),
+                "dialogueFrame": _dialogue_frame_from_state_row(state).model_dump(
+                    mode="json", by_alias=True
+                ),
                 "currentSessionSummary": (
                     state["current_session_summary"] if state is not None else None
                 ),
@@ -348,6 +361,119 @@ class PostgresAuthoritativeMemoryStore:
                     f"delivered turn {validated_turn.turn_id!r} is already committed"
                 ) from error
         return decision
+
+    async def apply_dialogue_frame_update(
+        self,
+        *,
+        subject: str,
+        expected_reset_revision: int,
+        source_turn_id: str,
+        update: DialogueFrameUpdate,
+    ) -> DialogueFrameUpdateDecision:
+        normalized_subject = _validate_subject(subject)
+        validated_expected_reset_revision = _validate_reset_revision(
+            expected_reset_revision,
+            field_name="expected_reset_revision",
+        )
+        validated_source_turn_id = _validate_dialogue_frame_source_turn_id(
+            source_turn_id
+        )
+        validated_update = DialogueFrameUpdate.model_validate(
+            update.model_dump(mode="json", by_alias=True)
+        )
+        fingerprint = canonical_dialogue_frame_update_fingerprint(validated_update)
+
+        async with self._connection() as connection:
+            async with connection.transaction():
+                await self._ensure_subject(connection, normalized_subject)
+                current_reset_revision = await self._lock_subject(
+                    connection, normalized_subject
+                )
+                if current_reset_revision != validated_expected_reset_revision:
+                    raise MemoryResetRevisionMismatchError(
+                        expected_reset_revision=validated_expected_reset_revision,
+                        current_reset_revision=current_reset_revision,
+                    )
+                current_frame = await self._load_dialogue_frame(
+                    connection, normalized_subject
+                )
+                receipt_cursor = await connection.execute(
+                    """
+                    select update_fingerprint
+                    from ava_private.dialogue_frame_receipts
+                    where subject = %s and source_turn_id = %s
+                    """,
+                    (normalized_subject, validated_source_turn_id),
+                )
+                receipt = await receipt_cursor.fetchone()
+                if receipt is not None:
+                    if receipt["update_fingerprint"] != fingerprint:
+                        raise DialogueFrameUpdateConflictError(
+                            "source turn already applied a different DialogueFrame update"
+                        )
+                    return _dialogue_frame_decision(
+                        DialogueFrameUpdateStatus.IDEMPOTENT, current_frame
+                    )
+                source_cursor = await connection.execute(
+                    """
+                    select 1 as durable
+                    from ava_private.turn_receipts
+                    where subject = %s and turn_id = %s
+                    """,
+                    (normalized_subject, validated_source_turn_id),
+                )
+                if await source_cursor.fetchone() is None:
+                    raise DialogueFrameSourceTurnMissingError(
+                        "DialogueFrame source turn is not durably committed"
+                    )
+                if validated_update.base_revision != current_frame.revision:
+                    return _dialogue_frame_decision(
+                        DialogueFrameUpdateStatus.STALE, current_frame
+                    )
+                replacement = DialogueFrame.model_validate(
+                    {
+                        **validated_update.frame.model_dump(mode="json", by_alias=True),
+                        "revision": current_frame.revision + 1,
+                    }
+                )
+                await connection.execute(
+                    """
+                    update ava_private.memory_state
+                    set dialogue_frame_revision = %s,
+                        dialogue_frame_payload = %s,
+                        dialogue_frame_last_source_turn_id = %s,
+                        updated_at = now()
+                    where subject = %s
+                    """,
+                    (
+                        replacement.revision,
+                        Jsonb(
+                            validated_update.frame.model_dump(
+                                mode="json", by_alias=True
+                            )
+                        ),
+                        validated_source_turn_id,
+                        normalized_subject,
+                    ),
+                )
+                await connection.execute(
+                    """
+                    insert into ava_private.dialogue_frame_receipts (
+                      subject, source_turn_id, base_revision, applied_revision,
+                      update_fingerprint
+                    ) values (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        normalized_subject,
+                        validated_source_turn_id,
+                        validated_update.base_revision,
+                        replacement.revision,
+                        fingerprint,
+                    ),
+                )
+                return _dialogue_frame_decision(
+                    DialogueFrameUpdateStatus.APPLIED, replacement
+                )
 
     async def search_memory_candidates(
         self,
@@ -672,6 +798,9 @@ class PostgresAuthoritativeMemoryStore:
                     """
                     update ava_private.memory_state
                     set current_session_summary = null,
+                        dialogue_frame_revision = 0,
+                        dialogue_frame_payload = '{}'::jsonb,
+                        dialogue_frame_last_source_turn_id = null,
                         reset_revision = reset_revision + 1,
                         updated_at = %s
                     where subject = %s
@@ -685,6 +814,10 @@ class PostgresAuthoritativeMemoryStore:
                         "PostgreSQL memory reset did not return a revision"
                     )
                 revision = revision_row["reset_revision"]
+                await connection.execute(
+                    "delete from ava_private.dialogue_frame_receipts where subject = %s",
+                    (normalized_subject,),
+                )
                 await connection.execute(
                     "delete from ava_private.stable_memories where subject = %s",
                     (normalized_subject,),
@@ -776,6 +909,26 @@ class PostgresAuthoritativeMemoryStore:
                 "PostgreSQL memory subject disappeared before locking"
             )
         return cast(int, row["reset_revision"])
+
+    @staticmethod
+    async def _load_dialogue_frame(
+        connection: AsyncConnection[dict[str, object]],
+        subject: str,
+    ) -> DialogueFrame:
+        cursor = await connection.execute(
+            """
+            select dialogue_frame_revision, dialogue_frame_payload
+            from ava_private.memory_state
+            where subject = %s
+            """,
+            (subject,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            raise PostgresMemoryStoreError(
+                "PostgreSQL memory subject disappeared while loading DialogueFrame"
+            )
+        return _dialogue_frame_from_state_row(row)
 
     @staticmethod
     async def _store_memory_decision(
@@ -976,6 +1129,36 @@ class PostgresAuthoritativeMemoryStore:
 def _rejected_decision(reason: str) -> MemoryProposalDecision:
     return MemoryProposalDecision.model_validate(
         {"accepted": False, "reason": reason, "record": None}
+    )
+
+
+def _validate_dialogue_frame_source_turn_id(value: str) -> str:
+    return _validate_protocol_identifier(value, field_name="source_turn_id")
+
+
+def _dialogue_frame_from_state_row(
+    row: dict[str, object] | None,
+) -> DialogueFrame:
+    if row is None:
+        return DialogueFrame()
+    payload = row.get("dialogue_frame_payload", {})
+    if not isinstance(payload, dict):
+        raise PostgresMemoryStoreError(
+            "PostgreSQL DialogueFrame payload is not a JSON object"
+        )
+    revision = row.get("dialogue_frame_revision", 0)
+    return DialogueFrame.model_validate({**payload, "revision": revision})
+
+
+def _dialogue_frame_decision(
+    status: DialogueFrameUpdateStatus,
+    frame: DialogueFrame,
+) -> DialogueFrameUpdateDecision:
+    return DialogueFrameUpdateDecision.model_validate(
+        {
+            "status": status,
+            "frame": frame.model_dump(mode="json", by_alias=True),
+        }
     )
 
 

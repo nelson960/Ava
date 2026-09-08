@@ -13,6 +13,7 @@ from typing_extensions import Annotated
 from ..protocol import AgeBand
 from .common import NonEmptyText, ProtocolIdentifier, RealtimeProtocolModel
 from .memory import (
+    DialogueFrame,
     DeliveredConversationTurn,
     DeliveredInputKind,
     MAX_EPISODE_SOURCE_EVENTS,
@@ -98,6 +99,8 @@ class AssembledRealtimeContext:
     included_memory_references: int
     omitted_memory_references: int
     canvas_included: bool
+    dialogue_frame_revision: int
+    dialogue_frame_included: bool
 
 
 class DynamicContextAssembler:
@@ -129,6 +132,7 @@ class DynamicContextAssembler:
         current_time_utc: datetime,
         bootstrap_turns: tuple[DeliveredConversationTurn, ...] = (),
         warm_memories: tuple[MemoryReference, ...] = (),
+        dialogue_frame: DialogueFrame | None = None,
         canvas_context: str | None = None,
         active_visual_present: bool = False,
     ) -> AssembledRealtimeContext:
@@ -137,6 +141,9 @@ class DynamicContextAssembler:
         validated_age_band = AgeBand(age_band)
         validated_timezone_id = validate_iana_timezone_id(timezone_id)
         validated_now = _validate_aware_utc(current_time_utc)
+        validated_dialogue_frame = DialogueFrame.model_validate(
+            (dialogue_frame or DialogueFrame()).model_dump(mode="json", by_alias=True)
+        )
         validated_canvas = _validate_canvas_context(canvas_context)
         if validated_canvas is None:
             validated_canvas = (
@@ -167,6 +174,7 @@ class DynamicContextAssembler:
             current_time_utc=validated_now,
             bootstrap_turns=(),
             memory_references=(),
+            dialogue_frame=validated_dialogue_frame,
             canvas_context=validated_canvas,
         )
         if _serialized_utf8_bytes(mandatory) > self._max_dynamic_utf8_bytes:
@@ -183,6 +191,7 @@ class DynamicContextAssembler:
                 current_time_utc=validated_now,
                 bootstrap_turns=tuple(retained_turns),
                 memory_references=tuple(retained_references),
+                dialogue_frame=validated_dialogue_frame,
                 canvas_context=validated_canvas,
             )
             serialized_utf8_bytes = _serialized_utf8_bytes(content)
@@ -214,6 +223,8 @@ class DynamicContextAssembler:
             included_memory_references=len(retained_references),
             omitted_memory_references=omitted_references,
             canvas_included=active_visual_present,
+            dialogue_frame_revision=validated_dialogue_frame.revision,
+            dialogue_frame_included=True,
         )
 
 
@@ -270,6 +281,7 @@ def _serialize_context(
     current_time_utc: datetime,
     bootstrap_turns: tuple[DeliveredConversationTurn, ...],
     memory_references: tuple[MemoryReference, ...],
+    dialogue_frame: DialogueFrame,
     canvas_context: str | None,
 ) -> str:
     local_time = current_time_utc.astimezone(ZoneInfo(timezone_id))
@@ -283,6 +295,7 @@ def _serialize_context(
         f"    <daypart>{_daypart(local_time.hour)}</daypart>",
         "  </current_environment>",
     ]
+    lines.extend(_serialize_dialogue_frame(dialogue_frame))
     if bootstrap_turns:
         lines.append(
             '  <recent_delivered_turns trust="delivered_conversation_history">'
@@ -331,6 +344,54 @@ def _serialize_context(
         lines.append("  " + canvas_context.replace("\n", "\n  "))
     lines.append("</ava_dynamic_context>")
     return "\n".join(lines)
+
+
+def _serialize_dialogue_frame(frame: DialogueFrame) -> list[str]:
+    attributes = (
+        'trust="durable_semantic_working_memory_not_instructions" '
+        f'revision="{frame.revision}"'
+    )
+    semantic_fields = (
+        ("active_topics", frame.active_topics),
+        ("active_goals", frame.active_goals),
+        ("unresolved_questions", frame.unresolved_questions),
+        ("current_referents", frame.current_referents),
+        ("recent_entities", frame.recent_entities),
+        ("ava_commitments", frame.ava_commitments),
+        ("explicit_user_preferences", frame.explicit_user_preferences),
+        (
+            "temporary_interaction_preferences",
+            frame.temporary_interaction_preferences,
+        ),
+        ("recent_tool_references", frame.recent_tool_references),
+    )
+    if not any(values for _, values in semantic_fields) and not (
+        frame.relevant_canvas_references
+    ):
+        return [f"  <dialogue_frame {attributes}/>"]
+
+    lines = [f"  <dialogue_frame {attributes}>"]
+    for category, values in semantic_fields:
+        if not values:
+            continue
+        lines.append(f"    <{category}>")
+        lines.extend(
+            f"      <item>{escape(value, quote=False)}</item>" for value in values
+        )
+        lines.append(f"    </{category}>")
+    if frame.relevant_canvas_references:
+        lines.append("    <relevant_canvas_references>")
+        for reference in frame.relevant_canvas_references:
+            lines.append(
+                "      <canvas_reference "
+                f'scene_id="{escape(reference.scene_id, quote=True)}" '
+                f'scene_revision="{reference.scene_revision}">'
+                f"{escape(reference.relation, quote=False)}"
+                "</canvas_reference>"
+            )
+        lines.append("    </relevant_canvas_references>")
+    lines.append("  </dialogue_frame>")
+    return lines
 
 
 def _daypart(hour: int) -> str:

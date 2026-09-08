@@ -32,6 +32,10 @@ from ava_backend.realtime.memory import (
     AvaMemoryProposal,
     ConversationEpisode,
     DeliveredConversationTurn,
+    DialogueFrame,
+    DialogueFrameSourceTurnMissingError,
+    DialogueFrameUpdate,
+    DialogueFrameUpdateConflictError,
     MAX_WEEKLY_RECORDS,
     MemoryResetRevisionMismatchError,
     RAW_RETENTION_HIGH_WATER,
@@ -133,7 +137,7 @@ def _interaction_turn(index: int) -> DeliveredConversationTurn:
     )
 
 
-async def test_postgres_v6_schema_removes_weekly_storage_without_replacement() -> None:
+async def test_postgres_v7_schema_removes_weekly_storage_without_replacement() -> None:
     assert TEST_DATABASE_URL is not None
     store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
     await store.open()
@@ -143,8 +147,15 @@ async def test_postgres_v6_schema_removes_weekly_storage_without_replacement() -
             """
             select
               (select version from ava_private.schema_migrations
-                where name = 'realtime_memory_v6'),
+                where name = 'realtime_memory_v7'),
               to_regclass('ava_private.weekly_records'),
+              to_regclass('ava_private.dialogue_frame_receipts'),
+              exists (
+                select 1 from information_schema.columns
+                where table_schema = 'ava_private'
+                  and table_name = 'memory_state'
+                  and column_name = 'dialogue_frame_payload'
+              ),
               exists (
                 select 1
                 from pg_catalog.pg_tables
@@ -153,28 +164,34 @@ async def test_postgres_v6_schema_removes_weekly_storage_without_replacement() -
               )
             """
         )
-        assert await cursor.fetchone() == (1, None, False)
+        assert await cursor.fetchone() == (
+            1,
+            None,
+            "ava_private.dialogue_frame_receipts",
+            True,
+            False,
+        )
     finally:
         await connection.close()
         await store.close()
 
 
-async def test_postgres_startup_rejects_schema_without_v6_registration() -> None:
+async def test_postgres_startup_rejects_schema_without_v7_registration() -> None:
     assert TEST_DATABASE_URL is not None
     connection = await AsyncConnection.connect(TEST_DATABASE_URL, autocommit=True)
     store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
     try:
         await connection.execute(
-            "delete from ava_private.schema_migrations where name = 'realtime_memory_v6'"
+            "delete from ava_private.schema_migrations where name = 'realtime_memory_v7'"
         )
-        with pytest.raises(PostgresMemoryStoreError, match="v6"):
+        with pytest.raises(PostgresMemoryStoreError, match="v7"):
             await store.open()
     finally:
         await store.close()
         await connection.execute(
             """
             insert into ava_private.schema_migrations (name, version)
-            values ('realtime_memory_v6', 1)
+            values ('realtime_memory_v7', 1)
             on conflict (name) do update
             set version = excluded.version,
                 applied_at = now()
@@ -254,6 +271,76 @@ async def test_postgres_memory_round_trip_does_not_compact_at_event_nine() -> No
         assert empty.delivered_turns == []
         assert empty.stable_memories == []
         assert empty.current_session_summary is None
+    finally:
+        await store.close()
+
+
+async def test_postgres_dialogue_frame_cas_receipts_and_reset() -> None:
+    assert TEST_DATABASE_URL is not None
+    store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
+    subject = f"test:{uuid4()}"
+    update = DialogueFrameUpdate.model_validate(
+        {"baseRevision": 0, "frame": {"activeTopics": ["Astronomy"]}}
+    )
+    await store.open()
+    try:
+        with pytest.raises(DialogueFrameSourceTurnMissingError):
+            await store.apply_dialogue_frame_update(
+                subject=subject,
+                expected_reset_revision=0,
+                source_turn_id="turn-1",
+                update=update,
+            )
+        await store.commit_delivered_turn(
+            subject=subject,
+            expected_reset_revision=0,
+            turn=_turn(1),
+            proposal=None,
+            memory_id=None,
+        )
+        applied = await store.apply_dialogue_frame_update(
+            subject=subject,
+            expected_reset_revision=0,
+            source_turn_id="turn-1",
+            update=update,
+        )
+        retry = await store.apply_dialogue_frame_update(
+            subject=subject,
+            expected_reset_revision=0,
+            source_turn_id="turn-1",
+            update=update,
+        )
+        with pytest.raises(DialogueFrameUpdateConflictError):
+            await store.apply_dialogue_frame_update(
+                subject=subject,
+                expected_reset_revision=0,
+                source_turn_id="turn-1",
+                update=DialogueFrameUpdate.model_validate(
+                    {"baseRevision": 0, "frame": {"activeTopics": ["Biology"]}}
+                ),
+            )
+
+        assert applied.status == "applied"
+        assert retry.status == "idempotent"
+        snapshot = await store.load_snapshot(
+            subject=subject, age_band="middleChildhood"
+        )
+        assert snapshot.dialogue_frame.revision == 1
+        assert snapshot.dialogue_frame.active_topics == ("Astronomy",)
+
+        receipt = await store.reset_conversation(subject=subject)
+        reset_snapshot = await store.load_snapshot(
+            subject=subject, age_band="middleChildhood"
+        )
+        assert receipt.revision == 1
+        assert reset_snapshot.dialogue_frame == DialogueFrame()
+        with pytest.raises(MemoryResetRevisionMismatchError):
+            await store.apply_dialogue_frame_update(
+                subject=subject,
+                expected_reset_revision=0,
+                source_turn_id="turn-1",
+                update=update,
+            )
     finally:
         await store.close()
 
