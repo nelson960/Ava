@@ -743,6 +743,7 @@ class SvgCanvasWorkspace:
                 modification_sequence=modification_sequence,
                 evicted_scene_id=evicted_scene_id,
             )
+            self._refresh_structural_manifest_digest()
             if evicted_scene_id is not None:
                 self._emit_capacity_eviction(
                     scene_id=evicted_scene_id,
@@ -823,6 +824,7 @@ class SvgCanvasWorkspace:
             creation_sequence=creation_sequence,
             modification_sequence=modification_sequence,
         )
+        self._refresh_structural_manifest_digest()
         if foreground:
             self._focused_scene = scene
         self._last_interaction = None
@@ -922,6 +924,21 @@ class SvgCanvasWorkspace:
                     reason="workspaceReset",
                 )
         self._reset_epoch = self._workspace_epoch
+
+    def _refresh_structural_manifest_digest(self) -> None:
+        if self._structural_manifest_digest is None:
+            return
+        self._structural_manifest_digest = _structural_manifest_digest(
+            CanvasWorkspaceManifest(
+                protocol_version=4,
+                workspace_epoch=self._workspace_epoch,
+                workspace_revision=self._workspace_revision,
+                next_creation_sequence=self._next_creation_sequence,
+                next_modification_sequence=self._next_modification_sequence,
+                focused_scene_id=self.focused_scene_id,
+                scenes=tuple(self._manifest_scenes),
+            )
+        )
 
     def _finish_active_execution(self, generation_id: str) -> None:
         execution = self._executions.get(generation_id)

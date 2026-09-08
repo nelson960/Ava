@@ -13,6 +13,7 @@ from ava_backend.canvas.svg_workspace import (
     CanvasNavigationDirection,
     CanvasWorkspaceManifest,
     CanvasWorkspaceManifestScene,
+    RecordedSvgCanvasInteraction,
     SvgCanvasWorkspace,
     SvgCanvasExecutionStatus,
     SvgCanvasWorkspaceError,
@@ -81,6 +82,18 @@ def _manifest(
             _row(scene, creation_sequence=index + 1)
             for index, scene in enumerate(scenes)
         ),
+    )
+
+
+def _canonical_manifest(workspace: SvgCanvasWorkspace) -> CanvasWorkspaceManifest:
+    return CanvasWorkspaceManifest(
+        protocol_version=4,
+        workspace_epoch=workspace.workspace_epoch,
+        workspace_revision=workspace.workspace_revision,
+        next_creation_sequence=workspace.next_creation_sequence,
+        next_modification_sequence=workspace.next_modification_sequence,
+        focused_scene_id=workspace.focused_scene_id,
+        scenes=workspace.manifest_scenes,
     )
 
 
@@ -225,7 +238,9 @@ def test_same_revision_with_different_scene_identity_remains_a_conflict(
         workspace.adopt_manifest(conflicting)
 
 
-def test_structural_commit_advances_workspace_revision_normally() -> None:
+def test_create_refreshes_adopted_structural_identity_from_canonical_state(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     scenes = [_active(index) for index in range(1, 4)]
     workspace = SvgCanvasWorkspace()
     assert workspace.adopt_manifest(_manifest(scenes, revision=11)) is True
@@ -245,6 +260,33 @@ def test_structural_commit_advances_workspace_revision_normally() -> None:
         "scene-3",
         "scene-4",
     )
+    with caplog.at_level("INFO", logger="ava_backend.canvas.svg_workspace"):
+        assert workspace.adopt_manifest(_canonical_manifest(workspace)) is False
+    assert any(
+        record.__dict__.get("ava_context", {}).get("classification")
+        == "structurallyIdempotent"
+        for record in caplog.records
+    )
+
+
+def test_current_revision_with_different_structure_remains_a_conflict() -> None:
+    scenes = [_active(index) for index in range(1, 4)]
+    workspace = SvgCanvasWorkspace()
+    assert workspace.adopt_manifest(_manifest(scenes, revision=11)) is True
+    workspace.commit(
+        _active(4),
+        base_scene_id=None,
+        base_revision=0,
+        workspace_epoch=7,
+    )
+    current = _canonical_manifest(workspace)
+    conflicting = replace(
+        current,
+        scenes=(replace(current.scenes[0], summary="Conflicting summary"), *current.scenes[1:]),
+    )
+
+    with pytest.raises(SvgCanvasWorkspaceError, match="conflicts"):
+        workspace.adopt_manifest(conflicting)
 
 
 def test_reconnect_focus_hint_remains_hidden_and_cannot_roll_back_live_focus() -> None:
@@ -324,6 +366,11 @@ def test_capacity_ten_create_evicts_oldest_in_one_structural_revision() -> None:
     assert workspace.ordered_scene_ids() == tuple(
         f"scene-{index}" for index in range(2, 12)
     )
+    current = _canonical_manifest(workspace)
+    assert tuple(row.scene_id for row in current.scenes) == tuple(
+        f"scene-{index}" for index in range(2, 12)
+    )
+    assert workspace.adopt_manifest(current) is False
     assert len(telemetry) == 1
     assert telemetry[0].as_context() == {
         "component": "svgCanvasWorkspace",
@@ -436,6 +483,38 @@ def test_revising_older_scene_preserves_creation_and_separates_latest_semantics(
     assert workspace.latest_created_scene_id == "scene-5"
     assert workspace.latest_modified_scene_id == "scene-2"
     assert workspace.workspace_revision == 4
+    assert workspace.adopt_manifest(_canonical_manifest(workspace)) is False
+
+
+def test_focus_presentation_and_interaction_remain_non_structural() -> None:
+    scenes = [_active(1), _active(2)]
+    workspace = SvgCanvasWorkspace()
+    workspace.adopt_manifest(_manifest(scenes, revision=5, focused_index=0))
+    workspace.restore_focused(scenes[0])
+    state = SvgCanvasSessionState(workspace=workspace)
+    original_revision = workspace.workspace_revision
+
+    state.focus_retained(scenes[1], focus_revision=9)
+    state.set_presentation_visible(True)
+    workspace.record_interaction(
+        RecordedSvgCanvasInteraction(
+            scene_id=scenes[1].scene_id,
+            scene_revision=scenes[1].revision,
+            interaction_revision=1,
+            svg_sha256=scenes[1].document.svg_sha256,
+            manifest_sha256=scenes[1].document.manifest_sha256,
+            binding_id="local-binding",
+            interaction_mode="none",
+            target_id="local-target",
+            accessibility_label="Local target",
+            step_index=None,
+        )
+    )
+
+    assert workspace.workspace_revision == original_revision
+    assert workspace.focus_revision == 9
+    assert state.presentation_visible is True
+    assert workspace.adopt_manifest(_canonical_manifest(workspace)) is False
 
 
 def test_legacy_manifest_keeps_modification_history_unknown() -> None:
