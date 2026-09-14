@@ -6,11 +6,16 @@ import json
 import logging
 from builtins import anext
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
+from functools import partial
 from time import monotonic
 from typing import Literal, TypeAlias, TypeVar, cast
 from zoneinfo import ZoneInfo
+from pydantic import TypeAdapter
+from .common import RealtimeProtocolModel
+from .memory import SemanticToolExchange
+from .tool_contract import MAX_SEMANTIC_TOOL_EXCHANGES
 
 from ..canvas.svg_workspace import (
     ActiveSvgCanvasScene,
@@ -23,17 +28,12 @@ from ..canvas.svg_workspace import (
     normalize_semantic_title,
 )
 
-RetainedSceneLoader: TypeAlias = Callable[
-    [CanvasWorkspaceManifestScene],
-    Awaitable[ActiveSvgCanvasScene | None] | ActiveSvgCanvasScene | None,
-]
 from ..diagnostics import new_failure_id
 from ..protocol import AgeBand
 from .bounded_queue import BoundedAsyncQueue, QueueClosed
 from .context_assembler import (
     DynamicContextAssembler,
     DynamicContextBuildReason,
-    MemoryReference,
 )
 from .coordinator_v4 import ProtocolV4CanvasEventSink
 from .delivery import (
@@ -82,16 +82,12 @@ from .memory import (
     DialogueFrameState,
     DialogueFrameCanvasReference,
     DialogueFrameUpdate,
-    DialogueFrameUpdateDecision,
     MemoryResetRevisionMismatchError,
-    MemoryProposalDecision,
     MemorySearchCandidate,
-    MemoryCandidateSourceKind,
     SemanticCaptureDisposition,
     SemanticCaptureJournalDraft,
     SemanticJournalCanvasReference,
     SemanticJournalEventFamily,
-    SemanticMemoryCommitDecision,
     SemanticMemoryCommitStatus,
     SemanticMemoryProposal,
     canonical_semantic_memory_proposal_fingerprint,
@@ -108,7 +104,6 @@ from .provider_session import (
     RealtimeProviderSession,
     RealtimeProviderUnavailableError,
     SemanticCaptureEvidence,
-    SettledSemanticToolOutcome,
 )
 from .state_machine import RealtimeStateError, RealtimeTurnStateMachine
 from .speech_contract import (
@@ -126,6 +121,7 @@ from .tool_contract import (
     GET_CURRENT_TIME_TOOL_NAME,
     InteractiveCanvasCancellationToolOutputV4,
     InteractiveCanvasOperation,
+    InteractiveCanvasRequest,
     InteractiveCanvasToolOutputV4,
     InteractiveCanvasToolStatusV4,
     GetCurrentTimeToolOutputV4,
@@ -158,6 +154,11 @@ from .websocket_v4 import (
     AvaServerOutboundFrameV4,
     AvaServerPcmFrameV4,
 )
+
+RetainedSceneLoader: TypeAlias = Callable[
+    [CanvasWorkspaceManifestScene],
+    Awaitable[ActiveSvgCanvasScene | None] | ActiveSvgCanvasScene | None,
+]
 
 LOGGER = logging.getLogger("ava_backend.realtime_coordinator")
 
@@ -233,7 +234,7 @@ class _CapturedMemoryCommit:
     delivered_sample_count: int
     terminal: DeliveredTurnTerminal
     transcript_waiter: Awaitable[str | None] | None
-    settled_tool_outcomes: tuple[SettledSemanticToolOutcome, ...] = ()
+    tool_exchanges: tuple[SemanticToolExchange, ...] = ()
     interrupted: bool = False
 
 
@@ -338,13 +339,12 @@ class DeterministicRealtimeSessionCoordinator:
         self._memory_snapshot: AuthoritativeMemorySnapshot | None = None
         self._memory_reset_revision: int | None = None
         self._dialogue_frame = DialogueFrame()
-        self._turn_settled_tool_outcomes: list[SettledSemanticToolOutcome] = []
+        self._turn_tool_exchanges: list[SemanticToolExchange] = []
         self._harness: RealtimeHarness | None = None
         self._pending_harness: RealtimeHarness | None = None
         self._pending_focus_revision: int | None = None
         self._pending_context_reason: DynamicContextBuildReason | None = None
         self._context_installation_task: asyncio.Task[None] | None = None
-        self._warm_memories: tuple[MemoryReference, ...] = ()
         self._context_build_sequence = 0
         self._negotiated_call: NegotiatedRealtimeCall | None = None
         self._sequence = 0
@@ -364,7 +364,6 @@ class DeterministicRealtimeSessionCoordinator:
         self._terminal = False
         self._session_reusable = True
         self._closed = False
-        self._last_memory_decision: MemoryProposalDecision | None = None
         self._canvas_status = "notRequested"
         self._terminal_failure_code: str | None = None
         self._last_failure_id: str | None = None
@@ -378,7 +377,6 @@ class DeterministicRealtimeSessionCoordinator:
         self._last_enqueued_memory_sequence = 0
         self._current_memory_commit_turn_id: str | None = None
         self._memory_commit_sequence = 0
-        self._latest_memory_commit_sequence = 0
         self._turn_occurred_at: datetime | None = None
         self._last_error: Exception | None = None
         self._active_planning_task: asyncio.Task[_TurnResult | None] | None = None
@@ -434,33 +432,35 @@ class DeterministicRealtimeSessionCoordinator:
         return self._machine.snapshot.received_sample_count
 
     @property
-    def last_memory_decision(self) -> MemoryProposalDecision | None:
-        return self._last_memory_decision
-
-    @property
     def dialogue_frame(self) -> DialogueFrame:
         return DialogueFrame.model_validate(
             self._dialogue_frame.model_dump(mode="json", by_alias=True)
         )
 
-    def _record_tool_outcome(
+    def _record_tool_exchange(
         self,
         *,
         tool_name: str,
-        call_id: str,
-        outcome: str,
-        detail: str | None = None,
-        canonical_scene_id: str | None = None,
-        canonical_scene_revision: int | None = None,
+        request: RealtimeProtocolModel | None,
+        result: RealtimeProtocolModel,
     ) -> None:
-        self._turn_settled_tool_outcomes.append(
-            SettledSemanticToolOutcome(
-                tool_name=tool_name,
-                call_id=call_id,
-                outcome=outcome,
-                detail=detail,
-                canonical_scene_id=canonical_scene_id,
-                canonical_scene_revision=canonical_scene_revision,
+        if len(self._turn_tool_exchanges) >= MAX_SEMANTIC_TOOL_EXCHANGES:
+            raise CoordinatorStateError("settled tool exchanges exceeded turn chain")
+        semantic_result = result.model_dump(
+            mode="json", by_alias=True, exclude_none=True
+        )
+        if isinstance(result, InteractiveCanvasToolOutputV4):
+            # Generation identity is transport bookkeeping, not semantic evidence.
+            semantic_result.pop("generationId", None)
+        self._turn_tool_exchanges.append(
+            TypeAdapter(SemanticToolExchange).validate_python(
+                {
+                    "tool": tool_name,
+                    "request": request.model_dump(mode="json", by_alias=True)
+                    if request is not None
+                    else None,
+                    "result": semantic_result,
+                }
             )
         )
 
@@ -1019,11 +1019,9 @@ class DeterministicRealtimeSessionCoordinator:
             if current is not None and reset_revision <= current:
                 return
             self._memory_reset_revision = reset_revision
-            self._warm_memories = ()
             self._dialogue_frame = DialogueFrame()
-            self._turn_settled_tool_outcomes = []
+            self._turn_tool_exchanges = []
             await self._canvas_jobs.reset_conversation()
-            self._last_memory_decision = None
             if self._harness is not None and not self._closed:
                 await self._refresh_canvas_context_locked(
                     reason=DynamicContextBuildReason.MEMORY_COMPACTED
@@ -1056,7 +1054,6 @@ class DeterministicRealtimeSessionCoordinator:
                 (monotonic() - memory_started) * 1000,
             )
             harness_started = monotonic()
-            self._warm_memories = ()
             bootstrap_current_time_utc = self._current_time_factory()
             dynamic_context = self._context_assembler.assemble(
                 build_id=self._next_context_build_id(),
@@ -1065,7 +1062,6 @@ class DeterministicRealtimeSessionCoordinator:
                 timezone_id=self._timezone_id,
                 current_time_utc=bootstrap_current_time_utc,
                 bootstrap_turns=tuple(snapshot.delivered_turns),
-                warm_memories=self._warm_memories,
                 dialogue_frame=self._dialogue_frame,
                 canvas_context=self._current_canvas_context(),
                 active_visual_present=(
@@ -2218,9 +2214,7 @@ class DeterministicRealtimeSessionCoordinator:
         self._previous_terminal_turn_id = self._turn_id
         self._previous_terminal_stream_id = self._stream_id
         self._memory_commit_sequence += 1
-        self._latest_memory_commit_sequence = self._memory_commit_sequence
-        self._last_memory_decision = None
-        self._turn_settled_tool_outcomes = []
+        self._turn_tool_exchanges = []
         self._turn_id = turn_id_factory()
         self._request_id = request_id_factory()
         self._stream_id = stream_id_factory()
@@ -2402,7 +2396,6 @@ class DeterministicRealtimeSessionCoordinator:
             timezone_id=self._timezone_id,
             current_time_utc=self._current_time_factory(),
             bootstrap_turns=(),
-            warm_memories=self._warm_memories,
             dialogue_frame=self._dialogue_frame,
             canvas_context=self._current_canvas_context(),
             active_visual_present=active_visual_present,
@@ -2874,17 +2867,17 @@ class DeterministicRealtimeSessionCoordinator:
                     for segment in parser.finish_response_chunk():
                         await updates.put(segment)
                     self._claim_rejected_utility(event, state=state)
-                    self._record_tool_outcome(
-                        tool_name=event.tool_kind.value,
-                        call_id=event.call_id,
-                        outcome="rejected",
-                        detail=event.reason,
-                    )
+                    rejected = RejectedUtilityToolOutputV4(reason=event.reason)
                     await self._realtime.complete_utility_tool(
                         turn_id=self._turn_id,
                         call_id=event.call_id,
-                        output=RejectedUtilityToolOutputV4(reason=event.reason),
+                        output=rejected,
                         harness=self.harness,
+                        on_result_created=lambda: self._record_tool_exchange(
+                            tool_name=event.tool_kind.value,
+                            request=None,
+                            result=rejected,
+                        ),
                     )
                     continue
                 if isinstance(event, RealtimeSearchMemoryToolCall):
@@ -2910,12 +2903,6 @@ class DeterministicRealtimeSessionCoordinator:
                         await updates.put(segment)
                     self._claim_canvas(event.call_id, state=state)
                     self._canvas_status = "rejected"
-                    self._record_tool_outcome(
-                        tool_name=INTERACTIVE_CANVAS_TOOL_NAME,
-                        call_id=event.call_id,
-                        outcome="rejected",
-                        detail=event.reason,
-                    )
                     LOGGER.warning(
                         "canvas_tool_arguments_rejected session_id=%s "
                         "turn_id=%s call_id=%s reason=%s",
@@ -2934,6 +2921,13 @@ class DeterministicRealtimeSessionCoordinator:
                             }
                         ),
                     )
+                    self._record_tool_exchange(
+                        tool_name=INTERACTIVE_CANVAS_TOOL_NAME,
+                        request=None,
+                        result=InteractiveCanvasCancellationToolOutputV4(
+                            status="rejected", reason=CANVAS_MODEL_SAFE_REJECTION_REASON
+                        ),
+                    )
                     await self._canvas_events.tool_call_rejected(
                         call_id=event.call_id,
                         source_turn_id=self._turn_id,
@@ -2944,12 +2938,6 @@ class DeterministicRealtimeSessionCoordinator:
                     for segment in parser.finish_response_chunk():
                         await updates.put(segment)
                     self._claim_canvas(event.call_id, state=state)
-                    self._record_tool_outcome(
-                        tool_name=MANAGE_CANVAS_PRESENTATION_TOOL_NAME,
-                        call_id=event.call_id,
-                        outcome="rejected",
-                        detail=event.reason,
-                    )
                     LOGGER.warning(
                         "manage_canvas_presentation_arguments_rejected session_id=%s "
                         "turn_id=%s call_id=%s reason=%s",
@@ -2968,6 +2956,11 @@ class DeterministicRealtimeSessionCoordinator:
                         turn_id=self._turn_id,
                         call_id=event.call_id,
                         output=output,
+                    )
+                    self._record_tool_exchange(
+                        tool_name=MANAGE_CANVAS_PRESENTATION_TOOL_NAME,
+                        request=None,
+                        result=output,
                     )
                     LOGGER.info(
                         "canvas_control_completion session_id=%s turn_id=%s "
@@ -3079,7 +3072,10 @@ class DeterministicRealtimeSessionCoordinator:
         *,
         state: _PlanningState,
     ) -> None:
-        if state.canvas_terminal_used or state.tool_steps_used >= 2:
+        if (
+            state.canvas_terminal_used
+            or state.tool_steps_used >= MAX_SEMANTIC_TOOL_EXCHANGES
+        ):
             raise StreamingTurnParseError(
                 "Realtime rejected utility exceeded the bounded turn chain"
             )
@@ -3091,7 +3087,7 @@ class DeterministicRealtimeSessionCoordinator:
         if (
             state.canvas_terminal_used
             or state.canvas_call_id is not None
-            or state.tool_steps_used >= 2
+            or state.tool_steps_used >= MAX_SEMANTIC_TOOL_EXCHANGES
         ):
             raise StreamingTurnParseError(
                 "Realtime requested a canvas outside the bounded turn chain"
@@ -3119,6 +3115,7 @@ class DeterministicRealtimeSessionCoordinator:
             candidates = await self._memory.search_memory_candidates(
                 subject=self._subject,
                 query=call.request.query,
+                order=call.request.order,
                 limit=5,
                 from_instant=lower,
                 to_instant=upper,
@@ -3156,12 +3153,11 @@ class DeterministicRealtimeSessionCoordinator:
             call_id=call.call_id,
             output=output,
             harness=self.harness,
-        )
-        self._record_tool_outcome(
-            tool_name=SEARCH_MEMORY_TOOL_NAME,
-            call_id=call.call_id,
-            outcome=str(output.status),
-            detail=output.reason,
+            on_result_created=lambda: self._record_tool_exchange(
+                tool_name=SEARCH_MEMORY_TOOL_NAME,
+                request=call.request,
+                result=output,
+            ),
         )
         result_source_kinds = [str(candidate.source_kind) for candidate in candidates]
         result_source_ids = [candidate.source_id for candidate in candidates]
@@ -3224,11 +3220,11 @@ class DeterministicRealtimeSessionCoordinator:
             call_id=call.call_id,
             output=output,
             harness=self.harness,
-        )
-        self._record_tool_outcome(
-            tool_name=GET_CURRENT_TIME_TOOL_NAME,
-            call_id=call.call_id,
-            outcome="available",
+            on_result_created=lambda: self._record_tool_exchange(
+                tool_name=GET_CURRENT_TIME_TOOL_NAME,
+                request=call.request,
+                result=output,
+            ),
         )
         LOGGER.info(
             "realtime_semantic_tool_completed session_id=%s turn_id=%s "
@@ -3245,6 +3241,7 @@ class DeterministicRealtimeSessionCoordinator:
         state: _PlanningState,
     ) -> None:
         state.canvas_started = monotonic()
+        complete_tool = partial(self._complete_canvas_tool, request=call.request)
         self._canvas_status = "requested"
         source_transcript = self._realtime.available_child_transcript(
             turn_id=self._turn_id,
@@ -3277,7 +3274,7 @@ class DeterministicRealtimeSessionCoordinator:
                         "reason": CANVAS_MODEL_SAFE_REJECTION_REASON,
                     }
                 )
-                await self._complete_canvas_tool(
+                await complete_tool(
                     turn_id=self._turn_id,
                     call_id=call.call_id,
                     output=output,
@@ -3285,12 +3282,6 @@ class DeterministicRealtimeSessionCoordinator:
                 if call.request.completion == CanvasActionCompletion.REQUEST_COMPLETE:
                     state.action_only_rejected = True
                 self._canvas_status = "rejected"
-                self._record_tool_outcome(
-                    tool_name=INTERACTIVE_CANVAS_TOOL_NAME,
-                    call_id=call.call_id,
-                    outcome="rejected",
-                    detail=output.reason,
-                )
                 return
 
             try:
@@ -3315,7 +3306,7 @@ class DeterministicRealtimeSessionCoordinator:
                         "reason": CANVAS_MODEL_SAFE_REJECTION_REASON,
                     }
                 )
-                await self._complete_canvas_tool(
+                await complete_tool(
                     turn_id=self._turn_id,
                     call_id=call.call_id,
                     output=output,
@@ -3323,12 +3314,6 @@ class DeterministicRealtimeSessionCoordinator:
                 if call.request.completion == CanvasActionCompletion.REQUEST_COMPLETE:
                     state.action_only_rejected = True
                 self._canvas_status = "rejected"
-                self._record_tool_outcome(
-                    tool_name=INTERACTIVE_CANVAS_TOOL_NAME,
-                    call_id=call.call_id,
-                    outcome="rejected",
-                    detail=output.reason,
-                )
                 return
 
             resolved_target_scene_id = resolution.scene.scene_id
@@ -3336,7 +3321,7 @@ class DeterministicRealtimeSessionCoordinator:
             source_turn_id=self._turn_id,
             source_transcript=bounded_source_transcript,
             call=call,
-            complete_tool=self._complete_canvas_tool,
+            complete_tool=complete_tool,
             resolved_target_scene_id=resolved_target_scene_id,
         )
         if output.status == InteractiveCanvasToolStatusV4.ACCEPTED:
@@ -3349,12 +3334,6 @@ class DeterministicRealtimeSessionCoordinator:
             if call.request.completion == CanvasActionCompletion.REQUEST_COMPLETE:
                 state.action_only_succeeded = True
             self._canvas_status = "accepted"
-            self._record_tool_outcome(
-                tool_name=INTERACTIVE_CANVAS_TOOL_NAME,
-                call_id=call.call_id,
-                outcome="accepted",
-                detail=output.reason,
-            )
             LOGGER.info(
                 "canvas_specialist_accepted_async session_id=%s turn_id=%s "
                 "call_id=%s generation_id=%s elapsed_ms=%.2f",
@@ -3369,12 +3348,6 @@ class DeterministicRealtimeSessionCoordinator:
         if call.request.completion == CanvasActionCompletion.REQUEST_COMPLETE:
             state.action_only_rejected = True
         self._canvas_status = "rejected"
-        self._record_tool_outcome(
-            tool_name=INTERACTIVE_CANVAS_TOOL_NAME,
-            call_id=call.call_id,
-            outcome="rejected",
-            detail=output.reason,
-        )
 
     async def _run_canvas_cancellation_tool(
         self,
@@ -3394,10 +3367,10 @@ class DeterministicRealtimeSessionCoordinator:
         if call.request.completion == CanvasActionCompletion.REQUEST_COMPLETE:
             state.action_only_succeeded = True
         self._canvas_status = "cancelled"
-        self._record_tool_outcome(
+        self._record_tool_exchange(
             tool_name=CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
-            call_id=call.call_id,
-            outcome="accepted",
+            request=call.request,
+            result=InteractiveCanvasCancellationToolOutputV4(status="accepted"),
         )
         LOGGER.info(
             "canvas_pending_work_cancelled session_id=%s turn_id=%s call_id=%s "
@@ -3641,11 +3614,10 @@ class DeterministicRealtimeSessionCoordinator:
             call_id=call.call_id,
             output=output,
         )
-        self._record_tool_outcome(
+        self._record_tool_exchange(
             tool_name=MANAGE_CANVAS_PRESENTATION_TOOL_NAME,
-            call_id=call.call_id,
-            outcome=str(output.status),
-            detail=output.reason,
+            request=call.request,
+            result=output,
         )
         if call.request.completion == CanvasActionCompletion.REQUEST_COMPLETE:
             if output.status == ManageCanvasPresentationStatus.ACCEPTED:
@@ -3915,11 +3887,18 @@ class DeterministicRealtimeSessionCoordinator:
         turn_id: str,
         call_id: str,
         output: InteractiveCanvasToolOutputV4,
+        *,
+        request: InteractiveCanvasRequest,
     ) -> None:
         await self._realtime.complete_canvas_tool(
             turn_id=turn_id,
             call_id=call_id,
             output=output,
+        )
+        self._record_tool_exchange(
+            tool_name=INTERACTIVE_CANVAS_TOOL_NAME,
+            request=request,
+            result=output,
         )
 
     async def _cancel_planning_work(
@@ -4596,8 +4575,7 @@ class DeterministicRealtimeSessionCoordinator:
                 f"memory commit sequence must increase monotonically: {sequence} <= {self._last_enqueued_memory_sequence}"
             )
         self._last_enqueued_memory_sequence = sequence
-        self._latest_memory_commit_sequence = sequence
-        settled_tool_outcomes = tuple(self._turn_settled_tool_outcomes)
+        tool_exchanges = tuple(self._turn_tool_exchanges)
         payload = _CapturedMemoryCommit(
             sequence=sequence,
             turn_id=turn_id,
@@ -4612,7 +4590,7 @@ class DeterministicRealtimeSessionCoordinator:
             delivered_text=delivered_text,
             terminal=terminal,
             transcript_waiter=transcript_waiter,
-            settled_tool_outcomes=settled_tool_outcomes,
+            tool_exchanges=tool_exchanges,
             interrupted=(terminal == DeliveredTurnTerminal.CANCELLED),
         )
         self._scheduled_memory_commit_turn_ids.add(turn_id)
@@ -4722,12 +4700,10 @@ class DeterministicRealtimeSessionCoordinator:
                 child_text_source=child_text_source,
             )
             commit_started = monotonic()
-            decision = await self._memory.commit_delivered_turn(
+            await self._memory.commit_delivered_turn(
                 subject=self._subject,
                 expected_reset_revision=payload.expected_reset_revision,
                 turn=turn,
-                proposal=None,
-                memory_id=None,
                 occurred_at=payload.occurred_at,
                 timezone_id=payload.timezone_id,
             )
@@ -4752,8 +4728,6 @@ class DeterministicRealtimeSessionCoordinator:
                     }
                 },
             )
-            if payload.sequence == self._latest_memory_commit_sequence:
-                self._last_memory_decision = decision
             await self._run_semantic_capture(
                 payload=payload,
                 turn=turn,
@@ -4807,7 +4781,7 @@ class DeterministicRealtimeSessionCoordinator:
             child_utterance=child_text,
             spoken_response_prefix=payload.delivered_text or None,
             interrupted=payload.interrupted,
-            settled_tool_outcomes=payload.settled_tool_outcomes,
+            tool_exchanges=payload.tool_exchanges,
         )
 
         try:
@@ -5447,6 +5421,7 @@ def _delivered_turn_from_memory_payload(
                 "deliveredSampleCount": payload.delivered_sample_count,
                 "childTurnSummary": _canvas_interaction_summary(interaction),
                 "terminal": payload.terminal,
+                "toolExchanges": payload.tool_exchanges,
             }
         )
     if child_text is None or child_text_source is None:
@@ -5462,6 +5437,7 @@ def _delivered_turn_from_memory_payload(
             "deliveredSampleCount": payload.delivered_sample_count,
             "childTurnSummary": payload.child_turn_summary,
             "terminal": payload.terminal,
+            "toolExchanges": payload.tool_exchanges,
         }
     )
 
@@ -5490,24 +5466,6 @@ def _canvas_interaction_summary(
     if len(summary) > MAX_CHILD_TURN_SUMMARY_CHARACTERS:
         raise AssertionError("Canvas interaction memory summary exceeded its boundary")
     return summary
-
-
-def _stable_memory_references(
-    snapshot: AuthoritativeMemorySnapshot,
-) -> tuple[MemoryReference, ...]:
-    return tuple(
-        MemoryReference.model_validate(
-            {
-                "sourceKind": MemoryCandidateSourceKind.STABLE_MEMORY,
-                "startedAt": None,
-                "endedAt": None,
-                "timezoneIds": [],
-                "text": memory.summary,
-                "sourceTurnIds": [memory.source_turn_id],
-            }
-        )
-        for memory in snapshot.stable_memories[-4:]
-    )
 
 
 def _provider_context_equivalence_key(

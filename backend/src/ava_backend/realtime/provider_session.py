@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import re
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
 from ..canvas.svg_workspace import RecordedSvgCanvasInteraction
 from .harness import RealtimeHarness
-from .memory import DialogueFrameState, SemanticCaptureFunctionArguments
+from .memory import (
+    DialogueFrameState,
+    SemanticCaptureFunctionArguments,
+    SemanticToolExchange,
+)
 from .tool_contract import (
     InteractiveCanvasCancellationToolOutputV4,
     InteractiveCanvasToolOutputV4,
@@ -120,23 +124,13 @@ type RealtimeProviderTurnEvent = RealtimeTurnEvent | RealtimeCommittedInput
 
 
 @dataclass(frozen=True, slots=True)
-class SettledSemanticToolOutcome:
-    tool_name: str
-    call_id: str
-    outcome: str
-    detail: str | None = None
-    canonical_scene_id: str | None = None
-    canonical_scene_revision: int | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class SemanticCaptureEvidence:
     source_turn_id: str
     current_frame: DialogueFrameState
     child_utterance: str | None = None
     spoken_response_prefix: str | None = None
     interrupted: bool = False
-    settled_tool_outcomes: tuple[SettledSemanticToolOutcome, ...] = ()
+    tool_exchanges: tuple[SemanticToolExchange, ...] = ()
 
 
 class RealtimeProviderSession(Protocol):
@@ -202,8 +196,7 @@ class RealtimeProviderSession(Protocol):
         turn_id: str,
         call_id: str,
         output: (
-            InteractiveCanvasToolOutputV4
-            | InteractiveCanvasCancellationToolOutputV4
+            InteractiveCanvasToolOutputV4 | InteractiveCanvasCancellationToolOutputV4
         ),
     ) -> None: ...
 
@@ -222,6 +215,7 @@ class RealtimeProviderSession(Protocol):
         call_id: str,
         output: RealtimeUtilityToolOutputV4,
         harness: RealtimeHarness,
+        on_result_created: Callable[[], None] | None = None,
     ) -> None: ...
 
     async def request_canvas_interaction_response(

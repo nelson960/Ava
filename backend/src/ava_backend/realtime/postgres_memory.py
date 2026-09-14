@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from collections.abc import Sequence
 from typing import AsyncIterator, cast
 
@@ -12,18 +12,17 @@ from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from ..protocol import AgeBand
 from .memory import (
-    EPISODE_RETENTION_DAYS,
-    MAX_EPISODES,
     MAX_SNAPSHOT_DELIVERED_TURNS,
     MAX_STABLE_MEMORIES,
     MAX_WEEKLY_RECORDS,
-    RAW_RETENTION_HIGH_WATER,
-    RAW_RETENTION_LOW_WATER,
-    AvaMemoryProposal,
     AuthoritativeMemorySnapshot,
-    ConversationEpisode,
     ConversationResetReceipt,
     DeliveredConversationTurn,
+    StoredDeliveredConversationTurn,
+    MemorySearchOrder,
+    MEMORY_SEARCH_CANDIDATE_POOL,
+    MAX_EPISODE_SOURCE_EVENTS,
+    select_memory_candidates,
     DeliveredInputKind,
     DialogueFrame,
     DialogueFrameSourceTurnMissingError,
@@ -33,7 +32,6 @@ from .memory import (
     DialogueFrameUpdateStatus,
     MemorySearchCandidate,
     MemoryResetRevisionMismatchError,
-    MemoryProposalDecision,
     SemanticCaptureDisposition,
     SemanticJournalEventDisposition,
     SemanticJournalEventRecord,
@@ -44,7 +42,6 @@ from .memory import (
     SemanticMemoryProposalConflictError,
     SemanticMemoryReceipt,
     SemanticMemorySourceTurnMissingError,
-    StoredDeliveredConversationEvent,
     WeeklyConversationRecap,
     WeeklyConversationRecord,
     _validate_aware_datetime,
@@ -55,17 +52,14 @@ from .memory import (
     _validate_semantic_journal_identity_key,
     _validate_subject,
     _validate_weekly_summary,
-    build_conversation_episodes,
     canonical_dialogue_frame_update_fingerprint,
     canonical_semantic_journal_event_fingerprint,
     canonical_semantic_memory_proposal_fingerprint,
     current_local_week_utc_bounds,
-    evaluate_delivered_turn_memory_proposal,
     semantic_journal_created_event_id,
     semantic_journal_identity_key,
     _prepare_semantic_journal_batch,
     _semantic_memory_decision,
-    _validate_optional_summary,
     _validate_protocol_identifier,
 )
 from .timezone import validate_iana_timezone_id
@@ -125,21 +119,30 @@ class PostgresAuthoritativeMemoryStore:
             ) as connection:
                 cursor = await connection.execute(
                     """
-                    select version
+                    select name, version
                     from ava_private.schema_migrations
-                    where name = 'semantic_capture_receipt_disposition'
+                    where name in ('durable_turn_timeline', 'semantic_capture_receipt_disposition')
                     """
                 )
-                row = await cursor.fetchone()
+                capabilities = {
+                    row["name"]: row["version"] for row in await cursor.fetchall()
+                }
         except (PsycopgError, PoolTimeout) as error:
             await self._pool.close()
             raise PostgresMemoryStoreError(
-                "PostgreSQL memory is unavailable or its semantic_capture_receipt_disposition migration is missing"
+                "PostgreSQL memory is unavailable or its durable_turn_timeline migration is missing"
             ) from error
-        if row is None or cast(int, row["version"]) != 1:
+        if any(
+            capabilities.get(name) != 1
+            for name in (
+                "durable_turn_timeline",
+                "semantic_capture_receipt_disposition",
+            )
+        ):
             await self._pool.close()
             raise PostgresMemoryStoreError(
-                "PostgreSQL memory schema capability semantic_capture_receipt_disposition version 1 is required"
+                "PostgreSQL memory schema capabilities durable_turn_timeline and "
+                "semantic_capture_receipt_disposition version 1 are required"
             )
         self._opened = True
 
@@ -184,7 +187,8 @@ class PostgresAuthoritativeMemoryStore:
                     """
                     select turn_id, input_kind, child_text, child_text_source,
                            ava_delivered_text, delivered_sample_count,
-                           child_turn_summary, terminal,
+                           child_turn_summary, terminal, occurred_at, timezone_id,
+                           reset_revision, turn_sequence, tool_exchanges,
                            canvas_scene_id, canvas_scene_revision,
                            canvas_interaction_revision, canvas_interaction_mode,
                            canvas_binding_id, canvas_target_id,
@@ -193,10 +197,10 @@ class PostgresAuthoritativeMemoryStore:
                       select *
                       from ava_private.delivered_turns
                       where subject = %s
-                      order by occurred_at desc, turn_id desc
+                      order by turn_sequence desc
                       limit %s
                     ) as newest
-                    order by occurred_at asc, turn_id asc
+                    order by turn_sequence asc
                     """,
                     (normalized_subject, MAX_SNAPSHOT_DELIVERED_TURNS),
                 )
@@ -223,36 +227,7 @@ class PostgresAuthoritativeMemoryStore:
                 "currentSessionSummary": (
                     state["current_session_summary"] if state is not None else None
                 ),
-                "deliveredTurns": [
-                    {
-                        "turnId": row["turn_id"],
-                        "inputKind": row["input_kind"],
-                        "childText": row["child_text"],
-                        "childTextSource": row["child_text_source"],
-                        "canvasInteraction": (
-                            {
-                                "sceneId": row["canvas_scene_id"],
-                                "sceneRevision": row["canvas_scene_revision"],
-                                "interactionRevision": row[
-                                    "canvas_interaction_revision"
-                                ],
-                                "interactionMode": row["canvas_interaction_mode"],
-                                "bindingId": row["canvas_binding_id"],
-                                "targetId": row["canvas_target_id"],
-                                "accessibilityLabel": row["canvas_accessibility_label"],
-                                "stepIndex": row["canvas_step_index"],
-                            }
-                            if row["input_kind"]
-                            == DeliveredInputKind.CANVAS_INTERACTION
-                            else None
-                        ),
-                        "avaDeliveredText": row["ava_delivered_text"],
-                        "deliveredSampleCount": row["delivered_sample_count"],
-                        "childTurnSummary": row["child_turn_summary"],
-                        "terminal": row["terminal"],
-                    }
-                    for row in turn_rows
-                ],
+                "deliveredTurns": [_delivered_turn_from_row(row) for row in turn_rows],
                 "stableMemories": [
                     {
                         "id": row["memory_id"],
@@ -272,11 +247,9 @@ class PostgresAuthoritativeMemoryStore:
         subject: str,
         expected_reset_revision: int,
         turn: DeliveredConversationTurn,
-        proposal: AvaMemoryProposal | None,
-        memory_id: str | None,
         occurred_at: datetime | None = None,
         timezone_id: str = "UTC",
-    ) -> MemoryProposalDecision:
+    ) -> None:
         normalized_subject = _validate_subject(subject)
         validated_expected_reset_revision = _validate_reset_revision(
             expected_reset_revision,
@@ -291,11 +264,6 @@ class PostgresAuthoritativeMemoryStore:
             turn.model_dump(mode="json", by_alias=True)
         )
         _validate_weekly_summary(validated_turn.child_turn_summary)
-        decision = evaluate_delivered_turn_memory_proposal(
-            turn=validated_turn,
-            proposal=proposal,
-            memory_id=memory_id,
-        )
         interaction = validated_turn.canvas_interaction
 
         async with self._connection() as connection:
@@ -311,6 +279,21 @@ class PostgresAuthoritativeMemoryStore:
                             expected_reset_revision=(validated_expected_reset_revision),
                             current_reset_revision=current_reset_revision,
                         )
+                    sequence_cursor = await connection.execute(
+                        """
+                        update ava_private.memory_state
+                        set last_turn_sequence = last_turn_sequence + 1
+                        where subject = %s
+                        returning last_turn_sequence
+                        """,
+                        (normalized_subject,),
+                    )
+                    sequence_row = await sequence_cursor.fetchone()
+                    if sequence_row is None:
+                        raise PostgresMemoryStoreError(
+                            "turn sequence owner disappeared"
+                        )
+                    turn_sequence = sequence_row["last_turn_sequence"]
                     await connection.execute(
                         """
                         insert into ava_private.turn_receipts (subject, turn_id)
@@ -328,10 +311,12 @@ class PostgresAuthoritativeMemoryStore:
                           canvas_scene_id, canvas_scene_revision,
                           canvas_interaction_revision, canvas_interaction_mode,
                           canvas_binding_id, canvas_target_id,
-                          canvas_accessibility_label, canvas_step_index
+                          canvas_accessibility_label, canvas_step_index,
+                          reset_revision, turn_sequence, tool_exchanges
                         ) values (
                           %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                          %s, %s, %s, %s, %s, %s, %s, %s, %s
+                          %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                          %s, %s, %s
                         )
                         """,
                         (
@@ -358,27 +343,21 @@ class PostgresAuthoritativeMemoryStore:
                             interaction.target_id if interaction else None,
                             interaction.accessibility_label if interaction else None,
                             interaction.step_index if interaction else None,
+                            current_reset_revision,
+                            turn_sequence,
+                            Jsonb(
+                                [
+                                    exchange.model_dump(mode="json", by_alias=True)
+                                    for exchange in validated_turn.tool_exchanges
+                                ]
+                            ),
                         ),
-                    )
-                    decision = await self._store_memory_decision(
-                        connection,
-                        subject=normalized_subject,
-                        decision=decision,
-                    )
-                    await self._compact_delivered_turns_into_episodes(
-                        connection,
-                        subject=normalized_subject,
-                        created_at=normalized_occurred_at,
-                    )
-                    await self._prune_retention(
-                        connection,
-                        subject=normalized_subject,
                     )
             except errors.UniqueViolation as error:
                 raise ValueError(
                     f"delivered turn {validated_turn.turn_id!r} is already committed"
                 ) from error
-        return decision
+        return None
 
     async def apply_dialogue_frame_update(
         self,
@@ -506,7 +485,9 @@ class PostgresAuthoritativeMemoryStore:
                 return SemanticMemoryReceipt(
                     source_turn_id=validated_source_turn_id,
                     disposition=SemanticCaptureDisposition.CHANGED,
-                    proposal_fingerprint=cast(str, legacy_receipt["update_fingerprint"]),
+                    proposal_fingerprint=cast(
+                        str, legacy_receipt["update_fingerprint"]
+                    ),
                     event_results=(),
                     resulting_frame_revision=cast(
                         int, legacy_receipt["applied_revision"]
@@ -727,7 +708,10 @@ class PostgresAuthoritativeMemoryStore:
                         (),
                     )
 
-                if validated_proposal.disposition == SemanticCaptureDisposition.NO_CHANGE:
+                if (
+                    validated_proposal.disposition
+                    == SemanticCaptureDisposition.NO_CHANGE
+                ):
                     await self._insert_semantic_memory_receipt(
                         connection,
                         subject=normalized_subject,
@@ -969,8 +953,10 @@ class PostgresAuthoritativeMemoryStore:
         limit: int = 5,
         from_instant: datetime | None = None,
         to_instant: datetime | None = None,
+        order: MemorySearchOrder = MemorySearchOrder.BEST_MATCH,
     ) -> list[MemorySearchCandidate]:
         normalized_subject = _validate_subject(subject)
+        order = MemorySearchOrder(order)
         query_text = " ".join(_validate_search_query(query))
         validated_limit = _validate_search_limit(limit)
         lower, upper = _validate_search_bounds(from_instant, to_instant)
@@ -1066,64 +1052,13 @@ class PostgresAuthoritativeMemoryStore:
                         and overlapping_raw.turn_id = any(episode.source_turn_ids)
                     )
                 ),
-                stable_candidates as (
-                  select
-                    memory.memory_id as source_id,
-                    'stableMemory'::text as source_kind,
-                    coalesce(raw.occurred_at, episode.started_at, memory.created_at)
-                      as started_at,
-                    coalesce(raw.occurred_at, episode.ended_at, memory.created_at)
-                      as ended_at,
-                    case
-                      when raw.timezone_id is not null
-                        then array[raw.timezone_id]::text[]
-                      when episode.timezone_id is not null
-                        then array[episode.timezone_id]::text[]
-                      else array[]::text[]
-                    end as timezone_ids,
-                    left(memory.summary || ' ' || memory.evidence, 1200)
-                      as reference_text,
-                    array[memory.source_turn_id]::text[] as source_turn_ids,
-                    ts_rank_cd(
-                      to_tsvector('simple', memory.summary || ' ' || memory.evidence),
-                      search_query.value
-                    ) as relevance
-                  from ava_private.stable_memories as memory
-                  cross join search_query
-                  left join ava_private.delivered_turns as raw
-                    on raw.subject = memory.subject
-                   and raw.turn_id = memory.source_turn_id
-                  left join lateral (
-                    select candidate.started_at, candidate.ended_at,
-                           candidate.timezone_id
-                    from ava_private.conversation_episodes as candidate
-                    where candidate.subject = memory.subject
-                      and memory.source_turn_id = any(candidate.source_turn_ids)
-                    order by candidate.ended_at desc, candidate.episode_id desc
-                    limit 1
-                  ) as episode on true
-                  where memory.subject = %s
-                    and to_tsvector(
-                      'simple', memory.summary || ' ' || memory.evidence
-                    ) @@ search_query.value
-                    and (
-                      %s::timestamptz is null
-                      or coalesce(raw.occurred_at, episode.ended_at, memory.created_at)
-                         >= %s
-                    )
-                    and (
-                      %s::timestamptz is null
-                      or coalesce(raw.occurred_at, episode.started_at, memory.created_at)
-                         < %s
-                    )
-                ),
                 journal_candidates as (
                   select
                     event.event_id as source_id,
                     'semanticJournal'::text as source_kind,
-                    event.created_at as started_at,
-                    event.created_at as ended_at,
-                    array[]::text[] as timezone_ids,
+                    coalesce(provenance.started_at, event.created_at) as started_at,
+                    coalesce(provenance.ended_at, event.created_at) as ended_at,
+                    coalesce(provenance.timezone_ids, array[]::text[]) as timezone_ids,
                     left(event.summary, 1200) as reference_text,
                     coalesce(
                       (
@@ -1135,7 +1070,6 @@ class PostgresAuthoritativeMemoryStore:
                             and sources.reset_revision = event.reset_revision
                             and sources.event_id = event.event_id
                           order by sources.source_turn_id
-                          limit 16
                         ) as sub
                       ),
                       array[]::text[]
@@ -1149,6 +1083,28 @@ class PostgresAuthoritativeMemoryStore:
                   join ava_private.memory_state as state
                     on state.subject = event.subject
                    and state.reset_revision = event.reset_revision
+                  left join lateral (
+                    select min(evidence.started_at) as started_at,
+                           max(evidence.ended_at) as ended_at,
+                           array_agg(distinct evidence.timezone_id order by evidence.timezone_id) as timezone_ids
+                    from (
+                      select raw.occurred_at as started_at, raw.occurred_at as ended_at,
+                             raw.timezone_id
+                      from ava_private.semantic_journal_event_sources source
+                      join ava_private.delivered_turns raw
+                        on raw.subject = source.subject and raw.turn_id = source.source_turn_id
+                      where source.subject = event.subject and source.event_id = event.event_id
+                      union all
+                      select episode.started_at, episode.ended_at, episode.timezone_id
+                      from ava_private.semantic_journal_event_sources source
+                      join ava_private.conversation_episodes episode
+                        on episode.subject = source.subject
+                       and source.source_turn_id = any(episode.source_turn_ids)
+                      where source.subject = event.subject and source.event_id = event.event_id
+                        and not exists (select 1 from ava_private.delivered_turns raw
+                          where raw.subject = source.subject and raw.turn_id = source.source_turn_id)
+                    ) evidence
+                  ) provenance on true
                   where event.subject = %s
                     and to_tsvector('simple', event.summary) @@ search_query.value
                     and not exists (
@@ -1158,22 +1114,24 @@ class PostgresAuthoritativeMemoryStore:
                         and s.reset_revision = event.reset_revision
                         and s.superseded_event_id = event.event_id
                     )
-                    and (%s::timestamptz is null or event.created_at >= %s)
-                    and (%s::timestamptz is null or event.created_at < %s)
+                    and (%s::timestamptz is null or coalesce(provenance.ended_at, event.created_at) >= %s)
+                    and (%s::timestamptz is null or coalesce(provenance.started_at, event.created_at) < %s)
                 ),
                 candidates as (
                   select * from raw_candidates
                   union all
                   select * from episode_candidates
                   union all
-                  select * from stable_candidates
-                  union all
                   select * from journal_candidates
                 )
                 select source_id, source_kind, started_at, ended_at,
                        timezone_ids, reference_text, source_turn_ids, relevance
                 from candidates
-                order by relevance desc, ended_at desc, source_id asc
+                order by
+                  case when %s = 'bestMatch' then relevance end desc,
+                  case when %s = 'oldest' then started_at end asc,
+                  case when %s <> 'oldest' then ended_at end desc,
+                  relevance desc, source_id asc, source_kind asc
                 limit %s
                 """,
                 (
@@ -1193,23 +1151,21 @@ class PostgresAuthoritativeMemoryStore:
                     lower,
                     upper,
                     upper,
-                    normalized_subject,
-                    lower,
-                    lower,
-                    upper,
-                    upper,
-                    validated_limit,
+                    str(order),
+                    str(order),
+                    str(order),
+                    MEMORY_SEARCH_CANDIDATE_POOL,
                 ),
             )
             rows = await cursor.fetchall()
-        return [
+        candidates = [
             MemorySearchCandidate.model_validate(
                 {
                     "sourceId": row["source_id"],
                     "sourceKind": row["source_kind"],
                     "startedAt": row["started_at"],
                     "endedAt": row["ended_at"],
-                    "timezoneIds": row["timezone_ids"],
+                    "timezoneIds": row["timezone_ids"][:MAX_EPISODE_SOURCE_EVENTS],
                     "referenceText": row["reference_text"],
                     "sourceTurnIds": row["source_turn_ids"],
                     "relevance": row["relevance"],
@@ -1217,40 +1173,7 @@ class PostgresAuthoritativeMemoryStore:
             )
             for row in rows
         ]
-
-    async def set_session_summary(
-        self,
-        *,
-        subject: str,
-        expected_reset_revision: int,
-        summary: str | None,
-    ) -> None:
-        normalized_subject = _validate_subject(subject)
-        validated_expected_reset_revision = _validate_reset_revision(
-            expected_reset_revision,
-            field_name="expected_reset_revision",
-        )
-        normalized_summary = _validate_optional_summary(summary)
-        async with self._connection() as connection:
-            async with connection.transaction():
-                await self._ensure_subject(connection, normalized_subject)
-                current_reset_revision = await self._lock_subject(
-                    connection,
-                    normalized_subject,
-                )
-                if current_reset_revision != validated_expected_reset_revision:
-                    raise MemoryResetRevisionMismatchError(
-                        expected_reset_revision=validated_expected_reset_revision,
-                        current_reset_revision=current_reset_revision,
-                    )
-                await connection.execute(
-                    """
-                    update ava_private.memory_state
-                    set current_session_summary = %s, updated_at = now()
-                    where subject = %s
-                    """,
-                    (normalized_summary, normalized_subject),
-                )
+        return select_memory_candidates(candidates, limit=validated_limit, order=order)
 
     async def load_weekly_recap(
         self,
@@ -1335,6 +1258,7 @@ class PostgresAuthoritativeMemoryStore:
                     """
                     update ava_private.memory_state
                     set current_session_summary = null,
+                        last_turn_sequence = 0,
                         dialogue_frame_revision = 0,
                         dialogue_frame_payload = '{}'::jsonb,
                         dialogue_frame_last_source_turn_id = null,
@@ -1578,184 +1502,6 @@ class PostgresAuthoritativeMemoryStore:
             ),
         )
 
-    @staticmethod
-    async def _store_memory_decision(
-        connection: AsyncConnection[dict[str, object]],
-        *,
-        subject: str,
-        decision: MemoryProposalDecision,
-    ) -> MemoryProposalDecision:
-        record = decision.record
-        if record is None:
-            return decision
-        duplicate_cursor = await connection.execute(
-            """
-            select 1
-            from ava_private.stable_memories
-            where subject = %s and kind = %s and lower(summary) = lower(%s)
-            """,
-            (subject, str(record.kind), record.summary),
-        )
-        if await duplicate_cursor.fetchone() is not None:
-            return _rejected_decision("Equivalent stable memory already exists.")
-        count_cursor = await connection.execute(
-            """
-            select count(*) as memory_count
-            from ava_private.stable_memories
-            where subject = %s
-            """,
-            (subject,),
-        )
-        count_row = await count_cursor.fetchone()
-        memory_count = (
-            cast(int, count_row["memory_count"]) if count_row is not None else 0
-        )
-        if memory_count >= MAX_STABLE_MEMORIES:
-            return _rejected_decision(
-                "Stable memory capacity is exhausted; the delivered turn was retained."
-            )
-        await connection.execute(
-            """
-            insert into ava_private.stable_memories (
-              subject, memory_id, kind, summary, evidence, source_turn_id
-            ) values (%s, %s, %s, %s, %s, %s)
-            """,
-            (
-                subject,
-                record.id,
-                str(record.kind),
-                record.summary,
-                record.evidence,
-                record.source_turn_id,
-            ),
-        )
-        return decision
-
-    async def _compact_delivered_turns_into_episodes(
-        self,
-        connection: AsyncConnection[dict[str, object]],
-        *,
-        subject: str,
-        created_at: datetime,
-    ) -> None:
-        count_cursor = await connection.execute(
-            """
-            select count(*) as raw_count
-            from ava_private.delivered_turns
-            where subject = %s
-            """,
-            (subject,),
-        )
-        count_row = await count_cursor.fetchone()
-        raw_count = cast(int, count_row["raw_count"]) if count_row else 0
-        if raw_count <= RAW_RETENTION_HIGH_WATER:
-            return
-        compact_count = raw_count - RAW_RETENTION_LOW_WATER
-        source_cursor = await connection.execute(
-            """
-            select turn_id, input_kind, child_text, child_text_source,
-                   ava_delivered_text, delivered_sample_count,
-                   child_turn_summary, terminal, occurred_at, timezone_id,
-                   canvas_scene_id, canvas_scene_revision,
-                   canvas_interaction_revision, canvas_interaction_mode,
-                   canvas_binding_id, canvas_target_id,
-                   canvas_accessibility_label, canvas_step_index
-            from ava_private.delivered_turns
-            where subject = %s
-            order by occurred_at asc, turn_id asc
-            limit %s
-            """,
-            (subject, compact_count),
-        )
-        source_rows = await source_cursor.fetchall()
-        if len(source_rows) != compact_count:
-            raise PostgresMemoryStoreError(
-                "PostgreSQL raw memory count changed while subject lock was held"
-            )
-        source_events = tuple(
-            StoredDeliveredConversationEvent(
-                occurred_at=cast(datetime, row["occurred_at"]).astimezone(UTC),
-                timezone_id=validate_iana_timezone_id(cast(str, row["timezone_id"])),
-                turn=_delivered_turn_from_row(row),
-            )
-            for row in source_rows
-        )
-        episodes = build_conversation_episodes(
-            subject=subject,
-            source_events=source_events,
-            created_at=created_at,
-        )
-        for episode in episodes:
-            await self._insert_episode(connection, episode=episode)
-        await connection.execute(
-            """
-            delete from ava_private.delivered_turns
-            where subject = %s and turn_id = any(%s)
-            """,
-            (subject, [event.turn.turn_id for event in source_events]),
-        )
-
-    @staticmethod
-    async def _insert_episode(
-        connection: AsyncConnection[dict[str, object]],
-        *,
-        episode: ConversationEpisode,
-    ) -> None:
-        await connection.execute(
-            """
-            insert into ava_private.conversation_episodes (
-              subject, episode_id, started_at, ended_at, timezone_id,
-              digest, source_turn_ids, source_event_count, created_at
-            ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                episode.subject,
-                episode.episode_id,
-                episode.started_at,
-                episode.ended_at,
-                episode.timezone_id,
-                episode.digest,
-                episode.source_turn_ids,
-                episode.source_event_count,
-                episode.created_at,
-            ),
-        )
-
-    async def _prune_retention(
-        self,
-        connection: AsyncConnection[dict[str, object]],
-        *,
-        subject: str,
-    ) -> None:
-        episode_threshold = datetime.now(UTC) - timedelta(days=EPISODE_RETENTION_DAYS)
-        await connection.execute(
-            """
-            delete from ava_private.conversation_episodes
-            where subject = %s and ended_at < %s
-            """,
-            (subject, episode_threshold),
-        )
-        await connection.execute(
-            """
-            delete from ava_private.conversation_episodes as episode
-            where episode.subject = %s
-              and (episode.ended_at, episode.episode_id) not in (
-                select retained.ended_at, retained.episode_id
-                from ava_private.conversation_episodes as retained
-                where retained.subject = %s
-                order by retained.ended_at desc, retained.episode_id desc
-                limit %s
-              )
-            """,
-            (subject, subject, MAX_EPISODES),
-        )
-
-
-def _rejected_decision(reason: str) -> MemoryProposalDecision:
-    return MemoryProposalDecision.model_validate(
-        {"accepted": False, "reason": reason, "record": None}
-    )
-
 
 def _validate_dialogue_frame_source_turn_id(value: str) -> str:
     return _validate_protocol_identifier(value, field_name="source_turn_id")
@@ -1811,10 +1557,15 @@ def _dialogue_frame_decision(
     )
 
 
-def _delivered_turn_from_row(row: dict[str, object]) -> DeliveredConversationTurn:
-    return DeliveredConversationTurn.model_validate(
+def _delivered_turn_from_row(row: dict[str, object]) -> StoredDeliveredConversationTurn:
+    return StoredDeliveredConversationTurn.model_validate(
         {
             "turnId": row["turn_id"],
+            "resetRevision": row["reset_revision"],
+            "turnSequence": row["turn_sequence"],
+            "occurredAt": row["occurred_at"],
+            "timezoneId": row["timezone_id"],
+            "toolExchanges": row["tool_exchanges"],
             "inputKind": row["input_kind"],
             "childText": row["child_text"],
             "childTextSource": row["child_text_source"],

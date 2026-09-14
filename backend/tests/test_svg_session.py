@@ -146,13 +146,7 @@ def test_preload_ack_does_not_activate_candidate() -> None:
     assert candidate.status is SvgCandidateStatus.DOCUMENT_READY
     assert prepared.status is SvgCandidateStatus.PREPARED
     assert state.active is None
-    assert (
-        state.render_realtime_context()
-        == '<canvas_context trust="backend_semantic_canvas_metadata">'
-        '<canvas_presentation trust="validated_current_state" visible="false"/>'
-        '<canvas retained_count="0" focused_position="none"/>'
-        "</canvas_context>"
-    )
+    assert state.render_realtime_context() == ""
 
 
 def test_first_rendered_frame_is_the_only_activation_boundary() -> None:
@@ -389,7 +383,7 @@ def test_realtime_context_reports_legacy_mixed_control_kinds_deterministically()
 
 
 def test_realtime_continuous_control_context_remains_bounded() -> None:
-    pending_visual = f'<pending_visual>{"x" * 1_500}</pending_visual>'
+    pending_visual = f"<pending_visual>{'x' * 1_500}</pending_visual>"
 
     context = _presented_context(
         _continuous_control_generation("timeline"),
@@ -559,9 +553,7 @@ def test_new_canvas_revision_clears_stale_interaction_context() -> None:
     assert "<last_interaction>" not in state.render_realtime_context()
 
 
-def test_session_state_derives_focus_from_shared_workspace() -> (
-    None
-):
+def test_session_state_derives_focus_from_shared_workspace() -> None:
     workspace = SvgCanvasWorkspace()
     state_a = SvgCanvasSessionState(workspace=workspace, inherit_focus=False)
     first = _generation("generation_1")

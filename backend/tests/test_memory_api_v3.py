@@ -10,6 +10,10 @@ from ava_backend.canvas.svg_workspace import (
     SvgCanvasWorkspaceStore,
 )
 from ava_backend.config import AvaEnvironment, Settings
+from ava_backend.realtime.harness import (
+    REALTIME_PROMPT_VERSION,
+    REALTIME_TOOL_CONTRACT_VERSION,
+)
 from ava_backend.realtime.memory import (
     DeliveredConversationTurn,
     DevelopmentAuthoritativeMemoryStore,
@@ -53,8 +57,6 @@ async def test_weekly_recap_and_reset_use_authenticated_subject() -> None:
                 "terminal": "completed",
             }
         ),
-        proposal=None,
-        memory_id=None,
     )
     async with await _client(store) as client:
         recap = await client.get(
@@ -180,8 +182,8 @@ async def test_readiness_checks_configured_authoritative_memory() -> None:
     payload = response.json()
     assert payload["status"] == "ready"
     assert payload["protocolVersion"] == 3
-    assert payload["promptVersion"] == "ava-realtime-v4.12"
-    assert payload["toolContractVersion"] == "ava-realtime-tools-v4.8"
+    assert payload["promptVersion"] == REALTIME_PROMPT_VERSION
+    assert payload["toolContractVersion"] == REALTIME_TOOL_CONTRACT_VERSION
     assert payload["canvasSpecialistVersion"] == SVG_CANVAS_SPECIALIST_PROMPT_VERSION
     assert payload["build"]["version"] == "0.1.0"
     assert payload["build"]["instanceId"].startswith("instance-")

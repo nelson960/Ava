@@ -4,13 +4,21 @@ import asyncio
 from collections.abc import Awaitable
 from datetime import UTC, datetime
 from types import MethodType, SimpleNamespace
-from typing import Any, cast
+from typing import cast
 
 import pytest
+from ava_backend.realtime.memory import (
+    SemanticToolExchange,
+    CanvasPresentationExchange,
+    SearchMemoryExchange,
+)
+from ava_backend.realtime.tool_contract import (
+    GetCurrentTimeRequest,
+    GetCurrentTimeToolOutputV4,
+)
 
 from ava_backend.realtime.context_assembler import (
     DynamicContextBuildReason,
-    MemoryReference,
 )
 from ava_backend.realtime.coordinator import (
     CoordinatorStateError,
@@ -28,7 +36,6 @@ from ava_backend.realtime.memory import (
     DevelopmentAuthoritativeMemoryStore,
     DialogueFrame,
     DialogueFrameState,
-    DialogueFrameUpdate,
     MemorySearchCandidate,
     SemanticCaptureDisposition,
     SemanticCaptureFunctionArguments,
@@ -39,7 +46,6 @@ from ava_backend.realtime.memory import (
 )
 from ava_backend.realtime.provider_session import (
     SemanticCaptureEvidence,
-    SettledSemanticToolOutcome,
 )
 
 
@@ -110,7 +116,9 @@ def _capture_result(
     if summary is not None:
         event_dict: dict[str, object] = {
             "family": family,
-            "semanticKey": "favorite_planet" if family != "canvasReference" else "jupiter_diagram",
+            "semanticKey": "favorite_planet"
+            if family != "canvasReference"
+            else "jupiter_diagram",
             "summary": summary,
         }
         if scene_revision is not None:
@@ -187,11 +195,9 @@ def _coordinator(
     coordinator._memory = memory or DevelopmentAuthoritativeMemoryStore()
     coordinator._memory_reset_revision = 0
     coordinator._dialogue_frame = DialogueFrame()
-    coordinator._turn_settled_tool_outcomes = []
+    coordinator._turn_tool_exchanges = []
     coordinator._canvas_jobs = _CanvasJobs(workspace or _Workspace())  # type: ignore[assignment]
     coordinator._canvas_context_lock = asyncio.Lock()
-    coordinator._warm_memories = ()
-    coordinator._last_memory_decision = None
     coordinator._memory_commit_queue = asyncio.Queue()
     coordinator._memory_commit_terminal = object()
     coordinator._memory_commit_worker_task = None
@@ -200,7 +206,6 @@ def _coordinator(
     coordinator._current_memory_commit_turn_id = None
     coordinator._memory_commit_drain_timeout_seconds = 2.0
     coordinator._memory_commit_sequence = 0
-    coordinator._latest_memory_commit_sequence = 0
     coordinator._failure_id_factory = lambda: "failure-semantic"
     coordinator._memory_snapshot = None
     coordinator._harness = None
@@ -220,19 +225,17 @@ def _payload(
     sequence: int = 1,
     turn_id: str = "turn-1",
     canvas_interaction: DeliveredCanvasInteraction | None = None,
-    settled_tool_outcomes: tuple[SettledSemanticToolOutcome, ...] = (),
+    tool_exchanges: tuple[SemanticToolExchange, ...] = (),
     interrupted: bool = False,
     delivered_text: str = "Jupiter is fascinating.",
     child_text: str | None = "I like Jupiter.",
     transcript_waiter: Awaitable[str | None] | None = None,
 ) -> _CapturedMemoryCommit:
-    resolved_child_text = (
-        None if canvas_interaction is not None else child_text
-    )
+    resolved_child_text = None if canvas_interaction is not None else child_text
     resolved_child_text_source = (
-        None if canvas_interaction is not None else (
-            ChildTurnTextSource.TRANSCRIPT if child_text is not None else None
-        )
+        None
+        if canvas_interaction is not None
+        else (ChildTurnTextSource.TRANSCRIPT if child_text is not None else None)
     )
     return _CapturedMemoryCommit(
         sequence=sequence,
@@ -248,22 +251,8 @@ def _payload(
         delivered_sample_count=24_000,
         terminal=DeliveredTurnTerminal.COMPLETED,
         transcript_waiter=transcript_waiter,
-        settled_tool_outcomes=settled_tool_outcomes,
+        tool_exchanges=tool_exchanges,
         interrupted=interrupted,
-    )
-
-
-def _warm_reference() -> MemoryReference:
-    instant = datetime(2026, 9, 7, tzinfo=UTC)
-    return MemoryReference.model_validate(
-        {
-            "sourceKind": "episode",
-            "startedAt": instant,
-            "endedAt": instant,
-            "timezoneIds": ["UTC"],
-            "text": "The child previously discussed astronomy.",
-            "sourceTurnIds": ["turn-history"],
-        }
     )
 
 
@@ -279,8 +268,6 @@ async def _advance_store_to_frame_revision_one(
             child_text=setup.child_text,
             child_text_source=setup.child_text_source,
         ),
-        proposal=None,
-        memory_id=None,
         occurred_at=setup.occurred_at,
     )
     decision = await memory.apply_semantic_memory_proposal(
@@ -306,16 +293,21 @@ def test_canvas_references_require_exact_canonical_retained_revision() -> None:
         )
 
 
-async def test_schedule_captures_settled_tool_outcomes() -> None:
+async def test_schedule_captures_tool_exchanges() -> None:
     coordinator = _coordinator()
     coordinator._turn_occurred_at = datetime(2026, 9, 8, tzinfo=UTC)
     coordinator._turn_canvas_interaction_input = None
     coordinator._child_text = "I like Jupiter."
     coordinator._child_text_source = ChildTurnTextSource.TRANSCRIPT
-    coordinator._record_tool_outcome(
+    coordinator._record_tool_exchange(
         tool_name="get_current_time",
-        call_id="call_time_1",
-        outcome="available",
+        request=GetCurrentTimeRequest(),
+        result=GetCurrentTimeToolOutputV4(
+            localIsoDateTime="2026-09-08T00:00:00+00:00",
+            weekday="Tuesday",
+            daypart="night",
+            timezoneId="UTC",
+        ),
     )
     captured: list[_CapturedMemoryCommit] = []
 
@@ -339,23 +331,30 @@ async def test_schedule_captures_settled_tool_outcomes() -> None:
         coordinator._memory_commit_worker_task.cancel()
 
     assert captured[0].turn_id == "turn-1"
-    assert len(captured[0].settled_tool_outcomes) == 1
-    assert captured[0].settled_tool_outcomes[0].tool_name == "get_current_time"
-    assert captured[0].settled_tool_outcomes[0].outcome == "available"
+    assert len(captured[0].tool_exchanges) == 1
+    assert captured[0].tool_exchanges[0].tool == "get_current_time"
+    assert captured[0].tool_exchanges[0].result.timezone_id == "UTC"
     assert not captured[0].interrupted
 
 
-async def test_reset_clears_settled_tool_outcomes_and_frame() -> None:
+async def test_reset_clears_tool_exchanges_and_frame() -> None:
     coordinator = _coordinator()
     coordinator._dialogue_frame = DialogueFrame.model_validate(
         {"revision": 2, "activeTopics": ["Jupiter"]}
     )
-    coordinator._record_tool_outcome(
-        tool_name="get_current_time", call_id="c1", outcome="available"
+    coordinator._record_tool_exchange(
+        tool_name="get_current_time",
+        request=GetCurrentTimeRequest(),
+        result=GetCurrentTimeToolOutputV4(
+            localIsoDateTime="2026-09-08T00:00:00+00:00",
+            weekday="Tuesday",
+            daypart="night",
+            timezoneId="UTC",
+        ),
     )
-    assert len(coordinator._turn_settled_tool_outcomes) == 1
+    assert len(coordinator._turn_tool_exchanges) == 1
     await coordinator.memory_reset(reset_revision=1)
-    assert coordinator._turn_settled_tool_outcomes == []
+    assert coordinator._turn_tool_exchanges == []
     assert coordinator.dialogue_frame == DialogueFrame()
 
 
@@ -366,7 +365,6 @@ async def test_normal_speech_commit_with_no_change_disposition() -> None:
         _capture_result(disposition=SemanticCaptureDisposition.NO_CHANGE)
     ]
     coordinator = _coordinator(memory=memory, realtime=provider)
-    coordinator._latest_memory_commit_sequence = 1
     builds: list[DynamicContextBuildReason] = []
 
     async def build(
@@ -403,7 +401,6 @@ async def test_canvas_interaction_commit_has_no_automatic_search() -> None:
         _capture_result(disposition=SemanticCaptureDisposition.NO_CHANGE)
     ]
     coordinator = _coordinator(memory=memory, realtime=provider)
-    coordinator._latest_memory_commit_sequence = 1
     interaction = DeliveredCanvasInteraction.model_validate(
         {
             "sceneId": "scene-jupiter",
@@ -441,7 +438,6 @@ async def test_delivered_turn_precedes_journal_transaction_without_context_build
     provider = DeterministicRealtimePlanProvider()
     provider.canned_capture_results = [_capture_result()]
     coordinator = _coordinator(memory=memory, realtime=provider)
-    coordinator._latest_memory_commit_sequence = 1
     builds: list[DynamicContextBuildReason] = []
 
     async def build(
@@ -475,9 +471,6 @@ async def test_journal_only_canonical_frame_sync_forces_one_build_without_search
     provider = DeterministicRealtimePlanProvider()
     provider.canned_capture_results = [_capture_result()]
     coordinator = _coordinator(memory=memory, realtime=provider)
-    coordinator._latest_memory_commit_sequence = 1
-    warm_references = (_warm_reference(),)
-    coordinator._warm_memories = warm_references
     builds: list[int] = []
 
     async def build(
@@ -501,7 +494,6 @@ async def test_journal_only_canonical_frame_sync_forces_one_build_without_search
     assert coordinator.dialogue_frame.revision == 1
     assert builds == [1]
     assert memory.search_call_count == 0
-    assert coordinator._warm_memories == warm_references
 
 
 async def test_unchanged_canonical_frame_does_not_search_or_build() -> None:
@@ -509,9 +501,6 @@ async def test_unchanged_canonical_frame_does_not_search_or_build() -> None:
     provider = DeterministicRealtimePlanProvider()
     provider.canned_capture_results = [_capture_result()]
     coordinator = _coordinator(memory=memory, realtime=provider)
-    coordinator._latest_memory_commit_sequence = 1
-    warm_references = (_warm_reference(),)
-    coordinator._warm_memories = warm_references
     builds: list[int] = []
 
     async def build(
@@ -533,7 +522,6 @@ async def test_unchanged_canonical_frame_does_not_search_or_build() -> None:
     assert coordinator.dialogue_frame.revision == 0
     assert builds == []
     assert memory.search_call_count == 0
-    assert coordinator._warm_memories == warm_references
 
 
 async def test_canvas_reference_revalidation_failure_does_not_trigger_search_or_abort_turn() -> (
@@ -546,7 +534,6 @@ async def test_canvas_reference_revalidation_failure_does_not_trigger_search_or_
         _capture_result(family="canvasReference", scene_revision=3)
     ]
     coordinator = _coordinator(memory=memory, workspace=workspace, realtime=provider)
-    coordinator._latest_memory_commit_sequence = 1
     builds: list[DynamicContextBuildReason] = []
 
     async def build(
@@ -574,7 +561,6 @@ async def test_frame_semantic_proposal_adopts_canonical_frame_with_one_build() -
     provider = DeterministicRealtimePlanProvider()
     provider.canned_capture_results = [_capture_result(frame=True)]
     coordinator = _coordinator(memory=memory, realtime=provider)
-    coordinator._latest_memory_commit_sequence = 1
     builds: list[int] = []
 
     async def build(
@@ -601,7 +587,6 @@ async def test_explicit_no_change_capture_persists_receipt() -> None:
         _capture_result(disposition=SemanticCaptureDisposition.NO_CHANGE)
     ]
     coordinator = _coordinator(memory=memory, realtime=provider)
-    coordinator._latest_memory_commit_sequence = 1
 
     await coordinator._run_memory_commit(payload=_payload(turn_id="turn-nc"))
 
@@ -626,7 +611,6 @@ async def test_capture_provider_failure_preserves_turn_and_logs_warning() -> Non
     memory = DevelopmentAuthoritativeMemoryStore()
     provider = _FailingCaptureProvider()
     coordinator = _coordinator(memory=memory, realtime=provider)
-    coordinator._latest_memory_commit_sequence = 1
 
     await coordinator._run_memory_commit(payload=_payload(turn_id="turn-fail"))
 
@@ -642,14 +626,15 @@ async def test_capture_provider_failure_preserves_turn_and_logs_warning() -> Non
     assert receipt is None
 
 
-async def test_interrupted_turn_capture_passes_spoken_prefix_and_interrupted_flag() -> None:
+async def test_interrupted_turn_capture_passes_spoken_prefix_and_interrupted_flag() -> (
+    None
+):
     memory = DevelopmentAuthoritativeMemoryStore()
     provider = DeterministicRealtimePlanProvider()
     provider.canned_capture_results = [
         _capture_result(disposition=SemanticCaptureDisposition.NO_CHANGE)
     ]
     coordinator = _coordinator(memory=memory, realtime=provider)
-    coordinator._latest_memory_commit_sequence = 1
 
     payload = _payload(
         turn_id="turn-intr",
@@ -672,19 +657,23 @@ async def test_request_complete_zero_audio_action_only_turn_capture() -> None:
         _capture_result(disposition=SemanticCaptureDisposition.NO_CHANGE)
     ]
     coordinator = _coordinator(memory=memory, realtime=provider)
-    coordinator._latest_memory_commit_sequence = 1
 
-    outcome = SettledSemanticToolOutcome(
-        tool_name="manage_canvas",
-        call_id="call_canvas_1",
-        outcome="presented",
-        detail="canvas updated",
+    outcome = CanvasPresentationExchange.model_validate(
+        {
+            "request": {"action": "hide", "completion": "requestComplete"},
+            "result": {
+                "status": "accepted",
+                "operation": "hide",
+                "changed": True,
+                "visible": False,
+            },
+        }
     )
     payload = _payload(
         turn_id="turn-act",
         delivered_text="",
         child_text="Zoom in on Jupiter.",
-        settled_tool_outcomes=(outcome,),
+        tool_exchanges=(outcome,),
     )
     await coordinator._run_memory_commit(payload=payload)
 
@@ -693,9 +682,9 @@ async def test_request_complete_zero_audio_action_only_turn_capture() -> None:
     assert evidence.source_turn_id == "turn-act"
     assert evidence.spoken_response_prefix is None
     assert evidence.child_utterance == "Zoom in on Jupiter."
-    assert len(evidence.settled_tool_outcomes) == 1
-    assert evidence.settled_tool_outcomes[0].tool_name == "manage_canvas"
-    assert evidence.settled_tool_outcomes[0].outcome == "presented"
+    assert len(evidence.tool_exchanges) == 1
+    assert evidence.tool_exchanges[0].tool == "manage_canvas_presentation"
+    assert evidence.tool_exchanges[0].result.visible is False
 
 
 async def test_rejected_tool_call_in_settled_outcomes() -> None:
@@ -705,24 +694,26 @@ async def test_rejected_tool_call_in_settled_outcomes() -> None:
         _capture_result(disposition=SemanticCaptureDisposition.NO_CHANGE)
     ]
     coordinator = _coordinator(memory=memory, realtime=provider)
-    coordinator._latest_memory_commit_sequence = 1
 
-    outcome = SettledSemanticToolOutcome(
-        tool_name="unknown_tool",
-        call_id="call_unk_1",
-        outcome="rejected",
-        detail="unsupported utility tool",
+    outcome = SearchMemoryExchange.model_validate(
+        {
+            "request": None,
+            "result": {
+                "status": "rejected",
+                "reason": "Invalid historical-memory query.",
+            },
+        }
     )
     payload = _payload(
         turn_id="turn-rej",
-        settled_tool_outcomes=(outcome,),
+        tool_exchanges=(outcome,),
     )
     await coordinator._run_memory_commit(payload=payload)
 
     assert len(provider.captured_evidences) == 1
     evidence = provider.captured_evidences[0]
-    assert len(evidence.settled_tool_outcomes) == 1
-    assert evidence.settled_tool_outcomes[0].outcome == "rejected"
+    assert len(evidence.tool_exchanges) == 1
+    assert evidence.tool_exchanges[0].result.status == "rejected"
 
 
 async def test_consecutive_captures_execute_fifo_under_lock() -> None:
@@ -738,9 +729,7 @@ async def test_consecutive_captures_execute_fifo_under_lock() -> None:
     ]
     coordinator = _coordinator(memory=memory, realtime=provider)
 
-    waiter_1: asyncio.Future[str | None] = (
-        asyncio.get_running_loop().create_future()
-    )
+    waiter_1: asyncio.Future[str | None] = asyncio.get_running_loop().create_future()
     p1 = _payload(
         sequence=1,
         turn_id="turn-c1",
@@ -805,7 +794,6 @@ async def test_stale_semantic_decision_synchronizes_frame_without_journal_write(
         _capture_result(summary="The child prefers Saturn.", frame=True)
     ]
     coordinator = _coordinator(memory=memory, realtime=provider)
-    coordinator._latest_memory_commit_sequence = 1
 
     await coordinator._run_memory_commit(payload=_payload(turn_id="turn-stale"))
 
@@ -816,9 +804,7 @@ async def test_stale_semantic_decision_synchronizes_frame_without_journal_write(
 async def test_superseded_journal_draft_resolves_against_store() -> None:
     memory = DevelopmentAuthoritativeMemoryStore()
     p1 = DeterministicRealtimePlanProvider()
-    p1.canned_capture_results = [
-        _capture_result(summary="The child loves Jupiter.")
-    ]
+    p1.canned_capture_results = [_capture_result(summary="The child loves Jupiter.")]
     c1 = _coordinator(memory=memory, realtime=p1)
     await c1._run_memory_commit(payload=_payload(turn_id="turn-1"))
 
@@ -871,11 +857,13 @@ async def test_stale_canvas_revision_reference_discarded_semantic_content_surviv
                     semantic_key="favorite_planet",
                     summary="Child is fascinated by Mars.",
                     canonical_canvas_references=(
-                        SemanticJournalCanvasReference.model_validate({
-                            "sceneId": "scene-mars",
-                            "sceneRevision": 1,
-                            "relation": "The discussed planet",
-                        }),
+                        SemanticJournalCanvasReference.model_validate(
+                            {
+                                "sceneId": "scene-mars",
+                                "sceneRevision": 1,
+                                "relation": "The discussed planet",
+                            }
+                        ),
                     ),
                 ),
             ),
@@ -909,11 +897,13 @@ async def test_empty_changed_proposal_fails_closed_without_receipt() -> None:
                     semantic_key="saturn_rings",
                     summary="Saturn ring diagram.",
                     canonical_canvas_references=(
-                        SemanticJournalCanvasReference.model_validate({
-                            "sceneId": "scene-saturn",
-                            "sceneRevision": 1,
-                            "relation": "Ring view",
-                        }),
+                        SemanticJournalCanvasReference.model_validate(
+                            {
+                                "sceneId": "scene-saturn",
+                                "sceneRevision": 1,
+                                "relation": "Ring view",
+                            }
+                        ),
                     ),
                 ),
             ),
@@ -1090,4 +1080,3 @@ async def test_semantic_capture_valid_journal_survives_overlong_frame_item() -> 
     receipts = memory._semantic_memory_receipts.get("child:semantic", {})
     assert "turn-1" in receipts
     assert receipts["turn-1"].resulting_frame_revision == 0
-

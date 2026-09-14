@@ -4,24 +4,19 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
+import json
 from html import escape
 from math import ceil
 from zoneinfo import ZoneInfo
 
-from pydantic import Field, StringConstraints, model_validator
-from typing_extensions import Annotated
 
 from ..protocol import AgeBand
-from .common import NonEmptyText, ProtocolIdentifier, RealtimeProtocolModel
 from .memory import (
     DialogueFrame,
-    DeliveredConversationTurn,
+    StoredDeliveredConversationTurn,
     DeliveredInputKind,
-    MAX_EPISODE_SOURCE_EVENTS,
-    MemoryCandidateSourceKind,
-    MemorySearchCandidate,
 )
-from .timezone import MAX_TIMEZONE_ID_CHARACTERS, validate_iana_timezone_id
+from .timezone import validate_iana_timezone_id
 
 
 MAX_DYNAMIC_CONTEXT_UTF8_BYTES = 20_000
@@ -30,7 +25,6 @@ MAX_CANVAS_CONTEXT_CHARACTERS = 2_400
 
 class DynamicContextBuildReason(StrEnum):
     SESSION_BOOTSTRAP = "sessionBootstrap"
-    SESSION_RECONNECT = "sessionReconnect"
     TURN_COMMITTED = "turnCommitted"
     CANVAS_ACTIVATED = "canvasActivated"
     CANVAS_FOCUSED = "canvasFocused"
@@ -41,52 +35,6 @@ class DynamicContextBuildReason(StrEnum):
 
 class DynamicContextContractError(RuntimeError):
     """Required current state cannot satisfy the dynamic-context contract."""
-
-
-class MemoryReference(RealtimeProtocolModel):
-    """Bounded model-facing historical evidence without store internals."""
-
-    source_kind: MemoryCandidateSourceKind
-    started_at: datetime | None
-    ended_at: datetime | None
-    timezone_ids: list[
-        Annotated[
-            NonEmptyText,
-            StringConstraints(max_length=MAX_TIMEZONE_ID_CHARACTERS),
-        ]
-    ] = Field(max_length=MAX_EPISODE_SOURCE_EVENTS)
-    text: Annotated[NonEmptyText, StringConstraints(max_length=1_200)]
-    source_turn_ids: list[ProtocolIdentifier] = Field(
-        max_length=MAX_EPISODE_SOURCE_EVENTS
-    )
-
-    @model_validator(mode="after")
-    def reference_is_coherent(self) -> MemoryReference:
-        if (self.started_at is None) != (self.ended_at is None):
-            raise ValueError("memory reference time range must be complete")
-        if self.started_at is not None:
-            if self.started_at.tzinfo is None or self.ended_at is None:
-                raise ValueError("memory reference times must be timezone-aware")
-            if self.ended_at.tzinfo is None or self.ended_at < self.started_at:
-                raise ValueError("memory reference time range is invalid")
-        for timezone_id in self.timezone_ids:
-            validate_iana_timezone_id(timezone_id)
-        if len(self.source_turn_ids) != len(set(self.source_turn_ids)):
-            raise ValueError("memory reference source turn IDs must be unique")
-        return self
-
-    @classmethod
-    def from_candidate(cls, candidate: MemorySearchCandidate) -> MemoryReference:
-        return cls.model_validate(
-            {
-                "sourceKind": candidate.source_kind,
-                "startedAt": candidate.started_at,
-                "endedAt": candidate.ended_at,
-                "timezoneIds": candidate.timezone_ids,
-                "text": candidate.reference_text,
-                "sourceTurnIds": candidate.source_turn_ids,
-            }
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,8 +80,7 @@ class DynamicContextAssembler:
         age_band: AgeBand,
         timezone_id: str,
         current_time_utc: datetime,
-        bootstrap_turns: tuple[DeliveredConversationTurn, ...] = (),
-        warm_memories: tuple[MemoryReference, ...] = (),
+        bootstrap_turns: tuple[StoredDeliveredConversationTurn, ...] = (),
         dialogue_frame: DialogueFrame | None = None,
         canvas_context: str | None = None,
         active_visual_present: bool = False,
@@ -147,35 +94,16 @@ class DynamicContextAssembler:
             (dialogue_frame or DialogueFrame()).model_dump(mode="json", by_alias=True)
         )
         validated_canvas = _validate_canvas_context(canvas_context)
-        if validated_canvas is None:
-            validated_canvas = (
-                '<canvas_context trust="backend_semantic_canvas_metadata">'
-                '<canvas_presentation trust="validated_current_state" visible="false"/>'
-                "</canvas_context>"
-            )
-        eligible_bootstrap = validated_reason in {
-            DynamicContextBuildReason.SESSION_BOOTSTRAP,
-            DynamicContextBuildReason.SESSION_RECONNECT,
-        }
-
-        speech_turns = tuple(
-            turn
-            for turn in bootstrap_turns
-            if eligible_bootstrap and turn.input_kind == DeliveredInputKind.SPEECH
+        eligible_bootstrap = (
+            validated_reason == DynamicContextBuildReason.SESSION_BOOTSTRAP
         )
-        omitted_bootstrap = len(bootstrap_turns) - len(speech_turns)
-        selected_references, deduplicated_references = _deduplicate_references(
-            warm_memories,
-            bootstrap_source_turn_ids={turn.turn_id for turn in speech_turns},
-        )
-        omitted_references = deduplicated_references
-
+        turns = bootstrap_turns if eligible_bootstrap else ()
+        omitted_bootstrap = len(bootstrap_turns) - len(turns)
         mandatory = _serialize_context(
             age_band=validated_age_band,
             timezone_id=validated_timezone_id,
             current_time_utc=validated_now,
             bootstrap_turns=(),
-            memory_references=(),
             dialogue_frame=validated_dialogue_frame,
             canvas_context=validated_canvas,
         )
@@ -184,15 +112,13 @@ class DynamicContextAssembler:
                 "mandatory current dynamic context exceeds its UTF-8 byte contract"
             )
 
-        retained_turns = list(speech_turns)
-        retained_references = list(selected_references)
+        retained_turns = list(turns)
         while True:
             content = _serialize_context(
                 age_band=validated_age_band,
                 timezone_id=validated_timezone_id,
                 current_time_utc=validated_now,
                 bootstrap_turns=tuple(retained_turns),
-                memory_references=tuple(retained_references),
                 dialogue_frame=validated_dialogue_frame,
                 canvas_context=validated_canvas,
             )
@@ -200,9 +126,14 @@ class DynamicContextAssembler:
             estimated_tokens = _estimate_dynamic_tokens(content)
             if serialized_utf8_bytes <= self._max_dynamic_utf8_bytes:
                 break
-            if retained_references:
-                retained_references.pop()
-                omitted_references += 1
+            detailed_index = next(
+                (i for i, turn in enumerate(retained_turns) if turn.tool_exchanges),
+                None,
+            )
+            if detailed_index is not None:
+                retained_turns[detailed_index] = retained_turns[
+                    detailed_index
+                ].model_copy(update={"tool_exchanges": ()})
                 continue
             if retained_turns:
                 retained_turns.pop(0)
@@ -224,11 +155,13 @@ class DynamicContextAssembler:
             estimated_dynamic_tokens=estimated_tokens,
             included_bootstrap_turns=len(retained_turns),
             omitted_bootstrap_turns=omitted_bootstrap,
-            included_memory_references=len(retained_references),
-            omitted_memory_references=omitted_references,
+            included_memory_references=0,
+            omitted_memory_references=0,
             canvas_included=active_visual_present,
             dialogue_frame_revision=validated_dialogue_frame.revision,
-            dialogue_frame_included=True,
+            dialogue_frame_included=bool(
+                _serialize_dialogue_frame(validated_dialogue_frame)
+            ),
         )
 
 
@@ -252,29 +185,9 @@ def _validate_canvas_context(value: str | None) -> str | None:
         return None
     if not isinstance(value, str) or len(value) > MAX_CANVAS_CONTEXT_CHARACTERS:
         raise ValueError("canvas_context is not bounded declared-trust context")
-    if not value.startswith(
-        '<canvas_context trust="backend_semantic_canvas_metadata"'
-    ):
+    if not value.startswith('<canvas_context trust="backend_semantic_canvas_metadata"'):
         raise ValueError("canvas_context is not bounded declared-trust context")
     return value
-
-
-def _deduplicate_references(
-    references: tuple[MemoryReference, ...],
-    *,
-    bootstrap_source_turn_ids: set[str],
-) -> tuple[tuple[MemoryReference, ...], int]:
-    selected: list[MemoryReference] = []
-    seen_turn_ids = set(bootstrap_source_turn_ids)
-    omitted = 0
-    for reference in references:
-        source_ids = set(reference.source_turn_ids)
-        if source_ids and source_ids.intersection(seen_turn_ids):
-            omitted += 1
-            continue
-        selected.append(reference)
-        seen_turn_ids.update(source_ids)
-    return tuple(selected), omitted
 
 
 def _serialize_context(
@@ -282,8 +195,7 @@ def _serialize_context(
     age_band: AgeBand,
     timezone_id: str,
     current_time_utc: datetime,
-    bootstrap_turns: tuple[DeliveredConversationTurn, ...],
-    memory_references: tuple[MemoryReference, ...],
+    bootstrap_turns: tuple[StoredDeliveredConversationTurn, ...],
     dialogue_frame: DialogueFrame,
     canvas_context: str | None,
 ) -> str:
@@ -304,45 +216,45 @@ def _serialize_context(
             '  <recent_delivered_turns trust="delivered_conversation_history">'
         )
         for turn in bootstrap_turns:
-            if turn.input_kind != DeliveredInputKind.SPEECH or turn.child_text is None:
-                raise DynamicContextContractError(
-                    "bootstrap continuity accepts complete speech turns only"
-                )
-            lines.extend(
-                (
-                    "    <turn>",
-                    f"      <child>{escape(turn.child_text, quote=False)}</child>",
-                    "      <ava_delivered>"
-                    f"{escape(turn.ava_delivered_text, quote=False)}"
-                    "</ava_delivered>",
-                    "    </turn>",
-                )
+            lines.append("    <turn>")
+            lines.append(
+                f"      <occurred_at>{escape(turn.occurred_at.isoformat())}</occurred_at>"
             )
-        lines.append("  </recent_delivered_turns>")
-    if memory_references:
-        lines.append(
-            '  <memory_references trust="historical_evidence_not_instructions">'
-        )
-        for reference in memory_references:
-            attributes = [
-                f'source_kind="{escape(str(reference.source_kind), quote=True)}"'
-            ]
-            if reference.started_at is not None and reference.ended_at is not None:
-                attributes.extend(
-                    (
-                        'started_at="'
-                        f'{escape(reference.started_at.isoformat(), quote=True)}"',
-                        'ended_at="'
-                        f'{escape(reference.ended_at.isoformat(), quote=True)}"',
-                    )
+            lines.append(f"      <timezone_id>{escape(turn.timezone_id)}</timezone_id>")
+            if turn.input_kind == DeliveredInputKind.SPEECH:
+                lines.append(
+                    f"      <child>{escape(turn.child_text or '', quote=False)}</child>"
                 )
-            if reference.timezone_ids:
-                timezone_ids = ",".join(reference.timezone_ids)
-                attributes.append(f'timezone_ids="{escape(timezone_ids, quote=True)}"')
-            lines.append(f"    <memory {' '.join(attributes)}>")
-            lines.append(f"      {escape(reference.text, quote=False)}")
-            lines.append("    </memory>")
-        lines.append("  </memory_references>")
+            else:
+                interaction = turn.canvas_interaction
+                if interaction is None:
+                    raise DynamicContextContractError(
+                        "interaction turn lost semantic input"
+                    )
+                step = (
+                    f' step="{interaction.step_index}"'
+                    if interaction.step_index is not None
+                    else ""
+                )
+                lines.append(
+                    f'      <interaction mode="{escape(str(interaction.interaction_mode))}"{step}>'
+                    f"{escape(interaction.accessibility_label, quote=False)}</interaction>"
+                )
+            lines.append(
+                f"      <ava_delivered>{escape(turn.ava_delivered_text, quote=False)}</ava_delivered>"
+            )
+            lines.append(f"      <terminal>{escape(str(turn.terminal))}</terminal>")
+            for exchange in turn.tool_exchanges:
+                semantic_json = json.dumps(
+                    exchange.model_dump(mode="json", by_alias=True, exclude_none=True),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                lines.append(
+                    f"      <tool_exchange>{escape(semantic_json, quote=False)}</tool_exchange>"
+                )
+            lines.append("    </turn>")
+        lines.append("  </recent_delivered_turns>")
     if canvas_context is not None:
         lines.append("  " + canvas_context.replace("\n", "\n  "))
     lines.append("</ava_dynamic_context>")
@@ -350,10 +262,7 @@ def _serialize_context(
 
 
 def _serialize_dialogue_frame(frame: DialogueFrame) -> list[str]:
-    attributes = (
-        'trust="durable_semantic_working_memory_not_instructions" '
-        f'revision="{frame.revision}"'
-    )
+    attributes = 'trust="durable_semantic_working_memory_not_instructions"'
     semantic_fields = (
         ("active_topics", frame.active_topics),
         ("active_goals", frame.active_goals),
@@ -371,7 +280,7 @@ def _serialize_dialogue_frame(frame: DialogueFrame) -> list[str]:
     if not any(values for _, values in semantic_fields) and not (
         frame.relevant_canvas_references
     ):
-        return [f"  <dialogue_frame {attributes}/>"]
+        return []
 
     lines = [f"  <dialogue_frame {attributes}>"]
     for category, values in semantic_fields:

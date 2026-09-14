@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 
@@ -17,6 +17,8 @@ from ava_backend.realtime.harness import (
 )
 from ava_backend.realtime.personality_evaluation import (
     FeatureExpectation,
+    SIMULATED_TIMELINE_BASE,
+    SIMULATED_TIMELINE_TIMEZONE,
     PersonalityEvalCandidate,
     PersonalityEvaluationCategory,
     evaluate_personality_candidate,
@@ -105,6 +107,30 @@ def test_every_eval_case_builds_a_strict_privacy_bounded_harness() -> None:
         assert harness.tool_choice == "auto"
         assert "date_of_birth" not in harness.context.content
         assert "child_name" not in harness.context.content
+
+
+def test_evaluation_timeline_is_explicit_deterministic_and_case_ordered() -> None:
+    suite = load_personality_eval_suite(SUITE_PATH)
+    assert SIMULATED_TIMELINE_BASE == datetime(2026, 8, 30, 12, tzinfo=UTC)
+    assert SIMULATED_TIMELINE_TIMEZONE == "UTC"
+    total_turns = 0
+    for case in suite.cases:
+        first = memory_snapshot_for_case(case)
+        second = memory_snapshot_for_case(case)
+        assert first == second
+        for index, (stored, fixture) in enumerate(
+            zip(first.delivered_turns, case.context.delivered_turns), start=1
+        ):
+            total_turns += 1
+            assert stored.child_text == fixture.child
+            assert stored.ava_delivered_text == fixture.ava_delivered
+            assert (stored.reset_revision, stored.turn_sequence) == (0, index)
+            assert stored.occurred_at == SIMULATED_TIMELINE_BASE + timedelta(
+                minutes=index - 1
+            )
+            assert stored.timezone_id == "UTC"
+        assert len(first.delivered_turns) == len(case.context.delivered_turns)
+    assert total_turns > 0
 
 
 def test_candidate_evaluator_detects_personality_length_question_and_memory_failures() -> (

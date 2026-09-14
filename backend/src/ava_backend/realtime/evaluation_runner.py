@@ -13,6 +13,9 @@ from .common import NonEmptyText, RealtimeProtocolModel
 from .context_assembler import DynamicContextAssembler, DynamicContextBuildReason
 from .harness import build_realtime_harness
 from .personality_evaluation import (
+    SIMULATED_TIMELINE_BASE,
+    SIMULATED_TIMELINE_STEP,
+    SIMULATED_TIMELINE_TIMEZONE,
     PersonalityEvalCandidate,
     PersonalityEvalSuite,
     evaluate_personality_candidate,
@@ -129,8 +132,11 @@ def run_personality_evaluation(
             build_id="ctx-1",
             reason=DynamicContextBuildReason.SESSION_BOOTSTRAP,
             age_band=snapshot.age_band,
-            timezone_id="UTC",
-            current_time_utc=generated_at,
+            timezone_id=SIMULATED_TIMELINE_TIMEZONE,
+            current_time_utc=(
+                SIMULATED_TIMELINE_BASE
+                + len(snapshot.delivered_turns) * SIMULATED_TIMELINE_STEP
+            ),
             bootstrap_turns=tuple(snapshot.delivered_turns),
         )
         harness = build_realtime_harness(dynamic_context=dynamic_context)

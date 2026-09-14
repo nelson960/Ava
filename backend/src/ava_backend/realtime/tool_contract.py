@@ -21,6 +21,8 @@ RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME = "record_semantic_turn_capture"
 INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS = 1000
 CANVAS_MODEL_SAFE_REJECTION_REASON = "visualUnavailable"
 SEARCH_MEMORY_MAX_REFERENCES = 5
+# One optional utility followed by one terminal Canvas action.
+MAX_SEMANTIC_TOOL_EXCHANGES = 2
 SEARCH_MEMORY_SOURCE_KIND_MAX_CHARACTERS = 32
 SEARCH_MEMORY_MAX_TIMEZONE_IDS = 32
 SEARCH_MEMORY_TIMEZONE_ID_MAX_CHARACTERS = 64
@@ -239,11 +241,20 @@ class ManageCanvasPresentationRequest(RealtimeProtocolModel):
         return selectors.get(self.action)
 
 
+class MemorySearchOrder(StrEnum):
+    BEST_MATCH = "bestMatch"
+    NEWEST = "newest"
+    OLDEST = "oldest"
+
+
 class SearchMemoryRequest(RealtimeProtocolModel):
+    order: MemorySearchOrder = Field(
+        default=MemorySearchOrder.BEST_MATCH,
+        description="Semantic historical order.",
+    )
     query: Annotated[NonEmptyText, StringConstraints(max_length=500)] = Field(
         description=(
-            "A concise historical detail to find when it is not already present "
-            "in the live conversation or supplied memory references."
+            "Historical detail absent from live conversation and supplied references."
         )
     )
     from_date: date | None = Field(

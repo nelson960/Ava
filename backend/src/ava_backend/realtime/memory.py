@@ -10,25 +10,34 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from enum import StrEnum
-from typing import Annotated, Any, Protocol
+from typing import Annotated, Any, Literal, Protocol
 from zoneinfo import ZoneInfo
 
 from pydantic import ConfigDict, Field, StringConstraints, model_validator
 
 from ..protocol import AgeBand
 from .common import NonEmptyText, ProtocolIdentifier, RealtimeProtocolModel, _to_camel
-from .tool_contract import InteractiveCanvasMode
+from .tool_contract import (
+    InteractiveCanvasMode,
+    InteractiveCanvasRequest,
+    InteractiveCanvasCancellationRequest,
+    InteractiveCanvasCancellationToolOutputV4,
+    ManageCanvasPresentationRequest,
+    ManageCanvasPresentationToolOutputV4,
+    SearchMemoryRequest,
+    SearchMemoryToolOutputV4,
+    GetCurrentTimeRequest,
+    GetCurrentTimeToolOutputV4,
+    RejectedUtilityToolOutputV4,
+    MAX_SEMANTIC_TOOL_EXCHANGES,
+    MemorySearchOrder,
+)
 from .timezone import MAX_TIMEZONE_ID_CHARACTERS, validate_iana_timezone_id
 
 MAX_SNAPSHOT_DELIVERED_TURNS = 8
-RAW_RETENTION_HIGH_WATER = 256
-RAW_RETENTION_LOW_WATER = 128
 MAX_EPISODE_SOURCE_EVENTS = 32
-MAX_EPISODES = 128
-EPISODE_RETENTION_DAYS = 180
 MAX_STABLE_MEMORIES = 12
 MAX_WEEKLY_RECORDS = 64
-MAX_SESSION_SUMMARY_CHARACTERS = 1_200
 MAX_CHILD_TURN_SUMMARY_CHARACTERS = 240
 MINIMUM_STABLE_MEMORY_CONFIDENCE = 0.8
 MAX_DIALOGUE_FRAME_ITEM_CHARACTERS = 160
@@ -43,11 +52,6 @@ MAX_SEMANTIC_JOURNAL_SUMMARY_CHARACTERS = 240
 MAX_SEMANTIC_JOURNAL_CANVAS_REFERENCES = 4
 MAX_SEMANTIC_JOURNAL_SUPERSEDES_EVENT_IDS = 4
 MAX_SEMANTIC_MEMORY_PROPOSAL_UTF8_BYTES = 4_096
-
-if MAX_WEEKLY_RECORDS > RAW_RETENTION_LOW_WATER:
-    raise RuntimeError(
-        "weekly recap projection cannot exceed retained raw conversation events"
-    )
 
 
 class MemoryResetRevisionMismatchError(RuntimeError):
@@ -136,6 +140,47 @@ class DeliveredCanvasInteraction(RealtimeProtocolModel):
         return self
 
 
+class SearchMemoryExchange(RealtimeProtocolModel):
+    tool: Literal["search_memory"] = "search_memory"
+    request: SearchMemoryRequest | None
+    result: SearchMemoryToolOutputV4 | RejectedUtilityToolOutputV4
+
+
+class CurrentTimeExchange(RealtimeProtocolModel):
+    tool: Literal["get_current_time"] = "get_current_time"
+    request: GetCurrentTimeRequest | None
+    result: GetCurrentTimeToolOutputV4 | RejectedUtilityToolOutputV4
+
+
+class CanvasExchange(RealtimeProtocolModel):
+    tool: Literal["request_interactive_canvas"] = "request_interactive_canvas"
+    request: InteractiveCanvasRequest | None
+    # This result has the same semantic accepted/rejected shape without generation ID.
+    result: InteractiveCanvasCancellationToolOutputV4
+
+
+class CanvasPresentationExchange(RealtimeProtocolModel):
+    tool: Literal["manage_canvas_presentation"] = "manage_canvas_presentation"
+    request: ManageCanvasPresentationRequest | None
+    result: ManageCanvasPresentationToolOutputV4
+
+
+class CanvasCancellationExchange(RealtimeProtocolModel):
+    tool: Literal["cancel_interactive_canvas"] = "cancel_interactive_canvas"
+    request: InteractiveCanvasCancellationRequest | None
+    result: InteractiveCanvasCancellationToolOutputV4
+
+
+SemanticToolExchange = Annotated[
+    SearchMemoryExchange
+    | CurrentTimeExchange
+    | CanvasExchange
+    | CanvasPresentationExchange
+    | CanvasCancellationExchange,
+    Field(discriminator="tool"),
+]
+
+
 class DeliveredConversationTurn(RealtimeProtocolModel):
     """Authoritative turn content derived from rendered playback.
 
@@ -157,9 +202,28 @@ class DeliveredConversationTurn(RealtimeProtocolModel):
         StringConstraints(max_length=MAX_CHILD_TURN_SUMMARY_CHARACTERS),
     ]
     terminal: DeliveredTurnTerminal
+    tool_exchanges: tuple[SemanticToolExchange, ...] = Field(
+        default=(), max_length=MAX_SEMANTIC_TOOL_EXCHANGES
+    )
 
     @model_validator(mode="after")
     def delivered_samples_match_text(self) -> DeliveredConversationTurn:
+        for index, exchange in enumerate(self.tool_exchanges):
+            if (
+                exchange.request is None
+                and getattr(exchange.result, "status", None) != "rejected"
+            ):
+                raise ValueError(
+                    "only rejected malformed calls may omit the semantic request"
+                )
+            if index and (
+                self.tool_exchanges[index - 1].tool
+                not in {"search_memory", "get_current_time"}
+                or exchange.tool in {"search_memory", "get_current_time"}
+            ):
+                raise ValueError(
+                    "tool exchanges must follow the utility then terminal Canvas chain"
+                )
         if self.input_kind == DeliveredInputKind.SPEECH:
             if self.child_text is None or self.child_text_source is None:
                 raise ValueError("speech input requires childText and childTextSource")
@@ -180,6 +244,19 @@ class DeliveredConversationTurn(RealtimeProtocolModel):
             raise ValueError(
                 "avaDeliveredText requires a positive deliveredSampleCount"
             )
+        return self
+
+
+class StoredDeliveredConversationTurn(DeliveredConversationTurn):
+    reset_revision: int = Field(ge=0, le=9_223_372_036_854_775_807)
+    turn_sequence: int = Field(ge=1, le=9_223_372_036_854_775_807)
+    occurred_at: datetime
+    timezone_id: str
+
+    @model_validator(mode="after")
+    def validate_time(self) -> StoredDeliveredConversationTurn:
+        _validate_aware_datetime(self.occurred_at, field_name="occurred_at")
+        validate_iana_timezone_id(self.timezone_id)
         return self
 
 
@@ -220,7 +297,6 @@ class ConversationEpisode(RealtimeProtocolModel):
 class MemoryCandidateSourceKind(StrEnum):
     RAW_EVENT = "rawEvent"
     EPISODE = "episode"
-    STABLE_MEMORY = "stableMemory"
     SEMANTIC_JOURNAL = "semanticJournal"
 
 
@@ -243,9 +319,9 @@ class MemorySearchCandidate(RealtimeProtocolModel):
         ]
     ] = Field(max_length=MAX_EPISODE_SOURCE_EVENTS)
     reference_text: Annotated[NonEmptyText, StringConstraints(max_length=1_200)]
-    source_turn_ids: list[ProtocolIdentifier] = Field(
-        max_length=MAX_EPISODE_SOURCE_EVENTS
-    )
+    # Internal provenance must be complete: truncation can hide an overlap.
+    # Only the bounded semantic reference is sent to Realtime.
+    source_turn_ids: list[ProtocolIdentifier]
     relevance: float = Field(ge=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
@@ -624,7 +700,10 @@ def _canonicalize_capture_dialogue_frame(data: Any) -> Any:
                     for item in val:
                         if isinstance(item, str):
                             stripped = item.strip()
-                            if not stripped or len(stripped) > MAX_DIALOGUE_FRAME_ITEM_CHARACTERS:
+                            if (
+                                not stripped
+                                or len(stripped) > MAX_DIALOGUE_FRAME_ITEM_CHARACTERS
+                            ):
                                 continue
                             retained.append(stripped)
                         else:
@@ -699,7 +778,9 @@ class SemanticCaptureFunctionArguments(RealtimeProtocolModel):
             for event in self.journal_events
         ]
         if len(identities) != len(set(identities)):
-            raise ValueError("journalEvents cannot contain duplicate semantic identities")
+            raise ValueError(
+                "journalEvents cannot contain duplicate semantic identities"
+            )
         return self
 
 
@@ -815,7 +896,6 @@ def _semantic_memory_decision(
     )
 
 
-
 def canonical_dialogue_frame_update_fingerprint(
     update: DialogueFrameUpdate,
 ) -> str:
@@ -905,7 +985,7 @@ def semantic_journal_created_event_id(
     validated_source_turn_id = _validate_protocol_identifier(
         source_turn_id, field_name="source_turn_id"
     )
-    validated_identity_key = _validate_semantic_journal_identity_key(identity_key)
+    _validate_semantic_journal_identity_key(identity_key)
     if not re.fullmatch(r"[0-9a-f]{64}", event_fingerprint):
         raise ValueError("semantic Journal event fingerprint is invalid")
     digest = hashlib.sha256(
@@ -979,7 +1059,7 @@ class AuthoritativeMemorySnapshot(RealtimeProtocolModel):
     current_session_summary: (
         Annotated[str, StringConstraints(min_length=1, max_length=1_200)] | None
     )
-    delivered_turns: list[DeliveredConversationTurn] = Field(
+    delivered_turns: list[StoredDeliveredConversationTurn] = Field(
         max_length=MAX_SNAPSHOT_DELIVERED_TURNS
     )
     stable_memories: list[StableMemoryRecord] = Field(max_length=MAX_STABLE_MEMORIES)
@@ -989,6 +1069,13 @@ class AuthoritativeMemorySnapshot(RealtimeProtocolModel):
         turn_ids = [turn.turn_id for turn in self.delivered_turns]
         if len(turn_ids) != len(set(turn_ids)):
             raise ValueError("delivered turn IDs must be unique")
+        sequences = [turn.turn_sequence for turn in self.delivered_turns]
+        if any(left >= right for left, right in zip(sequences, sequences[1:])):
+            raise ValueError("delivered turns must be in strict logical sequence order")
+        if any(
+            turn.reset_revision != self.reset_revision for turn in self.delivered_turns
+        ):
+            raise ValueError("delivered turns must belong to the snapshot reset epoch")
         memory_ids = [memory.id for memory in self.stable_memories]
         if len(memory_ids) != len(set(memory_ids)):
             raise ValueError("stable memory IDs must be unique")
@@ -1027,11 +1114,9 @@ class AuthoritativeMemoryStore(Protocol):
         subject: str,
         expected_reset_revision: int,
         turn: DeliveredConversationTurn,
-        proposal: AvaMemoryProposal | None,
-        memory_id: str | None,
         occurred_at: datetime | None = None,
         timezone_id: str = "UTC",
-    ) -> MemoryProposalDecision: ...
+    ) -> None: ...
 
     async def apply_dialogue_frame_update(
         self,
@@ -1075,15 +1160,8 @@ class AuthoritativeMemoryStore(Protocol):
         limit: int = 5,
         from_instant: datetime | None = None,
         to_instant: datetime | None = None,
+        order: MemorySearchOrder = MemorySearchOrder.BEST_MATCH,
     ) -> list[MemorySearchCandidate]: ...
-
-    async def set_session_summary(
-        self,
-        *,
-        subject: str,
-        expected_reset_revision: int,
-        summary: str | None,
-    ) -> None: ...
 
     async def load_weekly_recap(
         self,
@@ -1104,7 +1182,7 @@ class AuthoritativeMemoryStore(Protocol):
 class StoredDeliveredConversationEvent:
     occurred_at: datetime
     timezone_id: str
-    turn: DeliveredConversationTurn
+    turn: StoredDeliveredConversationTurn
 
 
 @dataclass(frozen=True, slots=True)
@@ -1305,21 +1383,11 @@ def _prepare_semantic_journal_batch(
 class DevelopmentAuthoritativeMemoryStore:
     """Deterministic development store for realtime coordinator tests."""
 
-    def __init__(
-        self,
-        *,
-        max_memories_per_subject: int = MAX_STABLE_MEMORIES,
-    ) -> None:
-        if not 1 <= max_memories_per_subject <= MAX_STABLE_MEMORIES:
-            raise ValueError("max_memories_per_subject must be between 1 and 12")
+    def __init__(self) -> None:
         self._turns: defaultdict[str, list[StoredDeliveredConversationEvent]] = (
             defaultdict(list)
         )
         self._episodes: defaultdict[str, list[ConversationEpisode]] = defaultdict(list)
-        self._memories: defaultdict[str, dict[str, StableMemoryRecord]] = defaultdict(
-            dict
-        )
-        self._summaries: dict[str, str] = {}
         self._committed_turn_ids: defaultdict[str, set[str]] = defaultdict(set)
         self._reset_revisions: defaultdict[str, int] = defaultdict(int)
         self._dialogue_frames: dict[str, DialogueFrame] = {}
@@ -1338,7 +1406,6 @@ class DevelopmentAuthoritativeMemoryStore:
         self._semantic_memory_receipts: defaultdict[
             str, dict[str, SemanticMemoryReceipt]
         ] = defaultdict(dict)
-        self._max_memories_per_subject = max_memories_per_subject
         self._lock = asyncio.Lock()
 
     async def open(self) -> None:
@@ -1365,19 +1432,14 @@ class DevelopmentAuthoritativeMemoryStore:
                     "dialogueFrame": self._dialogue_frames.get(
                         normalized_subject, DialogueFrame()
                     ).model_dump(mode="json", by_alias=True),
-                    "currentSessionSummary": self._summaries.get(normalized_subject),
+                    "currentSessionSummary": None,
                     "deliveredTurns": [
                         event.turn.model_dump(mode="json", by_alias=True)
                         for event in self._turns.get(normalized_subject, ())[
                             -MAX_SNAPSHOT_DELIVERED_TURNS:
                         ]
                     ],
-                    "stableMemories": [
-                        memory.model_dump(mode="json", by_alias=True)
-                        for memory in self._memories.get(
-                            normalized_subject, {}
-                        ).values()
-                    ],
+                    "stableMemories": [],
                 }
             )
 
@@ -1387,11 +1449,9 @@ class DevelopmentAuthoritativeMemoryStore:
         subject: str,
         expected_reset_revision: int,
         turn: DeliveredConversationTurn,
-        proposal: AvaMemoryProposal | None,
-        memory_id: str | None,
         occurred_at: datetime | None = None,
         timezone_id: str = "UTC",
-    ) -> MemoryProposalDecision:
+    ) -> None:
         normalized_subject = _validate_subject(subject)
         validated_expected_reset_revision = _validate_reset_revision(
             expected_reset_revision,
@@ -1406,11 +1466,6 @@ class DevelopmentAuthoritativeMemoryStore:
             turn.model_dump(mode="json", by_alias=True)
         )
         _validate_weekly_summary(validated_turn.child_turn_summary)
-        decision = evaluate_delivered_turn_memory_proposal(
-            turn=validated_turn,
-            proposal=proposal,
-            memory_id=memory_id,
-        )
 
         async with self._lock:
             current_reset_revision = self._reset_revisions[normalized_subject]
@@ -1423,55 +1478,22 @@ class DevelopmentAuthoritativeMemoryStore:
                 raise ValueError(
                     f"delivered turn {validated_turn.turn_id!r} is already committed"
                 )
-            if decision.record is not None:
-                record = decision.record
-                memories = self._memories[normalized_subject]
-                has_semantic_duplicate = any(
-                    existing.kind == record.kind
-                    and existing.summary.casefold() == record.summary.casefold()
-                    for existing in memories.values()
-                )
-                if has_semantic_duplicate:
-                    decision = _decision(
-                        False,
-                        "Equivalent stable memory already exists.",
-                    )
-                elif (
-                    record.id not in memories
-                    and len(memories) >= self._max_memories_per_subject
-                ):
-                    decision = _decision(
-                        False,
-                        "Stable memory capacity is exhausted; the delivered turn "
-                        "was retained.",
-                    )
-                else:
-                    memories[record.id] = record
             turns = self._turns[normalized_subject]
             turns.append(
                 StoredDeliveredConversationEvent(
                     occurred_at=normalized_occurred_at,
                     timezone_id=validated_timezone_id,
-                    turn=validated_turn,
+                    turn=StoredDeliveredConversationTurn(
+                        **validated_turn.model_dump(by_alias=True),
+                        resetRevision=current_reset_revision,
+                        turnSequence=len(turns) + 1,
+                        occurredAt=normalized_occurred_at,
+                        timezoneId=validated_timezone_id,
+                    ),
                 )
-            )
-            turns.sort(key=lambda item: (item.occurred_at, item.turn.turn_id))
-            if len(turns) > RAW_RETENTION_HIGH_WATER:
-                compacted_count = len(turns) - RAW_RETENTION_LOW_WATER
-                source_events = tuple(turns[:compacted_count])
-                new_episodes = build_conversation_episodes(
-                    subject=normalized_subject,
-                    source_events=source_events,
-                    created_at=normalized_occurred_at,
-                )
-                self._episodes[normalized_subject].extend(new_episodes)
-                del turns[:compacted_count]
-            _prune_development_episodes(
-                self._episodes[normalized_subject],
-                reference_time=datetime.now(UTC),
             )
             self._committed_turn_ids[normalized_subject].add(validated_turn.turn_id)
-        return decision
+        return None
 
     async def apply_dialogue_frame_update(
         self,
@@ -1841,6 +1863,7 @@ class DevelopmentAuthoritativeMemoryStore:
         limit: int = 5,
         from_instant: datetime | None = None,
         to_instant: datetime | None = None,
+        order: MemorySearchOrder = MemorySearchOrder.BEST_MATCH,
     ) -> list[MemorySearchCandidate]:
         normalized_subject = _validate_subject(subject)
         query_tokens = _validate_search_query(query)
@@ -1901,113 +1924,57 @@ class DevelopmentAuthoritativeMemoryStore:
                     )
                 )
 
-            for memory in self._memories.get(normalized_subject, {}).values():
-                text = f"{memory.summary} {memory.evidence}"
-                relevance = _lexical_relevance(text, query_tokens)
-                if relevance <= 0:
-                    continue
-                provenance = _find_provenance_range(
-                    source_turn_id=memory.source_turn_id,
-                    raw_events=raw_events,
-                    episodes=episodes,
-                )
-                if provenance is None:
-                    if lower is not None or upper is not None:
-                        continue
-                    started_at = ended_at = None
-                    timezone_ids: Sequence[str] = ()
-                else:
-                    started_at, ended_at, timezone_ids = provenance
-                    if not _range_overlaps(
-                        started_at,
-                        ended_at,
-                        lower,
-                        upper,
-                    ):
-                        continue
-                results.append(
-                    _memory_candidate(
-                        source_id=memory.id,
-                        source_kind=MemoryCandidateSourceKind.STABLE_MEMORY,
-                        started_at=started_at,
-                        ended_at=ended_at,
-                        timezone_ids=timezone_ids,
-                        reference_text=text,
-                        source_turn_ids=(memory.source_turn_id,),
-                        relevance=relevance,
-                    )
-                )
-
             current_reset_revision = self._reset_revisions.get(normalized_subject, 0)
             superseded_ids = set(
                 self._semantic_journal_supersessions.get(normalized_subject, {})
             )
-            for record in self._semantic_journal_events.get(normalized_subject, {}).values():
+            for record in self._semantic_journal_events.get(
+                normalized_subject, {}
+            ).values():
                 if record.reset_revision != current_reset_revision:
                     continue
                 if record.event_id in superseded_ids:
                     continue
-                if not _instant_is_in_range(record.created_at, lower, upper):
-                    continue
                 relevance = _lexical_relevance(record.summary, query_tokens)
                 if relevance <= 0:
                     continue
-                sources_by_event = self._semantic_journal_sources.get(normalized_subject)
+                sources_by_event = self._semantic_journal_sources.get(
+                    normalized_subject
+                )
                 source_turn_ids: tuple[str, ...] = ()
                 if sources_by_event is not None and record.event_id in sources_by_event:
-                    source_turn_ids = tuple(
-                        sorted(sources_by_event[record.event_id])
-                    )[:MAX_EPISODE_SOURCE_EVENTS]
+                    source_turn_ids = tuple(sorted(sources_by_event[record.event_id]))
+                provenance = [
+                    value
+                    for source_id in source_turn_ids
+                    if (
+                        value := _find_provenance_range(
+                            source_turn_id=source_id,
+                            raw_events=raw_events,
+                            episodes=episodes,
+                        )
+                    )
+                    is not None
+                ]
+                started = min((p[0] for p in provenance), default=record.created_at)
+                ended = max((p[1] for p in provenance), default=record.created_at)
+                zones = sorted({zone for p in provenance for zone in p[2]})
+                if not _range_overlaps(started, ended, lower, upper):
+                    continue
                 results.append(
                     _memory_candidate(
                         source_id=record.event_id,
                         source_kind=MemoryCandidateSourceKind.SEMANTIC_JOURNAL,
-                        started_at=record.created_at,
-                        ended_at=record.created_at,
-                        timezone_ids=(),
+                        started_at=started,
+                        ended_at=ended,
+                        timezone_ids=zones,
                         reference_text=record.summary,
                         source_turn_ids=source_turn_ids,
                         relevance=relevance,
                     )
                 )
 
-        results.sort(
-            key=lambda candidate: (
-                -candidate.relevance,
-                -(
-                    candidate.ended_at.timestamp()
-                    if candidate.ended_at is not None
-                    else float("-inf")
-                ),
-                candidate.source_id,
-            )
-        )
-        return results[:validated_limit]
-
-    async def set_session_summary(
-        self,
-        *,
-        subject: str,
-        expected_reset_revision: int,
-        summary: str | None,
-    ) -> None:
-        normalized_subject = _validate_subject(subject)
-        validated_expected_reset_revision = _validate_reset_revision(
-            expected_reset_revision,
-            field_name="expected_reset_revision",
-        )
-        validated = _validate_optional_summary(summary)
-        async with self._lock:
-            current_reset_revision = self._reset_revisions[normalized_subject]
-            if current_reset_revision != validated_expected_reset_revision:
-                raise MemoryResetRevisionMismatchError(
-                    expected_reset_revision=validated_expected_reset_revision,
-                    current_reset_revision=current_reset_revision,
-                )
-            if validated is None:
-                self._summaries.pop(normalized_subject, None)
-            else:
-                self._summaries[normalized_subject] = validated
+        return select_memory_candidates(results, limit=validated_limit, order=order)
 
     async def load_weekly_recap(
         self,
@@ -2064,8 +2031,6 @@ class DevelopmentAuthoritativeMemoryStore:
         async with self._lock:
             self._turns.pop(normalized_subject, None)
             self._episodes.pop(normalized_subject, None)
-            self._memories.pop(normalized_subject, None)
-            self._summaries.pop(normalized_subject, None)
             self._committed_turn_ids.pop(normalized_subject, None)
             self._dialogue_frames.pop(normalized_subject, None)
             self._dialogue_frame_receipts.pop(normalized_subject, None)
@@ -2103,88 +2068,6 @@ def current_local_week_utc_bounds(
     return period_start, period_end, lower_bound_utc, upper_bound_utc
 
 
-def conversation_episode_id(source_turn_ids: Sequence[str]) -> str:
-    if not source_turn_ids or len(source_turn_ids) > MAX_EPISODE_SOURCE_EVENTS:
-        raise ValueError("episode source batch must contain between 1 and 32 turns")
-    validated_ids = list(source_turn_ids)
-    if len(validated_ids) != len(set(validated_ids)):
-        raise ValueError("episode source turn IDs must be unique")
-    for turn_id in validated_ids:
-        if not isinstance(turn_id, str) or not re.fullmatch(
-            r"[A-Za-z][A-Za-z0-9._:-]{0,63}", turn_id
-        ):
-            raise ValueError("episode source turn ID is invalid")
-    digest = hashlib.sha256("\x1f".join(validated_ids).encode("utf-8")).hexdigest()
-    return f"ep-{digest[:60]}"
-
-
-def build_conversation_episodes(
-    *,
-    subject: str,
-    source_events: Sequence[StoredDeliveredConversationEvent],
-    created_at: datetime,
-) -> list[ConversationEpisode]:
-    normalized_subject = _validate_subject(subject)
-    normalized_created_at = _validate_aware_datetime(
-        created_at,
-        field_name="created_at",
-    )
-    episodes: list[ConversationEpisode] = []
-    for offset in range(0, len(source_events), MAX_EPISODE_SOURCE_EVENTS):
-        batch = tuple(source_events[offset : offset + MAX_EPISODE_SOURCE_EVENTS])
-        if not batch:
-            continue
-        ordered = tuple(
-            sorted(batch, key=lambda event: (event.occurred_at, event.turn.turn_id))
-        )
-        source_turn_ids = tuple(event.turn.turn_id for event in ordered)
-        digest = "\n".join(_episode_event_text(event) for event in ordered)
-        episodes.append(
-            ConversationEpisode.model_validate(
-                {
-                    "subject": normalized_subject,
-                    "episodeId": conversation_episode_id(source_turn_ids),
-                    "startedAt": ordered[0].occurred_at,
-                    "endedAt": ordered[-1].occurred_at,
-                    "timezoneId": ordered[0].timezone_id,
-                    "digest": digest,
-                    "sourceTurnIds": source_turn_ids,
-                    "sourceEventCount": len(ordered),
-                    "createdAt": normalized_created_at,
-                }
-            )
-        )
-    return episodes
-
-
-def _episode_event_text(event: StoredDeliveredConversationEvent) -> str:
-    turn = event.turn
-    fields = [_bounded_search_text(turn.child_turn_summary, 240)]
-    if turn.input_kind == DeliveredInputKind.SPEECH:
-        if turn.child_text is not None:
-            fields.append(_bounded_search_text(turn.child_text, 180))
-    elif turn.canvas_interaction is not None:
-        fields.append(
-            _bounded_search_text(turn.canvas_interaction.accessibility_label, 160)
-        )
-    if turn.ava_delivered_text:
-        fields.append(_bounded_search_text(turn.ava_delivered_text, 180))
-    return " ".join(fields)
-
-
-def _prune_development_episodes(
-    episodes: list[ConversationEpisode],
-    *,
-    reference_time: datetime,
-) -> None:
-    cutoff = reference_time - timedelta(days=EPISODE_RETENTION_DAYS)
-    retained = [episode for episode in episodes if episode.ended_at >= cutoff]
-    retained.sort(key=lambda episode: (episode.ended_at, episode.episode_id))
-    if len(retained) > MAX_EPISODES:
-        retained = retained[-MAX_EPISODES:]
-    episodes[:] = retained
-
-
 def _validate_search_query(query: str) -> tuple[str, ...]:
     if not isinstance(query, str):
         raise ValueError("memory search query must be text")
@@ -2195,6 +2078,63 @@ def _validate_search_query(query: str) -> tuple[str, ...]:
     if not tokens:
         raise ValueError("memory search query must contain searchable text")
     return tokens
+
+
+MEMORY_SEARCH_CANDIDATE_POOL = 40
+
+
+def select_memory_candidates(
+    candidates: Sequence[MemorySearchCandidate],
+    *,
+    limit: int,
+    order: MemorySearchOrder,
+) -> list[MemorySearchCandidate]:
+    """Bounded ranked selection using canonical provenance, never text similarity."""
+    limit = _validate_search_limit(limit)
+    order = MemorySearchOrder(order)
+
+    def rank(candidate: MemorySearchCandidate) -> tuple[float, float, str, str]:
+        instant = (
+            candidate.ended_at
+            if order != MemorySearchOrder.OLDEST
+            else candidate.started_at
+        )
+        timestamp = instant.timestamp() if instant is not None else 0.0
+        if order == MemorySearchOrder.NEWEST:
+            return (
+                -timestamp,
+                -candidate.relevance,
+                candidate.source_id,
+                str(candidate.source_kind),
+            )
+        if order == MemorySearchOrder.OLDEST:
+            return (
+                timestamp,
+                -candidate.relevance,
+                candidate.source_id,
+                str(candidate.source_kind),
+            )
+        return (
+            -candidate.relevance,
+            -timestamp,
+            candidate.source_id,
+            str(candidate.source_kind),
+        )
+
+    represented: set[str] = set()
+    identities: set[tuple[str, str]] = set()
+    selected: list[MemorySearchCandidate] = []
+    for candidate in sorted(candidates, key=rank)[:MEMORY_SEARCH_CANDIDATE_POOL]:
+        provenance = set(candidate.source_turn_ids)
+        identity = (str(candidate.source_kind), candidate.source_id)
+        if provenance.intersection(represented) or identity in identities:
+            continue
+        selected.append(candidate)
+        represented.update(provenance)
+        identities.add(identity)
+        if len(selected) == limit:
+            break
+    return selected
 
 
 def _validate_search_limit(limit: int) -> int:
@@ -2329,7 +2269,7 @@ def _memory_candidate(
             "sourceKind": source_kind,
             "startedAt": started_at,
             "endedAt": ended_at,
-            "timezoneIds": list(timezone_ids),
+            "timezoneIds": sorted(set(timezone_ids))[:MAX_EPISODE_SOURCE_EVENTS],
             "referenceText": _bounded_search_text(reference_text, 1_200),
             "sourceTurnIds": list(source_turn_ids),
             "relevance": relevance,
@@ -2410,35 +2350,6 @@ def evaluate_memory_proposal(
     )
 
 
-def evaluate_delivered_turn_memory_proposal(
-    *,
-    turn: DeliveredConversationTurn,
-    proposal: AvaMemoryProposal | None,
-    memory_id: str | None,
-) -> MemoryProposalDecision:
-    if turn.input_kind == DeliveredInputKind.CANVAS_INTERACTION:
-        if proposal is None:
-            if memory_id is not None:
-                raise ValueError("memory_id must be absent when there is no proposal")
-            return _decision(
-                False,
-                "Canvas interaction input is retained without a stable memory proposal.",
-            )
-        return _decision(
-            False,
-            "Stable memory requires genuine child speech transcript evidence.",
-        )
-    if turn.child_text is None or turn.child_text_source is None:
-        raise ValueError("speech delivered turn lost its transcript evidence")
-    return evaluate_memory_proposal(
-        proposal=proposal,
-        child_text=turn.child_text,
-        source_turn_id=turn.turn_id,
-        memory_id=memory_id,
-        child_text_source=turn.child_text_source,
-    )
-
-
 def _decision(accepted: bool, reason: str) -> MemoryProposalDecision:
     return MemoryProposalDecision.model_validate(
         {"accepted": accepted, "reason": reason, "record": None}
@@ -2447,23 +2358,6 @@ def _decision(accepted: bool, reason: str) -> MemoryProposalDecision:
 
 def _normalize_whitespace(value: str) -> str:
     return " ".join(value.split())
-
-
-def _validate_optional_summary(summary: str | None) -> str | None:
-    if summary is None:
-        return None
-    normalized = summary.strip()
-    if not normalized:
-        raise ValueError("session summary cannot be empty")
-    if len(normalized) > MAX_SESSION_SUMMARY_CHARACTERS:
-        raise ValueError("session summary cannot exceed 1200 characters")
-    if _SENSITIVE_MEMORY_PATTERN.search(normalized):
-        raise ValueError("session summary contains prohibited sensitive data")
-    if _HIDDEN_INFERENCE_PATTERN.search(
-        normalized
-    ) or _EMOTIONAL_CERTAINTY_PATTERN.search(normalized):
-        raise ValueError("session summary contains a hidden inference")
-    return normalized
 
 
 def _validate_weekly_summary(summary: str) -> str:
@@ -2515,41 +2409,3 @@ def _validate_subject(subject: str) -> str:
     if any(character not in allowed for character in subject):
         raise ValueError("memory subject contains unsupported characters")
     return subject
-
-
-def bounded_snapshot(
-    snapshot: AuthoritativeMemorySnapshot,
-    *,
-    max_turns: int,
-    max_memories: int,
-) -> AuthoritativeMemorySnapshot:
-    """Return newest bounded context without mutating the stored snapshot."""
-
-    if not 0 <= max_turns <= MAX_SNAPSHOT_DELIVERED_TURNS:
-        raise ValueError("max_turns must be between 0 and 8")
-    if not 0 <= max_memories <= MAX_STABLE_MEMORIES:
-        raise ValueError("max_memories must be between 0 and 12")
-    turns: Sequence[DeliveredConversationTurn] = snapshot.delivered_turns
-    memories: Sequence[StableMemoryRecord] = snapshot.stable_memories
-    return AuthoritativeMemorySnapshot.model_validate(
-        {
-            "ageBand": snapshot.age_band,
-            "resetRevision": snapshot.reset_revision,
-            "dialogueFrame": snapshot.dialogue_frame.model_dump(
-                mode="json", by_alias=True
-            ),
-            "currentSessionSummary": snapshot.current_session_summary,
-            "deliveredTurns": [
-                turn.model_dump(mode="json", by_alias=True)
-                for turn in turns[-max_turns:]
-            ]
-            if max_turns
-            else [],
-            "stableMemories": [
-                memory.model_dump(mode="json", by_alias=True)
-                for memory in memories[-max_memories:]
-            ]
-            if max_memories
-            else [],
-        }
-    )

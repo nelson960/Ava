@@ -7,7 +7,8 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from psycopg import AsyncConnection, errors
+from psycopg import AsyncConnection, errors, sql
+from psycopg.conninfo import make_conninfo
 
 from ava_backend.canvas.svg_delivery import SvgCanvasDocumentStore
 from ava_backend.canvas.svg_session import SvgCanvasSessionState
@@ -29,8 +30,6 @@ from ava_backend.realtime.fakes import (
     DeterministicStreamingSpeechSynthesizer,
 )
 from ava_backend.realtime.memory import (
-    AvaMemoryProposal,
-    ConversationEpisode,
     DeliveredConversationTurn,
     DialogueFrame,
     DialogueFrameSourceTurnMissingError,
@@ -39,8 +38,6 @@ from ava_backend.realtime.memory import (
     MAX_WEEKLY_RECORDS,
     MemoryCandidateSourceKind,
     MemoryResetRevisionMismatchError,
-    RAW_RETENTION_HIGH_WATER,
-    RAW_RETENTION_LOW_WATER,
     SemanticJournalConflictError,
     SemanticMemoryProposal,
     current_local_week_utc_bounds,
@@ -89,17 +86,6 @@ class _PausingFencePostgresStore(PostgresAuthoritativeMemoryStore):
         self.before_subject_lock.set()
         await self.allow_subject_lock.wait()
         return await super()._lock_subject(connection, subject)
-
-
-class _FailingEpisodeInsertPostgresStore(PostgresAuthoritativeMemoryStore):
-    async def _insert_episode(  # type: ignore[no-untyped-def]
-        self,
-        connection,
-        *,
-        episode: ConversationEpisode,
-    ) -> None:
-        del connection, episode
-        raise RuntimeError("injected episode insert failure")
 
 
 def _turn(index: int) -> DeliveredConversationTurn:
@@ -197,7 +183,9 @@ async def test_postgres_v8_schema_includes_semantic_journal() -> None:
         await store.close()
 
 
-async def test_postgres_startup_rejects_schema_without_disposition_registration() -> None:
+async def test_postgres_startup_rejects_schema_without_disposition_registration() -> (
+    None
+):
     assert TEST_DATABASE_URL is not None
     connection = await AsyncConnection.connect(TEST_DATABASE_URL, autocommit=True)
     store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
@@ -231,24 +219,10 @@ async def test_postgres_memory_round_trip_does_not_compact_at_event_nine() -> No
     try:
         await store.ping()
         for index in range(1, 10):
-            proposal = None
-            memory_id = None
-            if index == 1:
-                proposal = AvaMemoryProposal.model_validate(
-                    {
-                        "kind": "interest",
-                        "summary": "The child enjoys astronomy.",
-                        "evidence": "I enjoy astronomy number 1.",
-                        "confidence": 0.9,
-                    }
-                )
-                memory_id = "memory-1"
             await store.commit_delivered_turn(
                 subject=subject,
                 expected_reset_revision=0,
                 turn=_turn(index),
-                proposal=proposal,
-                memory_id=memory_id,
                 timezone_id="Asia/Kolkata",
             )
 
@@ -260,7 +234,7 @@ async def test_postgres_memory_round_trip_does_not_compact_at_event_nine() -> No
             f"turn-{index}" for index in range(2, 10)
         ]
         assert snapshot.current_session_summary is None
-        assert [memory.id for memory in snapshot.stable_memories] == ["memory-1"]
+        assert snapshot.stable_memories == []
         connection = await AsyncConnection.connect(TEST_DATABASE_URL)
         try:
             counts_cursor = await connection.execute(
@@ -318,8 +292,6 @@ async def test_postgres_dialogue_frame_cas_receipts_and_reset() -> None:
             subject=subject,
             expected_reset_revision=0,
             turn=_turn(1),
-            proposal=None,
-            memory_id=None,
         )
         applied = await store.apply_dialogue_frame_update(
             subject=subject,
@@ -384,8 +356,6 @@ async def test_postgres_weekly_recap_projects_newest_64_delivered_turns() -> Non
                 subject=subject,
                 expected_reset_revision=0,
                 turn=_turn(index),
-                proposal=None,
-                memory_id=None,
                 occurred_at=week_start + timedelta(minutes=index),
                 timezone_id="Europe/London",
             )
@@ -417,28 +387,31 @@ async def test_postgres_typed_canvas_interaction_round_trip_and_reset() -> None:
     interaction_turn = _interaction_turn(1)
     await store.open()
     try:
-        decision = await store.commit_delivered_turn(
+        await store.commit_delivered_turn(
             subject=subject,
             expected_reset_revision=0,
             turn=interaction_turn,
-            proposal=AvaMemoryProposal.model_validate(
-                {
-                    "kind": "interest",
-                    "summary": "A proposal without speech evidence.",
-                    "evidence": "target-1 label",
-                    "confidence": 0.99,
-                }
-            ),
-            memory_id="memory-from-interaction",
         )
         snapshot = await store.load_snapshot(
             subject=subject,
             age_band="middleChildhood",
         )
 
-        assert decision.accepted is False
-        assert "speech transcript" in decision.reason
-        assert snapshot.delivered_turns == [interaction_turn]
+        assert len(snapshot.delivered_turns) == 1
+        stored = snapshot.delivered_turns[0]
+        assert stored.turn_sequence == 1
+        assert stored.reset_revision == 0
+        assert (
+            DeliveredConversationTurn.model_validate(
+                {
+                    name: value
+                    for name, value in stored.model_dump(by_alias=True).items()
+                    if name
+                    not in {"resetRevision", "turnSequence", "occurredAt", "timezoneId"}
+                }
+            )
+            == interaction_turn
+        )
         assert snapshot.stable_memories == []
 
         await store.reset_conversation(subject=subject)
@@ -447,275 +420,6 @@ async def test_postgres_typed_canvas_interaction_round_trip_and_reset() -> None:
             age_band="middleChildhood",
         )
         assert reset_snapshot.delivered_turns == []
-    finally:
-        await store.close()
-
-
-async def test_postgres_event_257_atomically_compacts_to_128_raw_events() -> None:
-    assert TEST_DATABASE_URL is not None
-    store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
-    subject = f"test:{uuid4()}"
-    base = datetime.now(UTC) - timedelta(days=1)
-    await store.open()
-    try:
-        for index in range(1, RAW_RETENTION_HIGH_WATER + 2):
-            turn = _turn(index)
-            if index == 1:
-                turn = DeliveredConversationTurn.model_validate(
-                    {
-                        "turnId": "turn-1",
-                        "childText": "Saturn has beautiful rings.",
-                        "avaDeliveredText": "Saturn's rings contain ice and rock.",
-                        "deliveredSampleCount": 24_000,
-                        "childTurnSummary": "Discussed Saturn's icy rings.",
-                        "terminal": "completed",
-                    }
-                )
-            await store.commit_delivered_turn(
-                subject=subject,
-                expected_reset_revision=0,
-                turn=turn,
-                proposal=None,
-                memory_id=None,
-                occurred_at=base + timedelta(minutes=index),
-                timezone_id=("Asia/Kolkata" if index <= 48 else "America/New_York"),
-            )
-
-        connection = await AsyncConnection.connect(TEST_DATABASE_URL)
-        try:
-            raw_cursor = await connection.execute(
-                """
-                select turn_id
-                from ava_private.delivered_turns
-                where subject = %s
-                order by occurred_at asc, turn_id asc
-                """,
-                (subject,),
-            )
-            episode_cursor = await connection.execute(
-                """
-                select episode_id, source_turn_ids, source_event_count,
-                       timezone_id, digest
-                from ava_private.conversation_episodes
-                where subject = %s
-                order by started_at asc, episode_id asc
-                """,
-                (subject,),
-            )
-            raw_rows = await raw_cursor.fetchall()
-            episode_rows = await episode_cursor.fetchall()
-        finally:
-            await connection.close()
-
-        assert len(raw_rows) == RAW_RETENTION_LOW_WATER
-        assert raw_rows[0][0] == "turn-130"
-        assert [row[2] for row in episode_rows] == [32, 32, 32, 32, 1]
-        source_turn_ids = [turn_id for row in episode_rows for turn_id in row[1]]
-        assert source_turn_ids == [f"turn-{index}" for index in range(1, 130)]
-        assert all(len(row[1]) <= 32 for row in episode_rows)
-        assert episode_rows[1][3] == "Asia/Kolkata"
-        combined_digest = "\n".join(row[4] for row in episode_rows)
-        assert "turn=" not in combined_digest
-        assert "occurredAt=" not in combined_digest
-        assert "timezone=" not in combined_digest
-        assert "Asia/Kolkata" not in combined_digest
-        assert "America/New_York" not in combined_digest
-
-        snapshot = await store.load_snapshot(
-            subject=subject,
-            age_band=AgeBand.MIDDLE_CHILDHOOD,
-        )
-        assert [turn.turn_id for turn in snapshot.delivered_turns] == [
-            f"turn-{index}" for index in range(250, 258)
-        ]
-
-        episode_candidates = await store.search_memory_candidates(
-            subject=subject,
-            query="Saturn icy rings",
-            from_instant=base - timedelta(seconds=1),
-            to_instant=base + timedelta(minutes=2),
-        )
-        assert len(episode_candidates) == 1
-        assert episode_candidates[0].source_kind == "episode"
-        assert "turn-1" in episode_candidates[0].source_turn_ids
-
-        connection = await AsyncConnection.connect(TEST_DATABASE_URL, autocommit=True)
-        try:
-            await connection.execute(
-                """
-                insert into ava_private.delivered_turns (
-                  subject, turn_id, input_kind, child_text, child_text_source,
-                  ava_delivered_text, delivered_sample_count, child_turn_summary,
-                  terminal, occurred_at, timezone_id
-                ) values (
-                  %s, 'turn-1', 'speech', 'Saturn has beautiful rings.',
-                  'transcript', 'Saturn rings contain ice.', 24000,
-                  'Discussed Saturn icy rings.', 'completed', %s, 'Asia/Kolkata'
-                )
-                """,
-                (subject, base),
-            )
-            overlapping = await store.search_memory_candidates(
-                subject=subject,
-                query="Saturn icy rings",
-            )
-            assert [candidate.source_kind for candidate in overlapping] == ["rawEvent"]
-            await connection.execute(
-                "delete from ava_private.delivered_turns where subject = %s and turn_id = 'turn-1'",
-                (subject,),
-            )
-            await connection.execute(
-                """
-                update ava_private.turn_receipts
-                set committed_at = %s
-                where subject = %s and turn_id = 'turn-1'
-                """,
-                (datetime.now(UTC) - timedelta(days=365), subject),
-            )
-            async with store._connection() as pooled:
-                async with pooled.transaction():
-                    await store._prune_retention(pooled, subject=subject)
-            receipt_cursor = await connection.execute(
-                """
-                select count(*)
-                from ava_private.turn_receipts
-                where subject = %s and turn_id = 'turn-1'
-                """,
-                (subject,),
-            )
-            assert await receipt_cursor.fetchone() == (1,)
-        finally:
-            await connection.close()
-
-        await store.reset_conversation(subject=subject)
-        reset_connection = await AsyncConnection.connect(TEST_DATABASE_URL)
-        try:
-            reset_cursor = await reset_connection.execute(
-                "select count(*) from ava_private.conversation_episodes where subject = %s",
-                (subject,),
-            )
-            assert await reset_cursor.fetchone() == (0,)
-        finally:
-            await reset_connection.close()
-    finally:
-        await store.close()
-
-
-async def test_postgres_repeated_high_water_compaction_preserves_exact_partition() -> (
-    None
-):
-    assert TEST_DATABASE_URL is not None
-    store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
-    subject = f"test:{uuid4()}"
-    base = datetime.now(UTC) - timedelta(days=2)
-
-    async def retained_partition() -> tuple[list[str], list[list[str]]]:
-        connection = await AsyncConnection.connect(TEST_DATABASE_URL)
-        try:
-            raw_cursor = await connection.execute(
-                """
-                select turn_id
-                from ava_private.delivered_turns
-                where subject = %s
-                order by occurred_at asc, turn_id asc
-                """,
-                (subject,),
-            )
-            episode_cursor = await connection.execute(
-                """
-                select source_turn_ids
-                from ava_private.conversation_episodes
-                where subject = %s
-                order by started_at asc, episode_id asc
-                """,
-                (subject,),
-            )
-            raw_ids = [row[0] for row in await raw_cursor.fetchall()]
-            episode_batches = [list(row[0]) for row in await episode_cursor.fetchall()]
-            return raw_ids, episode_batches
-        finally:
-            await connection.close()
-
-    def assert_exact_partition(
-        *,
-        total_turns: int,
-        expected_raw_start: int,
-        raw_ids: list[str],
-        episode_batches: list[list[str]],
-    ) -> None:
-        episode_ids = [turn_id for batch in episode_batches for turn_id in batch]
-        retained_ids = [*episode_ids, *raw_ids]
-        expected_ids = [f"turn-{index}" for index in range(1, total_turns + 1)]
-        assert retained_ids == expected_ids
-        assert len(retained_ids) == len(set(retained_ids))
-        assert raw_ids == [
-            f"turn-{index}" for index in range(expected_raw_start, total_turns + 1)
-        ]
-        assert episode_ids == [
-            f"turn-{index}" for index in range(1, expected_raw_start)
-        ]
-        assert all(1 <= len(batch) <= 32 for batch in episode_batches)
-
-    await store.open()
-    try:
-        for index in range(1, RAW_RETENTION_HIGH_WATER + 2):
-            await store.commit_delivered_turn(
-                subject=subject,
-                expected_reset_revision=0,
-                turn=_turn(index),
-                proposal=None,
-                memory_id=None,
-                occurred_at=base + timedelta(minutes=index),
-                timezone_id="UTC",
-            )
-
-        raw_ids, episode_batches = await retained_partition()
-        assert len(raw_ids) == RAW_RETENTION_LOW_WATER
-        assert_exact_partition(
-            total_turns=257,
-            expected_raw_start=130,
-            raw_ids=raw_ids,
-            episode_batches=episode_batches,
-        )
-
-        for index in range(258, 386):
-            await store.commit_delivered_turn(
-                subject=subject,
-                expected_reset_revision=0,
-                turn=_turn(index),
-                proposal=None,
-                memory_id=None,
-                occurred_at=base + timedelta(minutes=index),
-                timezone_id="UTC",
-            )
-
-        raw_ids, episode_batches = await retained_partition()
-        assert len(raw_ids) == RAW_RETENTION_HIGH_WATER
-        assert_exact_partition(
-            total_turns=385,
-            expected_raw_start=130,
-            raw_ids=raw_ids,
-            episode_batches=episode_batches,
-        )
-
-        await store.commit_delivered_turn(
-            subject=subject,
-            expected_reset_revision=0,
-            turn=_turn(386),
-            proposal=None,
-            memory_id=None,
-            occurred_at=base + timedelta(minutes=386),
-            timezone_id="UTC",
-        )
-
-        raw_ids, episode_batches = await retained_partition()
-        assert len(raw_ids) == RAW_RETENTION_LOW_WATER
-        assert_exact_partition(
-            total_turns=386,
-            expected_raw_start=259,
-            raw_ids=raw_ids,
-            episode_batches=episode_batches,
-        )
     finally:
         await store.close()
 
@@ -798,55 +502,7 @@ async def test_postgres_episode_search_excerpt_contains_late_matching_line() -> 
         await store.close()
 
 
-async def test_postgres_episode_insert_failure_rolls_back_new_raw_event() -> None:
-    assert TEST_DATABASE_URL is not None
-    store = _FailingEpisodeInsertPostgresStore(TEST_DATABASE_URL)
-    subject = f"test:{uuid4()}"
-    await store.open()
-    try:
-        for index in range(1, RAW_RETENTION_HIGH_WATER + 1):
-            await store.commit_delivered_turn(
-                subject=subject,
-                expected_reset_revision=0,
-                turn=_turn(index),
-                proposal=None,
-                memory_id=None,
-                timezone_id="UTC",
-            )
-
-        with pytest.raises(RuntimeError, match="injected episode insert failure"):
-            await store.commit_delivered_turn(
-                subject=subject,
-                expected_reset_revision=0,
-                turn=_turn(RAW_RETENTION_HIGH_WATER + 1),
-                proposal=None,
-                memory_id=None,
-                timezone_id="UTC",
-            )
-
-        connection = await AsyncConnection.connect(TEST_DATABASE_URL)
-        try:
-            cursor = await connection.execute(
-                """
-                select
-                  (select count(*) from ava_private.delivered_turns where subject = %s),
-                  (select count(*) from ava_private.conversation_episodes where subject = %s),
-                  (select count(*) from ava_private.turn_receipts where subject = %s)
-                """,
-                (subject, subject, subject),
-            )
-            assert await cursor.fetchone() == (
-                RAW_RETENTION_HIGH_WATER,
-                0,
-                RAW_RETENTION_HIGH_WATER,
-            )
-        finally:
-            await connection.close()
-    finally:
-        await store.close()
-
-
-async def test_postgres_episode_retention_enforces_age_and_count_bounds() -> None:
+async def test_postgres_legacy_episode_history_survives_new_commits() -> None:
     assert TEST_DATABASE_URL is not None
     store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
     subject = f"test:{uuid4()}"
@@ -882,9 +538,13 @@ async def test_postgres_episode_retention_enforces_age_and_count_bounds() -> Non
                 ),
             )
 
-        async with store._connection() as pooled:
-            async with pooled.transaction():
-                await store._prune_retention(pooled, subject=subject)
+        await store.commit_delivered_turn(
+            subject=subject,
+            expected_reset_revision=0,
+            turn=_turn(999),
+            occurred_at=now,
+            timezone_id="UTC",
+        )
 
         cursor = await connection.execute(
             """
@@ -895,8 +555,13 @@ async def test_postgres_episode_retention_enforces_age_and_count_bounds() -> Non
             (subject,),
         )
         count, oldest = await cursor.fetchone()
-        assert count == 128
-        assert oldest >= now - timedelta(days=180)
+        assert count == 130
+        assert oldest == now - timedelta(days=181)
+        evidence = await store.search_memory_candidates(
+            subject=subject, query="retention", to_instant=now - timedelta(days=180)
+        )
+        assert len(evidence) == 1
+        assert evidence[0].source_kind == "episode"
     finally:
         await connection.execute(
             "delete from ava_private.memory_state where subject = %s",
@@ -936,12 +601,12 @@ async def test_postgres_rejects_ambiguous_hybrid_delivered_input() -> None:
                   canvas_scene_id, canvas_scene_revision,
                   canvas_interaction_revision, canvas_interaction_mode,
                   canvas_binding_id, canvas_target_id,
-                  canvas_accessibility_label, canvas_step_index
+                  canvas_accessibility_label, canvas_step_index, reset_revision, turn_sequence
                 ) values (
                   %s, %s, 'canvasInteraction', %s, 'transcript',
                   '', 0, 'Canvas interaction.', 'completed', 'UTC',
                   'scene-A', 1, 1, 'explore', 'binding-A', 'target-A',
-                  'target-A label', null
+                  'target-A label', null, 0, 1
                 )
                 """,
                 (subject, turn_id, "fabricated child speech"),
@@ -996,11 +661,11 @@ async def test_postgres_rejects_null_or_blank_canvas_interaction_fields() -> Non
                       canvas_scene_id, canvas_scene_revision,
                       canvas_interaction_revision, canvas_interaction_mode,
                       canvas_binding_id, canvas_target_id,
-                      canvas_accessibility_label, canvas_step_index
+                      canvas_accessibility_label, canvas_step_index, reset_revision, turn_sequence
                     ) values (
                       %s, %s, 'canvasInteraction', null, null,
                       '', 0, 'Canvas interaction.', 'completed', 'UTC',
-                      %s, %s, %s, %s, %s, %s, %s, %s
+                      %s, %s, %s, %s, %s, %s, %s, %s, 0, 1
                     )
                     """,
                     (subject, turn_id, *values),
@@ -1118,7 +783,7 @@ async def test_fake_realtime_tts_delivery_pipeline_commits_to_postgres() -> None
         await store.close()
 
 
-async def test_postgres_serializes_concurrent_semantic_memory_proposals() -> None:
+async def test_postgres_serializes_concurrent_delivered_turn_sequences() -> None:
     assert TEST_DATABASE_URL is not None
     store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
     subject = f"test:{uuid4()}"
@@ -1130,27 +795,20 @@ async def test_postgres_serializes_concurrent_semantic_memory_proposals() -> Non
                 subject=subject,
                 expected_reset_revision=0,
                 turn=_turn(index),
-                proposal=AvaMemoryProposal.model_validate(
-                    {
-                        "kind": "interest",
-                        "summary": "The child enjoys astronomy.",
-                        "evidence": f"I enjoy astronomy number {index}.",
-                        "confidence": 0.9,
-                    }
-                ),
-                memory_id=f"memory-{index}",
             )
 
-        decisions = await asyncio.gather(commit(20), commit(21))
-        assert sum(decision.accepted for decision in decisions) == 1
-        rejected = next(decision for decision in decisions if not decision.accepted)
-        assert "equivalent" in rejected.reason.lower()
+        await asyncio.gather(commit(20), commit(21))
         snapshot = await store.load_snapshot(
             subject=subject,
             age_band=AgeBand.MIDDLE_CHILDHOOD,
         )
         assert len(snapshot.delivered_turns) == 2
-        assert len(snapshot.stable_memories) == 1
+        assert snapshot.stable_memories == []
+        assert [turn.turn_sequence for turn in snapshot.delivered_turns] == [1, 2]
+        assert {turn.turn_id for turn in snapshot.delivered_turns} == {
+            "turn-20",
+            "turn-21",
+        }
     finally:
         await store.close()
 
@@ -1172,8 +830,6 @@ async def test_postgres_reset_wins_against_in_flight_delivered_commit() -> None:
                 subject=subject,
                 expected_reset_revision=0,
                 turn=_turn(90),
-                proposal=None,
-                memory_id=None,
             )
         )
         await store.before_subject_lock.wait()
@@ -1207,55 +863,6 @@ async def test_postgres_reset_wins_against_in_flight_delivered_commit() -> None:
         store.allow_subject_lock.set()
         if commit is not None:
             await asyncio.gather(commit, return_exceptions=True)
-        await connection.execute(
-            "delete from ava_private.reset_log where subject = %s",
-            (subject,),
-        )
-        await connection.execute(
-            "delete from ava_private.memory_state where subject = %s",
-            (subject,),
-        )
-        await connection.close()
-        await store.close()
-
-
-async def test_postgres_reset_wins_against_in_flight_summary_write() -> None:
-    assert TEST_DATABASE_URL is not None
-    store = _PausingFencePostgresStore(TEST_DATABASE_URL)
-    subject = f"test:{uuid4()}"
-    connection = await AsyncConnection.connect(TEST_DATABASE_URL, autocommit=True)
-    write: asyncio.Task[None] | None = None
-    await store.open()
-    try:
-        await connection.execute(
-            "insert into ava_private.memory_state (subject) values (%s)",
-            (subject,),
-        )
-        write = asyncio.create_task(
-            store.set_session_summary(
-                subject=subject,
-                expected_reset_revision=0,
-                summary="A stale pre-reset summary.",
-            )
-        )
-        await store.before_subject_lock.wait()
-
-        receipt = await store.reset_conversation(subject=subject)
-        assert receipt.revision == 1
-        store.allow_subject_lock.set()
-
-        with pytest.raises(MemoryResetRevisionMismatchError):
-            await write
-        snapshot = await store.load_snapshot(
-            subject=subject,
-            age_band=AgeBand.MIDDLE_CHILDHOOD,
-        )
-        assert snapshot.reset_revision == 1
-        assert snapshot.current_session_summary is None
-    finally:
-        store.allow_subject_lock.set()
-        if write is not None:
-            await asyncio.gather(write, return_exceptions=True)
         await connection.execute(
             "delete from ava_private.reset_log where subject = %s",
             (subject,),
@@ -1335,8 +942,6 @@ async def test_postgres_semantic_memory_atomic_apply_and_exact_idempotency() -> 
             subject=subject,
             expected_reset_revision=0,
             turn=_turn(1),
-            proposal=None,
-            memory_id=None,
         )
         proposal = _semantic_proposal("The child prefers Jupiter.", base_revision=0)
         applied = await store.apply_semantic_memory_proposal(
@@ -1387,8 +992,6 @@ async def test_postgres_semantic_memory_supersession_and_reset_cascade() -> None
             subject=subject,
             expected_reset_revision=0,
             turn=_turn(1),
-            proposal=None,
-            memory_id=None,
         )
         first = await store.apply_semantic_memory_proposal(
             subject=subject,
@@ -1401,8 +1004,6 @@ async def test_postgres_semantic_memory_supersession_and_reset_cascade() -> None
             subject=subject,
             expected_reset_revision=0,
             turn=_turn(2),
-            proposal=None,
-            memory_id=None,
         )
         await store.apply_semantic_memory_proposal(
             subject=subject,
@@ -1445,8 +1046,6 @@ async def test_postgres_semantic_journal_search_parity_supersession_and_reset() 
             subject=subject,
             expected_reset_revision=0,
             turn=_turn(1),
-            proposal=None,
-            memory_id=None,
         )
         first = await store.apply_semantic_memory_proposal(
             subject=subject,
@@ -1463,21 +1062,21 @@ async def test_postgres_semantic_journal_search_parity_supersession_and_reset() 
         )
         assert len(initial_search) == 1
         assert initial_search[0].source_id == first_id
-        assert initial_search[0].source_kind == MemoryCandidateSourceKind.SEMANTIC_JOURNAL
+        assert (
+            initial_search[0].source_kind == MemoryCandidateSourceKind.SEMANTIC_JOURNAL
+        )
         assert initial_search[0].source_kind == "semanticJournal"
         assert "volcanic Jupiter moons" in initial_search[0].reference_text
         assert initial_search[0].source_turn_ids == ["turn-1"]
         assert initial_search[0].started_at is not None
         assert initial_search[0].ended_at == initial_search[0].started_at
-        assert initial_search[0].timezone_ids == []
+        assert initial_search[0].timezone_ids == ["UTC"]
 
         # 2. Supersede with second event
         await store.commit_delivered_turn(
             subject=subject,
             expected_reset_revision=0,
             turn=_turn(2),
-            proposal=None,
-            memory_id=None,
         )
         second = await store.apply_semantic_memory_proposal(
             subject=subject,
@@ -1504,7 +1103,9 @@ async def test_postgres_semantic_journal_search_parity_supersession_and_reset() 
         )
         assert len(second_search) == 1
         assert second_search[0].source_id == second_id
-        assert second_search[0].source_kind == MemoryCandidateSourceKind.SEMANTIC_JOURNAL
+        assert (
+            second_search[0].source_kind == MemoryCandidateSourceKind.SEMANTIC_JOURNAL
+        )
 
         # 3. Reset conversation isolates old records
         receipt = await store.reset_conversation(subject=subject)
@@ -1527,7 +1128,6 @@ async def test_postgres_semantic_journal_search_parity_supersession_and_reset() 
         await store.close()
 
 
-
 async def test_postgres_semantic_memory_allows_immutable_a_b_a_recurrence() -> None:
     assert TEST_DATABASE_URL is not None
     store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
@@ -1538,8 +1138,6 @@ async def test_postgres_semantic_memory_allows_immutable_a_b_a_recurrence() -> N
             subject=subject,
             expected_reset_revision=0,
             turn=_turn(1),
-            proposal=None,
-            memory_id=None,
         )
         first = await store.apply_semantic_memory_proposal(
             subject=subject,
@@ -1553,8 +1151,6 @@ async def test_postgres_semantic_memory_allows_immutable_a_b_a_recurrence() -> N
             subject=subject,
             expected_reset_revision=0,
             turn=_turn(2),
-            proposal=None,
-            memory_id=None,
         )
         second = await store.apply_semantic_memory_proposal(
             subject=subject,
@@ -1570,8 +1166,6 @@ async def test_postgres_semantic_memory_allows_immutable_a_b_a_recurrence() -> N
             subject=subject,
             expected_reset_revision=0,
             turn=_turn(3),
-            proposal=None,
-            memory_id=None,
         )
         third = await store.apply_semantic_memory_proposal(
             subject=subject,
@@ -1628,8 +1222,6 @@ async def test_postgres_semantic_conflict_rolls_back_frame_and_receipt() -> None
             subject=subject,
             expected_reset_revision=0,
             turn=_turn(1),
-            proposal=None,
-            memory_id=None,
         )
         await store.apply_semantic_memory_proposal(
             subject=subject,
@@ -1641,8 +1233,6 @@ async def test_postgres_semantic_conflict_rolls_back_frame_and_receipt() -> None
             subject=subject,
             expected_reset_revision=0,
             turn=_turn(2),
-            proposal=None,
-            memory_id=None,
         )
         with pytest.raises(SemanticJournalConflictError):
             await store.apply_semantic_memory_proposal(
@@ -1678,4 +1268,295 @@ async def test_postgres_semantic_conflict_rolls_back_frame_and_receipt() -> None
             "delete from ava_private.memory_state where subject = %s", (subject,)
         )
         await connection.close()
+        await store.close()
+
+
+async def test_postgres_migration_backfills_legacy_ties_then_allocates_forward() -> (
+    None
+):
+    assert TEST_DATABASE_URL is not None
+    database = "ava_pass3_migration_" + uuid4().hex
+    url = make_conninfo(TEST_DATABASE_URL, dbname=database)
+    admin = await AsyncConnection.connect(TEST_DATABASE_URL, autocommit=True)
+    await admin.execute(sql.SQL("create database {}").format(sql.Identifier(database)))
+    migrations = Path(__file__).resolve().parents[1] / "supabase" / "migrations"
+    timeline = migrations / "202609140001_add_durable_turn_timeline.sql"
+    subject = "test:legacy-migration"
+    when = datetime(2025, 2, 1, tzinfo=UTC)
+    ids = [f"turn-{uuid4()}" for _ in range(4)]
+    store = PostgresAuthoritativeMemoryStore(url)
+    try:
+        async with await AsyncConnection.connect(url, autocommit=True) as connection:
+            for migration in sorted(migrations.glob("*.sql")):
+                # The July public/auth migration is outside the private memory schema.
+                if migration.name >= "202608" and migration.name < timeline.name:
+                    await connection.execute(migration.read_text())
+            await connection.execute(
+                "insert into ava_private.memory_state(subject) values (%s)", (subject,)
+            )
+            for turn_id in ids:
+                await connection.execute(
+                    "insert into ava_private.turn_receipts(subject, turn_id) values (%s, %s)",
+                    (subject, turn_id),
+                )
+                await connection.execute(
+                    """
+                    insert into ava_private.delivered_turns
+                    (subject, turn_id, child_text, child_text_source, ava_delivered_text,
+                     delivered_sample_count, child_turn_summary, terminal, occurred_at, timezone_id)
+                    values (%s, %s, 'Legacy astronomy', 'transcript', 'Heard prefix',
+                            24000, 'Legacy astronomy', 'completed', %s, 'UTC')
+                """,
+                    (subject, turn_id, when),
+                )
+            await connection.execute(timeline.read_text())
+            await connection.execute(timeline.read_text())
+        await store.open()
+        before = await store.load_snapshot(
+            subject=subject, age_band=AgeBand.MIDDLE_CHILDHOOD
+        )
+        assert [(t.turn_id, t.turn_sequence) for t in before.delivered_turns] == list(
+            zip(sorted(ids), range(1, 5))
+        )
+        await store.commit_delivered_turn(
+            subject=subject,
+            expected_reset_revision=0,
+            turn=_turn(99),
+            occurred_at=when - timedelta(days=1),
+            timezone_id="UTC",
+        )
+        after = await store.load_snapshot(
+            subject=subject, age_band=AgeBand.MIDDLE_CHILDHOOD
+        )
+        assert after.delivered_turns[-1].turn_id == "turn-99"
+        assert after.delivered_turns[-1].turn_sequence == 5
+        assert (
+            after.delivered_turns[-1].occurred_at < after.delivered_turns[0].occurred_at
+        )
+    finally:
+        await store.close()
+        await admin.execute(
+            sql.SQL("drop database {}").format(sql.Identifier(database))
+        )
+        await admin.close()
+
+
+async def test_postgres_search_order_source_time_and_provenance_dedup() -> None:
+    assert TEST_DATABASE_URL is not None
+    store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
+    subject = f"test:{uuid4()}"
+    base = datetime(2024, 1, 1, tzinfo=UTC)
+    await store.open()
+    try:
+        for turn_id, day in (("turn-z", 2), ("turn-m", 0), ("turn-a", 0)):
+            turn = _turn(1).model_copy(
+                update={
+                    "turn_id": turn_id,
+                    "child_text": "nebula",
+                    "ava_delivered_text": "nebula",
+                    "child_turn_summary": "nebula",
+                }
+            )
+            await store.commit_delivered_turn(
+                subject=subject,
+                expected_reset_revision=0,
+                turn=turn,
+                occurred_at=base + timedelta(days=day),
+                timezone_id="Asia/Kolkata",
+            )
+        for order, expected in (
+            ("bestMatch", ["turn-z", "turn-a", "turn-m"]),
+            ("newest", ["turn-z", "turn-a", "turn-m"]),
+            ("oldest", ["turn-a", "turn-m", "turn-z"]),
+        ):
+            candidates = await store.search_memory_candidates(
+                subject=subject, query="nebula", order=order
+            )
+            assert [c.source_id for c in candidates] == expected
+        filtered = await store.search_memory_candidates(
+            subject=subject,
+            query="nebula",
+            from_instant=base,
+            to_instant=base + timedelta(days=1),
+            order="newest",
+        )
+        assert [c.source_id for c in filtered] == ["turn-a", "turn-m"]
+        await store.apply_semantic_memory_proposal(
+            subject=subject,
+            expected_reset_revision=0,
+            source_turn_id="turn-z",
+            proposal=_semantic_proposal("nebula nebula nebula nebula nebula"),
+        )
+        candidates = await store.search_memory_candidates(
+            subject=subject, query="nebula", order="newest"
+        )
+        assert len(candidates) == 3
+        represented: set[str] = set()
+        for candidate in candidates:
+            assert represented.isdisjoint(candidate.source_turn_ids)
+            represented.update(candidate.source_turn_ids)
+        assert represented == {"turn-z", "turn-a", "turn-m"}
+        journal = next(c for c in candidates if c.source_kind == "semanticJournal")
+        assert journal.started_at == journal.ended_at == base + timedelta(days=2)
+        assert journal.timezone_ids == ["Asia/Kolkata"]
+        # Simulate a pre-migration episode-only source, never fabricate exact text.
+        async with await AsyncConnection.connect(
+            TEST_DATABASE_URL, autocommit=True
+        ) as connection:
+            await connection.execute(
+                """
+                insert into ava_private.conversation_episodes
+                (subject, episode_id, started_at, ended_at, timezone_id, digest,
+                 source_turn_ids, source_event_count, created_at)
+                values (%s, 'episode-legacy-nebula', %s, %s, 'Europe/Paris',
+                        'nebula digest', array['turn-z'], 1, %s)
+            """,
+                (subject, base + timedelta(days=2), base + timedelta(days=3), base),
+            )
+            await connection.execute(
+                "delete from ava_private.delivered_turns where subject = %s and turn_id = 'turn-z'",
+                (subject,),
+            )
+        legacy = await store.search_memory_candidates(
+            subject=subject, query="nebula", order="newest"
+        )
+        historical = next(c for c in legacy if c.source_kind == "semanticJournal")
+        assert historical.started_at == base + timedelta(days=2)
+        assert historical.ended_at == base + timedelta(days=3)
+        assert historical.timezone_ids == ["Europe/Paris"]
+        assert sum("turn-z" in c.source_turn_ids for c in legacy) == 1
+    finally:
+        await store.close()
+
+
+async def test_postgres_current_supersession_preserves_historical_raw_truth() -> None:
+    assert TEST_DATABASE_URL is not None
+    store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
+    subject = f"test:{uuid4()}"
+    base = datetime(2024, 1, 1, tzinfo=UTC)
+    await store.open()
+    try:
+        previous = None
+        for index, color in enumerate(("blue", "green"), start=1):
+            text = f"My favorite color is {color}."
+            await store.commit_delivered_turn(
+                subject=subject,
+                expected_reset_revision=0,
+                turn=_turn(index).model_copy(
+                    update={"child_text": text, "child_turn_summary": text}
+                ),
+                occurred_at=base + timedelta(days=index),
+                timezone_id="UTC",
+            )
+            proposal = SemanticMemoryProposal.model_validate(
+                {
+                    "disposition": "changed",
+                    "journalEvents": [
+                        {
+                            "family": "userPreference",
+                            "semanticKey": "favorite_color",
+                            "summary": text,
+                            "supersedesEventIds": [previous] if previous else [],
+                        }
+                    ],
+                }
+            )
+            result = await store.apply_semantic_memory_proposal(
+                subject=subject,
+                expected_reset_revision=0,
+                source_turn_id=f"turn-{index}",
+                proposal=proposal,
+            )
+            previous = result.journal_results[0].event.event_id
+        active = await store.get_active_semantic_journal_event(
+            subject=subject,
+            expected_reset_revision=0,
+            identity_key="userPreference:favorite_color",
+        )
+        assert active is not None and "green" in active.summary
+        historical = await store.search_memory_candidates(
+            subject=subject,
+            query="blue",
+            from_instant=base + timedelta(days=1),
+            to_instant=base + timedelta(days=2),
+        )
+        assert len(historical) == 1
+        assert (
+            historical[0].source_kind == "rawEvent"
+            and "blue" in historical[0].reference_text
+        )
+    finally:
+        await store.close()
+
+
+async def test_postgres_durable_sequence_restart_reset_and_retention() -> None:
+    assert TEST_DATABASE_URL is not None
+    subject = f"test:{uuid4()}"
+    when = datetime(2025, 1, 1, tzinfo=UTC)
+    store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
+    await store.open()
+    ids = [f"turn-{uuid4()}" for _ in range(258)]
+    try:
+        for index, turn_id in enumerate(ids):
+            await store.commit_delivered_turn(
+                subject=subject,
+                expected_reset_revision=0,
+                turn=_turn(index).model_copy(update={"turn_id": turn_id}),
+                occurred_at=when,
+                timezone_id="Asia/Kolkata",
+            )
+        await store.close()
+        store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
+        await store.open()
+        snapshot = await store.load_snapshot(
+            subject=subject, age_band=AgeBand.MIDDLE_CHILDHOOD
+        )
+        assert [t.turn_sequence for t in snapshot.delivered_turns] == list(
+            range(251, 259)
+        )
+        assert [t.turn_id for t in snapshot.delivered_turns] == ids[-8:]
+        assert all(
+            t.occurred_at == when and t.timezone_id == "Asia/Kolkata"
+            for t in snapshot.delivered_turns
+        )
+        async with await AsyncConnection.connect(TEST_DATABASE_URL) as connection:
+            cursor = await connection.execute(
+                "select turn_id, turn_sequence from ava_private.delivered_turns where subject = %s order by turn_sequence",
+                (subject,),
+            )
+            rows = await cursor.fetchall()
+            assert rows == list(zip(ids, range(1, 259)))
+            cursor = await connection.execute(
+                "select count(*) from ava_private.conversation_episodes where subject = %s",
+                (subject,),
+            )
+            assert await cursor.fetchone() == (0,)
+        recalled = await store.search_memory_candidates(
+            subject=subject,
+            query="astronomy",
+            from_instant=when,
+            to_instant=when + timedelta(seconds=1),
+        )
+        assert recalled and all(c.source_kind == "rawEvent" for c in recalled)
+        await store.reset_conversation(subject=subject)
+        with pytest.raises(MemoryResetRevisionMismatchError):
+            await store.commit_delivered_turn(
+                subject=subject,
+                expected_reset_revision=0,
+                turn=_turn(999),
+            )
+        await store.commit_delivered_turn(
+            subject=subject,
+            expected_reset_revision=1,
+            turn=_turn(999),
+            occurred_at=when,
+            timezone_id="UTC",
+        )
+        fresh = await store.load_snapshot(
+            subject=subject, age_band=AgeBand.MIDDLE_CHILDHOOD
+        )
+        assert [(t.reset_revision, t.turn_sequence) for t in fresh.delivered_turns] == [
+            (1, 1)
+        ]
+    finally:
         await store.close()

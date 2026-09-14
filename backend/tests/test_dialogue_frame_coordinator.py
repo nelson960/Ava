@@ -5,10 +5,12 @@ from datetime import UTC, datetime
 from types import MethodType, SimpleNamespace
 from typing import Any, cast
 
-import pytest
+from ava_backend.realtime.tool_contract import (
+    GetCurrentTimeRequest,
+    GetCurrentTimeToolOutputV4,
+)
 
 from ava_backend.realtime.coordinator import (
-    CoordinatorStateError,
     DeterministicRealtimeSessionCoordinator,
     _CapturedMemoryCommit,
     _TurnResult,
@@ -93,11 +95,9 @@ def _bare_coordinator(
     coordinator._memory = memory or DevelopmentAuthoritativeMemoryStore()
     coordinator._memory_reset_revision = 0
     coordinator._dialogue_frame = DialogueFrame()
-    coordinator._turn_settled_tool_outcomes = []
+    coordinator._turn_tool_exchanges = []
     coordinator._canvas_jobs = _ResettableCanvasJobs(workspace or _Workspace())  # type: ignore[assignment]
     coordinator._canvas_context_lock = asyncio.Lock()
-    coordinator._warm_memories = ()
-    coordinator._last_memory_decision = None
     coordinator._memory_commit_queue = asyncio.Queue()
     coordinator._memory_commit_terminal = object()
     if start_memory_worker:
@@ -109,7 +109,6 @@ def _bare_coordinator(
     coordinator._last_enqueued_memory_sequence = 0
     coordinator._scheduled_memory_commit_turn_ids = set()
     coordinator._memory_commit_sequence = 0
-    coordinator._latest_memory_commit_sequence = 0
     coordinator._current_memory_commit_turn_id = None
     coordinator._memory_commit_drain_timeout_seconds = 5.0
     coordinator._failure_id_factory = lambda: "failure-frame"
@@ -166,7 +165,9 @@ def _record_context_refreshes(
     return builds
 
 
-async def test_post_delivery_capture_updates_dialogue_frame_and_refreshes_context() -> None:
+async def test_post_delivery_capture_updates_dialogue_frame_and_refreshes_context() -> (
+    None
+):
     provider = DeterministicRealtimePlanProvider()
     provider.canned_capture_results = [_capture_result("Moon")]
     coordinator = _bare_coordinator(realtime=provider)
@@ -196,9 +197,11 @@ async def test_canvas_references_require_exact_canonical_retained_revision() -> 
 
     await coordinator._run_memory_commit(payload=_payload(turn_id="turn-1"))
 
-    # Invalid canvas reference caused proposal rejection; frame remains default
-    assert coordinator.dialogue_frame == DialogueFrame()
-    assert builds == []
+    # Canonicalization drops the invalid reference without losing semantic content.
+    assert coordinator.dialogue_frame.active_topics == ("Moon",)
+    assert coordinator.dialogue_frame.relevant_canvas_references == ()
+    assert coordinator.dialogue_frame.revision == 1
+    assert builds == [(1, DynamicContextBuildReason.TURN_COMMITTED)]
 
 
 async def test_schedule_captures_settled_outcomes_without_cross_turn_leak() -> None:
@@ -207,10 +210,15 @@ async def test_schedule_captures_settled_outcomes_without_cross_turn_leak() -> N
     coordinator._turn_canvas_interaction_input = None
     coordinator._child_text = "Tell me about the Moon."
     coordinator._child_text_source = ChildTurnTextSource.TRANSCRIPT
-    coordinator._record_tool_outcome(
+    coordinator._record_tool_exchange(
         tool_name="get_current_time",
-        call_id="call_time_1",
-        outcome="available",
+        request=GetCurrentTimeRequest(),
+        result=GetCurrentTimeToolOutputV4(
+            localIsoDateTime="2026-09-08T00:00:00+00:00",
+            weekday="Tuesday",
+            daypart="night",
+            timezoneId="UTC",
+        ),
     )
     captured: list[_CapturedMemoryCommit] = []
 
@@ -232,14 +240,16 @@ async def test_schedule_captures_settled_outcomes_without_cross_turn_leak() -> N
     await coordinator._memory_commit_queue.join()
 
     assert captured[0].turn_id == "turn-1"
-    assert len(captured[0].settled_tool_outcomes) == 1
-    assert captured[0].settled_tool_outcomes[0].tool_name == "get_current_time"
+    assert len(captured[0].tool_exchanges) == 1
+    assert captured[0].tool_exchanges[0].tool == "get_current_time"
     assert not captured[0].interrupted
     # Settled tool outcomes are preserved per turn and cleared on transition
-    coordinator._harness = cast(Any, SimpleNamespace(prompt_version="1", tool_contract_version="1"))
+    coordinator._harness = cast(
+        Any, SimpleNamespace(prompt_version="1", tool_contract_version="1")
+    )
     coordinator._terminal = True
     await coordinator._prepare_next_turn()
-    assert coordinator._turn_settled_tool_outcomes == []
+    assert coordinator._turn_tool_exchanges == []
     coordinator._memory_commit_queue.put_nowait(coordinator._memory_commit_terminal)
     if coordinator._memory_commit_worker_task is not None:
         await coordinator._memory_commit_worker_task
@@ -250,7 +260,6 @@ async def test_delivered_turn_precedes_frame_and_first_refresh_sees_new_frame() 
     provider.canned_capture_results = [_capture_result("Moon")]
     memory = DevelopmentAuthoritativeMemoryStore()
     coordinator = _bare_coordinator(memory=memory, realtime=provider)
-    coordinator._latest_memory_commit_sequence = 1
     observed_revisions: list[int] = []
 
     async def observe_refresh(
@@ -274,7 +283,9 @@ async def test_delivered_turn_precedes_frame_and_first_refresh_sees_new_frame() 
     assert observed_revisions == [1]
 
 
-async def test_stale_frame_does_not_erase_later_delivered_turn_or_kill_refresh() -> None:
+async def test_stale_frame_does_not_erase_later_delivered_turn_or_kill_refresh() -> (
+    None
+):
     memory = DevelopmentAuthoritativeMemoryStore()
     await memory.commit_delivered_turn(
         subject="child:frame",
@@ -289,8 +300,6 @@ async def test_stale_frame_does_not_erase_later_delivered_turn_or_kill_refresh()
                 "terminal": "completed",
             }
         ),
-        proposal=None,
-        memory_id=None,
     )
     await memory.apply_dialogue_frame_update(
         subject="child:frame",
@@ -334,14 +343,21 @@ async def test_memory_reset_clears_settled_outcomes_and_current_frame() -> None:
     coordinator._dialogue_frame = DialogueFrame.model_validate(
         {"revision": 2, "activeTopics": ["Moon"]}
     )
-    coordinator._record_tool_outcome(
-        tool_name="get_current_time", call_id="c1", outcome="available"
+    coordinator._record_tool_exchange(
+        tool_name="get_current_time",
+        request=GetCurrentTimeRequest(),
+        result=GetCurrentTimeToolOutputV4(
+            localIsoDateTime="2026-09-08T00:00:00+00:00",
+            weekday="Tuesday",
+            daypart="night",
+            timezoneId="UTC",
+        ),
     )
 
     await coordinator.memory_reset(reset_revision=1)
 
     assert coordinator.dialogue_frame == DialogueFrame()
-    assert coordinator._turn_settled_tool_outcomes == []
+    assert coordinator._turn_tool_exchanges == []
 
 
 class _FrameFailingMemory(DevelopmentAuthoritativeMemoryStore):
@@ -392,8 +408,6 @@ async def test_frame_change_preserves_bootstrap_references_and_builds_once() -> 
     provider.canned_capture_results = [_capture_result("Moon")]
     memory = DevelopmentAuthoritativeMemoryStore()
     coordinator = _bare_coordinator(memory=memory, realtime=provider)
-    existing_warm_references = (object(),)
-    coordinator._warm_memories = existing_warm_references  # type: ignore[assignment]
     builds = _record_context_refreshes(coordinator)
 
     await coordinator._run_memory_commit(payload=_payload(turn_id="turn-1"))
@@ -404,7 +418,6 @@ async def test_frame_change_preserves_bootstrap_references_and_builds_once() -> 
     assert [turn.turn_id for turn in snapshot.delivered_turns] == ["turn-1"]
     assert snapshot.dialogue_frame.revision == 1
     assert coordinator.dialogue_frame.revision == 1
-    assert coordinator._warm_memories is existing_warm_references
     assert builds == [(1, DynamicContextBuildReason.TURN_COMMITTED)]
 
 
@@ -423,8 +436,6 @@ async def test_reset_epoch_fence_prevents_old_frame_resurrection() -> None:
                 "terminal": "completed",
             }
         ),
-        proposal=None,
-        memory_id=None,
     )
     await memory.reset_conversation(subject="child:frame")
     provider = DeterministicRealtimePlanProvider()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal
@@ -17,6 +18,13 @@ from .memory import (
 )
 from .tool_contract import InteractiveCanvasRequest
 from .turn_parser import StreamingSpeechParser, StreamingTurnParseError
+
+
+# Synthetic fixture chronology, never inferred historical occurrence time.
+# Each independent evaluation case starts a new simulated reset epoch.
+SIMULATED_TIMELINE_BASE = datetime(2026, 8, 30, 12, tzinfo=UTC)
+SIMULATED_TIMELINE_TIMEZONE = "UTC"
+SIMULATED_TIMELINE_STEP = timedelta(minutes=1)
 
 
 class PersonalityEvaluationCategory(StrEnum):
@@ -220,6 +228,7 @@ def evaluate_personality_candidate(
 def memory_snapshot_for_case(
     case: PersonalityEvalCase,
 ) -> AuthoritativeMemorySnapshot:
+    """Compile ordered case fixtures onto the evaluator's explicit virtual clock."""
     return AuthoritativeMemorySnapshot.model_validate(
         {
             "ageBand": case.age_band,
@@ -228,6 +237,11 @@ def memory_snapshot_for_case(
             "deliveredTurns": [
                 {
                     "turnId": f"eval-prior-turn-{index}",
+                    "resetRevision": 0,
+                    "turnSequence": index,
+                    "occurredAt": SIMULATED_TIMELINE_BASE
+                    + (index - 1) * SIMULATED_TIMELINE_STEP,
+                    "timezoneId": SIMULATED_TIMELINE_TIMEZONE,
                     "childText": turn.child,
                     "avaDeliveredText": turn.ava_delivered,
                     "deliveredSampleCount": 1,

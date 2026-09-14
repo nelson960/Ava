@@ -16,7 +16,6 @@ from ava_backend.realtime.memory import (
     DialogueFrameUpdateConflictError,
     DeliveredConversationTurn,
     MemoryResetRevisionMismatchError,
-    RAW_RETENTION_HIGH_WATER,
     canonical_dialogue_frame_update_fingerprint,
 )
 
@@ -45,8 +44,6 @@ async def _commit(
         subject=subject,
         expected_reset_revision=reset_revision,
         turn=_turn(turn_id),
-        proposal=None,
-        memory_id=None,
         occurred_at=datetime(2026, 9, 8, tzinfo=UTC),
     )
 
@@ -259,7 +256,9 @@ async def test_development_store_reset_and_subject_isolation() -> None:
         )
 
 
-async def test_development_receipts_survive_evidence_compaction_and_pruning() -> None:
+async def test_development_receipts_and_exact_evidence_survive_old_retention_limits() -> (
+    None
+):
     store = DevelopmentAuthoritativeMemoryStore()
     subject = "child:receipt-retention"
     old_base = datetime.now(UTC) - timedelta(days=181)
@@ -268,8 +267,6 @@ async def test_development_receipts_survive_evidence_compaction_and_pruning() ->
         subject=subject,
         expected_reset_revision=0,
         turn=_turn("turn-source"),
-        proposal=None,
-        memory_id=None,
         occurred_at=old_base,
     )
     await store.apply_dialogue_frame_update(
@@ -279,13 +276,11 @@ async def test_development_receipts_survive_evidence_compaction_and_pruning() ->
         update=source_update,
     )
 
-    for index in range(1, RAW_RETENTION_HIGH_WATER + 1):
+    for index in range(1, 256 + 1):
         await store.commit_delivered_turn(
             subject=subject,
             expected_reset_revision=0,
             turn=_turn(f"turn-retention-{index}"),
-            proposal=None,
-            memory_id=None,
             occurred_at=old_base + timedelta(minutes=index),
         )
 
@@ -294,14 +289,14 @@ async def test_development_receipts_survive_evidence_compaction_and_pruning() ->
         for episode in store._episodes[subject]
         for turn_id in episode.source_turn_ids
     }
-    assert "turn-source" not in retained_evidence_ids
+    assert "turn-source" in retained_evidence_ids
+    assert len(store._turns[subject]) == 257
+    assert store._episodes[subject] == []
     with pytest.raises(ValueError, match="already committed"):
         await store.commit_delivered_turn(
             subject=subject,
             expected_reset_revision=0,
             turn=_turn("turn-source"),
-            proposal=None,
-            memory_id=None,
         )
 
     exact_retry = await store.apply_dialogue_frame_update(

@@ -49,8 +49,6 @@ async def _commit_turn(
         subject=subject,
         expected_reset_revision=reset_revision,
         turn=_turn(turn_id),
-        proposal=None,
-        memory_id=None,
         occurred_at=datetime(2026, 9, 8, tzinfo=UTC),
     )
 
@@ -558,7 +556,9 @@ async def test_subject_isolation_and_reset_clear_all_semantic_state() -> None:
 
     receipt = await store.reset_conversation(subject="child:a")
     assert receipt.revision == 1
-    snapshot = await store.load_snapshot(subject="child:a", age_band=AgeBand.MIDDLE_CHILDHOOD)
+    snapshot = await store.load_snapshot(
+        subject="child:a", age_band=AgeBand.MIDDLE_CHILDHOOD
+    )
     assert snapshot.dialogue_frame.revision == 0
     assert _records(store, "child:a") == ()
     await _commit_turn(store, "turn-new", subject="child:a", reset_revision=1)
@@ -608,7 +608,11 @@ async def test_semantic_journal_search_active_events_across_all_families() -> No
         family="canvasReference",
         semantic_key="orbit_diagram",
         canvas_references=[
-            {"sceneId": "scene-orbit", "sceneRevision": 1, "relation": "solar system view"}
+            {
+                "sceneId": "scene-orbit",
+                "sceneRevision": 1,
+                "relation": "solar system view",
+            }
         ],
     )
 
@@ -635,14 +639,19 @@ async def test_semantic_journal_search_active_events_across_all_families() -> No
     )
     assert len(candidates_storms) == 1
     assert candidates_storms[0].source_id == created_events["userPreference"].event_id
-    assert candidates_storms[0].source_kind == MemoryCandidateSourceKind.SEMANTIC_JOURNAL
+    assert (
+        candidates_storms[0].source_kind == MemoryCandidateSourceKind.SEMANTIC_JOURNAL
+    )
     assert candidates_storms[0].source_kind == "semanticJournal"
-    assert candidates_storms[0].reference_text == "The child prefers exploring Jupiter's storms."
+    assert (
+        candidates_storms[0].reference_text
+        == "The child prefers exploring Jupiter's storms."
+    )
     assert candidates_storms[0].source_turn_ids == ["turn-1"]
     assert candidates_storms[0].started_at is not None
     assert candidates_storms[0].started_at.tzinfo is not None
     assert candidates_storms[0].ended_at == candidates_storms[0].started_at
-    assert candidates_storms[0].timezone_ids == []
+    assert candidates_storms[0].timezone_ids == ["UTC"]
     assert candidates_storms[0].relevance > 0
 
     # Jupiter matches both the raw turn and the journal event
@@ -650,9 +659,11 @@ async def test_semantic_journal_search_active_events_across_all_families() -> No
         subject=subject,
         query="Jupiter storms",
     )
-    assert len(candidates_both) == 2
+    assert len(candidates_both) == 1
     journal_cands = [
-        c for c in candidates_both if c.source_kind == MemoryCandidateSourceKind.SEMANTIC_JOURNAL
+        c
+        for c in candidates_both
+        if c.source_kind == MemoryCandidateSourceKind.SEMANTIC_JOURNAL
     ]
     assert len(journal_cands) == 1
     assert journal_cands[0].source_id == created_events["userPreference"].event_id
@@ -784,7 +795,9 @@ async def test_semantic_journal_search_reset_isolation() -> None:
     assert len(post_reset_search) == 0
 
 
-async def test_semantic_journal_search_bounded_and_ranked_with_other_candidates() -> None:
+async def test_semantic_journal_search_bounded_and_ranked_with_other_candidates() -> (
+    None
+):
     store = DevelopmentAuthoritativeMemoryStore()
     subject = "child:ranking-bounds"
     now = datetime.now(UTC)
@@ -804,8 +817,6 @@ async def test_semantic_journal_search_bounded_and_ranked_with_other_candidates(
                 "terminal": "completed",
             }
         ),
-        proposal=None,
-        memory_id=None,
         occurred_at=now,
         timezone_id="UTC",
     )
@@ -849,10 +860,11 @@ async def test_semantic_journal_search_bounded_and_ranked_with_other_candidates(
         query="space telescope",
         limit=5,
     )
-    assert len(all_candidates) == 4
+    # Three journal projections share one source turn, so only one is returned.
+    assert len(all_candidates) == 2
     assert all_candidates[0].source_kind == MemoryCandidateSourceKind.RAW_EVENT
     assert all_candidates[0].source_id == "turn-raw-strong"
     assert all_candidates[1].source_kind == MemoryCandidateSourceKind.SEMANTIC_JOURNAL
-    assert all_candidates[2].source_kind == MemoryCandidateSourceKind.SEMANTIC_JOURNAL
-    assert all_candidates[3].source_kind == MemoryCandidateSourceKind.SEMANTIC_JOURNAL
-
+    assert set(all_candidates[0].source_turn_ids).isdisjoint(
+        all_candidates[1].source_turn_ids
+    )

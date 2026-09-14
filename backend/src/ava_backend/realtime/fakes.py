@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import AsyncIterator, Awaitable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass
 
 from ..canvas.svg_workspace import RecordedSvgCanvasInteraction
@@ -174,10 +174,7 @@ class DeterministicRealtimePlanProvider:
         self.yield_count = 0
         self.cancelled_turn_ids: list[str] = []
         self.completed_canvas_outputs: list[
-            (
-                InteractiveCanvasToolOutputV4
-                | InteractiveCanvasCancellationToolOutputV4
-            )
+            (InteractiveCanvasToolOutputV4 | InteractiveCanvasCancellationToolOutputV4)
         ] = []
         self.completed_utility_outputs: list[RealtimeUtilityToolOutputV4] = []
         self.completed_manage_canvas_presentation_outputs: list[
@@ -461,8 +458,7 @@ class DeterministicRealtimePlanProvider:
         turn_id: str,
         call_id: str,
         output: (
-            InteractiveCanvasToolOutputV4
-            | InteractiveCanvasCancellationToolOutputV4
+            InteractiveCanvasToolOutputV4 | InteractiveCanvasCancellationToolOutputV4
         ),
     ) -> None:
         if not turn_id:
@@ -491,11 +487,14 @@ class DeterministicRealtimePlanProvider:
         call_id: str,
         output: RealtimeUtilityToolOutputV4,
         harness: RealtimeHarness,
+        on_result_created: Callable[[], None] | None = None,
     ) -> None:
         del harness
         if not turn_id or not call_id:
             raise ValueError("utility completion requires turn and call identity")
         self.completed_utility_outputs.append(output)
+        if on_result_created is not None:
+            on_result_created()
         await asyncio.sleep(0)
 
     async def request_canvas_interaction_response(

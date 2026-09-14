@@ -541,8 +541,8 @@ class SvgCanvasSessionState:
         )
 
     def _render_workspace_header(self) -> str:
-        if not self._workspace.navigation_ready:
-            return '<canvas retained_count="0" focused_position="none"/>'
+        if not self._workspace.navigation_ready or not self._workspace.manifest_scenes:
+            return ""
         rows = self._workspace.manifest_scenes
         focused = self.focused_scene
         focused_id = focused.scene_id if focused else None
@@ -591,6 +591,13 @@ class SvgCanvasSessionState:
         pending_visual: str = "",
     ) -> str:
         focused = self.focused_scene
+        if not (
+            self._workspace.manifest_scenes
+            or focused is not None
+            or pending_visual
+            or self._presentation_visible
+        ):
+            return ""
         prefix = '<canvas_context trust="backend_semantic_canvas_metadata">'
         suffix = "</canvas_context>"
         presentation = (

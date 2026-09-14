@@ -25,12 +25,12 @@ from ava_backend.realtime.provider_session import (
 NOW = datetime(2026, 9, 9, 6, 30, tzinfo=UTC)
 CANVAS_A = None
 CANVAS_B = (
-    '<active_canvas trust="validated_scene_data" scene_id="scene-b" '
-    'revision="1">Scene B</active_canvas>'
+    '<canvas_context trust="backend_semantic_canvas_metadata" scene_id="scene-b" '
+    'revision="1">Scene B</canvas_context>'
 )
 CANVAS_C = (
-    '<active_canvas trust="validated_scene_data" scene_id="scene-c" '
-    'revision="1">Scene C</active_canvas>'
+    '<canvas_context trust="backend_semantic_canvas_metadata" scene_id="scene-c" '
+    'revision="1">Scene C</canvas_context>'
 )
 
 
@@ -172,7 +172,6 @@ def _coordinator(
     coordinator._current_time_factory = lambda: NOW
     coordinator._memory_snapshot = SimpleNamespace()
     coordinator._dialogue_frame = DialogueFrame()
-    coordinator._warm_memories = ()
     coordinator._harness = _initial_harness()
     coordinator._pending_harness = None
     coordinator._pending_focus_revision = None
@@ -252,6 +251,43 @@ async def test_real_dialogue_frame_change_attempts_provider_install_once() -> No
 
     assert len(provider.prepare_calls) == 1
     assert coordinator.harness.context.build_id == "ctx-2"
+
+
+async def test_semantic_removal_installs_sparse_context_and_only_equivalence_is_suppressed() -> (
+    None
+):
+    provider = _ContextProvider(
+        statuses=(
+            RealtimeContextInstallationStatus.INSTALLED,
+            RealtimeContextInstallationStatus.INSTALLED,
+        )
+    )
+    coordinator = _coordinator(provider)
+    jobs = cast(_CanvasJobs, coordinator._canvas_jobs)
+    coordinator._dialogue_frame = DialogueFrame.model_validate(
+        {"revision": 1, "activeTopics": ["Saturn"]}
+    )
+    jobs.context = CANVAS_B
+    await coordinator._refresh_canvas_context(
+        reason=DynamicContextBuildReason.TURN_COMMITTED
+    )
+    populated = coordinator.harness.context
+    coordinator._dialogue_frame = DialogueFrame(revision=2)
+    jobs.context = None
+    await coordinator._refresh_canvas_context(
+        reason=DynamicContextBuildReason.TURN_COMMITTED
+    )
+    empty = coordinator.harness.context
+    assert len(provider.prepare_calls) == 2
+    assert empty.content_fingerprint != populated.content_fingerprint
+    assert "Saturn" not in empty.content
+    assert "dialogue_frame" not in empty.content
+    assert "canvas_context" not in empty.content
+    assert provider.active_context_build_id == empty.build_id
+    await coordinator._refresh_canvas_context(
+        reason=DynamicContextBuildReason.CANVAS_PRESENTATION_CHANGED
+    )
+    assert len(provider.prepare_calls) == 2
 
 
 async def test_real_canvas_change_attempts_provider_install_once() -> None:

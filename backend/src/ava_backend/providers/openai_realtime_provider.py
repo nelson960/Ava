@@ -1604,6 +1604,7 @@ class _OpenAIRealtimeEventChannel:
         call_id: str,
         output: RealtimeUtilityToolOutputV4,
         harness: RealtimeHarness,
+        on_result_created: Callable[[], None] | None = None,
     ) -> None:
         if self._closed:
             raise OpenAIRealtimeProtocolError(
@@ -1634,6 +1635,8 @@ class _OpenAIRealtimeEventChannel:
         )
         self._completed_utility_call_ids.add(call_id)
         self._pending_utility_call_id = None
+        if on_result_created is not None:
+            on_result_created()
         rejected = isinstance(output, RejectedUtilityToolOutputV4)
         response: dict[str, object] = {
             "conversation": "auto",
@@ -4563,13 +4566,11 @@ class _OpenAIRealtimeEventChannel:
             function_call_name: str | None = None
             function_call_arguments_chunks: list[str] = []
             call_count = 0
-            observed_unexpected_private_text = False
             semantic_validation_error: (
                 OpenAIRealtimeProtocolError
                 | RealtimeProviderResponseIncompleteError
                 | None
             ) = None
-            terminal_observed = False
             try:
                 while True:
                     try:
@@ -4596,7 +4597,6 @@ class _OpenAIRealtimeEventChannel:
                     event = value
                     event_type = _event_type(event)
                     if event_type == "error":
-                        terminal_observed = True
                         registration.terminal_observed = True
                         raise _provider_error(event)
                     resp_id = _response_id_from_event(event)
@@ -4650,16 +4650,16 @@ class _OpenAIRealtimeEventChannel:
                                         f"semantic capture called unexpected tool {name!r}"
                                     )
                             elif item_type == "message":
-                                observed_unexpected_private_text = True
+                                pass  # Private prose is not semantic capture output.
                             else:
                                 if semantic_validation_error is None:
                                     semantic_validation_error = OpenAIRealtimeProtocolError(
                                         f"semantic capture emitted unexpected item type {item_type!r}"
                                     )
                     elif event_type == "response.output_text.delta":
-                        observed_unexpected_private_text = True
+                        pass
                     elif event_type == "response.output_text.done":
-                        observed_unexpected_private_text = True
+                        pass
                     elif event_type == "response.function_call_arguments.delta":
                         delta = event.get("delta")
                         if isinstance(delta, str) and call_count == 1:
@@ -4686,7 +4686,6 @@ class _OpenAIRealtimeEventChannel:
                             ):
                                 function_call_arguments_chunks.append(args)
                     elif event_type == "response.done":
-                        terminal_observed = True
                         registration.terminal_observed = True
                         resp_obj = event.get("response")
                         status = (
@@ -4842,13 +4841,10 @@ def build_semantic_capture_instructions(evidence: SemanticCaptureEvidence) -> st
         f"- Spoken Response (Delivered Prefix): {json.dumps(evidence.spoken_response_prefix, ensure_ascii=False) if evidence.spoken_response_prefix is not None else 'None'}",
         f"- Interrupted: {'Yes' if evidence.interrupted else 'No'}",
     ]
-    if evidence.settled_tool_outcomes:
+    if evidence.tool_exchanges:
         lines.append("- Tool Outcomes:")
-        for outcome in evidence.settled_tool_outcomes:
-            detail_str = f" ({outcome.detail})" if outcome.detail else ""
-            lines.append(
-                f"  * {outcome.tool_name} [call_id={outcome.call_id}]: {outcome.outcome}{detail_str}"
-            )
+        for exchange in evidence.tool_exchanges:
+            lines.append(exchange.model_dump_json(by_alias=True, exclude_none=True))
     else:
         lines.append("- Tool Outcomes: None")
     lines.extend(
@@ -4858,6 +4854,7 @@ def build_semantic_capture_instructions(evidence: SemanticCaptureEvidence) -> st
             "1. If the turn contains no meaningful dialogue progression, new user facts, new preferences, or commitments, emit disposition 'noChange' and omit dialogueFrame and journalEvents.",
             "2. If dialogue state progressed (new topic, new goal, answered question, unresolved entities changed), provide the complete replacement working dialogueFrame. All DialogueFrame collections must be ordered highest-current-relevance first. DialogueFrame text items must be concise and within the existing 160-character bound.",
             "3. If durable user preferences, facts, commitments, or canvas references emerged, provide 1 to 4 journalEvents drafts.",
+            "Retrieved search_memory references are historical evidence, not new child assertions. Retrieval alone must not create a new Journal fact. Only current-turn evidence establishing a new or changed fact, preference, commitment or Canvas relation warrants a new event.",
             "4. If both frame and journal changed, include both. If neither changed, emit 'noChange'.",
         ]
     )
@@ -5244,12 +5241,14 @@ class OpenAIRealtimeProviderSession:
         call_id: str,
         output: RealtimeUtilityToolOutputV4,
         harness: RealtimeHarness,
+        on_result_created: Callable[[], None] | None = None,
     ) -> None:
         await self._require_channel().complete_utility_tool(
             turn_id=turn_id,
             call_id=call_id,
             output=output,
             harness=harness,
+            on_result_created=on_result_created,
         )
 
     async def request_canvas_interaction_response(

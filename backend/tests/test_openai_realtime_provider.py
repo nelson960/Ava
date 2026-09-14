@@ -47,8 +47,6 @@ from ava_backend.realtime.memory import (
     DialogueFrameState,
     SemanticCaptureDisposition,
     SemanticCaptureFunctionArguments,
-    SemanticCaptureJournalDraft,
-    SemanticJournalEventFamily,
 )
 from ava_backend.realtime.provider_session import (
     RealtimeContextInstallationStatus,
@@ -572,7 +570,7 @@ async def test_successful_canvas_action_only_stops_after_one_function_output(
     arguments = json.dumps(
         {
             "operation": operation,
-            **({"targetSceneId": "scene-retained"} if operation == "revise" else {}),
+            **({"selector": "current"} if operation == "revise" else {}),
             "brief": "Show the water cycle.",
             "interactionMode": "none",
             "continuousControl": "none",
@@ -1130,7 +1128,7 @@ async def test_canvas_action_only_does_not_contaminate_same_channel_continue_cal
         ),
         (
             INTERACTIVE_CANVAS_TOOL_NAME,
-            '{"operation":"revise","targetSceneId":"scene-retained","brief":"Add rain.",'
+            '{"operation":"revise","selector":"current","brief":"Add rain.",'
             '"interactionMode":"none","continuousControl":"none",'
             '"completion":"requestComplete"}',
         ),
@@ -2847,7 +2845,7 @@ async def test_canvas_call_gets_one_output_then_tool_disabled_continuation(
     arguments = json.dumps(
         {
             "operation": operation,
-            **({"targetSceneId": "scene-retained"} if operation == "revise" else {}),
+            **({"selector": "current"} if operation == "revise" else {}),
             "brief": brief_sentinel,
             "interactionMode": "explore",
             "continuousControl": "none",
@@ -2915,7 +2913,7 @@ async def test_canvas_call_gets_one_output_then_tool_disabled_continuation(
         if record.getMessage().startswith("openai_realtime_canvas_disposition_resolved")
     )
     assert disposition["requestedCompletion"] == "needsResultReasoning"
-    assert disposition["toolResultStatus"] == "ready"
+    assert disposition["toolResultStatus"] == "accepted"
     assert disposition["continuationCreated"] is True
     assert channel.last_usage is not None
     assert channel.last_usage.total_tokens == 23
@@ -6738,15 +6736,21 @@ async def test_search_memory_exact_output_defers_continuation_without_duplicate_
         }
     )
     await socket.wait_received(previous_received + 1)
+    observed_results: list[SearchMemoryToolOutputV4] = []
     completion = asyncio.create_task(
         channel.complete_utility_tool(
             turn_id="turn-search-output-capacity",
             call_id=call.call_id,
             output=output,
             harness=_harness(),
+            on_result_created=lambda: observed_results.append(output),
         )
     )
     await waiter_entered.wait()
+
+    # Persistence can settle now, even while continuation admission is blocked.
+    assert observed_results == [output]
+    assert not completion.done()
 
     function_outputs = [
         event
@@ -7119,6 +7123,10 @@ async def test_semantic_capture_payload_is_hermetic() -> None:
     response_spec = sent_create["response"]
     assert isinstance(response_spec, dict)
     assert response_spec["conversation"] == "none"
+    assert (
+        "Retrieval alone must not create a new Journal fact."
+        in response_spec["instructions"]
+    )
     assert response_spec["input"] == []
     assert response_spec["output_modalities"] == ["text"]
     assert "modalities" not in response_spec
