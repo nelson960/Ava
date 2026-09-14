@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
+from html import escape
 import hashlib
 import json
 from collections.abc import Callable
@@ -118,6 +119,27 @@ class CanvasSceneEvictedTelemetryEvent:
 CanvasSceneEvictionTelemetrySink = Callable[[CanvasSceneEvictedTelemetryEvent], None]
 
 
+def normalize_semantic_title(value: str) -> str:
+    return " ".join(value.split()).casefold()
+
+
+_MODEL_FACING_TITLE_MAX_RENDERED_CHARACTERS = 56
+
+
+def _bounded_model_facing_text(value: str, *, max_rendered_characters: int) -> str:
+    """Keep a semantic label small without returning an invalid XML value."""
+
+    rendered: list[str] = []
+    rendered_length = 0
+    for character in value:
+        escaped = escape(character, quote=True)
+        if rendered_length + len(escaped) > max_rendered_characters:
+            break
+        rendered.append(character)
+        rendered_length += len(escaped)
+    return "".join(rendered)
+
+
 def _log_canvas_scene_evicted(event: CanvasSceneEvictedTelemetryEvent) -> None:
     LOGGER.info("canvas_scene_evicted", extra={"ava_context": event.as_context()})
 
@@ -129,6 +151,16 @@ class CanvasNavigationDirection(StrEnum):
     LAST = "last"
 
 
+class CanvasSceneSelector(StrEnum):
+    CURRENT = "current"
+    NEXT = "next"
+    PREVIOUS = "previous"
+    FIRST = "first"
+    LAST = "last"
+    POSITION = "position"
+    TITLE = "title"
+
+
 @dataclass(frozen=True, slots=True)
 class CanvasNavigationResolution:
     changed: bool
@@ -138,6 +170,20 @@ class CanvasNavigationResolution:
     total: int
     has_previous: bool
     has_next: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CanvasSceneResolution:
+    """One semantic selector resolved against one canonical workspace snapshot."""
+
+    reason: str | None
+    scene: CanvasWorkspaceManifestScene | None
+    position: int | None
+    total: int
+    has_previous: bool
+    has_next: bool
+    workspace_epoch: int
+    workspace_revision: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,6 +308,81 @@ class SvgCanvasWorkspace:
     @property
     def manifest_scenes(self) -> tuple[CanvasWorkspaceManifestScene, ...]:
         return tuple(self._manifest_scenes)
+
+    def model_facing_titles(self) -> dict[str, str]:
+        """Return the selector-safe labels for the current retained directory.
+
+        The label is deliberately derived only from durable manifest data.  A
+        truncated or duplicate canonical title receives its bounded retained
+        position as a suffix,
+        so the model never sees a title which the presentation adapter cannot
+        map back to exactly one retained manifest row.
+        """
+
+        base_titles = {
+            row.scene_id: _bounded_model_facing_text(
+                row.title,
+                max_rendered_characters=_MODEL_FACING_TITLE_MAX_RENDERED_CHARACTERS,
+            )
+            for row in self._manifest_scenes
+        }
+        normalized_counts: dict[str, int] = {}
+        for title in base_titles.values():
+            normalized = normalize_semantic_title(title)
+            normalized_counts[normalized] = normalized_counts.get(normalized, 0) + 1
+
+        positions = {
+            row.scene_id: position
+            for position, row in enumerate(self._manifest_scenes, start=1)
+        }
+        labels: dict[str, str] = {}
+        suffixed: set[str] = set()
+        for row in self._manifest_scenes:
+            base = base_titles[row.scene_id]
+            needs_suffix = (
+                base != row.title
+                or normalized_counts[normalize_semantic_title(base)] > 1
+            )
+            if not needs_suffix:
+                labels[row.scene_id] = base
+                continue
+            suffix = f" [position {positions[row.scene_id]}]"
+            labels[row.scene_id] = (
+                _bounded_model_facing_text(
+                    row.title,
+                    max_rendered_characters=(
+                        _MODEL_FACING_TITLE_MAX_RENDERED_CHARACTERS - len(suffix)
+                    ),
+                )
+                + suffix
+            )
+            suffixed.add(row.scene_id)
+
+        # A canonical title can itself equal another row's generated label.
+        # Add the same stable retained-position suffix to every remaining collision
+        # so an emitted label always identifies exactly one retained row.
+        label_counts: dict[str, int] = {}
+        for label in labels.values():
+            normalized = normalize_semantic_title(label)
+            label_counts[normalized] = label_counts.get(normalized, 0) + 1
+        for row in self._manifest_scenes:
+            label = labels[row.scene_id]
+            if (
+                label_counts[normalize_semantic_title(label)] == 1
+                or row.scene_id in suffixed
+            ):
+                continue
+            suffix = f" [position {positions[row.scene_id]}]"
+            labels[row.scene_id] = (
+                _bounded_model_facing_text(
+                    row.title,
+                    max_rendered_characters=(
+                        _MODEL_FACING_TITLE_MAX_RENDERED_CHARACTERS - len(suffix)
+                    ),
+                )
+                + suffix
+            )
+        return labels
 
     @property
     def last_structural_mutation(self) -> CanvasWorkspaceStructuralMutation | None:
@@ -452,6 +573,94 @@ class SvgCanvasWorkspace:
             target_index < total - 1,
         )
 
+    def resolve_scene_selector(
+        self,
+        selector: CanvasSceneSelector,
+        *,
+        position: int | None = None,
+        title: str | None = None,
+    ) -> CanvasSceneResolution:
+        """Resolve model/UI semantic intent without exposing identity to either."""
+
+        selector = CanvasSceneSelector(selector)
+        if selector is CanvasSceneSelector.CURRENT:
+            if not self._navigation_ready:
+                return self._selector_failure("workspaceNotSynchronized")
+            focused = self.current
+            if focused is None:
+                return self._selector_failure("noFocusedScene")
+            row = self.manifest_scene(focused.scene_id)
+            if row is None:
+                return self._selector_failure("noFocusedScene")
+            return self._selector_success(row)
+        if not self._navigation_ready:
+            return self._selector_failure("workspaceNotSynchronized")
+        if selector in {
+            CanvasSceneSelector.NEXT,
+            CanvasSceneSelector.PREVIOUS,
+            CanvasSceneSelector.FIRST,
+            CanvasSceneSelector.LAST,
+        }:
+            navigation = self.resolve_navigation(CanvasNavigationDirection(selector))
+            if navigation.reason is not None:
+                return self._selector_failure(navigation.reason)
+            assert navigation.scene is not None
+            return self._selector_success(navigation.scene)
+        if selector is CanvasSceneSelector.POSITION:
+            if (
+                position is None
+                or position < 1
+                or position > len(self._manifest_scenes)
+            ):
+                return self._selector_failure("positionOutOfRange")
+            return self._selector_success(self._manifest_scenes[position - 1])
+        assert selector is CanvasSceneSelector.TITLE
+        normalized = normalize_semantic_title(title or "")
+        model_titles = self.model_facing_titles()
+        matches = [
+            row
+            for row in self._manifest_scenes
+            if normalize_semantic_title(model_titles[row.scene_id]) == normalized
+        ]
+        if not matches:
+            matches = [
+                row
+                for row in self._manifest_scenes
+                if normalize_semantic_title(row.title) == normalized
+            ]
+        if not matches:
+            return self._selector_failure("titleNotFound")
+        if len(matches) != 1:
+            return self._selector_failure("ambiguousTitle")
+        return self._selector_success(matches[0])
+
+    def _selector_success(
+        self, row: CanvasWorkspaceManifestScene
+    ) -> CanvasSceneResolution:
+        position = self._manifest_scenes.index(row) + 1
+        return CanvasSceneResolution(
+            None,
+            row,
+            position,
+            len(self._manifest_scenes),
+            position > 1,
+            position < len(self._manifest_scenes),
+            self._workspace_epoch,
+            self._workspace_revision,
+        )
+
+    def _selector_failure(self, reason: str) -> CanvasSceneResolution:
+        return CanvasSceneResolution(
+            reason,
+            None,
+            None,
+            self.scene_count,
+            False,
+            False,
+            self._workspace_epoch,
+            self._workspace_revision,
+        )
+
     @property
     def latest_created_scene_id(self) -> str | None:
         if not self._manifest_scenes:
@@ -496,8 +705,8 @@ class SvgCanvasWorkspace:
 
         return self.focus_retained(scene)
 
-    def validate_retained_focus(self, scene: ActiveSvgCanvasScene) -> None:
-        """Validate one retained scene for runtime focus without mutating workspace."""
+    def validate_retained_scene(self, scene: ActiveSvgCanvasScene) -> None:
+        """Validate one retained scene against workspace manifest and cache integrity."""
 
         if scene.revision < 1 or scene.revision > 10_001:
             raise SvgCanvasWorkspaceError("restored canvas revision is invalid")
@@ -531,25 +740,49 @@ class SvgCanvasWorkspace:
                     "conflicting canvas scene revision or identity cannot be focused"
                 )
 
+    def validate_retained_focus(self, scene: ActiveSvgCanvasScene) -> None:
+        """Validate one retained scene for runtime focus without mutating workspace."""
+
+        self.validate_retained_scene(scene)
+
+    def commit_retained_scene(
+        self, scene: ActiveSvgCanvasScene
+    ) -> ActiveSvgCanvasScene:
+        """Synchronously commit a pre-validated retained scene into cache without mutating focus."""
+
+        existing = self.scene(scene.scene_id)
+        if existing is not None:
+            return existing
+
+        if len(self._scenes) >= self.maximum_scene_count:
+            evict_index = 0
+            if (
+                self._focused_scene is not None
+                and self._scenes[0].scene_id == self._focused_scene.scene_id
+                and len(self._scenes) > 1
+            ):
+                evict_index = 1
+            evicted = self._scenes.pop(evict_index)
+            self._scene_recency.pop(evicted.scene_id, None)
+        self._scenes.append(scene)
+        self._record_scene_recency(scene.scene_id)
+        return scene
+
+    def hydrate_retained(self, scene: ActiveSvgCanvasScene) -> ActiveSvgCanvasScene:
+        """Validate and cache one retained scene without changing focus."""
+
+        self.validate_retained_scene(scene)
+        return self.commit_retained_scene(scene)
+
     def commit_retained_focus(
         self, scene: ActiveSvgCanvasScene
     ) -> ActiveSvgCanvasScene:
         """Synchronously and infallibly commit a pre-validated retained scene focus."""
 
-        existing = self.scene(scene.scene_id)
-        if existing is not None:
-            self._focused_scene = scene
-            self._last_interaction = None
-            return existing
-
-        if not self._navigation_ready and len(self._scenes) >= self.maximum_scene_count:
-            evicted = self._scenes.pop(0)
-            self._scene_recency.pop(evicted.scene_id, None)
-        self._scenes.append(scene)
-        self._record_scene_recency(scene.scene_id)
-        self._focused_scene = scene
+        existing = self.commit_retained_scene(scene)
+        self._focused_scene = existing
         self._last_interaction = None
-        return scene
+        return existing
 
     def focus_retained(self, scene: ActiveSvgCanvasScene) -> ActiveSvgCanvasScene:
         """Focus or hydrate one independently validated retained scene at runtime."""
@@ -679,12 +912,15 @@ class SvgCanvasWorkspace:
                 raise SvgCanvasWorkspaceError(
                     "canonical SVG canvas has no matching revision base"
                 )
+            self._validate_active_execution_ready(scene.generation_id)
             creation_sequence = self._next_creation_sequence
             modification_sequence = self._next_modification_sequence
-            self._next_creation_sequence += 1
-            self._next_modification_sequence += 1
             resulting_workspace_revision = self._workspace_revision + 1
             if self._navigation_ready:
+                if self.manifest_scene(scene.scene_id) is not None:
+                    raise SvgCanvasWorkspaceError(
+                        "canonical SVG canvas scene already exists but is not hydrated"
+                    )
                 scene = replace(
                     scene,
                     workspace_epoch=self._workspace_epoch,
@@ -692,47 +928,119 @@ class SvgCanvasWorkspace:
                     creation_sequence=creation_sequence,
                     modification_sequence=modification_sequence,
                 )
-            self._scenes.append(scene)
-            self._record_scene_recency(scene.scene_id)
-            evicted_scene_id: str | None = None
-            evicted_scene: ActiveSvgCanvasScene | None = None
-            evicted_manifest_scene: CanvasWorkspaceManifestScene | None = None
-            if len(self._scenes) > self.maximum_scene_count:
-                evicted = self._scenes.pop(0)
-                evicted_scene = evicted
-                evicted_scene_id = evicted.scene_id
-                self._scene_recency.pop(evicted.scene_id, None)
-                if self.focused_scene_id == evicted.scene_id:
-                    self._focused_scene = None
-            if self._navigation_ready:
-                self._manifest_scenes.append(
+                evicted_manifest_scene = (
+                    self._manifest_scenes[0]
+                    if len(self._manifest_scenes) >= self.maximum_scene_count
+                    else None
+                )
+                evicted_scene_id = (
+                    evicted_manifest_scene.scene_id
+                    if evicted_manifest_scene is not None
+                    else None
+                )
+                evicted_scene = (
+                    self.scene(evicted_scene_id)
+                    if evicted_scene_id is not None
+                    else None
+                )
+                scene = replace(scene, evicted_scene_id=evicted_scene_id)
+                retained_manifest_scenes = (
+                    self._manifest_scenes[1:]
+                    if evicted_manifest_scene is not None
+                    else list(self._manifest_scenes)
+                )
+                resulting_manifest_scenes = [
+                    *retained_manifest_scenes,
                     _manifest_scene_from_active(
                         scene,
                         creation_sequence=creation_sequence,
                         modification_sequence=modification_sequence,
-                    )
+                    ),
+                ]
+                resulting_scenes = [
+                    retained
+                    for retained in self._scenes
+                    if retained.scene_id != evicted_scene_id
+                ]
+                resulting_scenes.append(scene)
+                resulting_scene_recency = dict(self._scene_recency)
+                if evicted_scene_id is not None:
+                    resulting_scene_recency.pop(evicted_scene_id, None)
+                resulting_next_scene_recency = self._next_scene_recency + 1
+                resulting_scene_recency[scene.scene_id] = resulting_next_scene_recency
+                evicted_focused_scene = (
+                    evicted_scene_id is not None
+                    and self.focused_scene_id == evicted_scene_id
                 )
-                if len(self._manifest_scenes) > self.maximum_scene_count:
-                    expected_evicted = self._manifest_scenes.pop(0)
-                    evicted_manifest_scene = expected_evicted
-                    if evicted_scene_id is None:
-                        evicted_scene_id = expected_evicted.scene_id
-                        self._scenes = [
-                            retained
-                            for retained in self._scenes
-                            if retained.scene_id != evicted_scene_id
-                        ]
-                    elif evicted_scene_id != expected_evicted.scene_id:
-                        raise SvgCanvasWorkspaceError(
-                            "hydrated and canonical workspace eviction order diverged"
-                        )
-            self._workspace_revision += 1
-            if self._navigation_ready:
-                scene = replace(scene, evicted_scene_id=evicted_scene_id)
-            self._scenes = [
-                scene if retained.scene_id == scene.scene_id else retained
-                for retained in self._scenes
-            ]
+                resulting_focused_scene = (
+                    None if evicted_focused_scene else self._focused_scene
+                )
+                if foreground:
+                    resulting_focused_scene = scene
+                resulting_manifest = CanvasWorkspaceManifest(
+                    protocol_version=4,
+                    workspace_epoch=self._workspace_epoch,
+                    workspace_revision=resulting_workspace_revision,
+                    next_creation_sequence=creation_sequence + 1,
+                    next_modification_sequence=modification_sequence + 1,
+                    focused_scene_id=(
+                        resulting_focused_scene.scene_id
+                        if resulting_focused_scene is not None
+                        else None
+                    ),
+                    scenes=tuple(resulting_manifest_scenes),
+                )
+                _validate_workspace_manifest(
+                    resulting_manifest,
+                    maximum_scene_count=self.maximum_scene_count,
+                )
+                resulting_structural_digest = _structural_manifest_digest(
+                    resulting_manifest
+                )
+
+                self._next_creation_sequence = creation_sequence + 1
+                self._next_modification_sequence = modification_sequence + 1
+                self._next_scene_recency = resulting_next_scene_recency
+                self._scene_recency = resulting_scene_recency
+                self._scenes = resulting_scenes
+                self._manifest_scenes = resulting_manifest_scenes
+                self._focused_scene = resulting_focused_scene
+                self._workspace_revision = resulting_workspace_revision
+                self._structural_manifest_digest = resulting_structural_digest
+                self._last_structural_mutation = CanvasWorkspaceStructuralMutation(
+                    operation="create",
+                    workspace_epoch=self._workspace_epoch,
+                    workspace_revision=self._workspace_revision,
+                    scene_id=scene.scene_id,
+                    scene_revision=scene.revision,
+                    creation_sequence=creation_sequence,
+                    modification_sequence=modification_sequence,
+                    evicted_scene_id=evicted_scene_id,
+                )
+                if foreground or evicted_focused_scene:
+                    self._last_interaction = None
+                if evicted_manifest_scene is not None:
+                    self._emit_capacity_eviction(
+                        scene_id=evicted_manifest_scene.scene_id,
+                        hydrated_scene=evicted_scene,
+                        manifest_scene=evicted_manifest_scene,
+                    )
+                self._finish_active_execution(scene.generation_id)
+                return scene
+
+            self._next_creation_sequence += 1
+            self._next_modification_sequence += 1
+            self._scenes.append(scene)
+            self._record_scene_recency(scene.scene_id)
+            legacy_evicted_scene_id: str | None = None
+            legacy_evicted_scene: ActiveSvgCanvasScene | None = None
+            if len(self._scenes) > self.maximum_scene_count:
+                legacy_evicted_scene = self._scenes.pop(0)
+                legacy_evicted_scene_id = legacy_evicted_scene.scene_id
+                self._scene_recency.pop(legacy_evicted_scene.scene_id, None)
+                if self.focused_scene_id == legacy_evicted_scene.scene_id:
+                    self._focused_scene = None
+            self._workspace_revision = resulting_workspace_revision
             self._last_structural_mutation = CanvasWorkspaceStructuralMutation(
                 operation="create",
                 workspace_epoch=self._workspace_epoch,
@@ -741,14 +1049,13 @@ class SvgCanvasWorkspace:
                 scene_revision=scene.revision,
                 creation_sequence=creation_sequence,
                 modification_sequence=modification_sequence,
-                evicted_scene_id=evicted_scene_id,
+                evicted_scene_id=legacy_evicted_scene_id,
             )
-            self._refresh_structural_manifest_digest()
-            if evicted_scene_id is not None:
+            if legacy_evicted_scene_id is not None:
                 self._emit_capacity_eviction(
-                    scene_id=evicted_scene_id,
-                    hydrated_scene=evicted_scene,
-                    manifest_scene=evicted_manifest_scene,
+                    scene_id=legacy_evicted_scene_id,
+                    hydrated_scene=legacy_evicted_scene,
+                    manifest_scene=None,
                 )
             if foreground:
                 self._focused_scene = scene
@@ -941,14 +1248,21 @@ class SvgCanvasWorkspace:
         )
 
     def _finish_active_execution(self, generation_id: str) -> None:
+        self._validate_active_execution_ready(generation_id)
         execution = self._executions.get(generation_id)
         if execution is None:
             return
-        if execution.status is not SvgCanvasExecutionStatus.PRESENTED:
+        self.finish_execution(generation_id, SvgCanvasExecutionStatus.ACTIVE)
+
+    def _validate_active_execution_ready(self, generation_id: str) -> None:
+        execution = self._executions.get(generation_id)
+        if (
+            execution is not None
+            and execution.status is not SvgCanvasExecutionStatus.PRESENTED
+        ):
             raise SvgCanvasWorkspaceError(
                 "canvas execution must be presented before activation"
             )
-        self.finish_execution(generation_id, SvgCanvasExecutionStatus.ACTIVE)
 
     def _record_scene_recency(self, scene_id: str) -> None:
         self._next_scene_recency += 1

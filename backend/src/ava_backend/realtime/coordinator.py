@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import json
 import logging
 from builtins import anext
-from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from time import monotonic
 from typing import Literal, TypeAlias, TypeVar, cast
@@ -13,11 +14,19 @@ from zoneinfo import ZoneInfo
 
 from ..canvas.svg_workspace import (
     ActiveSvgCanvasScene,
-    CanvasNavigationDirection,
+    CanvasSceneSelector,
     CanvasWorkspaceManifest,
+    CanvasWorkspaceManifestScene,
     RecordedSvgCanvasInteraction,
+    SvgCanvasWorkspace,
     SvgCanvasWorkspaceError,
+    normalize_semantic_title,
 )
+
+RetainedSceneLoader: TypeAlias = Callable[
+    [CanvasWorkspaceManifestScene],
+    Awaitable[ActiveSvgCanvasScene | None] | ActiveSvgCanvasScene | None,
+]
 from ..diagnostics import new_failure_id
 from ..protocol import AgeBand
 from .bounded_queue import BoundedAsyncQueue, QueueClosed
@@ -48,8 +57,8 @@ from .events_v4 import (
     CanvasInteractionEventV4,
     CanvasPreparationFailedEventV4,
     CanvasPresentationAcknowledgedEventV4,
+    CanvasPresentationRequestedEventV4,
     CanvasPresentationChangedSource,
-    CanvasPresentationUpdatedEventV4,
     CanvasPresentedEventV4,
     CanvasRetainedEventV4,
     CanvasRenderProfileUpdatedEventV4,
@@ -68,9 +77,9 @@ from .memory import (
     ChildTurnTextSource,
     DeliveredCanvasInteraction,
     DeliveredConversationTurn,
-    DeliveredInputKind,
     DeliveredTurnTerminal,
     DialogueFrame,
+    DialogueFrameState,
     DialogueFrameCanvasReference,
     DialogueFrameUpdate,
     DialogueFrameUpdateDecision,
@@ -78,11 +87,15 @@ from .memory import (
     MemoryProposalDecision,
     MemorySearchCandidate,
     MemoryCandidateSourceKind,
+    SemanticCaptureDisposition,
+    SemanticCaptureJournalDraft,
+    SemanticJournalCanvasReference,
+    SemanticJournalEventFamily,
     SemanticMemoryCommitDecision,
     SemanticMemoryCommitStatus,
     SemanticMemoryProposal,
-    SemanticJournalCanvasReference,
     canonical_semantic_memory_proposal_fingerprint,
+    resolve_semantic_journal_proposals,
 )
 from .provider_session import (
     NegotiatedRealtimeCall,
@@ -94,6 +107,8 @@ from .provider_session import (
     RealtimeCommittedInput,
     RealtimeProviderSession,
     RealtimeProviderUnavailableError,
+    SemanticCaptureEvidence,
+    SettledSemanticToolOutcome,
 )
 from .state_machine import RealtimeStateError, RealtimeTurnStateMachine
 from .speech_contract import (
@@ -105,13 +120,19 @@ from .speech_contract import (
 )
 from .svg_canvas_jobs import SvgCanvasJobCoordinator
 from .tool_contract import (
+    CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
     CANVAS_MODEL_SAFE_REJECTION_REASON,
+    CanvasActionCompletion,
+    GET_CURRENT_TIME_TOOL_NAME,
     InteractiveCanvasCancellationToolOutputV4,
+    InteractiveCanvasOperation,
     InteractiveCanvasToolOutputV4,
     InteractiveCanvasToolStatusV4,
     GetCurrentTimeToolOutputV4,
+    INTERACTIVE_CANVAS_TOOL_NAME,
+    MANAGE_CANVAS_PRESENTATION_TOOL_NAME,
     ManageCanvasPresentationAction,
-    ManageCanvasNavigationDirection,
+    ManageCanvasPresentationRequest,
     ManageCanvasPresentationStatus,
     ManageCanvasPresentationToolOutputV4,
     RealtimeGetCurrentTimeToolCall,
@@ -121,6 +142,7 @@ from .tool_contract import (
     RealtimeSearchMemoryToolCall,
     RealtimeUtilityToolKind,
     RejectedUtilityToolOutputV4,
+    SEARCH_MEMORY_TOOL_NAME,
     SearchMemoryReferenceV4,
     SearchMemoryToolOutputV4,
     SearchMemoryToolStatus,
@@ -138,7 +160,9 @@ from .websocket_v4 import (
 )
 
 LOGGER = logging.getLogger("ava_backend.realtime_coordinator")
-RECENT_LIVE_ECHO_SUPPRESSION_TURNS = 8
+
+
+type _ProviderContextEquivalenceKey = tuple[str, str, str, str, str]
 
 
 class TurnContextSynchronizationError(RuntimeError):
@@ -183,12 +207,15 @@ class _PlanningState:
     tool_steps_used: int = 0
     utility_tool_kind: RealtimeUtilityToolKind | None = None
     canvas_terminal_used: bool = False
+    action_only_succeeded: bool = False
+    action_only_rejected: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class _TurnResult:
     segments: tuple[SpeechPhrase, ...]
     child_turn_summary: str
+    action_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,34 +233,8 @@ class _CapturedMemoryCommit:
     delivered_sample_count: int
     terminal: DeliveredTurnTerminal
     transcript_waiter: Awaitable[str | None] | None
-    warm_refresh_revision: int
-    dialogue_frame_update: DialogueFrameUpdate | None = None
-    semantic_memory_proposal: SemanticMemoryProposal | None = None
-
-    def __post_init__(self) -> None:
-        proposal = self.semantic_memory_proposal
-        update = self.dialogue_frame_update
-        if proposal is None and update is not None:
-            proposal = SemanticMemoryProposal.model_validate(
-                {"dialogueFrameUpdate": update.model_dump(mode="json", by_alias=True)}
-            )
-            object.__setattr__(self, "semantic_memory_proposal", proposal)
-        elif proposal is not None:
-            proposal_update = proposal.dialogue_frame_update
-            if update is not None and proposal_update != update:
-                raise ValueError(
-                    "captured semantic proposal and DialogueFrame compatibility "
-                    "view disagree"
-                )
-            if update is None and proposal_update is not None:
-                object.__setattr__(self, "dialogue_frame_update", proposal_update)
-
-
-@dataclass(frozen=True, slots=True)
-class _StagedSemanticMemoryProposal:
-    turn_id: str
-    proposal: SemanticMemoryProposal
-    fingerprint: str
+    settled_tool_outcomes: tuple[SettledSemanticToolOutcome, ...] = ()
+    interrupted: bool = False
 
 
 @dataclass(slots=True)
@@ -241,10 +242,12 @@ class _PendingPresentationCommand:
     command_id: str
     action: ManageCanvasPresentationAction
     target_scene_id: str | None
+    workspace_epoch: int
+    workspace_revision: int
     future: asyncio.Future[ManageCanvasPresentationToolOutputV4]
-    direction: ManageCanvasNavigationDirection | None = None
     changed: bool = True
     superseded: bool = False
+    source: CanvasPresentationChangedSource = CanvasPresentationChangedSource.MODEL
 
 
 class DeterministicRealtimeSessionCoordinator:
@@ -281,6 +284,7 @@ class DeterministicRealtimeSessionCoordinator:
         turn_context_timeout_seconds: float = 90.0,
         context_assembler: DynamicContextAssembler | None = None,
         current_time_factory: OccurrenceTimeFactory = _utc_now,
+        retained_scene_loader: RetainedSceneLoader | None = None,
     ) -> None:
         if not 2_048 <= max_audio_chunk_bytes <= 192_000:
             raise ValueError("max_audio_chunk_bytes must be between 2048 and 192000")
@@ -314,6 +318,7 @@ class DeterministicRealtimeSessionCoordinator:
         self._turn_context_timeout_seconds = turn_context_timeout_seconds
         self._context_assembler = context_assembler or DynamicContextAssembler()
         self._current_time_factory = current_time_factory
+        self._retained_scene_loader = retained_scene_loader
         if persistent and (
             turn_id_factory is None
             or request_id_factory is None
@@ -333,20 +338,14 @@ class DeterministicRealtimeSessionCoordinator:
         self._memory_snapshot: AuthoritativeMemorySnapshot | None = None
         self._memory_reset_revision: int | None = None
         self._dialogue_frame = DialogueFrame()
-        self._staged_semantic_memory_proposal: _StagedSemanticMemoryProposal | None = (
-            None
-        )
+        self._turn_settled_tool_outcomes: list[SettledSemanticToolOutcome] = []
         self._harness: RealtimeHarness | None = None
         self._pending_harness: RealtimeHarness | None = None
         self._pending_focus_revision: int | None = None
         self._pending_context_reason: DynamicContextBuildReason | None = None
         self._context_installation_task: asyncio.Task[None] | None = None
         self._warm_memories: tuple[MemoryReference, ...] = ()
-        self._warm_refresh_revision = 0
         self._context_build_sequence = 0
-        self._recent_live_echo_suppression_turn_ids: deque[str] = deque(
-            maxlen=RECENT_LIVE_ECHO_SUPPRESSION_TURNS
-        )
         self._negotiated_call: NegotiatedRealtimeCall | None = None
         self._sequence = 0
         self._revision = 0
@@ -370,7 +369,14 @@ class DeterministicRealtimeSessionCoordinator:
         self._terminal_failure_code: str | None = None
         self._last_failure_id: str | None = None
         self._last_failure_component: str | None = None
-        self._memory_commit_tasks: dict[str, asyncio.Task[None]] = {}
+        self._memory_commit_queue: asyncio.Queue[_CapturedMemoryCommit | object] = (
+            asyncio.Queue()
+        )
+        self._memory_commit_terminal = object()
+        self._memory_commit_worker_task: asyncio.Task[None] | None = None
+        self._scheduled_memory_commit_turn_ids: set[str] = set()
+        self._last_enqueued_memory_sequence = 0
+        self._current_memory_commit_turn_id: str | None = None
         self._memory_commit_sequence = 0
         self._latest_memory_commit_sequence = 0
         self._turn_occurred_at: datetime | None = None
@@ -387,7 +393,6 @@ class DeterministicRealtimeSessionCoordinator:
         self._focus_build_id_by_revision: dict[int, str] = {}
         self._acknowledged_focus_revision = 0
         self._focus_changed = asyncio.Event()
-        self._presentation_focus_changed = asyncio.Event()
         self._focus_linearization_lock = asyncio.Lock()
         self._turn_context_request: RealtimeCommittedInput | None = None
         self._turn_context_snapshot: (
@@ -438,68 +443,47 @@ class DeterministicRealtimeSessionCoordinator:
             self._dialogue_frame.model_dump(mode="json", by_alias=True)
         )
 
-    def stage_dialogue_frame_update(
+    def _record_tool_outcome(
         self,
         *,
-        turn_id: str,
-        update: DialogueFrameUpdate,
+        tool_name: str,
+        call_id: str,
+        outcome: str,
+        detail: str | None = None,
+        canonical_scene_id: str | None = None,
+        canonical_scene_revision: int | None = None,
     ) -> None:
-        """Retain the M1 frame-only seam through the unified M2 owner."""
-
-        validated = DialogueFrameUpdate.model_validate(
-            update.model_dump(mode="json", by_alias=True)
-        )
-        self.stage_semantic_memory_proposal(
-            turn_id=turn_id,
-            proposal=SemanticMemoryProposal.model_validate(
-                {
-                    "dialogueFrameUpdate": validated.model_dump(
-                        mode="json", by_alias=True
-                    )
-                }
-            ),
+        self._turn_settled_tool_outcomes.append(
+            SettledSemanticToolOutcome(
+                tool_name=tool_name,
+                call_id=call_id,
+                outcome=outcome,
+                detail=detail,
+                canonical_scene_id=canonical_scene_id,
+                canonical_scene_revision=canonical_scene_revision,
+            )
         )
 
-    def stage_semantic_memory_proposal(
+    def _is_canonical_canvas_reference(
         self,
-        *,
-        turn_id: str,
-        proposal: SemanticMemoryProposal,
-    ) -> None:
-        """Stage one immutable transport-neutral proposal for the exact turn."""
-
-        if turn_id != self._turn_id or self._terminal:
-            raise CoordinatorStateError(
-                "semantic memory proposal must belong to the active current turn"
-            )
-        if self._memory_reset_revision is None:
-            raise CoordinatorStateError(
-                "semantic memory proposal cannot stage before memory bootstrap"
-            )
-        validated = SemanticMemoryProposal.model_validate(
-            proposal.model_dump(mode="json", by_alias=True)
+        reference: DialogueFrameCanvasReference | SemanticJournalCanvasReference,
+    ) -> bool:
+        workspace = self._canvas_jobs.state.workspace
+        scene = workspace.scene(reference.scene_id)
+        manifest_scene = workspace.manifest_scene(reference.scene_id)
+        canonical_revision = (
+            scene.revision
+            if scene is not None
+            else (manifest_scene.scene_revision if manifest_scene is not None else None)
         )
-        self._validate_semantic_memory_canvas_references(validated)
-        fingerprint = canonical_semantic_memory_proposal_fingerprint(validated)
-        existing = self._staged_semantic_memory_proposal
-        if existing is not None:
-            if existing.turn_id == turn_id and existing.fingerprint == fingerprint:
-                return
-            raise CoordinatorStateError(
-                "current turn already staged a different semantic memory proposal"
-            )
-        self._staged_semantic_memory_proposal = _StagedSemanticMemoryProposal(
-            turn_id=turn_id,
-            proposal=SemanticMemoryProposal.model_validate(
-                validated.model_dump(mode="json", by_alias=True)
-            ),
-            fingerprint=fingerprint,
+        return (
+            canonical_revision is not None
+            and canonical_revision == reference.scene_revision
         )
 
     def _validate_semantic_memory_canvas_references(
         self, proposal: SemanticMemoryProposal
     ) -> None:
-        workspace = self._canvas_jobs.state.workspace
         references: list[
             DialogueFrameCanvasReference | SemanticJournalCanvasReference
         ] = []
@@ -510,18 +494,7 @@ class DeterministicRealtimeSessionCoordinator:
         for event in proposal.journal_events:
             references.extend(event.canonical_canvas_references)
         for reference in references:
-            scene = workspace.scene(reference.scene_id)
-            manifest_scene = workspace.manifest_scene(reference.scene_id)
-            canonical_revision = (
-                scene.revision
-                if scene is not None
-                else (
-                    manifest_scene.scene_revision
-                    if manifest_scene is not None
-                    else None
-                )
-            )
-            if canonical_revision != reference.scene_revision:
+            if not self._is_canonical_canvas_reference(reference):
                 raise CoordinatorStateError(
                     "semantic memory Canvas reference is not a canonical retained "
                     "scene revision"
@@ -568,6 +541,131 @@ class DeterministicRealtimeSessionCoordinator:
                 "Canvas workspace synchronization must complete before realtime negotiation"
             )
         return self._canvas_jobs.state.workspace.adopt_manifest(manifest)
+
+    def validate_retained_canvas_scene(self, scene: ActiveSvgCanvasScene) -> None:
+        """Verify retained Flutter content against the adopted canonical manifest.
+
+        This intentionally does not hydrate the session workspace or mutate
+        focus.  Startup retains every document as an on-demand backing source;
+        only the focused document is hydrated into the active runtime cache.
+        """
+        if self._closed or self._started or self._negotiated_call is not None:
+            raise CoordinatorStateError(
+                "Canvas retained scene registration must complete before realtime negotiation"
+            )
+        self._canvas_jobs.state.workspace.validate_retained_scene(scene)
+
+    async def ensure_retained_scene_hydrated(
+        self,
+        workspace: SvgCanvasWorkspace,
+        scene_id: str,
+        *,
+        source: str = "realtime",
+    ) -> bool:
+        """Hydrate an unhydrated retained scene on-demand from the backing loader.
+
+        Checks runtime cache first. If missed, invokes retained scene loader,
+        checks snapshot fence, validates against manifest, commits to runtime
+        cache without mutating focus, and re-checks snapshot fence.
+        """
+        if workspace.scene(scene_id) is not None:
+            return True
+
+        manifest_scene = workspace.manifest_scene(scene_id)
+        if manifest_scene is None:
+            LOGGER.warning(
+                "retained_scene_hydration_failed session_id=%s scene_id=%s source=%s reason=%s",
+                self._session_id,
+                scene_id,
+                source,
+                "manifest_missing",
+            )
+            return False
+
+        if self._retained_scene_loader is None:
+            LOGGER.warning(
+                "retained_scene_hydration_failed session_id=%s scene_id=%s source=%s reason=%s",
+                self._session_id,
+                scene_id,
+                source,
+                "no_loader",
+            )
+            return False
+
+        expected_epoch = workspace.workspace_epoch
+        expected_revision = workspace.workspace_revision
+
+        try:
+            loaded = self._retained_scene_loader(manifest_scene)
+            if inspect.isawaitable(loaded):
+                scene = await loaded
+            else:
+                scene = loaded
+        except Exception as exc:
+            LOGGER.warning(
+                "retained_scene_hydration_failed session_id=%s scene_id=%s source=%s reason=%s error=%s",
+                self._session_id,
+                scene_id,
+                source,
+                "loader_error",
+                exc,
+            )
+            return False
+
+        if scene is None:
+            LOGGER.warning(
+                "retained_scene_hydration_failed session_id=%s scene_id=%s source=%s reason=%s",
+                self._session_id,
+                scene_id,
+                source,
+                "scene_none",
+            )
+            return False
+
+        if (
+            workspace.workspace_epoch != expected_epoch
+            or workspace.workspace_revision != expected_revision
+        ):
+            LOGGER.warning(
+                "retained_scene_hydration_snapshot_conflict session_id=%s scene_id=%s source=%s "
+                "expected_epoch=%s actual_epoch=%s expected_revision=%s actual_revision=%s",
+                self._session_id,
+                scene_id,
+                source,
+                expected_epoch,
+                workspace.workspace_epoch,
+                expected_revision,
+                workspace.workspace_revision,
+            )
+            raise SvgCanvasWorkspaceError("workspaceChanged")
+
+        workspace.validate_retained_scene(scene)
+        workspace.commit_retained_scene(scene)
+
+        if (
+            workspace.workspace_epoch != expected_epoch
+            or workspace.workspace_revision != expected_revision
+        ):
+            LOGGER.warning(
+                "retained_scene_hydration_snapshot_conflict session_id=%s scene_id=%s source=%s "
+                "expected_epoch=%s actual_epoch=%s expected_revision=%s actual_revision=%s",
+                self._session_id,
+                scene_id,
+                source,
+                expected_epoch,
+                workspace.workspace_epoch,
+                expected_revision,
+                workspace.workspace_revision,
+            )
+            raise SvgCanvasWorkspaceError("workspaceChanged")
+
+        LOGGER.info(
+            "retained_scene_hydrated_on_demand session_id=%s scene_id=%s source=%s",
+            self._session_id,
+            scene_id,
+            source,
+        )
+        return True
 
     async def focus_canvas(
         self, scene: ActiveSvgCanvasScene, *, focus_revision: int
@@ -620,16 +718,11 @@ class DeterministicRealtimeSessionCoordinator:
                 )
                 return
             state.focus_retained(scene, focus_revision=focus_revision)
-            self._signal_presentation_focus_changed()
             for command_id, pending in tuple(
                 self._pending_presentation_commands.items()
             ):
                 incompatible_show = (
-                    pending.action
-                    in {
-                        ManageCanvasPresentationAction.SHOW,
-                        ManageCanvasPresentationAction.NAVIGATE,
-                    }
+                    pending.action == ManageCanvasPresentationAction.SHOW
                     and pending.target_scene_id != scene.scene_id
                 )
                 incompatible_hide = (
@@ -926,12 +1019,10 @@ class DeterministicRealtimeSessionCoordinator:
             if current is not None and reset_revision <= current:
                 return
             self._memory_reset_revision = reset_revision
-            self._warm_refresh_revision += 1
             self._warm_memories = ()
             self._dialogue_frame = DialogueFrame()
-            self._staged_semantic_memory_proposal = None
+            self._turn_settled_tool_outcomes = []
             await self._canvas_jobs.reset_conversation()
-            self._recent_live_echo_suppression_turn_ids.clear()
             self._last_memory_decision = None
             if self._harness is not None and not self._closed:
                 await self._refresh_canvas_context_locked(
@@ -965,7 +1056,7 @@ class DeterministicRealtimeSessionCoordinator:
                 (monotonic() - memory_started) * 1000,
             )
             harness_started = monotonic()
-            self._warm_memories = _stable_memory_references(snapshot)
+            self._warm_memories = ()
             bootstrap_current_time_utc = self._current_time_factory()
             dynamic_context = self._context_assembler.assemble(
                 build_id=self._next_context_build_id(),
@@ -1006,6 +1097,15 @@ class DeterministicRealtimeSessionCoordinator:
                 (monotonic() - negotiation_started) * 1000,
             )
             prompt_started = monotonic()
+            bootstrap_focus_revision = self._canvas_jobs.state.focus_revision
+            self._log_context_installation(
+                harness=harness,
+                reason=DynamicContextBuildReason.SESSION_BOOTSTRAP,
+                status="providerAttempted",
+                provider_call_id=negotiated.provider_call_id,
+                pending_build_id=harness.context.build_id,
+                focus_revision=bootstrap_focus_revision,
+            )
             try:
                 installation_status = await self._realtime.prepare(harness=harness)
             except Exception as error:
@@ -1015,6 +1115,8 @@ class DeterministicRealtimeSessionCoordinator:
                     status="failed",
                     provider_call_id=negotiated.provider_call_id,
                     error_type=type(error).__name__,
+                    pending_build_id=harness.context.build_id,
+                    focus_revision=bootstrap_focus_revision,
                 )
                 raise
             self._log_context_installation(
@@ -1022,6 +1124,8 @@ class DeterministicRealtimeSessionCoordinator:
                 reason=DynamicContextBuildReason.SESSION_BOOTSTRAP,
                 status=str(installation_status),
                 provider_call_id=negotiated.provider_call_id,
+                effective_build_id=harness.context.build_id,
+                focus_revision=bootstrap_focus_revision,
             )
             LOGGER.info(
                 "realtime_stage session_id=%s request_id=%s stage=prompt.install "
@@ -1035,15 +1139,6 @@ class DeterministicRealtimeSessionCoordinator:
             self._last_error = error
             raise
         self._harness = harness
-        bootstrap_speech_turn_ids = [
-            turn.turn_id
-            for turn in snapshot.delivered_turns
-            if turn.input_kind == DeliveredInputKind.SPEECH
-        ]
-        if dynamic_context.included_bootstrap_turns:
-            self._recent_live_echo_suppression_turn_ids.extend(
-                bootstrap_speech_turn_ids[-dynamic_context.included_bootstrap_turns :]
-            )
         self._negotiated_call = negotiated
         LOGGER.info(
             "realtime_session_prepared session_id=%s timezone_id=%s "
@@ -1137,8 +1232,8 @@ class DeterministicRealtimeSessionCoordinator:
                     self._canvas_jobs.state.set_presentation_visible(False)
             return
 
-        if isinstance(event, CanvasPresentationUpdatedEventV4):
-            await self._handle_client_presentation_updated(event)
+        if isinstance(event, CanvasPresentationRequestedEventV4):
+            await self._handle_client_presentation_requested(event)
             return
 
         if isinstance(event, CanvasPresentationAcknowledgedEventV4):
@@ -1875,6 +1970,39 @@ class DeterministicRealtimeSessionCoordinator:
             )
             return
 
+        if (
+            plan is not None
+            and plan.action_only
+            and not plan.segments
+            and not synthesis_started
+        ):
+            if not planning_started:
+                yield self._phase_frame(SpeechPhase.PLANNING)
+            if planning_state.canvas_generation_id is not None:
+                try:
+                    await self._canvas_jobs.request_presentation(
+                        generation_id=planning_state.canvas_generation_id,
+                        presentation_sample_offset=0,
+                    )
+                except Exception as error:
+                    self._last_error = error
+                    failure_id = self._failure_id_factory()
+                    LOGGER.exception(
+                        "canvas_presentation_schedule_failed failure_id=%s "
+                        "session_id=%s turn_id=%s generation_id=%s",
+                        failure_id,
+                        self._session_id,
+                        self._turn_id,
+                        planning_state.canvas_generation_id,
+                    )
+                    raise CoordinatorStateError(
+                        "accepted action-only Canvas presentation could not be "
+                        "scheduled"
+                    ) from error
+            async for frame in self._complete_frames(plan=plan, ledger=ledger):
+                yield frame
+            return
+
         if plan is None or not synthesis_started:
             if self._cancel_event is None:
                 self._cancel_event = CancelTurnEventV4.model_validate(
@@ -2092,7 +2220,7 @@ class DeterministicRealtimeSessionCoordinator:
         self._memory_commit_sequence += 1
         self._latest_memory_commit_sequence = self._memory_commit_sequence
         self._last_memory_decision = None
-        self._staged_semantic_memory_proposal = None
+        self._turn_settled_tool_outcomes = []
         self._turn_id = turn_id_factory()
         self._request_id = request_id_factory()
         self._stream_id = stream_id_factory()
@@ -2149,9 +2277,57 @@ class DeterministicRealtimeSessionCoordinator:
         async with self._focus_linearization_lock:
             focus_revision = self._canvas_jobs.state.focus_revision
             harness = self._build_live_harness(reason=reason)
+            current_harness = self._harness
+            if _provider_context_equivalence_key(
+                harness
+            ) == _provider_context_equivalence_key(
+                current_harness
+            ) and self._provider_owns_context_build(current_harness.context.build_id):
+                retired = self._retire_pending_context()
+                reused_build_id = current_harness.context.build_id
+                self._associate_focus_revision_with_build(
+                    focus_revision=focus_revision,
+                    build_id=reused_build_id,
+                )
+                self._log_context_installation(
+                    harness=harness,
+                    reason=reason,
+                    status="currentEquivalentSuppressed",
+                    effective_build_id=reused_build_id,
+                    pending_build_id=(
+                        retired.context.build_id if retired is not None else None
+                    ),
+                    focus_revision=focus_revision,
+                )
+                return
+            pending_harness = self._pending_harness
+            if pending_harness is not None and (
+                _provider_context_equivalence_key(harness)
+                == _provider_context_equivalence_key(pending_harness)
+            ):
+                pending_build_id = pending_harness.context.build_id
+                self._pending_focus_revision = focus_revision
+                self._pending_context_reason = reason
+                self._log_context_installation(
+                    harness=harness,
+                    reason=reason,
+                    status="pendingEquivalentCoalesced",
+                    pending_build_id=pending_build_id,
+                    focus_revision=focus_revision,
+                )
+                self._ensure_pending_context_installation()
+                return
+            self._retire_pending_context()
             self._pending_harness = harness
             self._pending_focus_revision = focus_revision
             self._pending_context_reason = reason
+        self._log_context_installation(
+            harness=harness,
+            reason=reason,
+            status="providerAttempted",
+            pending_build_id=harness.context.build_id,
+            focus_revision=focus_revision,
+        )
         try:
             installation_status = await self._realtime.prepare_if_idle(
                 harness=harness,
@@ -2163,15 +2339,16 @@ class DeterministicRealtimeSessionCoordinator:
                 reason=reason,
                 status="failed",
                 error_type=type(error).__name__,
+                pending_build_id=harness.context.build_id,
+                focus_revision=focus_revision,
             )
             raise
         if installation_status is not None:
             self._harness = harness
-            if focus_revision >= self._submitted_focus_revision:
-                self._submitted_focus_revision = focus_revision
-                self._submitted_focus_build_id = harness.context.build_id
-            self._focus_build_id_by_revision[focus_revision] = harness.context.build_id
-            self._focus_changed.set()
+            self._associate_focus_revision_with_build(
+                focus_revision=focus_revision,
+                build_id=harness.context.build_id,
+            )
             if self._pending_harness is harness:
                 self._pending_harness = None
                 self._pending_focus_revision = None
@@ -2186,6 +2363,13 @@ class DeterministicRealtimeSessionCoordinator:
                 if installation_status is not None
                 else "deferred"
             ),
+            effective_build_id=(
+                harness.context.build_id if installation_status is not None else None
+            ),
+            pending_build_id=(
+                harness.context.build_id if installation_status is None else None
+            ),
+            focus_revision=focus_revision,
         )
 
     async def _refresh_canvas_context(
@@ -2235,13 +2419,15 @@ class DeterministicRealtimeSessionCoordinator:
         context = harness.context
         LOGGER.info(
             "realtime_dynamic_context_built session_id=%s reason=%s "
-            "context_build_id=%s final_utf8_bytes=%d estimated_tokens=%d "
+            "context_build_id=%s content_fingerprint_prefix=%s "
+            "final_utf8_bytes=%d estimated_tokens=%d "
             "bootstrap_turn_count=%d warm_reference_count=%d "
             "canvas_included=%s included_references=%d omitted_references=%d "
             "dialogue_frame_revision=%d dialogue_frame_included=%s",
             self._session_id,
             reason,
             context.build_id,
+            context.content_fingerprint[:12],
             context.final_utf8_bytes,
             context.estimated_dynamic_tokens,
             context.included_bootstrap_turns,
@@ -2256,6 +2442,7 @@ class DeterministicRealtimeSessionCoordinator:
                     "sessionId": self._session_id,
                     "reason": str(reason),
                     "contextBuildId": context.build_id,
+                    "contentFingerprintPrefix": context.content_fingerprint[:12],
                     "finalUtf8Bytes": context.final_utf8_bytes,
                     "estimatedTokens": context.estimated_dynamic_tokens,
                     "bootstrapTurnCount": context.included_bootstrap_turns,
@@ -2273,6 +2460,38 @@ class DeterministicRealtimeSessionCoordinator:
         self._context_build_sequence += 1
         return f"ctx-{self._context_build_sequence}"
 
+    def _provider_owns_context_build(self, build_id: str) -> bool:
+        return (
+            self._realtime.active_context_build_id == build_id
+            or self._realtime.desired_context_build_id == build_id
+            or self._realtime.is_context_acknowledged(build_id)
+        )
+
+    def _associate_focus_revision_with_build(
+        self,
+        *,
+        focus_revision: int,
+        build_id: str,
+    ) -> None:
+        if focus_revision >= self._submitted_focus_revision:
+            self._submitted_focus_revision = focus_revision
+            self._submitted_focus_build_id = build_id
+        self._focus_build_id_by_revision[focus_revision] = build_id
+        self._focus_changed.set()
+
+    def _retire_pending_context(self) -> RealtimeHarness | None:
+        pending = self._pending_harness
+        if pending is None:
+            return None
+        retired_build_id = pending.context.build_id
+        self._pending_harness = None
+        self._pending_focus_revision = None
+        self._pending_context_reason = None
+        for revision, build_id in tuple(self._focus_build_id_by_revision.items()):
+            if build_id == retired_build_id:
+                self._focus_build_id_by_revision.pop(revision, None)
+        return pending
+
     def _log_context_installation(
         self,
         *,
@@ -2281,6 +2500,9 @@ class DeterministicRealtimeSessionCoordinator:
         status: str,
         provider_call_id: str | None = None,
         error_type: str | None = None,
+        effective_build_id: str | None = None,
+        pending_build_id: str | None = None,
+        focus_revision: int | None = None,
     ) -> None:
         resolved_provider_call_id = provider_call_id
         if resolved_provider_call_id is None and self._negotiated_call is not None:
@@ -2288,13 +2510,21 @@ class DeterministicRealtimeSessionCoordinator:
         interaction = self._canvas_jobs.state.last_interaction
         LOGGER.info(
             "realtime_context_installation session_id=%s reason=%s status=%s "
-            "context_build_id=%s provider_call_id=%s scene_id=%s "
+            "candidate_build_id=%s effective_build_id=%s pending_build_id=%s "
+            "content_fingerprint_prefix=%s final_utf8_bytes=%d "
+            "estimated_tokens=%d focus_revision=%s provider_call_id=%s scene_id=%s "
             "scene_revision=%s interaction_revision=%s binding_id=%s "
             "error_type=%s",
             self._session_id,
             reason,
             status,
             harness.context.build_id,
+            effective_build_id,
+            pending_build_id,
+            harness.context.content_fingerprint[:12],
+            harness.context.final_utf8_bytes,
+            harness.context.estimated_dynamic_tokens,
+            focus_revision,
             resolved_provider_call_id,
             interaction.scene_id if interaction is not None else None,
             interaction.scene_revision if interaction is not None else None,
@@ -2306,7 +2536,15 @@ class DeterministicRealtimeSessionCoordinator:
                     "sessionId": self._session_id,
                     "reason": str(reason),
                     "status": status,
-                    "contextBuildId": harness.context.build_id,
+                    "candidateBuildId": harness.context.build_id,
+                    "effectiveBuildId": effective_build_id,
+                    "pendingBuildId": pending_build_id,
+                    "contentFingerprintPrefix": (
+                        harness.context.content_fingerprint[:12]
+                    ),
+                    "finalUtf8Bytes": harness.context.final_utf8_bytes,
+                    "estimatedTokens": harness.context.estimated_dynamic_tokens,
+                    "focusRevision": focus_revision,
                     "providerCallId": resolved_provider_call_id,
                     "sceneId": interaction.scene_id if interaction else None,
                     "sceneRevision": (
@@ -2341,6 +2579,14 @@ class DeterministicRealtimeSessionCoordinator:
             reason = self._pending_context_reason
             if harness is None or focus_revision is None:
                 return True, None, None, None
+            resolved_reason = reason or DynamicContextBuildReason.CANVAS_ACTIVATED
+            self._log_context_installation(
+                harness=harness,
+                reason=resolved_reason,
+                status="providerAttempted",
+                pending_build_id=harness.context.build_id,
+                focus_revision=focus_revision,
+            )
             try:
                 installation_status = await self._realtime.prepare_if_idle(
                     harness=harness,
@@ -2349,24 +2595,41 @@ class DeterministicRealtimeSessionCoordinator:
             except Exception as error:
                 self._log_context_installation(
                     harness=harness,
-                    reason=reason or DynamicContextBuildReason.CANVAS_ACTIVATED,
+                    reason=resolved_reason,
                     status="failed",
                     error_type=type(error).__name__,
+                    pending_build_id=harness.context.build_id,
+                    focus_revision=focus_revision,
                 )
                 raise
             if installation_status is not None:
                 self._harness = harness
-                if focus_revision >= self._submitted_focus_revision:
-                    self._submitted_focus_revision = focus_revision
-                    self._submitted_focus_build_id = harness.context.build_id
-                self._focus_build_id_by_revision[focus_revision] = (
-                    harness.context.build_id
+                self._associate_focus_revision_with_build(
+                    focus_revision=focus_revision,
+                    build_id=harness.context.build_id,
                 )
-                self._focus_changed.set()
                 if self._pending_harness is harness:
                     self._pending_harness = None
                     self._pending_focus_revision = None
                     self._pending_context_reason = None
+            self._log_context_installation(
+                harness=harness,
+                reason=resolved_reason,
+                status=(
+                    str(installation_status)
+                    if installation_status is not None
+                    else "deferred"
+                ),
+                effective_build_id=(
+                    harness.context.build_id
+                    if installation_status is not None
+                    else None
+                ),
+                pending_build_id=(
+                    harness.context.build_id if installation_status is None else None
+                ),
+                focus_revision=focus_revision,
+            )
             return (
                 installation_status is not None,
                 installation_status,
@@ -2397,22 +2660,7 @@ class DeterministicRealtimeSessionCoordinator:
             )
             if not ready or self._closed or self._turn_id != turn_id:
                 return
-            (
-                _,
-                installation_status,
-                harness,
-                reason,
-            ) = await self._install_pending_context_if_idle(turn_id=turn_id)
-            if harness is not None:
-                self._log_context_installation(
-                    harness=harness,
-                    reason=reason or DynamicContextBuildReason.CANVAS_ACTIVATED,
-                    status=(
-                        str(installation_status)
-                        if installation_status is not None
-                        else "deferred"
-                    ),
-                )
+            await self._install_pending_context_if_idle(turn_id=turn_id)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -2626,6 +2874,12 @@ class DeterministicRealtimeSessionCoordinator:
                     for segment in parser.finish_response_chunk():
                         await updates.put(segment)
                     self._claim_rejected_utility(event, state=state)
+                    self._record_tool_outcome(
+                        tool_name=event.tool_kind.value,
+                        call_id=event.call_id,
+                        outcome="rejected",
+                        detail=event.reason,
+                    )
                     await self._realtime.complete_utility_tool(
                         turn_id=self._turn_id,
                         call_id=event.call_id,
@@ -2656,6 +2910,12 @@ class DeterministicRealtimeSessionCoordinator:
                         await updates.put(segment)
                     self._claim_canvas(event.call_id, state=state)
                     self._canvas_status = "rejected"
+                    self._record_tool_outcome(
+                        tool_name=INTERACTIVE_CANVAS_TOOL_NAME,
+                        call_id=event.call_id,
+                        outcome="rejected",
+                        detail=event.reason,
+                    )
                     LOGGER.warning(
                         "canvas_tool_arguments_rejected session_id=%s "
                         "turn_id=%s call_id=%s reason=%s",
@@ -2684,6 +2944,12 @@ class DeterministicRealtimeSessionCoordinator:
                     for segment in parser.finish_response_chunk():
                         await updates.put(segment)
                     self._claim_canvas(event.call_id, state=state)
+                    self._record_tool_outcome(
+                        tool_name=MANAGE_CANVAS_PRESENTATION_TOOL_NAME,
+                        call_id=event.call_id,
+                        outcome="rejected",
+                        detail=event.reason,
+                    )
                     LOGGER.warning(
                         "manage_canvas_presentation_arguments_rejected session_id=%s "
                         "turn_id=%s call_id=%s reason=%s",
@@ -2767,7 +3033,9 @@ class DeterministicRealtimeSessionCoordinator:
             for segment in parser.finish(allow_empty=True):
                 await updates.put(segment)
             segments = parser.emitted_segments
-            if not segments:
+            if not segments and not (
+                state.action_only_succeeded or state.action_only_rejected
+            ):
                 return None
             child_transcript = self._realtime.available_child_transcript(
                 turn_id=self._turn_id
@@ -2783,6 +3051,7 @@ class DeterministicRealtimeSessionCoordinator:
             return _TurnResult(
                 segments=segments,
                 child_turn_summary=child_summary,
+                action_only=state.action_only_succeeded or state.action_only_rejected,
             )
         finally:
             updates.put_nowait(None)
@@ -2888,6 +3157,12 @@ class DeterministicRealtimeSessionCoordinator:
             output=output,
             harness=self.harness,
         )
+        self._record_tool_outcome(
+            tool_name=SEARCH_MEMORY_TOOL_NAME,
+            call_id=call.call_id,
+            outcome=str(output.status),
+            detail=output.reason,
+        )
         result_source_kinds = [str(candidate.source_kind) for candidate in candidates]
         result_source_ids = [candidate.source_id for candidate in candidates]
         LOGGER.info(
@@ -2950,6 +3225,11 @@ class DeterministicRealtimeSessionCoordinator:
             output=output,
             harness=self.harness,
         )
+        self._record_tool_outcome(
+            tool_name=GET_CURRENT_TIME_TOOL_NAME,
+            call_id=call.call_id,
+            outcome="available",
+        )
         LOGGER.info(
             "realtime_semantic_tool_completed session_id=%s turn_id=%s "
             "tool_kind=%s step=1 result_count=1",
@@ -2981,11 +3261,83 @@ class DeterministicRealtimeSessionCoordinator:
             self._turn_id,
             bounded_source_transcript is not None,
         )
+        resolved_target_scene_id: str | None = None
+        if call.request.operation == InteractiveCanvasOperation.REVISE:
+            resolution = self._canvas_jobs.state.workspace.resolve_scene_selector(
+                CanvasSceneSelector(
+                    call.request.selector or CanvasSceneSelector.CURRENT
+                ),
+                position=call.request.position,
+                title=call.request.title,
+            )
+            if resolution.scene is None or resolution.reason is not None:
+                output = InteractiveCanvasToolOutputV4.model_validate(
+                    {
+                        "status": InteractiveCanvasToolStatusV4.REJECTED,
+                        "reason": CANVAS_MODEL_SAFE_REJECTION_REASON,
+                    }
+                )
+                await self._complete_canvas_tool(
+                    turn_id=self._turn_id,
+                    call_id=call.call_id,
+                    output=output,
+                )
+                if call.request.completion == CanvasActionCompletion.REQUEST_COMPLETE:
+                    state.action_only_rejected = True
+                self._canvas_status = "rejected"
+                self._record_tool_outcome(
+                    tool_name=INTERACTIVE_CANVAS_TOOL_NAME,
+                    call_id=call.call_id,
+                    outcome="rejected",
+                    detail=output.reason,
+                )
+                return
+
+            try:
+                hydrated = await self.ensure_retained_scene_hydrated(
+                    self._canvas_jobs.state.workspace,
+                    resolution.scene.scene_id,
+                    source="realtime",
+                )
+            except Exception as exc:
+                LOGGER.warning(
+                    "revise_hydration_failed session_id=%s turn_id=%s error=%s",
+                    self._session_id,
+                    self._turn_id,
+                    exc,
+                )
+                hydrated = False
+
+            if not hydrated:
+                output = InteractiveCanvasToolOutputV4.model_validate(
+                    {
+                        "status": InteractiveCanvasToolStatusV4.REJECTED,
+                        "reason": CANVAS_MODEL_SAFE_REJECTION_REASON,
+                    }
+                )
+                await self._complete_canvas_tool(
+                    turn_id=self._turn_id,
+                    call_id=call.call_id,
+                    output=output,
+                )
+                if call.request.completion == CanvasActionCompletion.REQUEST_COMPLETE:
+                    state.action_only_rejected = True
+                self._canvas_status = "rejected"
+                self._record_tool_outcome(
+                    tool_name=INTERACTIVE_CANVAS_TOOL_NAME,
+                    call_id=call.call_id,
+                    outcome="rejected",
+                    detail=output.reason,
+                )
+                return
+
+            resolved_target_scene_id = resolution.scene.scene_id
         output = await self._canvas_jobs.accept_tool_call(
             source_turn_id=self._turn_id,
             source_transcript=bounded_source_transcript,
             call=call,
             complete_tool=self._complete_canvas_tool,
+            resolved_target_scene_id=resolved_target_scene_id,
         )
         if output.status == InteractiveCanvasToolStatusV4.ACCEPTED:
             generation_id = output.generation_id
@@ -2994,7 +3346,15 @@ class DeterministicRealtimeSessionCoordinator:
                     "accepted protocol-v4 canvas output lost generationId"
                 )
             state.canvas_generation_id = generation_id
+            if call.request.completion == CanvasActionCompletion.REQUEST_COMPLETE:
+                state.action_only_succeeded = True
             self._canvas_status = "accepted"
+            self._record_tool_outcome(
+                tool_name=INTERACTIVE_CANVAS_TOOL_NAME,
+                call_id=call.call_id,
+                outcome="accepted",
+                detail=output.reason,
+            )
             LOGGER.info(
                 "canvas_specialist_accepted_async session_id=%s turn_id=%s "
                 "call_id=%s generation_id=%s elapsed_ms=%.2f",
@@ -3006,7 +3366,15 @@ class DeterministicRealtimeSessionCoordinator:
             )
             await self._refresh_canvas_context()
             return
+        if call.request.completion == CanvasActionCompletion.REQUEST_COMPLETE:
+            state.action_only_rejected = True
         self._canvas_status = "rejected"
+        self._record_tool_outcome(
+            tool_name=INTERACTIVE_CANVAS_TOOL_NAME,
+            call_id=call.call_id,
+            outcome="rejected",
+            detail=output.reason,
+        )
 
     async def _run_canvas_cancellation_tool(
         self,
@@ -3023,7 +3391,14 @@ class DeterministicRealtimeSessionCoordinator:
                 {"status": InteractiveCanvasToolStatusV4.ACCEPTED}
             ),
         )
+        if call.request.completion == CanvasActionCompletion.REQUEST_COMPLETE:
+            state.action_only_succeeded = True
         self._canvas_status = "cancelled"
+        self._record_tool_outcome(
+            tool_name=CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
+            call_id=call.call_id,
+            outcome="accepted",
+        )
         LOGGER.info(
             "canvas_pending_work_cancelled session_id=%s turn_id=%s call_id=%s "
             "retired_count=%d elapsed_ms=%.2f",
@@ -3041,84 +3416,166 @@ class DeterministicRealtimeSessionCoordinator:
         *,
         state: _PlanningState,
     ) -> None:
-        action = call.request.action
-        scene_id = call.request.scene_id
-        direction = call.request.direction
-        workspace = self._canvas_jobs.state.workspace
+        output, command_id, superseded = await self._execute_model_canvas_presentation(
+            call.request
+        )
+        required_context_build_id = self._realtime.desired_context_build_id
+        while required_context_build_id is not None:
+            await self._realtime.wait_for_context(build_id=required_context_build_id)
+            latest_desired = self._realtime.desired_context_build_id
+            if latest_desired in {None, required_context_build_id}:
+                break
+            required_context_build_id = latest_desired
+        await self._complete_manage_canvas_presentation(
+            call=call,
+            state=state,
+            output=output,
+            presentation_command_id=command_id,
+            supersession_result=(
+                "superseded"
+                if superseded
+                else (
+                    "applied"
+                    if output.status == ManageCanvasPresentationStatus.ACCEPTED
+                    else "rejected"
+                )
+            ),
+        )
 
-        if action == ManageCanvasPresentationAction.NAVIGATE:
-            if direction is None:
-                raise CoordinatorStateError("validated navigate request lost direction")
-            try:
-                resolution = workspace.resolve_navigation(
-                    CanvasNavigationDirection(direction)
-                )
-            except SvgCanvasWorkspaceError as error:
-                await self._complete_manage_canvas_presentation(
-                    call=call,
-                    output=self._canvas_presentation_output(
-                        status=ManageCanvasPresentationStatus.REJECTED,
-                        operation=action,
-                        direction=direction,
-                        changed=False,
-                        reason=str(error),
-                    ),
-                )
-                return
-            if resolution.reason is not None:
-                await self._complete_manage_canvas_presentation(
-                    call=call,
-                    output=self._canvas_presentation_output(
-                        status=ManageCanvasPresentationStatus.REJECTED,
-                        operation=action,
-                        direction=direction,
-                        changed=False,
-                        reason=resolution.reason,
-                        scene_id=resolution.scene.scene_id
-                        if resolution.scene
-                        else None,
-                    ),
-                )
-                return
-            if resolution.scene is None:
-                raise CoordinatorStateError("navigation resolution lost target scene")
-            scene_id = resolution.scene.scene_id
-            if not resolution.changed:
-                await self._complete_manage_canvas_presentation(
-                    call=call,
-                    output=self._canvas_presentation_output(
-                        status=ManageCanvasPresentationStatus.ACCEPTED,
-                        operation=action,
-                        direction=direction,
-                        changed=False,
-                        scene_id=scene_id,
-                    ),
-                )
-                return
+    async def _execute_model_canvas_presentation(
+        self,
+        request: ManageCanvasPresentationRequest,
+    ) -> tuple[ManageCanvasPresentationToolOutputV4, str | None, bool]:
+        """Translate one model semantic action into the existing selector owner."""
+
+        return await self._execute_canvas_presentation(
+            action=request.presentation_operation,
+            selector=request.presentation_selector,
+            position=request.position,
+            title=request.title,
+            source="realtime",
+        )
+
+    async def _execute_canvas_presentation(
+        self,
+        *,
+        action: ManageCanvasPresentationAction,
+        selector: CanvasSceneSelector | None,
+        position: int | None,
+        title: str | None,
+        source: str = "realtime",
+    ) -> tuple[ManageCanvasPresentationToolOutputV4, str | None, bool]:
+        """Resolve semantic intent once, then await the exact Flutter command."""
+        workspace = self._canvas_jobs.state.workspace
+        scene_id: str | None = None
 
         if action == ManageCanvasPresentationAction.SHOW:
-            if scene_id is None or (
-                workspace.scene(scene_id) is None
-                and workspace.manifest_scene(scene_id) is None
-            ):
+            requested_selector = CanvasSceneSelector(
+                selector or CanvasSceneSelector.CURRENT
+            )
+            resolution = workspace.resolve_scene_selector(
+                requested_selector,
+                position=position,
+                title=title,
+            )
+            if resolution.reason is not None or resolution.scene is None:
                 LOGGER.warning(
-                    "manage_canvas_presentation_scene_not_found session_id=%s turn_id=%s call_id=%s scene_id=%s",
+                    "manage_canvas_presentation_selector_rejected session_id=%s turn_id=%s source=%s reason=%s",
                     self._session_id,
                     self._turn_id,
-                    call.call_id,
-                    scene_id,
+                    source,
+                    resolution.reason,
                 )
-                await self._complete_manage_canvas_presentation(
-                    call=call,
-                    output=self._canvas_presentation_output(
+                return (
+                    self._canvas_presentation_output(
                         status=ManageCanvasPresentationStatus.REJECTED,
                         operation=action,
                         changed=False,
                         scene_id=scene_id,
-                        reason="scene not found in retained visuals",
+                        reason=resolution.reason or "selectorRejected",
                     ),
+                    None,
+                    False,
                 )
-                return
+            assert resolution.scene is not None
+            LOGGER.info(
+                "manage_canvas_presentation_selector_resolved "
+                "session_id=%s turn_id=%s source=%s selector=%s position=%s",
+                self._session_id,
+                self._turn_id,
+                source,
+                requested_selector.value,
+                resolution.position,
+                extra={
+                    "ava_context": {
+                        "selector": requested_selector.value,
+                        "requestedNormalizedTitle": (
+                            normalize_semantic_title(title or "")
+                            if requested_selector is CanvasSceneSelector.TITLE
+                            else None
+                        ),
+                        "resolvedCanonicalTitle": resolution.scene.title,
+                        "resolvedPosition": resolution.position,
+                        "workspaceRevision": resolution.workspace_revision,
+                        "contextBuildId": self._realtime.active_context_build_id,
+                    }
+                },
+            )
+            scene_id = resolution.scene.scene_id
+            try:
+                hydrated = await self.ensure_retained_scene_hydrated(
+                    workspace,
+                    scene_id,
+                    source=source,
+                )
+            except SvgCanvasWorkspaceError as exc:
+                if str(exc) == "workspaceChanged":
+                    LOGGER.warning(
+                        "manage_canvas_presentation_workspace_changed session_id=%s turn_id=%s source=%s scene_id=%s",
+                        self._session_id,
+                        self._turn_id,
+                        source,
+                        scene_id,
+                    )
+                    return (
+                        self._canvas_presentation_output(
+                            status=ManageCanvasPresentationStatus.REJECTED,
+                            operation=action,
+                            changed=False,
+                            reason="workspaceChanged",
+                        ),
+                        None,
+                        False,
+                    )
+                LOGGER.warning(
+                    "manage_canvas_presentation_hydration_failed session_id=%s turn_id=%s source=%s scene_id=%s error=%s",
+                    self._session_id,
+                    self._turn_id,
+                    source,
+                    scene_id,
+                    exc,
+                )
+                return (
+                    self._canvas_presentation_output(
+                        status=ManageCanvasPresentationStatus.REJECTED,
+                        operation=action,
+                        changed=False,
+                        reason="retainedVisualUnavailable",
+                    ),
+                    None,
+                    False,
+                )
+            if not hydrated:
+                return (
+                    self._canvas_presentation_output(
+                        status=ManageCanvasPresentationStatus.REJECTED,
+                        operation=action,
+                        changed=False,
+                        reason="retainedVisualUnavailable",
+                    ),
+                    None,
+                    False,
+                )
 
         import uuid
 
@@ -3130,23 +3587,24 @@ class DeterministicRealtimeSessionCoordinator:
             command_id=command_id,
             action=action,
             target_scene_id=scene_id,
+            workspace_epoch=workspace.workspace_epoch,
+            workspace_revision=workspace.workspace_revision,
             future=future,
-            direction=direction,
             changed=(
                 action != ManageCanvasPresentationAction.SHOW
                 or self._canvas_jobs.state.focused_scene is None
                 or self._canvas_jobs.state.focused_scene.scene_id != scene_id
             ),
+            source=(
+                CanvasPresentationChangedSource.USER
+                if source == "flutter"
+                else CanvasPresentationChangedSource.MODEL
+            ),
         )
         self._pending_presentation_commands[command_id] = pending_cmd
 
-        physical_action = (
-            ManageCanvasPresentationAction.SHOW
-            if action == ManageCanvasPresentationAction.NAVIGATE
-            else action
-        )
         action_val: Literal["show", "hide"] = (
-            "show" if physical_action == ManageCanvasPresentationAction.SHOW else "hide"
+            "show" if action == ManageCanvasPresentationAction.SHOW else "hide"
         )
         await self._canvas_events.presentation_command(
             command_id=command_id,
@@ -3163,38 +3621,17 @@ class DeterministicRealtimeSessionCoordinator:
             output = ManageCanvasPresentationToolOutputV4(
                 status=ManageCanvasPresentationStatus.REJECTED,
                 operation=action,
-                direction=direction,
-                scene_id=scene_id,
                 changed=False,
                 reason="presentation command timed out",
             )
 
-        required_context_build_id = self._realtime.desired_context_build_id
-        while required_context_build_id is not None:
-            await self._realtime.wait_for_context(build_id=required_context_build_id)
-            latest_desired = self._realtime.desired_context_build_id
-            if latest_desired in {None, required_context_build_id}:
-                break
-            required_context_build_id = latest_desired
-        await self._complete_manage_canvas_presentation(
-            call=call,
-            output=output,
-            presentation_command_id=command_id,
-            supersession_result=(
-                "superseded"
-                if pending_cmd.superseded
-                else (
-                    "applied"
-                    if output.status == ManageCanvasPresentationStatus.ACCEPTED
-                    else "rejected"
-                )
-            ),
-        )
+        return output, command_id, pending_cmd.superseded
 
     async def _complete_manage_canvas_presentation(
         self,
         *,
         call: RealtimeManageCanvasPresentationToolCall,
+        state: _PlanningState,
         output: ManageCanvasPresentationToolOutputV4,
         presentation_command_id: str | None = None,
         supersession_result: str | None = None,
@@ -3204,9 +3641,20 @@ class DeterministicRealtimeSessionCoordinator:
             call_id=call.call_id,
             output=output,
         )
+        self._record_tool_outcome(
+            tool_name=MANAGE_CANVAS_PRESENTATION_TOOL_NAME,
+            call_id=call.call_id,
+            outcome=str(output.status),
+            detail=output.reason,
+        )
+        if call.request.completion == CanvasActionCompletion.REQUEST_COMPLETE:
+            if output.status == ManageCanvasPresentationStatus.ACCEPTED:
+                state.action_only_succeeded = True
+            else:
+                state.action_only_rejected = True
         LOGGER.info(
             "canvas_control_completion session_id=%s turn_id=%s "
-            "function_call_id=%s operation=%s status=%s",
+            "function_call_id=%s action=%s status=%s",
             self._session_id,
             self._turn_id,
             call.call_id,
@@ -3218,22 +3666,17 @@ class DeterministicRealtimeSessionCoordinator:
                     "turnId": self._turn_id,
                     "providerResponseId": call.provider_response_id,
                     "functionCallId": call.call_id,
-                    "operation": str(call.request.action),
-                    "direction": (
-                        str(call.request.direction)
-                        if call.request.direction is not None
-                        else None
-                    ),
-                    "requestedSceneId": call.request.scene_id,
+                    "action": str(call.request.action),
+                    "requestedCompletion": str(call.request.completion),
                     "status": str(output.status),
                     "changed": output.changed,
                     "reason": output.reason,
-                    "resolvedSceneId": output.scene_id,
-                    "sceneRevision": output.scene_revision,
+                    "resolvedSceneId": None,
+                    "sceneRevision": None,
                     "position": output.position,
                     "total": output.total,
-                    "workspaceEpoch": output.workspace_epoch,
-                    "workspaceRevision": output.workspace_revision,
+                    "workspaceEpoch": None,
+                    "workspaceRevision": None,
                     "focusRevision": self._canvas_jobs.state.focus_revision,
                     "presentationCommandId": presentation_command_id,
                     "supersessionResult": supersession_result,
@@ -3249,7 +3692,6 @@ class DeterministicRealtimeSessionCoordinator:
         status: ManageCanvasPresentationStatus,
         operation: ManageCanvasPresentationAction,
         changed: bool,
-        direction: ManageCanvasNavigationDirection | None = None,
         reason: str | None = None,
         scene_id: str | None = None,
     ) -> ManageCanvasPresentationToolOutputV4:
@@ -3283,158 +3725,40 @@ class DeterministicRealtimeSessionCoordinator:
             if effective_scene_id is not None
             else None
         )
-        scene_revision = (
-            metadata.scene_revision
-            if metadata is not None
-            else (hydrated.revision if hydrated is not None else None)
-        )
         total = len(ordered_ids)
         return ManageCanvasPresentationToolOutputV4(
             status=status,
             operation=operation,
-            direction=direction,
             changed=changed,
             visible=state.presentation_visible,
-            scene_id=effective_scene_id,
-            scene_revision=scene_revision,
             position=position,
             total=total,
             has_previous=position is not None and position > 1,
             has_next=position is not None and position < total,
-            workspace_epoch=workspace.workspace_epoch,
-            workspace_revision=workspace.workspace_revision,
+            title=(
+                metadata.title
+                if metadata is not None
+                else (hydrated.document.title if hydrated is not None else None)
+            ),
             reason=reason,
         )
 
-    async def _handle_client_presentation_updated(
+    async def _handle_client_presentation_requested(
         self,
-        event: CanvasPresentationUpdatedEventV4,
+        event: CanvasPresentationRequestedEventV4,
     ) -> None:
-        if not event.visible:
-            superseded_commands = self._take_pending_presentation_commands()
-            self._canvas_jobs.state.set_presentation_visible(False)
-            self._canonical_presentation_revision += 1
-            await self._canvas_events.presentation_changed(
-                visible=False,
-                scene_id=None,
-                focus_revision=None,
-                source=CanvasPresentationChangedSource.USER.value,
-            )
-            await self._refresh_canvas_context(
-                reason=DynamicContextBuildReason.CANVAS_PRESENTATION_CHANGED
-            )
-            self._complete_superseded_presentation_commands(superseded_commands)
-            return
+        """Route Flutter semantic intent through the same presentation execution path."""
 
-        if event.focus_revision is None or event.scene_id is None:
-            raise CoordinatorStateError(
-                "validated visible presentation update lost focus identity"
-            )
-        try:
-            async with asyncio.timeout(2.0):
-                while not self._closed:
-                    resolution = self._presentation_focus_resolution(
-                        scene_id=event.scene_id,
-                        focus_revision=event.focus_revision,
-                    )
-                    if resolution == "matched":
-                        break
-                    if resolution == "superseded":
-                        LOGGER.info(
-                            "presentation_visible_focus_superseded "
-                            "session_id=%s scene_id=%s focus_revision=%s "
-                            "canonical_scene_id=%s canonical_focus_revision=%s",
-                            self._session_id,
-                            event.scene_id,
-                            event.focus_revision,
-                            (
-                                self._canvas_jobs.state.focused_scene.scene_id
-                                if self._canvas_jobs.state.focused_scene is not None
-                                else None
-                            ),
-                            self._canvas_jobs.state.focus_revision,
-                            extra={
-                                "ava_context": {
-                                    "sessionId": self._session_id,
-                                    "sceneId": event.scene_id,
-                                    "focusRevision": event.focus_revision,
-                                    "canonicalSceneId": (
-                                        self._canvas_jobs.state.focused_scene.scene_id
-                                        if self._canvas_jobs.state.focused_scene
-                                        is not None
-                                        else None
-                                    ),
-                                    "canonicalFocusRevision": (
-                                        self._canvas_jobs.state.focus_revision
-                                    ),
-                                    "result": "superseded",
-                                }
-                            },
-                        )
-                        return
-                    focus_changed = self._presentation_focus_changed
-                    if (
-                        self._presentation_focus_resolution(
-                            scene_id=event.scene_id,
-                            focus_revision=event.focus_revision,
-                        )
-                        != "pending"
-                    ):
-                        continue
-                    await focus_changed.wait()
-            if self._closed:
-                return
-        except TimeoutError:
-            LOGGER.warning(
-                "presentation_visible_focus_timeout session_id=%s scene_id=%s focus_revision=%s",
-                self._session_id,
-                event.scene_id,
-                str(event.focus_revision),
-            )
-            return
-
-        if (
-            self._presentation_focus_resolution(
-                scene_id=event.scene_id,
-                focus_revision=event.focus_revision,
-            )
-            != "matched"
-        ):
-            return
-
-        superseded_commands = self._take_pending_presentation_commands()
-        self._canvas_jobs.state.set_presentation_visible(True)
-        self._canonical_presentation_revision += 1
-        await self._canvas_events.presentation_changed(
-            visible=True,
-            scene_id=event.scene_id,
-            focus_revision=self._canvas_jobs.state.focus_revision,
-            source=CanvasPresentationChangedSource.USER.value,
+        asyncio.create_task(
+            self._execute_canvas_presentation(
+                action=ManageCanvasPresentationAction(event.operation),
+                selector=event.selector,
+                position=event.position,
+                title=None,
+                source="flutter",
+            ),
+            name=f"ava-client-presentation-{event.sequence}",
         )
-        await self._refresh_canvas_context(
-            reason=DynamicContextBuildReason.CANVAS_PRESENTATION_CHANGED
-        )
-        self._complete_superseded_presentation_commands(superseded_commands)
-
-    def _presentation_focus_resolution(
-        self,
-        *,
-        scene_id: str,
-        focus_revision: int,
-    ) -> Literal["matched", "pending", "superseded"]:
-        state = self._canvas_jobs.state
-        if state.focus_revision > focus_revision:
-            return "superseded"
-        if state.focus_revision < focus_revision:
-            return "pending"
-        if state.focused_scene is None or state.focused_scene.scene_id != scene_id:
-            return "superseded"
-        return "matched"
-
-    def _signal_presentation_focus_changed(self) -> None:
-        waiting = self._presentation_focus_changed
-        self._presentation_focus_changed = asyncio.Event()
-        waiting.set()
 
     def _take_pending_presentation_commands(
         self,
@@ -3459,7 +3783,6 @@ class DeterministicRealtimeSessionCoordinator:
                 self._canvas_presentation_output(
                     status=ManageCanvasPresentationStatus.REJECTED,
                     operation=command.action,
-                    direction=command.direction,
                     changed=False,
                     scene_id=(
                         current_scene.scene_id if current_scene is not None else None
@@ -3481,13 +3804,28 @@ class DeterministicRealtimeSessionCoordinator:
             )
             return
 
+        workspace = self._canvas_jobs.state.workspace
+        if pending_cmd.action == ManageCanvasPresentationAction.SHOW and (
+            workspace.workspace_epoch != pending_cmd.workspace_epoch
+            or workspace.workspace_revision != pending_cmd.workspace_revision
+        ):
+            if not pending_cmd.future.done():
+                pending_cmd.future.set_result(
+                    self._canvas_presentation_output(
+                        status=ManageCanvasPresentationStatus.REJECTED,
+                        operation=pending_cmd.action,
+                        changed=False,
+                        reason="workspaceChanged",
+                    )
+                )
+            return
+
         if not event.applied:
             if not pending_cmd.future.done():
                 pending_cmd.future.set_result(
                     self._canvas_presentation_output(
                         status=ManageCanvasPresentationStatus.REJECTED,
                         operation=pending_cmd.action,
-                        direction=pending_cmd.direction,
                         changed=False,
                         scene_id=pending_cmd.target_scene_id,
                         reason=event.reason or "client rejected presentation command",
@@ -3495,10 +3833,7 @@ class DeterministicRealtimeSessionCoordinator:
                 )
             return
 
-        if pending_cmd.action in {
-            ManageCanvasPresentationAction.SHOW,
-            ManageCanvasPresentationAction.NAVIGATE,
-        }:
+        if pending_cmd.action == ManageCanvasPresentationAction.SHOW:
             if (
                 pending_cmd.target_scene_id is None
                 or event.scene_id != pending_cmd.target_scene_id
@@ -3509,9 +3844,7 @@ class DeterministicRealtimeSessionCoordinator:
                         ManageCanvasPresentationToolOutputV4(
                             status=ManageCanvasPresentationStatus.REJECTED,
                             operation=pending_cmd.action,
-                            direction=pending_cmd.direction,
                             changed=False,
-                            scene_id=pending_cmd.target_scene_id,
                             reason="client acknowledgement changed presentation identity",
                         )
                     )
@@ -3528,9 +3861,7 @@ class DeterministicRealtimeSessionCoordinator:
                         ManageCanvasPresentationToolOutputV4(
                             status=ManageCanvasPresentationStatus.REJECTED,
                             operation=pending_cmd.action,
-                            direction=pending_cmd.direction,
                             changed=False,
-                            scene_id=pending_cmd.target_scene_id,
                             reason="superseded by newer client focus",
                         )
                     )
@@ -3542,22 +3873,19 @@ class DeterministicRealtimeSessionCoordinator:
                         ManageCanvasPresentationToolOutputV4(
                             status=ManageCanvasPresentationStatus.REJECTED,
                             operation=pending_cmd.action,
-                            direction=pending_cmd.direction,
                             changed=False,
-                            scene_id=pending_cmd.target_scene_id,
                             reason="retained visual is no longer available",
                         )
                     )
                 return
             state.focus_retained(target_scene, focus_revision=event.focus_revision)
-            self._signal_presentation_focus_changed()
             self._canvas_jobs.state.set_presentation_visible(True)
             self._canonical_presentation_revision += 1
             await self._canvas_events.presentation_changed(
                 visible=True,
                 scene_id=pending_cmd.target_scene_id,
                 focus_revision=self._canvas_jobs.state.focus_revision,
-                source=CanvasPresentationChangedSource.MODEL.value,
+                source=pending_cmd.source.value,
             )
         else:
             self._canvas_jobs.state.set_presentation_visible(False)
@@ -3566,7 +3894,7 @@ class DeterministicRealtimeSessionCoordinator:
                 visible=False,
                 scene_id=None,
                 focus_revision=None,
-                source=CanvasPresentationChangedSource.MODEL.value,
+                source=pending_cmd.source.value,
             )
 
         await self._refresh_canvas_context(
@@ -3577,7 +3905,6 @@ class DeterministicRealtimeSessionCoordinator:
                 self._canvas_presentation_output(
                     status=ManageCanvasPresentationStatus.ACCEPTED,
                     operation=pending_cmd.action,
-                    direction=pending_cmd.direction,
                     changed=pending_cmd.changed,
                     scene_id=pending_cmd.target_scene_id,
                 )
@@ -3928,47 +4255,53 @@ class DeterministicRealtimeSessionCoordinator:
         if interaction_task is not None:
             await asyncio.gather(interaction_task, return_exceptions=True)
         await self._cancel_active_turn_work()
-        memory_tasks_by_turn = dict(self._memory_commit_tasks)
-        if memory_tasks_by_turn:
-            _, pending = await asyncio.wait(
-                tuple(memory_tasks_by_turn.values()),
-                timeout=self._memory_commit_drain_timeout_seconds,
-            )
-            if pending:
-                pending_turns = {
-                    task: turn_id
-                    for turn_id, task in memory_tasks_by_turn.items()
-                    if task in pending
-                }
-                for task, turn_id in pending_turns.items():
-                    failure_id = self._failure_id_factory()
-                    LOGGER.warning(
-                        "memory_commit_drain_timed_out failure_id=%s "
-                        "session_id=%s turn_id=%s component=%s "
-                        "reason_category=%s timeout_seconds=%.2f",
-                        failure_id,
-                        self._session_id,
-                        turn_id,
-                        SpeechFailureComponent.MEMORY_STORE,
-                        "shutdownDrainTimeout",
-                        self._memory_commit_drain_timeout_seconds,
-                        extra={
-                            "ava_context": {
-                                "failureId": failure_id,
-                                "component": str(SpeechFailureComponent.MEMORY_STORE),
-                                "sessionId": self._session_id,
-                                "turnId": turn_id,
-                                "reasonCategory": "shutdownDrainTimeout",
-                                "timeoutSeconds": (
-                                    self._memory_commit_drain_timeout_seconds
-                                ),
-                            }
-                        },
-                    )
-                    task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-        self._memory_commit_tasks.clear()
-        self._recent_live_echo_suppression_turn_ids.clear()
+        if (
+            self._memory_commit_worker_task is not None
+            and not self._memory_commit_worker_task.done()
+        ):
+            self._memory_commit_queue.put_nowait(self._memory_commit_terminal)
+            try:
+                await asyncio.wait_for(
+                    self._memory_commit_worker_task,
+                    timeout=self._memory_commit_drain_timeout_seconds,
+                )
+            except TimeoutError:
+                hung_turn_id = self._current_memory_commit_turn_id or self._session_id
+                failure_id = self._failure_id_factory()
+                LOGGER.warning(
+                    "memory_commit_drain_timed_out failure_id=%s "
+                    "session_id=%s turn_id=%s component=%s "
+                    "reason_category=%s timeout_seconds=%.2f",
+                    failure_id,
+                    self._session_id,
+                    hung_turn_id,
+                    SpeechFailureComponent.MEMORY_STORE,
+                    "shutdownDrainTimeout",
+                    self._memory_commit_drain_timeout_seconds,
+                    extra={
+                        "ava_context": {
+                            "failureId": failure_id,
+                            "component": str(SpeechFailureComponent.MEMORY_STORE),
+                            "sessionId": self._session_id,
+                            "turnId": hung_turn_id,
+                            "reasonCategory": "shutdownDrainTimeout",
+                            "timeoutSeconds": (
+                                self._memory_commit_drain_timeout_seconds
+                            ),
+                        }
+                    },
+                )
+                self._memory_commit_worker_task.cancel()
+                await asyncio.gather(
+                    self._memory_commit_worker_task,
+                    return_exceptions=True,
+                )
+            while not self._memory_commit_queue.empty():
+                try:
+                    self._memory_commit_queue.get_nowait()
+                    self._memory_commit_queue.task_done()
+                except (asyncio.QueueEmpty, ValueError):
+                    break
         if not self._terminal:
             await self._realtime.cancel(turn_id=self._turn_id)
             await self._speech.cancel(turn_id=self._turn_id)
@@ -4206,7 +4539,9 @@ class DeterministicRealtimeSessionCoordinator:
         delivered_text: str,
         terminal: DeliveredTurnTerminal,
     ) -> None:
-        if turn_id in self._memory_commit_tasks:
+        if self._closed:
+            return
+        if turn_id in self._scheduled_memory_commit_turn_ids:
             raise CoordinatorStateError(
                 "one turn cannot own multiple durable memory commit tasks"
             )
@@ -4256,19 +4591,13 @@ class DeterministicRealtimeSessionCoordinator:
 
         self._memory_commit_sequence += 1
         sequence = self._memory_commit_sequence
-        self._latest_memory_commit_sequence = sequence
-        self._warm_refresh_revision += 1
-        warm_refresh_revision = self._warm_refresh_revision
-        staged_semantic_memory = self._staged_semantic_memory_proposal
-        semantic_memory_proposal: SemanticMemoryProposal | None = None
-        if (
-            staged_semantic_memory is not None
-            and staged_semantic_memory.turn_id == turn_id
-        ):
-            semantic_memory_proposal = SemanticMemoryProposal.model_validate(
-                staged_semantic_memory.proposal.model_dump(mode="json", by_alias=True)
+        if sequence <= self._last_enqueued_memory_sequence:
+            raise CoordinatorStateError(
+                f"memory commit sequence must increase monotonically: {sequence} <= {self._last_enqueued_memory_sequence}"
             )
-            self._staged_semantic_memory_proposal = None
+        self._last_enqueued_memory_sequence = sequence
+        self._latest_memory_commit_sequence = sequence
+        settled_tool_outcomes = tuple(self._turn_settled_tool_outcomes)
         payload = _CapturedMemoryCommit(
             sequence=sequence,
             turn_id=turn_id,
@@ -4283,13 +4612,44 @@ class DeterministicRealtimeSessionCoordinator:
             delivered_text=delivered_text,
             terminal=terminal,
             transcript_waiter=transcript_waiter,
-            warm_refresh_revision=warm_refresh_revision,
-            semantic_memory_proposal=semantic_memory_proposal,
+            settled_tool_outcomes=settled_tool_outcomes,
+            interrupted=(terminal == DeliveredTurnTerminal.CANCELLED),
         )
-        self._memory_commit_tasks[turn_id] = asyncio.create_task(
-            self._run_memory_commit(payload=payload),
-            name=f"ava-memory-commit-{turn_id}",
-        )
+        self._scheduled_memory_commit_turn_ids.add(turn_id)
+        self._memory_commit_queue.put_nowait(payload)
+        self._ensure_memory_commit_worker()
+
+    def _ensure_memory_commit_worker(self) -> None:
+        if (
+            self._memory_commit_worker_task is None
+            or self._memory_commit_worker_task.done()
+        ):
+            self._memory_commit_worker_task = asyncio.create_task(
+                self._run_memory_commit_worker(),
+                name=f"ava-memory-commit-worker-{self._session_id}",
+            )
+
+    async def _run_memory_commit_worker(self) -> None:
+        while True:
+            item = await self._memory_commit_queue.get()
+            if item is self._memory_commit_terminal:
+                self._memory_commit_queue.task_done()
+                break
+            if not isinstance(item, _CapturedMemoryCommit):
+                self._memory_commit_queue.task_done()
+                continue
+            payload = item
+            self._current_memory_commit_turn_id = payload.turn_id
+            try:
+                await self._run_memory_commit(payload=payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            finally:
+                self._scheduled_memory_commit_turn_ids.discard(payload.turn_id)
+                self._current_memory_commit_turn_id = None
+                self._memory_commit_queue.task_done()
 
     def _schedule_failed_interaction_memory(
         self,
@@ -4322,17 +4682,14 @@ class DeterministicRealtimeSessionCoordinator:
                 if transcript_waiter is None:
                     LOGGER.info(
                         "memory_commit_skipped session_id=%s turn_id=%s "
-                        "reason=child_transcript_waiter_unavailable "
-                        "warm_refresh_revision=%d",
+                        "reason=child_transcript_waiter_unavailable",
                         self._session_id,
                         payload.turn_id,
-                        payload.warm_refresh_revision,
                         extra={
                             "ava_context": {
                                 "sessionId": self._session_id,
                                 "turnId": payload.turn_id,
                                 "reason": "childTranscriptWaiterUnavailable",
-                                "warmRefreshRevision": (payload.warm_refresh_revision),
                             }
                         },
                     )
@@ -4346,17 +4703,14 @@ class DeterministicRealtimeSessionCoordinator:
             ):
                 LOGGER.info(
                     "memory_commit_skipped session_id=%s turn_id=%s "
-                    "reason=child_transcription_terminal_without_text "
-                    "warm_refresh_revision=%d",
+                    "reason=child_transcription_terminal_without_text",
                     self._session_id,
                     payload.turn_id,
-                    payload.warm_refresh_revision,
                     extra={
                         "ava_context": {
                             "sessionId": self._session_id,
                             "turnId": payload.turn_id,
                             "reason": "childTranscriptionTerminalWithoutText",
-                            "warmRefreshRevision": payload.warm_refresh_revision,
                         }
                     },
                 )
@@ -4398,32 +4752,12 @@ class DeterministicRealtimeSessionCoordinator:
                     }
                 },
             )
-            self._recent_live_echo_suppression_turn_ids.append(payload.turn_id)
             if payload.sequence == self._latest_memory_commit_sequence:
                 self._last_memory_decision = decision
-            semantic_decision: SemanticMemoryCommitDecision | None = None
-            semantic_proposal = payload.semantic_memory_proposal
-            prior_local_frame = self.dialogue_frame
-            if semantic_proposal is not None:
-                semantic_decision = await self._apply_semantic_memory_proposal(
-                    payload=payload
-                )
-            authoritative_frame_changed = (
-                semantic_decision is not None
-                and payload.expected_reset_revision == self._memory_reset_revision
-                and semantic_decision.dialogue_frame != prior_local_frame
-            )
-            await self._refresh_warm_memory(
+            await self._run_semantic_capture(
                 payload=payload,
                 turn=turn,
-                force_context_refresh=(
-                    semantic_decision is not None
-                    and semantic_proposal is not None
-                    and (
-                        semantic_proposal.dialogue_frame_update is not None
-                        or authoritative_frame_changed
-                    )
-                ),
+                child_text=child_text,
             )
         except asyncio.CancelledError:
             raise
@@ -4453,47 +4787,170 @@ class DeterministicRealtimeSessionCoordinator:
                     }
                 },
             )
-        finally:
-            task = asyncio.current_task()
-            if self._memory_commit_tasks.get(payload.turn_id) is task:
-                self._memory_commit_tasks.pop(payload.turn_id, None)
 
-    async def _apply_dialogue_frame_update(
+    async def _run_semantic_capture(
         self,
         *,
         payload: _CapturedMemoryCommit,
-    ) -> DialogueFrameUpdateDecision | None:
-        """Compatibility view for focused M1 tests and callers."""
+        turn: DeliveredConversationTurn,
+        child_text: str | None,
+    ) -> None:
+        if (
+            self._closed
+            or payload.expected_reset_revision != self._memory_reset_revision
+        ):
+            return
 
-        decision = await self._apply_semantic_memory_proposal(payload=payload)
-        if decision is None:
-            return None
-        return DialogueFrameUpdateDecision.model_validate(
-            {
-                "status": decision.status,
-                "frame": decision.dialogue_frame.model_dump(mode="json", by_alias=True),
-            }
+        evidence = SemanticCaptureEvidence(
+            source_turn_id=payload.turn_id,
+            current_frame=self._dialogue_frame.to_state(),
+            child_utterance=child_text,
+            spoken_response_prefix=payload.delivered_text or None,
+            interrupted=payload.interrupted,
+            settled_tool_outcomes=payload.settled_tool_outcomes,
         )
 
-    async def _apply_semantic_memory_proposal(
-        self,
-        *,
-        payload: _CapturedMemoryCommit,
-    ) -> SemanticMemoryCommitDecision | None:
-        proposal = payload.semantic_memory_proposal
-        if proposal is None:
-            return None
-        update = proposal.dialogue_frame_update
-        started = monotonic()
+        try:
+            capture_args = await self._realtime.capture_semantic_memory(
+                evidence=evidence,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            LOGGER.warning(
+                "semantic_capture_inference_failed session_id=%s turn_id=%s "
+                "reset_revision=%d error_type=%s reason=%s",
+                self._session_id,
+                payload.turn_id,
+                payload.expected_reset_revision,
+                type(error).__name__,
+                str(error),
+                extra={
+                    "ava_context": {
+                        "sessionId": self._session_id,
+                        "turnId": payload.turn_id,
+                        "resetRevision": payload.expected_reset_revision,
+                        "status": "failed",
+                        "errorType": type(error).__name__,
+                        "reason": str(error),
+                    }
+                },
+            )
+            return
+
+        if (
+            self._closed
+            or payload.expected_reset_revision != self._memory_reset_revision
+        ):
+            return
+
+        if capture_args.disposition == SemanticCaptureDisposition.NO_CHANGE:
+            proposal = SemanticMemoryProposal(
+                disposition=SemanticCaptureDisposition.NO_CHANGE,
+                dialogue_frame_update=None,
+                journal_events=(),
+            )
+        else:
+            frame_state: DialogueFrameState | None = None
+            if capture_args.dialogue_frame is not None:
+                valid_frame_refs = tuple(
+                    ref
+                    for ref in capture_args.dialogue_frame.relevant_canvas_references
+                    if self._is_canonical_canvas_reference(ref)
+                )
+                frame_state = (
+                    capture_args.dialogue_frame.model_copy(
+                        update={"relevant_canvas_references": valid_frame_refs}
+                    )
+                    if len(valid_frame_refs)
+                    != len(capture_args.dialogue_frame.relevant_canvas_references)
+                    else capture_args.dialogue_frame
+                )
+
+            filtered_drafts: list[SemanticCaptureJournalDraft] = []
+            for draft in capture_args.journal_events:
+                if draft.family == SemanticJournalEventFamily.CANVAS_REFERENCE:
+                    if draft.canonical_canvas_references and all(
+                        self._is_canonical_canvas_reference(ref)
+                        for ref in draft.canonical_canvas_references
+                    ):
+                        filtered_drafts.append(draft)
+                else:
+                    valid_draft_refs = tuple(
+                        ref
+                        for ref in draft.canonical_canvas_references
+                        if self._is_canonical_canvas_reference(ref)
+                    )
+                    if len(valid_draft_refs) != len(draft.canonical_canvas_references):
+                        filtered_drafts.append(
+                            draft.model_copy(
+                                update={"canonical_canvas_references": valid_draft_refs}
+                            )
+                        )
+                    else:
+                        filtered_drafts.append(draft)
+
+            if not filtered_drafts and (
+                frame_state is None or frame_state == self._dialogue_frame.to_state()
+            ):
+                LOGGER.warning(
+                    "semantic_capture_inference_failed session_id=%s turn_id=%s "
+                    "reset_revision=%d error_type=%s reason=%s",
+                    self._session_id,
+                    payload.turn_id,
+                    payload.expected_reset_revision,
+                    "EmptyChangedCaptureProposalError",
+                    "changed disposition produced no valid dialogue frame update or journal events",
+                    extra={
+                        "ava_context": {
+                            "sessionId": self._session_id,
+                            "turnId": payload.turn_id,
+                            "resetRevision": payload.expected_reset_revision,
+                            "status": "failed",
+                            "errorType": "EmptyChangedCaptureProposalError",
+                            "reason": "changed disposition produced no valid dialogue frame update or journal events",
+                        }
+                    },
+                )
+                return
+
+            dialogue_frame_update: DialogueFrameUpdate | None = None
+            if (
+                frame_state is not None
+                and frame_state != self._dialogue_frame.to_state()
+            ):
+                dialogue_frame_update = DialogueFrameUpdate(
+                    base_revision=self._dialogue_frame.revision,
+                    frame=frame_state,
+                )
+
+            resolved_events = await resolve_semantic_journal_proposals(
+                store=self._memory,
+                subject=self._subject,
+                reset_revision=payload.expected_reset_revision,
+                drafts=filtered_drafts,
+            )
+            proposal = SemanticMemoryProposal(
+                disposition=SemanticCaptureDisposition.CHANGED,
+                dialogue_frame_update=dialogue_frame_update,
+                journal_events=resolved_events,
+            )
+
         proposal_fingerprint = canonical_semantic_memory_proposal_fingerprint(proposal)
-        base_revision = update.base_revision if update is not None else None
+        base_revision = (
+            proposal.dialogue_frame_update.base_revision
+            if proposal.dialogue_frame_update is not None
+            else None
+        )
+        started = monotonic()
         LOGGER.info(
             "semantic_memory_commit_started session_id=%s turn_id=%s "
-            "reset_revision=%d proposal_fingerprint_prefix=%s "
+            "reset_revision=%d disposition=%s proposal_fingerprint_prefix=%s "
             "base_frame_revision=%s proposed_journal_event_count=%d",
             self._session_id,
             payload.turn_id,
             payload.expected_reset_revision,
+            proposal.disposition,
             proposal_fingerprint[:12],
             base_revision,
             len(proposal.journal_events),
@@ -4539,7 +4996,8 @@ class DeterministicRealtimeSessionCoordinator:
                     }
                 },
             )
-            return None
+            return
+
         duration_ms = max(0.0, (monotonic() - started) * 1000)
         status = str(decision.status)
         event_suffix = (
@@ -4547,8 +5005,6 @@ class DeterministicRealtimeSessionCoordinator:
             if decision.status == SemanticMemoryCommitStatus.APPLIED
             else status
         )
-        if payload.expected_reset_revision == self._memory_reset_revision:
-            self._dialogue_frame = decision.dialogue_frame
         created_count = sum(
             result.disposition == "created" for result in decision.journal_results
         )
@@ -4593,121 +5049,32 @@ class DeterministicRealtimeSessionCoordinator:
                 }
             },
         )
-        return decision
 
-    async def _refresh_warm_memory(
-        self,
-        *,
-        payload: _CapturedMemoryCommit,
-        turn: DeliveredConversationTurn,
-        force_context_refresh: bool = False,
-    ) -> None:
-        revision = payload.warm_refresh_revision
-        LOGGER.info(
-            "memory_warm_refresh_started session_id=%s turn_id=%s revision=%d",
-            self._session_id,
-            payload.turn_id,
-            revision,
-        )
-        try:
-            candidates = await self._memory.search_memory_candidates(
-                subject=self._subject,
-                query=_warm_memory_query(turn),
-                limit=4,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            LOGGER.warning(
-                "memory_warm_refresh_failed session_id=%s turn_id=%s "
-                "revision=%d reason_category=%s",
-                self._session_id,
-                payload.turn_id,
-                revision,
-                _memory_failure_reason_category(error),
-            )
-            if (
-                force_context_refresh
-                and payload.expected_reset_revision == self._memory_reset_revision
-                and revision == self._warm_refresh_revision
-            ):
-                await self._refresh_post_commit_context(payload=payload, turn=turn)
+        if payload.expected_reset_revision != self._memory_reset_revision:
             return
-        if (
-            payload.expected_reset_revision != self._memory_reset_revision
-            or revision != self._warm_refresh_revision
-        ):
-            return
-        recent_live_turn_ids = set(self._recent_live_echo_suppression_turn_ids)
-        surviving_candidates = [
-            candidate
-            for candidate in candidates
-            if not recent_live_turn_ids.intersection(candidate.source_turn_ids)
-        ]
-        selected_candidates = surviving_candidates[:4]
-        references = tuple(
-            MemoryReference.from_candidate(candidate)
-            for candidate in selected_candidates
-        )
-        self._warm_memories = references
-        raw_candidate_count = len(candidates)
-        recent_suppressed_count = raw_candidate_count - len(surviving_candidates)
-        selected_source_kinds = [
-            str(candidate.source_kind) for candidate in selected_candidates
-        ]
-        selected_source_ids = [candidate.source_id for candidate in selected_candidates]
-        LOGGER.info(
-            "memory_warm_refresh_completed session_id=%s turn_id=%s "
-            "revision=%d raw_candidate_count=%d recent_suppressed_count=%d "
-            "selected_count=%d selected_source_kinds=%s selected_source_ids=%s",
-            self._session_id,
-            payload.turn_id,
-            revision,
-            raw_candidate_count,
-            recent_suppressed_count,
-            len(selected_candidates),
-            selected_source_kinds,
-            selected_source_ids,
-            extra={
-                "ava_context": {
-                    "sessionId": self._session_id,
-                    "turnId": payload.turn_id,
-                    "sourceTurnId": payload.turn_id,
-                    "revision": revision,
-                    "rawCandidateCount": raw_candidate_count,
-                    "recentSuppressedCount": recent_suppressed_count,
-                    "selectedCount": len(selected_candidates),
-                    "selectedSourceKinds": selected_source_kinds,
-                    "selectedSourceIds": selected_source_ids,
-                }
-            },
-        )
-        await self._refresh_post_commit_context(payload=payload, turn=turn)
 
-    async def _refresh_post_commit_context(
-        self,
-        *,
-        payload: _CapturedMemoryCommit,
-        turn: DeliveredConversationTurn,
-    ) -> None:
-        reason = (
-            DynamicContextBuildReason.CANVAS_INTERACTION_COMMITTED
-            if turn.canvas_interaction is not None
-            else DynamicContextBuildReason.TURN_COMMITTED
-        )
-        try:
-            await self._refresh_canvas_context(reason=reason)
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            LOGGER.warning(
-                "realtime_context_installation_failed session_id=%s turn_id=%s "
-                "reason=%s error_type=%s",
-                self._session_id,
-                payload.turn_id,
-                reason,
-                type(error).__name__,
+        prior_frame = self._dialogue_frame
+        self._dialogue_frame = decision.dialogue_frame
+
+        if decision.dialogue_frame != prior_frame:
+            reason = (
+                DynamicContextBuildReason.CANVAS_INTERACTION_COMMITTED
+                if turn.canvas_interaction is not None
+                else DynamicContextBuildReason.TURN_COMMITTED
             )
+            try:
+                await self._refresh_canvas_context(reason=reason)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                LOGGER.warning(
+                    "realtime_context_installation_failed session_id=%s turn_id=%s "
+                    "reason=%s error_type=%s",
+                    self._session_id,
+                    payload.turn_id,
+                    reason,
+                    type(error).__name__,
+                )
 
     async def _schedule_interrupted_canvas_presentation(self) -> None:
         if self._closed:
@@ -5143,16 +5510,22 @@ def _stable_memory_references(
     )
 
 
-def _warm_memory_query(turn: DeliveredConversationTurn) -> str:
-    fields = [turn.child_turn_summary]
-    if turn.child_text is not None:
-        fields.append(turn.child_text)
-    elif turn.canvas_interaction is not None:
-        fields.append(turn.canvas_interaction.accessibility_label)
-    normalized = " ".join(" ".join(fields).split())
-    if not normalized:
-        raise CoordinatorStateError("warm memory seed lost semantic turn material")
-    return normalized[:500]
+def _provider_context_equivalence_key(
+    harness: RealtimeHarness,
+) -> _ProviderContextEquivalenceKey:
+    provider_neutral_update = json.dumps(
+        harness.session_update(),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return (
+        harness.prompt_version,
+        harness.tool_contract_version,
+        harness.reasoning_effort,
+        harness.context.content_fingerprint,
+        provider_neutral_update,
+    )
 
 
 def _local_date_search_bounds(

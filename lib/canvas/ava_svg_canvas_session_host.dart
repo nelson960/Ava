@@ -71,11 +71,9 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
   AvaSvgCanvasSessionHost({
     Duration renderProfileDebounce = const Duration(milliseconds: 150),
     Duration persistenceRestoreTimeout = const Duration(seconds: 2),
-    Duration clientPresentationTimeout = const Duration(seconds: 3),
     AvaCanvasPersistence? persistence,
   })  : _renderProfileDebounce = renderProfileDebounce,
         _persistenceRestoreTimeout = persistenceRestoreTimeout,
-        _clientPresentationTimeout = clientPresentationTimeout,
         _persistence = persistence {
     if (renderProfileDebounce.isNegative) {
       throw ArgumentError.value(
@@ -91,19 +89,11 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
         'must be positive',
       );
     }
-    if (clientPresentationTimeout <= Duration.zero) {
-      throw ArgumentError.value(
-        clientPresentationTimeout,
-        'clientPresentationTimeout',
-        'must be positive',
-      );
-    }
     _restoration = _restorePersistedWorkspace();
   }
 
   final Duration _renderProfileDebounce;
   final Duration _persistenceRestoreTimeout;
-  final Duration _clientPresentationTimeout;
   final AvaCanvasPersistence? _persistence;
   late final Future<void> _restoration;
   bool _restoreInvalidated = false;
@@ -118,16 +108,12 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
   AvaCanvasRuntimeFocusSink? _runtimeFocusSink;
   bool _focusTransitionPending = false;
   int _focusRevision = 0;
-  int _clientOperationSequence = 0;
-  String? _pendingClientOperationId;
-  Timer? _pendingClientOperationTimer;
   int _lastAppliedCanonicalRevision = 0;
   bool _acceptedPresentationVisible = false;
   String? _acceptedPresentationSceneId;
   int? _acceptedPresentationFocusRevision;
 
   int get focusRevision => _focusRevision;
-  String? get pendingClientOperationId => _pendingClientOperationId;
   int get lastAppliedCanonicalRevision => _lastAppliedCanonicalRevision;
 
   AvaCanvasPresentationSnapshot presentationSnapshot() {
@@ -243,11 +229,11 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
   }
 
   bool get panelVisible {
-    if (_panelDismissed) return false;
-    return _hasMeaningfulCanvasState;
+    return _controller != null && !_panelDismissed && _hasMeaningfulCanvasState;
   }
 
-  bool get canReopen => _panelDismissed && _hasMeaningfulCanvasState;
+  bool get canReopen =>
+      _controller != null && _panelDismissed && _hasMeaningfulCanvasState;
 
   bool get generating {
     final phase = _controller?.lifecyclePhase;
@@ -269,34 +255,19 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     );
   }
 
-  bool get canSelectPrevious => currentSceneIndex > 0;
+  void requestPreviousScene() => _controller?.emitPresentationRequested(
+        operation: 'show',
+        selector: 'previous',
+      );
 
-  bool get canSelectNext =>
-      currentSceneIndex >= 0 &&
-      currentSceneIndex < _workspaceDocuments.length - 1;
+  void requestNextScene() => _controller?.emitPresentationRequested(
+        operation: 'show',
+        selector: 'next',
+      );
 
-  Future<void> selectPreviousScene() async {
-    final index = currentSceneIndex;
-    if (index > 0) {
-      await selectSceneByIndex(index - 1);
-    }
-  }
-
-  Future<void> selectNextScene() async {
-    final index = currentSceneIndex;
-    if (index >= 0 && index < _workspaceDocuments.length - 1) {
-      await selectSceneByIndex(index + 1);
-    }
-  }
-
-  Future<void> selectSceneByIndex(
-    int index, {
-    bool synchronizeVisiblePresentation = true,
-  }) async {
-    if (index < 0 || index >= _workspaceDocuments.length) {
-      throw RangeError.index(index, _workspaceDocuments, 'index');
-    }
-    final target = _workspaceDocuments[index];
+  Future<void> _applyPresentationScene(
+    AvaValidatedSvgCanvasDocument target,
+  ) async {
     if (identical(_presentedDocument, target) ||
         _presentedDocument?.descriptor.sceneId == target.descriptor.sceneId) {
       return;
@@ -307,14 +278,6 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     final revision = ++_focusRevision;
     final epoch = _workspaceEpoch;
     final targetSceneId = target.descriptor.sceneId;
-    final previousSceneId = _presentedDocument?.descriptor.sceneId;
-    final presentationRemainsAccepted = _acceptedPresentationVisible &&
-        _acceptedPresentationSceneId == previousSceneId &&
-        _acceptedPresentationFocusRevision == revision - 1;
-    final visibleNeedsPresentationSync = synchronizeVisiblePresentation &&
-        panelVisible &&
-        !presentationRemainsAccepted;
-    _clearPendingClientOperation();
     _presentedDocument = target;
     _clearAcceptedPresentation();
     _controller?.focusRetainedActive(
@@ -339,17 +302,6 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
           sceneId: targetSceneId,
           focusRevision: revision,
         );
-        if (presentationRemainsAccepted) {
-          _acceptPresentation(
-            sceneId: targetSceneId,
-            focusRevision: revision,
-          );
-        } else if (visibleNeedsPresentationSync && _controller != null) {
-          _emitVisiblePresentation(
-            document: target,
-            focusRevision: revision,
-          );
-        }
       }
     } catch (error) {
       if (_workspaceEpoch == epoch && _focusRevision == revision) {
@@ -382,13 +334,6 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     }
     if (identical(_controller, controller)) {
       _runtimeFocusSink = runtimeFocusSink;
-      if (runtimeFocusSink != null &&
-          panelVisible &&
-          _presentedDocument != null) {
-        _clearAcceptedPresentation();
-        controller.markPresentationUnavailable(focusPending: true);
-        unawaited(_synchronizeReopenedPresentation());
-      }
       return;
     }
     final previous = _controller;
@@ -412,7 +357,6 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     _lastSentRenderProfile = initialRenderProfile;
     _renderProfileRevision = 0;
     _observedPendingGenerationId = null;
-    _clearPendingClientOperation();
     _clearAcceptedPresentation();
     controller.addListener(_handleControllerChanged);
     controller.presentationCommandHandler = handlePresentationCommand;
@@ -425,12 +369,6 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
         _renderProfileDebounce,
         _flushRenderProfileUpdate,
       );
-    }
-    if (runtimeFocusSink != null &&
-        panelVisible &&
-        _presentedDocument != null) {
-      controller.markPresentationUnavailable(focusPending: true);
-      unawaited(_synchronizeReopenedPresentation());
     }
     notifyListeners();
   }
@@ -448,7 +386,10 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     _lastSentRenderProfile = null;
     _renderProfileRevision = 0;
     controller.currentFocusRevision = null;
-    _clearPendingClientOperation();
+    _panelDismissed = true;
+    _dismissedGenerationId = _displayGenerationId;
+    _clearAcceptedPresentation();
+    controller.markPresentationUnavailable();
     _controller = null;
     _observedPendingGenerationId = null;
     _clearDismissalWithoutCanvasState();
@@ -457,32 +398,17 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
 
   void dismissPanel() {
     if (!panelVisible) return;
-    final generationId = _displayGenerationId;
-    if (generationId == null) return;
-    _panelDismissed = true;
-    _dismissedGenerationId = generationId;
-    final opId = _beginClientOperation();
-    _clearAcceptedPresentation();
-    _controller?.markPresentationUnavailable();
-    notifyListeners();
-    _controller?.emitPresentationUpdated(
-      visible: false,
-      clientOperationId: opId,
+    _controller?.emitPresentationRequested(
+      operation: 'hide',
     );
   }
 
   void reopenPanel() {
     if (!canReopen) return;
-    _panelDismissed = false;
-    _dismissedGenerationId = null;
-    if (_focusRevision == 0) {
-      _focusRevision = 1;
-    }
-    _clearAcceptedPresentation();
-    _controller?.markPresentationUnavailable(
-        focusPending: _runtimeFocusSink != null);
-    notifyListeners();
-    unawaited(_synchronizeReopenedPresentation());
+    _controller?.emitPresentationRequested(
+      operation: 'show',
+      selector: 'current',
+    );
   }
 
   Future<void> handlePresentationCommand({
@@ -490,17 +416,9 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     required String action,
     String? sceneId,
   }) async {
-    if (_pendingClientOperationId != null) {
-      _controller?.emitPresentationAcknowledged(
-        commandId: commandId,
-        applied: false,
-        reason: 'supersededByClient',
-      );
-      return;
-    }
-
     if (action == 'hide') {
       _panelDismissed = true;
+      _dismissedGenerationId = _displayGenerationId;
       _clearAcceptedPresentation();
       _controller?.markPresentationUnavailable();
       notifyListeners();
@@ -520,10 +438,10 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
         );
         return;
       }
-      final index = _workspaceDocuments.indexWhere(
-        (doc) => doc.descriptor.sceneId == sceneId,
-      );
-      if (index < 0) {
+      final target = _workspaceDocuments
+          .where((doc) => doc.descriptor.sceneId == sceneId)
+          .firstOrNull;
+      if (target == null) {
         _controller?.emitPresentationAcknowledged(
           commandId: commandId,
           applied: false,
@@ -532,7 +450,6 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
         return;
       }
 
-      final target = _workspaceDocuments[index];
       _panelDismissed = false;
       _dismissedGenerationId = null;
 
@@ -552,19 +469,15 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
 
       final targetFocusRevision = _focusRevision + 1;
       try {
-        await selectSceneByIndex(
-          index,
-          synchronizeVisiblePresentation: false,
-        );
-        if (_pendingClientOperationId != null ||
-            _presentedDocument?.descriptor.sceneId !=
+        await _applyPresentationScene(target);
+        if (_presentedDocument?.descriptor.sceneId !=
                 target.descriptor.sceneId ||
             _focusRevision != targetFocusRevision ||
             _controller?.activeFocusRevision != targetFocusRevision) {
           _controller?.emitPresentationAcknowledged(
             commandId: commandId,
             applied: false,
-            reason: 'supersededByClient',
+            reason: 'presentationApplyFailed',
           );
           return;
         }
@@ -586,27 +499,9 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
 
   void handlePresentationChanged(Map<String, Object?> event) {
     final revision = event['revision'] as int? ?? 0;
-    final source = event['source'] as String? ?? 'user';
     final visible = event['visible'] as bool? ?? false;
     final sceneId = event['sceneId'] as String?;
     final focusRevision = event['focusRevision'] as int?;
-
-    if (source == 'user' || source == 'restore') {
-      _lastAppliedCanonicalRevision = revision;
-      final matchesLocal = _recordAcceptedPresentation(
-        visible: visible,
-        sceneId: sceneId,
-        focusRevision: focusRevision,
-      );
-      if (matchesLocal) {
-        _clearPendingClientOperation();
-      }
-      return;
-    }
-
-    if (_pendingClientOperationId != null) {
-      return;
-    }
 
     if (revision <= _lastAppliedCanonicalRevision) {
       return;
@@ -659,8 +554,6 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     _creationSequences.clear();
     _modificationSequences.clear();
     _lastAppliedCanonicalRevision = 0;
-    _clientOperationSequence = 0;
-    _clearPendingClientOperation();
     _clearAcceptedPresentation();
     if (_workspaceDocuments.isEmpty &&
         _presentedDocument == null &&
@@ -675,67 +568,6 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     _dismissedGenerationId = null;
     _observedPendingGenerationId = null;
     notifyListeners();
-  }
-
-  Future<void> _synchronizeReopenedPresentation() async {
-    final presented = _presentedDocument;
-    final controller = _controller;
-    if (presented == null || controller == null || !panelVisible) return;
-    final sceneId = presented.descriptor.sceneId;
-    final focusRevision = _focusRevision;
-    final epoch = _workspaceEpoch;
-    final opId = _beginClientOperation();
-    try {
-      final sink = _runtimeFocusSink;
-      if (sink != null) {
-        controller.focusRetainedActive(
-          presented,
-          focusRevision: focusRevision,
-          pendingSync: true,
-        );
-        await sink(presented, focusRevision);
-        if (_workspaceEpoch != epoch ||
-            _focusRevision != focusRevision ||
-            _presentedDocument?.descriptor.sceneId != sceneId ||
-            !panelVisible ||
-            _pendingClientOperationId != opId) {
-          return;
-        }
-        controller.completeFocusSync(
-          sceneId: sceneId,
-          focusRevision: focusRevision,
-        );
-      }
-      if (_workspaceEpoch != epoch ||
-          _focusRevision != focusRevision ||
-          _presentedDocument?.descriptor.sceneId != sceneId ||
-          !panelVisible ||
-          _pendingClientOperationId != opId) {
-        return;
-      }
-      controller.emitPresentationUpdated(
-        visible: true,
-        sceneId: sceneId,
-        focusRevision: focusRevision,
-        clientOperationId: opId,
-      );
-    } catch (error, stackTrace) {
-      if (_pendingClientOperationId == opId) {
-        _clearPendingClientOperation();
-      }
-      controller.failFocusSync(
-        sceneId: sceneId,
-        focusRevision: focusRevision,
-        error: error,
-      );
-      developer.log(
-        'canvas_reopen_sync_failed sceneId=$sceneId focusRevision=$focusRevision',
-        name: 'ava.canvas.presentation',
-        error: error,
-        stackTrace: stackTrace,
-      );
-      notifyListeners();
-    }
   }
 
   bool _recordAcceptedPresentation({
@@ -775,43 +607,6 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
     _acceptedPresentationVisible = false;
     _acceptedPresentationSceneId = null;
     _acceptedPresentationFocusRevision = null;
-  }
-
-  String _beginClientOperation() {
-    _clearPendingClientOperation();
-    final operationId = 'op_${++_clientOperationSequence}';
-    _pendingClientOperationId = operationId;
-    _pendingClientOperationTimer = Timer(_clientPresentationTimeout, () {
-      if (_pendingClientOperationId != operationId) return;
-      _pendingClientOperationId = null;
-      _pendingClientOperationTimer = null;
-      _controller?.markPresentationUnavailable();
-      developer.log(
-        'canvas_presentation_client_operation_timeout operationId=$operationId',
-        name: 'ava.canvas.presentation',
-      );
-      notifyListeners();
-    });
-    return operationId;
-  }
-
-  void _clearPendingClientOperation() {
-    _pendingClientOperationTimer?.cancel();
-    _pendingClientOperationTimer = null;
-    _pendingClientOperationId = null;
-  }
-
-  void _emitVisiblePresentation({
-    required AvaValidatedSvgCanvasDocument document,
-    required int focusRevision,
-  }) {
-    final operationId = _beginClientOperation();
-    _controller?.emitPresentationUpdated(
-      visible: true,
-      sceneId: document.descriptor.sceneId,
-      focusRevision: focusRevision,
-      clientOperationId: operationId,
-    );
   }
 
   void _handleControllerChanged() {
@@ -1159,7 +954,6 @@ final class AvaSvgCanvasSessionHost extends ChangeNotifier {
   void dispose() {
     _renderProfileTimer?.cancel();
     _renderProfileTimer = null;
-    _clearPendingClientOperation();
     _renderProfileUpdateSink = null;
     _controller?.removeListener(_handleControllerChanged);
     _controller = null;

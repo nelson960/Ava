@@ -58,6 +58,16 @@ def _svg(*, label: str = "Cloud", interaction_mode: str = "select") -> str:
     )
 
 
+def _continuous_svg(kind: str) -> str:
+    return f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 200" data-ava-interaction-mode="explore">
+<title>Changing state</title><desc>Move the handle between two semantic states.</desc>
+<path id="track" d="M 40 100 L 360 100" stroke="black"/>
+<g id="handle" aria-label="Change state" data-ava-control="state" data-ava-control-kind="{kind}" data-ava-track="track" data-ava-checkpoints="0=begin;1=end"><circle cx="30" cy="80" r="12"/></g>
+<g id="start" data-ava-binding="begin" data-ava-target="start" aria-label="Initial state"><text x="20" y="160">Start</text></g>
+<g id="finish" data-ava-binding="end" data-ava-target="finish" aria-label="Final state"><text x="320" y="160">End</text></g>
+</svg>'''
+
+
 def _response(svg: str, *, request_id: str = "resp_123") -> object:
     return SimpleNamespace(
         id=request_id,
@@ -250,6 +260,7 @@ def _request(**changes: object) -> SvgCanvasSpecialistRequest:
         "sourceTurnId": "turn_1",
         "brief": "Show how a cloud forms.",
         "interactionMode": "select",
+        "continuousControl": "none",
         "ageBand": "middleChildhood",
     }
     payload.update(changes)
@@ -428,6 +439,9 @@ def test_render_svg_canvas_specialist_instructions_contract() -> None:
     assert "autonomous" not in instructions
     assert "there is no required" not in instructions.lower()
     assert "controlsContract" in instructions
+    assert "Copy the requested interactionMode and continuousControl exactly" in instructions
+    assert "preserve the targetId and bindingId" in instructions
+    assert "EXPLORE may use drag, slider, or timeline" not in instructions
     assert "child-friendly" not in instructions
     assert "editorial vector illustration" not in instructions
 
@@ -531,6 +545,54 @@ async def test_interaction_mode_mismatch_uses_existing_quality_repair() -> None:
     assert len(client.responses.arguments) == 2
     repair_input = client.responses.arguments[1]["input"]
     assert "interactionModeMismatch" in str(repair_input)
+
+
+@pytest.mark.parametrize(
+    ("continuous_control", "svg", "failure_code"),
+    [
+        ("none", _continuous_svg("drag"), "continuousControlMismatch"),
+        ("slider", _svg(interaction_mode="explore"), "continuousControlMissing"),
+        ("slider", _continuous_svg("drag"), "continuousControlMismatch"),
+    ],
+)
+async def test_requested_continuous_control_must_match_validated_svg(
+    continuous_control: str,
+    svg: str,
+    failure_code: str,
+) -> None:
+    client = _Client([_response(svg)])
+    provider = OpenAISvgCanvasSpecialist(
+        Settings(environment=AvaEnvironment.TEST, openai_canvas_max_quality_repairs=0),
+        session_id="session_control_mismatch",
+        safety_identifier="ava_test_user_control_mismatch",
+        client=client,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(SvgCanvasSpecialistInvalidError, match=failure_code):
+        await provider.generate(
+            _request(
+                interactionMode="explore",
+                continuousControl=continuous_control,
+            )
+        )
+
+
+async def test_exact_requested_continuous_control_is_accepted() -> None:
+    client = _Client([_response(_continuous_svg("slider"))])
+    provider = OpenAISvgCanvasSpecialist(
+        Settings(environment=AvaEnvironment.TEST, openai_canvas_max_quality_repairs=0),
+        session_id="session_control_exact",
+        safety_identifier="ava_test_user_control_exact",
+        client=client,  # type: ignore[arg-type]
+    )
+
+    generation = await provider.generate(
+        _request(interactionMode="explore", continuousControl="slider")
+    )
+
+    assert {control.kind for control in generation.document.controls.values()} == {
+        "slider"
+    }
 
 
 def test_exact_extractor_allows_reasoning_but_does_not_join_text() -> None:

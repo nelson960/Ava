@@ -10,13 +10,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from enum import StrEnum
-from typing import Annotated, Protocol
+from typing import Annotated, Any, Protocol
 from zoneinfo import ZoneInfo
 
-from pydantic import Field, StringConstraints, model_validator
+from pydantic import ConfigDict, Field, StringConstraints, model_validator
 
 from ..protocol import AgeBand
-from .common import NonEmptyText, ProtocolIdentifier, RealtimeProtocolModel
+from .common import NonEmptyText, ProtocolIdentifier, RealtimeProtocolModel, _to_camel
 from .tool_contract import InteractiveCanvasMode
 from .timezone import MAX_TIMEZONE_ID_CHARACTERS, validate_iana_timezone_id
 
@@ -221,6 +221,7 @@ class MemoryCandidateSourceKind(StrEnum):
     RAW_EVENT = "rawEvent"
     EPISODE = "episode"
     STABLE_MEMORY = "stableMemory"
+    SEMANTIC_JOURNAL = "semanticJournal"
 
 
 class MemorySearchCandidate(RealtimeProtocolModel):
@@ -325,8 +326,34 @@ class DialogueFrameCanvasReference(RealtimeProtocolModel):
         return self
 
 
+_DIALOGUE_FRAME_TEXT_COLLECTION_LIMITS: dict[str, int] = {
+    "active_topics": MAX_DIALOGUE_FRAME_LIST_ITEMS,
+    "active_goals": MAX_DIALOGUE_FRAME_LIST_ITEMS,
+    "unresolved_questions": MAX_DIALOGUE_FRAME_LIST_ITEMS,
+    "current_referents": MAX_DIALOGUE_FRAME_LIST_ITEMS,
+    "recent_entities": MAX_DIALOGUE_FRAME_RECENT_ENTITIES,
+    "ava_commitments": MAX_DIALOGUE_FRAME_LIST_ITEMS,
+    "explicit_user_preferences": MAX_DIALOGUE_FRAME_LIST_ITEMS,
+    "temporary_interaction_preferences": MAX_DIALOGUE_FRAME_LIST_ITEMS,
+    "recent_tool_references": MAX_DIALOGUE_FRAME_TOOL_REFERENCES,
+}
+_DIALOGUE_FRAME_TEXT_FIELDS = tuple(_DIALOGUE_FRAME_TEXT_COLLECTION_LIMITS.keys())
+_DIALOGUE_FRAME_COLLECTION_FIELDS = _DIALOGUE_FRAME_TEXT_FIELDS + (
+    "relevant_canvas_references",
+)
+
+
 class DialogueFrameState(RealtimeProtocolModel):
     """Bounded semantic working state supplied by an external authority."""
+
+    model_config = ConfigDict(
+        alias_generator=_to_camel,
+        populate_by_name=True,
+        validate_by_name=True,
+        extra="forbid",
+        str_strip_whitespace=True,
+        use_enum_values=True,
+    )
 
     active_topics: tuple[DialogueFrameText, ...] = Field(
         default=(), max_length=MAX_DIALOGUE_FRAME_LIST_ITEMS
@@ -338,10 +365,20 @@ class DialogueFrameState(RealtimeProtocolModel):
         default=(), max_length=MAX_DIALOGUE_FRAME_LIST_ITEMS
     )
     current_referents: tuple[DialogueFrameText, ...] = Field(
-        default=(), max_length=MAX_DIALOGUE_FRAME_LIST_ITEMS
+        default=(),
+        max_length=MAX_DIALOGUE_FRAME_LIST_ITEMS,
+        description=(
+            "Objects actively referred to in current context, ordered "
+            "highest-current-relevance first (max 4)."
+        ),
     )
     recent_entities: tuple[DialogueFrameText, ...] = Field(
-        default=(), max_length=MAX_DIALOGUE_FRAME_RECENT_ENTITIES
+        default=(),
+        max_length=MAX_DIALOGUE_FRAME_RECENT_ENTITIES,
+        description=(
+            "Recently mentioned entities, ordered highest-current-relevance "
+            "first (max 8)."
+        ),
     )
     ava_commitments: tuple[DialogueFrameText, ...] = Field(
         default=(), max_length=MAX_DIALOGUE_FRAME_LIST_ITEMS
@@ -396,8 +433,21 @@ class DialogueFrameState(RealtimeProtocolModel):
 class DialogueFrame(DialogueFrameState):
     revision: int = Field(default=0, ge=0)
 
+    def to_state(self) -> DialogueFrameState:
+        return DialogueFrameState.model_validate(
+            self.model_dump(mode="python", exclude={"revision"})
+        )
+
 
 class DialogueFrameUpdate(RealtimeProtocolModel):
+    model_config = ConfigDict(
+        alias_generator=_to_camel,
+        populate_by_name=True,
+        validate_by_name=True,
+        extra="forbid",
+        str_strip_whitespace=True,
+        use_enum_values=True,
+    )
     base_revision: int = Field(ge=0)
     frame: DialogueFrameState
 
@@ -418,6 +468,25 @@ class SemanticJournalEventFamily(StrEnum):
     AVA_COMMITMENT = "avaCommitment"
     USER_FACT = "userFact"
     CANVAS_REFERENCE = "canvasReference"
+
+
+def canonicalize_semantic_key(key: str) -> str:
+    """Normalize wire semantic key representation to canonical snake_case slug syntax.
+
+    Allowed behavior:
+      - trim surrounding whitespace
+      - split camelCase/PascalCase boundaries into snake_case
+      - lowercase
+      - preserve already-valid '.', '_', ':', '-'
+    """
+    if not isinstance(key, str):
+        return key
+    s = key.strip()
+    if not s:
+        return s
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s)
+    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", s)
+    return s.lower()
 
 
 SemanticJournalKey = Annotated[
@@ -472,7 +541,178 @@ class SemanticJournalEventProposal(RealtimeProtocolModel):
         return self
 
 
+class SemanticCaptureDisposition(StrEnum):
+    CHANGED = "changed"
+    NO_CHANGE = "noChange"
+
+
+class SemanticCaptureJournalDraft(RealtimeProtocolModel):
+    model_config = ConfigDict(
+        alias_generator=_to_camel,
+        populate_by_name=True,
+        validate_by_name=True,
+        extra="forbid",
+        str_strip_whitespace=True,
+        use_enum_values=True,
+    )
+
+    family: SemanticJournalEventFamily
+    semantic_key: SemanticJournalKey
+    summary: SemanticJournalSummary
+    canonical_canvas_references: tuple[SemanticJournalCanvasReference, ...] = Field(
+        default=(), max_length=MAX_SEMANTIC_JOURNAL_CANVAS_REFERENCES
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def canonicalize_draft(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        for key in ("canonicalCanvasReferences", "canonical_canvas_references"):
+            if key in data and data[key] is None:
+                data[key] = []
+        for key in ("semanticKey", "semantic_key"):
+            if key in data and isinstance(data[key], str):
+                data[key] = canonicalize_semantic_key(data[key])
+        family = data.get("family")
+        if (
+            family != SemanticJournalEventFamily.CANVAS_REFERENCE
+            and family != "canvasReference"
+        ):
+            for key in ("canonicalCanvasReferences", "canonical_canvas_references"):
+                if key in data and isinstance(data[key], (list, tuple)):
+                    valid_refs = []
+                    for item in data[key]:
+                        if isinstance(item, SemanticJournalCanvasReference):
+                            valid_refs.append(item)
+                        elif isinstance(item, dict):
+                            try:
+                                valid_refs.append(
+                                    SemanticJournalCanvasReference.model_validate(item)
+                                )
+                            except Exception:
+                                continue
+                    data[key] = valid_refs
+        return data
+
+    @model_validator(mode="after")
+    def draft_is_mechanically_bounded(self) -> SemanticCaptureJournalDraft:
+        _reject_control_characters(self.summary)
+        canvas_identities = [
+            (reference.scene_id, reference.scene_revision, reference.relation)
+            for reference in self.canonical_canvas_references
+        ]
+        if len(canvas_identities) != len(set(canvas_identities)):
+            raise ValueError("canonicalCanvasReferences cannot contain duplicates")
+        return self
+
+
+def _canonicalize_capture_dialogue_frame(data: Any) -> Any:
+    if not isinstance(data, dict):
+        return data
+    data = dict(data)
+    for field, max_items in _DIALOGUE_FRAME_TEXT_COLLECTION_LIMITS.items():
+        camel = _to_camel(field)
+        for key in (camel, field):
+            if key in data:
+                val = data[key]
+                if val is None:
+                    data[key] = []
+                elif isinstance(val, (list, tuple)):
+                    retained: list[Any] = []
+                    for item in val:
+                        if isinstance(item, str):
+                            stripped = item.strip()
+                            if not stripped or len(stripped) > MAX_DIALOGUE_FRAME_ITEM_CHARACTERS:
+                                continue
+                            retained.append(stripped)
+                        else:
+                            retained.append(item)
+                    data[key] = retained[:max_items]
+
+    for key in ("relevantCanvasReferences", "relevant_canvas_references"):
+        if key in data:
+            val = data[key]
+            if val is None:
+                data[key] = []
+            elif isinstance(val, (list, tuple)):
+                valid_refs: list[DialogueFrameCanvasReference] = []
+                for item in data[key]:
+                    if isinstance(item, DialogueFrameCanvasReference):
+                        valid_refs.append(item)
+                    elif isinstance(item, dict):
+                        try:
+                            valid_refs.append(
+                                DialogueFrameCanvasReference.model_validate(item)
+                            )
+                        except Exception:
+                            continue
+                data[key] = valid_refs[:MAX_DIALOGUE_FRAME_CANVAS_REFERENCES]
+
+    return data
+
+
+class SemanticCaptureFunctionArguments(RealtimeProtocolModel):
+    model_config = ConfigDict(
+        alias_generator=_to_camel,
+        populate_by_name=True,
+        validate_by_name=True,
+        extra="forbid",
+        str_strip_whitespace=True,
+        use_enum_values=True,
+    )
+    disposition: SemanticCaptureDisposition
+    dialogue_frame: DialogueFrameState | None = None
+    journal_events: tuple[SemanticCaptureJournalDraft, ...] = Field(
+        default=(), max_length=MAX_SEMANTIC_JOURNAL_EVENTS_PER_PROPOSAL
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def canonicalize_wire_arguments(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        for key in ("dialogueFrame", "dialogue_frame"):
+            if key in data and data[key] is not None:
+                data[key] = _canonicalize_capture_dialogue_frame(data[key])
+        for key in ("journalEvents", "journal_events"):
+            if key in data and data[key] is None:
+                data[key] = []
+        return data
+
+    @model_validator(mode="after")
+    def arguments_are_valid(self) -> SemanticCaptureFunctionArguments:
+        if self.disposition == SemanticCaptureDisposition.NO_CHANGE:
+            if self.dialogue_frame is not None or self.journal_events:
+                raise ValueError(
+                    "noChange capture disposition forbids dialogueFrame and journalEvents"
+                )
+        else:
+            if self.dialogue_frame is None and not self.journal_events:
+                raise ValueError(
+                    "changed capture disposition requires dialogueFrame or journalEvents"
+                )
+        identities = [
+            semantic_journal_identity_key(event.family, event.semantic_key)
+            for event in self.journal_events
+        ]
+        if len(identities) != len(set(identities)):
+            raise ValueError("journalEvents cannot contain duplicate semantic identities")
+        return self
+
+
 class SemanticMemoryProposal(RealtimeProtocolModel):
+    model_config = ConfigDict(
+        alias_generator=_to_camel,
+        populate_by_name=True,
+        validate_by_name=True,
+        extra="forbid",
+        str_strip_whitespace=True,
+        use_enum_values=True,
+    )
+    disposition: SemanticCaptureDisposition
     dialogue_frame_update: DialogueFrameUpdate | None = None
     journal_events: tuple[SemanticJournalEventProposal, ...] = Field(
         default=(), max_length=MAX_SEMANTIC_JOURNAL_EVENTS_PER_PROPOSAL
@@ -480,11 +720,17 @@ class SemanticMemoryProposal(RealtimeProtocolModel):
 
     @model_validator(mode="after")
     def proposal_is_bounded_and_unambiguous(self) -> SemanticMemoryProposal:
-        if self.dialogue_frame_update is None and not self.journal_events:
-            raise ValueError(
-                "semantic memory proposal requires a DialogueFrame update or "
-                "Journal event"
-            )
+        if self.disposition == SemanticCaptureDisposition.NO_CHANGE:
+            if self.dialogue_frame_update is not None or self.journal_events:
+                raise ValueError(
+                    "noChange semantic proposal cannot contain frame updates or journal events"
+                )
+        else:
+            if self.dialogue_frame_update is None and not self.journal_events:
+                raise ValueError(
+                    "changed semantic memory proposal requires a DialogueFrame update or "
+                    "Journal event"
+                )
         identities = [
             semantic_journal_identity_key(event.family, event.semantic_key)
             for event in self.journal_events
@@ -569,18 +815,6 @@ def _semantic_memory_decision(
     )
 
 
-_DIALOGUE_FRAME_TEXT_FIELDS = (
-    "active_topics",
-    "active_goals",
-    "unresolved_questions",
-    "current_referents",
-    "recent_entities",
-    "ava_commitments",
-    "explicit_user_preferences",
-    "temporary_interaction_preferences",
-    "recent_tool_references",
-)
-
 
 def canonical_dialogue_frame_update_fingerprint(
     update: DialogueFrameUpdate,
@@ -644,6 +878,16 @@ def canonical_semantic_memory_proposal_fingerprint(
     ).hexdigest()
 
 
+def _validate_semantic_journal_identity_key(identity_key: str) -> str:
+    family, separator, semantic_key = identity_key.partition(":")
+    if (
+        not separator
+        or semantic_journal_identity_key(family, semantic_key) != identity_key
+    ):
+        raise ValueError("semantic Journal identity key is invalid")
+    return identity_key
+
+
 def semantic_journal_created_event_id(
     *,
     subject: str,
@@ -661,12 +905,7 @@ def semantic_journal_created_event_id(
     validated_source_turn_id = _validate_protocol_identifier(
         source_turn_id, field_name="source_turn_id"
     )
-    family, separator, semantic_key = identity_key.partition(":")
-    if (
-        not separator
-        or semantic_journal_identity_key(family, semantic_key) != identity_key
-    ):
-        raise ValueError("semantic Journal identity key is invalid")
+    validated_identity_key = _validate_semantic_journal_identity_key(identity_key)
     if not re.fullmatch(r"[0-9a-f]{64}", event_fingerprint):
         raise ValueError("semantic Journal event fingerprint is invalid")
     digest = hashlib.sha256(
@@ -812,6 +1051,22 @@ class AuthoritativeMemoryStore(Protocol):
         proposal: SemanticMemoryProposal,
     ) -> SemanticMemoryCommitDecision: ...
 
+    async def load_semantic_memory_receipt(
+        self,
+        *,
+        subject: str,
+        expected_reset_revision: int,
+        source_turn_id: str,
+    ) -> SemanticMemoryReceipt | None: ...
+
+    async def get_active_semantic_journal_event(
+        self,
+        *,
+        subject: str,
+        expected_reset_revision: int,
+        identity_key: str,
+    ) -> SemanticJournalEventRecord | None: ...
+
     async def search_memory_candidates(
         self,
         *,
@@ -853,11 +1108,65 @@ class StoredDeliveredConversationEvent:
 
 
 @dataclass(frozen=True, slots=True)
-class _SemanticMemoryReceipt:
+class SemanticMemoryReceipt:
+    source_turn_id: str
+    disposition: SemanticCaptureDisposition
     proposal_fingerprint: str
     event_results: tuple[tuple[str, SemanticJournalEventDisposition], ...]
     resulting_frame_revision: int
     applied_at: datetime
+
+
+async def resolve_semantic_journal_proposals(
+    *,
+    store: AuthoritativeMemoryStore,
+    subject: str,
+    reset_revision: int,
+    drafts: Sequence[SemanticCaptureJournalDraft],
+) -> tuple[SemanticJournalEventProposal, ...]:
+    proposals: list[SemanticJournalEventProposal] = []
+    for draft in drafts:
+        identity_key = semantic_journal_identity_key(draft.family, draft.semantic_key)
+        active_record = await store.get_active_semantic_journal_event(
+            subject=subject,
+            expected_reset_revision=reset_revision,
+            identity_key=identity_key,
+        )
+        if active_record is None:
+            supersedes_event_ids: tuple[str, ...] = ()
+        else:
+            tentative_proposal = SemanticJournalEventProposal.model_validate(
+                {
+                    "family": draft.family,
+                    "semanticKey": draft.semantic_key,
+                    "summary": draft.summary,
+                    "canonicalCanvasReferences": [
+                        ref.model_dump(mode="json", by_alias=True)
+                        for ref in draft.canonical_canvas_references
+                    ],
+                    "supersedesEventIds": (),
+                }
+            )
+            cand_fp = canonical_semantic_journal_event_fingerprint(tentative_proposal)
+            if active_record.fingerprint == cand_fp:
+                supersedes_event_ids = ()
+            else:
+                supersedes_event_ids = (active_record.event_id,)
+        proposals.append(
+            SemanticJournalEventProposal.model_validate(
+                {
+                    "family": draft.family,
+                    "semanticKey": draft.semantic_key,
+                    "summary": draft.summary,
+                    "canonicalCanvasReferences": [
+                        ref.model_dump(mode="json", by_alias=True)
+                        for ref in draft.canonical_canvas_references
+                    ],
+                    "supersedesEventIds": list(supersedes_event_ids),
+                }
+            )
+        )
+    return tuple(proposals)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1027,7 +1336,7 @@ class DevelopmentAuthoritativeMemoryStore:
             str, defaultdict[str, set[str]]
         ] = defaultdict(lambda: defaultdict(set))
         self._semantic_memory_receipts: defaultdict[
-            str, dict[str, _SemanticMemoryReceipt]
+            str, dict[str, SemanticMemoryReceipt]
         ] = defaultdict(dict)
         self._max_memories_per_subject = max_memories_per_subject
         self._lock = asyncio.Lock()
@@ -1177,9 +1486,10 @@ class DevelopmentAuthoritativeMemoryStore:
         )
         proposal = SemanticMemoryProposal.model_validate(
             {
+                "disposition": "changed",
                 "dialogueFrameUpdate": validated_update.model_dump(
                     mode="json", by_alias=True
-                )
+                ),
             }
         )
         try:
@@ -1216,6 +1526,78 @@ class DevelopmentAuthoritativeMemoryStore:
             proposal=proposal,
             allow_m1_frame_retry=False,
         )
+
+    async def load_semantic_memory_receipt(
+        self,
+        *,
+        subject: str,
+        expected_reset_revision: int,
+        source_turn_id: str,
+    ) -> SemanticMemoryReceipt | None:
+        normalized_subject = _validate_subject(subject)
+        validated_expected_reset_revision = _validate_reset_revision(
+            expected_reset_revision,
+            field_name="expected_reset_revision",
+        )
+        validated_source_turn_id = _validate_protocol_identifier(
+            source_turn_id, field_name="source_turn_id"
+        )
+        async with self._lock:
+            current_reset_revision = self._reset_revisions[normalized_subject]
+            if current_reset_revision != validated_expected_reset_revision:
+                raise MemoryResetRevisionMismatchError(
+                    expected_reset_revision=validated_expected_reset_revision,
+                    current_reset_revision=current_reset_revision,
+                )
+            receipt = self._semantic_memory_receipts[normalized_subject].get(
+                validated_source_turn_id
+            )
+            if receipt is not None:
+                return receipt
+            legacy_frame_receipt = self._dialogue_frame_receipts[
+                normalized_subject
+            ].get(validated_source_turn_id)
+            if legacy_frame_receipt is not None:
+                return SemanticMemoryReceipt(
+                    source_turn_id=validated_source_turn_id,
+                    disposition=SemanticCaptureDisposition.CHANGED,
+                    proposal_fingerprint=legacy_frame_receipt[0],
+                    event_results=(),
+                    resulting_frame_revision=legacy_frame_receipt[1],
+                    applied_at=datetime.now(UTC),
+                )
+            return None
+
+    async def get_active_semantic_journal_event(
+        self,
+        *,
+        subject: str,
+        expected_reset_revision: int,
+        identity_key: str,
+    ) -> SemanticJournalEventRecord | None:
+        normalized_subject = _validate_subject(subject)
+        validated_expected_reset_revision = _validate_reset_revision(
+            expected_reset_revision,
+            field_name="expected_reset_revision",
+        )
+        validated_identity_key = _validate_semantic_journal_identity_key(identity_key)
+        async with self._lock:
+            current_reset_revision = self._reset_revisions[normalized_subject]
+            if current_reset_revision != validated_expected_reset_revision:
+                raise MemoryResetRevisionMismatchError(
+                    expected_reset_revision=validated_expected_reset_revision,
+                    current_reset_revision=current_reset_revision,
+                )
+            superseded_ids = set(
+                self._semantic_journal_supersessions[normalized_subject]
+            )
+            for record in self._semantic_journal_events[normalized_subject].values():
+                if (
+                    record.identity_key == validated_identity_key
+                    and record.event_id not in superseded_ids
+                ):
+                    return record
+            return None
 
     async def _apply_semantic_memory_proposal(
         self,
@@ -1308,7 +1690,9 @@ class DevelopmentAuthoritativeMemoryStore:
                     raise SemanticMemoryProposalConflictError(
                         "source turn already applied a different DialogueFrame update"
                     )
-                migrated_receipt = _SemanticMemoryReceipt(
+                migrated_receipt = SemanticMemoryReceipt(
+                    source_turn_id=validated_source_turn_id,
+                    disposition=SemanticCaptureDisposition.CHANGED,
                     proposal_fingerprint=proposal_fingerprint,
                     event_results=(),
                     resulting_frame_revision=legacy_frame_receipt[1],
@@ -1321,6 +1705,24 @@ class DevelopmentAuthoritativeMemoryStore:
                     subject=normalized_subject,
                     receipt=migrated_receipt,
                     frame=current_frame,
+                )
+
+            if validated_proposal.disposition == SemanticCaptureDisposition.NO_CHANGE:
+                semantic_receipt = SemanticMemoryReceipt(
+                    source_turn_id=validated_source_turn_id,
+                    disposition=SemanticCaptureDisposition.NO_CHANGE,
+                    proposal_fingerprint=proposal_fingerprint,
+                    event_results=(),
+                    resulting_frame_revision=current_frame.revision,
+                    applied_at=datetime.now(UTC),
+                )
+                self._semantic_memory_receipts[normalized_subject][
+                    validated_source_turn_id
+                ] = semantic_receipt
+                return _semantic_memory_decision(
+                    SemanticMemoryCommitStatus.APPLIED,
+                    current_frame,
+                    (),
                 )
 
             if (
@@ -1389,7 +1791,9 @@ class DevelopmentAuthoritativeMemoryStore:
                         }
                     )
                 )
-            semantic_receipt = _SemanticMemoryReceipt(
+            semantic_receipt = SemanticMemoryReceipt(
+                source_turn_id=validated_source_turn_id,
+                disposition=SemanticCaptureDisposition.CHANGED,
                 proposal_fingerprint=proposal_fingerprint,
                 event_results=tuple(
                     (result.event.event_id, result.disposition)
@@ -1411,7 +1815,7 @@ class DevelopmentAuthoritativeMemoryStore:
         self,
         *,
         subject: str,
-        receipt: _SemanticMemoryReceipt,
+        receipt: SemanticMemoryReceipt,
         frame: DialogueFrame,
     ) -> SemanticMemoryCommitDecision:
         results = [
@@ -1530,6 +1934,39 @@ class DevelopmentAuthoritativeMemoryStore:
                         timezone_ids=timezone_ids,
                         reference_text=text,
                         source_turn_ids=(memory.source_turn_id,),
+                        relevance=relevance,
+                    )
+                )
+
+            current_reset_revision = self._reset_revisions.get(normalized_subject, 0)
+            superseded_ids = set(
+                self._semantic_journal_supersessions.get(normalized_subject, {})
+            )
+            for record in self._semantic_journal_events.get(normalized_subject, {}).values():
+                if record.reset_revision != current_reset_revision:
+                    continue
+                if record.event_id in superseded_ids:
+                    continue
+                if not _instant_is_in_range(record.created_at, lower, upper):
+                    continue
+                relevance = _lexical_relevance(record.summary, query_tokens)
+                if relevance <= 0:
+                    continue
+                sources_by_event = self._semantic_journal_sources.get(normalized_subject)
+                source_turn_ids: tuple[str, ...] = ()
+                if sources_by_event is not None and record.event_id in sources_by_event:
+                    source_turn_ids = tuple(
+                        sorted(sources_by_event[record.event_id])
+                    )[:MAX_EPISODE_SOURCE_EVENTS]
+                results.append(
+                    _memory_candidate(
+                        source_id=record.event_id,
+                        source_kind=MemoryCandidateSourceKind.SEMANTIC_JOURNAL,
+                        started_at=record.created_at,
+                        ended_at=record.created_at,
+                        timezone_ids=(),
+                        reference_text=record.summary,
+                        source_turn_ids=source_turn_ids,
                         relevance=relevance,
                     )
                 )

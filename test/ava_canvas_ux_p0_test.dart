@@ -379,7 +379,8 @@ void main() {
     _announceGeneration(controller, documentB);
 
     // Generation B owns pending state and automatically opens
-    expect(controller.generation?.generationId, documentB.descriptor.generationId);
+    expect(
+        controller.generation?.generationId, documentB.descriptor.generationId);
     expect(host.panelVisible, isTrue);
     expect(host.canReopen, isFalse);
 
@@ -677,8 +678,8 @@ void main() {
     );
     expect(hiddenCaptionPositioned.bottom, equals(0.0));
 
-    // 2. Make canvas visible: Announce generation
-    _announceGeneration(controller, documentA);
+    // 2. Backend SHOW has already established the retained focused scene.
+    controller.restoreRetainedActive(documentA);
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 500));
 
@@ -704,6 +705,41 @@ void main() {
       captionTickerRect.bottom,
       lessThanOrEqualTo(canvasPanelRect.top + 0.01),
     );
+
+    // 3. A backend HIDE command removes the real panel from MainScreen while
+    // preserving the retained focused document.
+    controller.receivePresentationCommand({
+      'protocolVersion': 4,
+      'event': 'canvasPresentationCommand',
+      'sessionId': 'session-1',
+      'sequence': 1,
+      'revision': 1,
+      'commandId': 'cmd-hide-main-screen',
+      'action': 'hide',
+    });
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+
+    expect(host.panelVisible, isFalse);
+    expect(host.presentedDocument, same(documentA));
+    expect(find.byType(AvaSvgCanvasPanel), findsNothing);
+
+    // 4. Backend SHOW current remounts the same focused retained scene.
+    controller.receivePresentationCommand({
+      'protocolVersion': 4,
+      'event': 'canvasPresentationCommand',
+      'sessionId': 'session-1',
+      'sequence': 2,
+      'revision': 2,
+      'commandId': 'cmd-show-main-screen',
+      'action': 'show',
+      'sceneId': documentA.descriptor.sceneId,
+    });
+    await tester.pump();
+
+    expect(host.panelVisible, isTrue);
+    expect(host.presentedDocument, same(documentA));
+    expect(find.byType(AvaSvgCanvasPanel), findsOneWidget);
   });
 }
 
@@ -714,7 +750,7 @@ void _announceGeneration(
   controller.receiveGenerationStarted({
     'protocolVersion': 4,
     'event': 'canvasGenerationStarted',
-      'focusRevision': 0,
+    'focusRevision': 0,
     'sessionId': 'session-1234',
     'sequence': 0,
     'revision': 1,

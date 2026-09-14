@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
+from xml.etree import ElementTree
 
 import pytest
 
@@ -11,6 +12,7 @@ from ava_backend.canvas.svg_session import SvgCanvasSessionState
 from ava_backend.canvas.svg_workspace import (
     ActiveSvgCanvasScene,
     CanvasNavigationDirection,
+    CanvasSceneSelector,
     CanvasWorkspaceManifest,
     CanvasWorkspaceManifestScene,
     RecordedSvgCanvasInteraction,
@@ -18,6 +20,7 @@ from ava_backend.canvas.svg_workspace import (
     SvgCanvasExecutionStatus,
     SvgCanvasWorkspaceError,
 )
+from ava_backend.realtime.tool_contract import ManageCanvasPresentationRequest
 
 
 def _active(index: int, *, revision: int = 1) -> ActiveSvgCanvasScene:
@@ -95,6 +98,15 @@ def _canonical_manifest(workspace: SvgCanvasWorkspace) -> CanvasWorkspaceManifes
         focused_scene_id=workspace.focused_scene_id,
         scenes=workspace.manifest_scenes,
     )
+
+
+def _hydrate_in_order(
+    workspace: SvgCanvasWorkspace,
+    scenes: list[ActiveSvgCanvasScene],
+    indexes: tuple[int, ...],
+) -> None:
+    for index in indexes:
+        workspace.focus_retained(scenes[index])
 
 
 def test_six_scene_manifest_preserves_durable_order_and_navigates_sequentially() -> (
@@ -282,7 +294,10 @@ def test_current_revision_with_different_structure_remains_a_conflict() -> None:
     current = _canonical_manifest(workspace)
     conflicting = replace(
         current,
-        scenes=(replace(current.scenes[0], summary="Conflicting summary"), *current.scenes[1:]),
+        scenes=(
+            replace(current.scenes[0], summary="Conflicting summary"),
+            *current.scenes[1:],
+        ),
     )
 
     with pytest.raises(SvgCanvasWorkspaceError, match="conflicts"):
@@ -386,6 +401,214 @@ def test_capacity_ten_create_evicts_oldest_in_one_structural_revision() -> None:
         "evictionReason": "capacityFifo",
         "occurredAt": "2026-09-06T12:00:00+00:00",
     }
+
+
+def test_full_manifest_sparse_out_of_order_hydration_evicts_canonical_oldest() -> None:
+    scenes = [_active(index) for index in range(1, 11)]
+    workspace = SvgCanvasWorkspace()
+    workspace.adopt_manifest(_manifest(scenes, revision=20, focused_index=None))
+    _hydrate_in_order(workspace, scenes, (9, 5, 7, 0))
+
+    created = workspace.commit(
+        _active(11),
+        base_scene_id=None,
+        base_revision=0,
+        workspace_epoch=7,
+    )
+
+    assert workspace.ordered_scene_ids() == tuple(
+        f"scene-{index}" for index in range(2, 12)
+    )
+    assert [scene.scene_id for scene in workspace.scenes] == [
+        "scene-10",
+        "scene-6",
+        "scene-8",
+        "scene-11",
+    ]
+    assert workspace.scene_count == 10
+    assert workspace.workspace_revision == 21
+    assert created.evicted_scene_id == "scene-1"
+
+
+def test_canonical_capacity_eviction_does_not_require_evicted_scene_hydration() -> None:
+    scenes = [_active(index) for index in range(1, 11)]
+    workspace = SvgCanvasWorkspace()
+    workspace.adopt_manifest(_manifest(scenes, revision=20, focused_index=None))
+    _hydrate_in_order(workspace, scenes, (9, 5))
+
+    workspace.commit(
+        _active(11),
+        base_scene_id=None,
+        base_revision=0,
+        workspace_epoch=7,
+    )
+
+    assert [scene.scene_id for scene in workspace.scenes] == [
+        "scene-10",
+        "scene-6",
+        "scene-11",
+    ]
+    assert workspace.scene("scene-1") is None
+
+
+def test_canonical_capacity_eviction_removes_hydrated_scene_by_id() -> None:
+    scenes = [_active(index) for index in range(1, 11)]
+    workspace = SvgCanvasWorkspace()
+    workspace.adopt_manifest(_manifest(scenes, revision=20, focused_index=None))
+    _hydrate_in_order(workspace, scenes, (9, 5, 0, 7))
+
+    workspace.commit(
+        _active(11),
+        base_scene_id=None,
+        base_revision=0,
+        workspace_epoch=7,
+    )
+
+    assert [scene.scene_id for scene in workspace.scenes] == [
+        "scene-10",
+        "scene-6",
+        "scene-8",
+        "scene-11",
+    ]
+    assert workspace.scene("scene-1") is None
+    assert workspace.scene("scene-10") is scenes[9]
+
+
+def test_focused_canonical_capacity_eviction_clears_focus() -> None:
+    scenes = [_active(index) for index in range(1, 11)]
+    workspace = SvgCanvasWorkspace()
+    workspace.adopt_manifest(_manifest(scenes, revision=20, focused_index=None))
+    _hydrate_in_order(workspace, scenes, (9, 5, 7, 0))
+    assert workspace.focused_scene_id == "scene-1"
+
+    workspace.commit(
+        _active(11),
+        base_scene_id=None,
+        base_revision=0,
+        workspace_epoch=7,
+        foreground=False,
+    )
+
+    assert workspace.focused_scene_id is None
+    assert workspace.scene("scene-1") is None
+
+
+def test_capacity_eviction_telemetry_uses_canonical_manifest_identity() -> None:
+    scenes = [_active(index) for index in range(1, 11)]
+    telemetry = []
+    workspace = SvgCanvasWorkspace(eviction_telemetry_sink=telemetry.append)
+    workspace.adopt_manifest(_manifest(scenes, revision=20, focused_index=None))
+    _hydrate_in_order(workspace, scenes, (9, 5))
+
+    workspace.commit(
+        _active(11),
+        base_scene_id=None,
+        base_revision=0,
+        workspace_epoch=7,
+    )
+
+    assert len(telemetry) == 1
+    assert telemetry[0].scene_id == "scene-1"
+    assert telemetry[0].generation_id == scenes[0].generation_id
+    assert telemetry[0].scene_id != workspace.scenes[0].scene_id
+
+
+def test_capacity_eviction_digest_matches_resulting_canonical_manifest(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    scenes = [_active(index) for index in range(1, 11)]
+    workspace = SvgCanvasWorkspace()
+    workspace.adopt_manifest(_manifest(scenes, revision=20, focused_index=None))
+    _hydrate_in_order(workspace, scenes, (9, 5, 7, 0))
+    workspace.commit(
+        _active(11),
+        base_scene_id=None,
+        base_revision=0,
+        workspace_epoch=7,
+    )
+
+    resulting_manifest = _canonical_manifest(workspace)
+    with caplog.at_level("INFO", logger="ava_backend.canvas.svg_workspace"):
+        assert workspace.adopt_manifest(resulting_manifest) is False
+
+    context = next(
+        record.__dict__["ava_context"]
+        for record in caplog.records
+        if record.getMessage().startswith("canvas_workspace_manifest_adoption")
+    )
+    assert context["classification"] == "structurallyIdempotent"
+    assert context["structuralDigestIncoming"] == context["structuralDigestCanonical"]
+
+
+def test_failed_create_precondition_leaves_canonical_workspace_unchanged() -> None:
+    scenes = [_active(index) for index in range(1, 11)]
+    manifest = _manifest(scenes, revision=20, focused_index=None)
+    workspace = SvgCanvasWorkspace()
+    workspace.adopt_manifest(manifest)
+    _hydrate_in_order(workspace, scenes, (9, 5, 7, 0))
+    candidate = _active(11)
+    workspace.start_execution(
+        generation_id=candidate.generation_id,
+        source_turn_id=candidate.source_turn_id,
+        operation="new",
+    )
+    hydrated_before = workspace.scenes
+    recency_before = tuple(
+        (scene.scene_id, workspace.scene_recency(scene.scene_id))
+        for scene in hydrated_before
+    )
+    digest_before = workspace._structural_manifest_digest
+
+    with pytest.raises(
+        SvgCanvasWorkspaceError,
+        match="must be presented before activation",
+    ):
+        workspace.commit(
+            candidate,
+            base_scene_id=None,
+            base_revision=0,
+            workspace_epoch=7,
+        )
+
+    assert workspace.manifest_scenes == manifest.scenes
+    assert workspace.scenes == hydrated_before
+    assert workspace.workspace_revision == 20
+    assert workspace.next_creation_sequence == 11
+    assert workspace.next_modification_sequence == 1
+    assert workspace._structural_manifest_digest == digest_before
+    assert workspace.focused_scene_id == "scene-1"
+    assert (
+        tuple(
+            (scene.scene_id, workspace.scene_recency(scene.scene_id))
+            for scene in workspace.scenes
+        )
+        == recency_before
+    )
+    assert workspace.last_structural_mutation is None
+    assert workspace.adopt_manifest(manifest) is False
+
+
+def test_restart_restore_out_of_order_full_hydration_uses_manifest_eviction_order() -> (
+    None
+):
+    scenes = [_active(index) for index in range(1, 11)]
+    workspace = SvgCanvasWorkspace()
+    workspace.adopt_manifest(_manifest(scenes, revision=20, focused_index=None))
+    _hydrate_in_order(workspace, scenes, (9, 5, 7, 0, 3, 1, 8, 2, 6, 4))
+
+    created = workspace.commit(
+        _active(11),
+        base_scene_id=None,
+        base_revision=0,
+        workspace_epoch=7,
+    )
+
+    assert created.evicted_scene_id == "scene-1"
+    assert workspace.ordered_scene_ids() == tuple(
+        f"scene-{index}" for index in range(2, 12)
+    )
+    assert workspace.scene("scene-10") is scenes[9]
+    assert workspace.scene("scene-1") is None
 
 
 def test_create_after_six_scenes_appends_at_position_seven() -> None:
@@ -572,15 +795,288 @@ def test_synchronized_context_exposes_exact_workspace_header_and_compact_ranks()
 
     rendered = state.render_realtime_context()
     assert (
-        '<canvas_workspace synchronized="true" workspace_epoch="7" '
-        'workspace_revision="12" total="3" focused_scene_id="scene-2" '
-        'focused_revision="1" focused_position="2" has_previous="true" '
-        'has_next="true" latest_created_scene_id="scene-3" '
-        'latest_modified_scene_id="scene-1"/>'
-    ) in rendered
+        '<canvas_workspace retained_count="3" latest_created_position="3" latest_modified_position="1" focused_position="2"'
+        in rendered
+    )
     assert (
-        '<visual scene_id="scene-1" revision="1" position="1" '
-        'creation_rank="1" modification_rank="1" focused="false" '
-        'presented="false">'
-    ) in rendered
-    assert 'scene_id="scene-2" revision="1" position="2" creation_rank="2"' in rendered
+        '<scene position="1" title="Diagram 1" summary="Summary 1" created_order="1" modified_order="1"/>'
+        in rendered
+    )
+    assert (
+        '<scene position="2" title="Diagram 2" summary="Summary 2" created_order="2" modified_order="none"/>'
+        in rendered
+    )
+    assert "scene-1" not in rendered
+    assert "workspace_revision" not in rendered
+
+
+def test_model_facing_directory_keeps_ten_maximum_rows_selector_safe_and_bounded() -> (
+    None
+):
+    validator = SvgDocumentValidator()
+    scenes = []
+    for index in range(1, 11):
+        title_prefix = f"Diagram {index} "
+        title = title_prefix + ("x" * (160 - len(title_prefix)))
+        summary = "x" * 800
+        document = validator.validate(
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" '
+            'data-ava-interaction-mode="none">'
+            f"<title>{title}</title><desc>{summary}</desc>"
+            f'<circle id="dot-{index}" cx="50" cy="50" r="20"/>'
+            "</svg>"
+        )
+        scenes.append(
+            ActiveSvgCanvasScene(
+                generation_id=f"maximum-generation-{index}",
+                source_turn_id=f"maximum-turn-{index}",
+                scene_id=f"maximum-scene-{index}",
+                revision=1,
+                document=document,
+                first_rendered_sample=0,
+            )
+        )
+    workspace = SvgCanvasWorkspace()
+    workspace.adopt_manifest(_manifest(scenes, focused_index=4))
+    workspace.restore_focused(scenes[4])
+    state = SvgCanvasSessionState(workspace=workspace)
+    state.set_presentation_visible(True)
+
+    rendered = state.render_realtime_context()
+    root = ElementTree.fromstring(rendered)
+    directory = root.findall("./retained_visuals/scene")
+
+    assert len(rendered) <= 2_400
+    assert [row.attrib["position"] for row in directory] == [
+        str(index) for index in range(1, 11)
+    ]
+    assert all(row.attrib["title"] for row in directory)
+    assert all(row.attrib["summary"] for row in directory)
+    assert all(row.attrib["created_order"] for row in directory)
+    assert all(row.attrib["modified_order"] for row in directory)
+    for row in directory:
+        request = ManageCanvasPresentationRequest.model_validate(
+            {
+                "action": "showTitle",
+                "title": row.attrib["title"],
+                "completion": "requestComplete",
+            }
+        )
+        assert request.presentation_selector is CanvasSceneSelector.TITLE
+        resolution = workspace.resolve_scene_selector(
+            request.presentation_selector,
+            title=request.title,
+        )
+        assert resolution.scene is not None
+
+
+def test_model_facing_directory_bounds_extreme_manifest_sequences() -> None:
+    validator = SvgDocumentValidator()
+    scenes = []
+    for index in range(1, 11):
+        document = validator.validate(
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" '
+            'data-ava-interaction-mode="none">'
+            f"<title>{'T' * 160}</title><desc>{'x' * 800}</desc>"
+            f'<circle id="dot-{index}" cx="50" cy="50" r="20"/>'
+            "</svg>"
+        )
+        scenes.append(
+            ActiveSvgCanvasScene(
+                generation_id=f"sequence-generation-{index}",
+                source_turn_id=f"sequence-turn-{index}",
+                scene_id=f"sequence-scene-{index}",
+                revision=1,
+                document=document,
+                first_rendered_sample=0,
+            )
+        )
+
+    sequence_base = 10**300
+    base = _manifest(scenes, focused_index=4)
+    manifest = replace(
+        base,
+        next_creation_sequence=sequence_base + 11,
+        next_modification_sequence=sequence_base + 11,
+        scenes=tuple(
+            replace(
+                row,
+                creation_sequence=sequence_base + position,
+                modification_sequence=sequence_base + (11 - position),
+            )
+            for position, row in enumerate(base.scenes, start=1)
+        ),
+    )
+    workspace = SvgCanvasWorkspace()
+    workspace.adopt_manifest(manifest)
+    workspace.restore_focused(scenes[4])
+    state = SvgCanvasSessionState(workspace=workspace)
+    state.set_presentation_visible(True)
+
+    rendered = state.render_realtime_context()
+    directory = ElementTree.fromstring(rendered).findall("./retained_visuals/scene")
+
+    assert len(rendered) <= 2_400
+    assert [row.attrib["position"] for row in directory] == [
+        str(index) for index in range(1, 11)
+    ]
+    assert [row.attrib["title"] for row in directory] == [
+        f"{'T' * (56 - len(f' [position {index}]'))} [position {index}]"
+        for index in range(1, 11)
+    ]
+    assert str(sequence_base) not in rendered
+    for position, row in enumerate(directory, start=1):
+        resolution = workspace.resolve_scene_selector(
+            CanvasSceneSelector.TITLE,
+            title=row.attrib["title"],
+        )
+        assert resolution.position == position
+
+
+def test_model_facing_titles_disambiguate_duplicate_canonical_titles() -> None:
+    scenes = [_active(1), _active(2)]
+    base = _manifest(scenes)
+    manifest = replace(
+        base,
+        scenes=(
+            replace(base.scenes[0], title="Same title"),
+            replace(base.scenes[1], title="Same title"),
+        ),
+    )
+    workspace = SvgCanvasWorkspace()
+    workspace.adopt_manifest(manifest)
+
+    labels = workspace.model_facing_titles()
+    assert labels["scene-1"] == "Same title [position 1]"
+    assert labels["scene-2"] == "Same title [position 2]"
+    assert (
+        workspace.resolve_scene_selector(
+            CanvasSceneSelector.TITLE, title=labels["scene-1"]
+        ).position
+        == 1
+    )
+    assert (
+        workspace.resolve_scene_selector(
+            CanvasSceneSelector.TITLE, title=labels["scene-2"]
+        ).position
+        == 2
+    )
+
+
+def test_model_facing_titles_do_not_collide_with_a_canonical_title() -> None:
+    scenes = [_active(1), _active(2), _active(3)]
+    base = _manifest(scenes)
+    manifest = replace(
+        base,
+        scenes=(
+            replace(base.scenes[0], title="Same title"),
+            replace(base.scenes[1], title="Same title"),
+            replace(base.scenes[2], title="Same title [position 1]"),
+        ),
+    )
+    workspace = SvgCanvasWorkspace()
+    workspace.adopt_manifest(manifest)
+
+    labels = workspace.model_facing_titles()
+    assert len({label.casefold() for label in labels.values()}) == 3
+    for position, scene in enumerate(scenes, start=1):
+        assert (
+            workspace.resolve_scene_selector(
+                CanvasSceneSelector.TITLE,
+                title=labels[scene.scene_id],
+            ).position
+            == position
+        )
+
+
+def test_semantic_selector_resolution_uses_manifest_order_and_fails_closed() -> None:
+    scenes = [_active(1), _active(2), _active(3)]
+    workspace = SvgCanvasWorkspace()
+    workspace.adopt_manifest(_manifest(scenes))
+    workspace.restore_focused(scenes[1])
+
+    assert workspace.resolve_scene_selector(CanvasSceneSelector.NEXT).position == 3
+    assert workspace.resolve_scene_selector(CanvasSceneSelector.PREVIOUS).position == 1
+    assert workspace.resolve_scene_selector(CanvasSceneSelector.FIRST).position == 1
+    assert workspace.resolve_scene_selector(CanvasSceneSelector.LAST).position == 3
+    assert (
+        workspace.resolve_scene_selector(CanvasSceneSelector.POSITION, position=3).scene
+        == workspace.manifest_scenes[2]
+    )
+    assert (
+        workspace.resolve_scene_selector(
+            CanvasSceneSelector.TITLE, title="  diagram   1 "
+        ).position
+        == 1
+    )
+    assert (
+        workspace.resolve_scene_selector(
+            CanvasSceneSelector.TITLE, title="unknown"
+        ).reason
+        == "titleNotFound"
+    )
+
+    duplicate_manifest = replace(
+        _manifest(scenes),
+        scenes=tuple(replace(row, title="Same") for row in _manifest(scenes).scenes),
+    )
+    duplicates = SvgCanvasWorkspace()
+    duplicates.adopt_manifest(duplicate_manifest)
+    duplicates.restore_focused(scenes[0])
+    assert (
+        duplicates.resolve_scene_selector(
+            CanvasSceneSelector.TITLE, title="same"
+        ).reason
+        == "ambiguousTitle"
+    )
+
+    # Position selector lower and upper bounds enforce canonical 1-based manifest index.
+    assert (
+        workspace.resolve_scene_selector(CanvasSceneSelector.POSITION, position=1).scene
+        == workspace.manifest_scenes[0]
+    )
+    assert (
+        workspace.resolve_scene_selector(CanvasSceneSelector.POSITION, position=3).scene
+        == workspace.manifest_scenes[2]
+    )
+    for invalid_position in (0, -1, 4):
+        resolution = workspace.resolve_scene_selector(
+            CanvasSceneSelector.POSITION, position=invalid_position
+        )
+        assert resolution.reason == "positionOutOfRange"
+        assert resolution.scene is None
+        assert workspace.focused_scene_id == scenes[1].scene_id
+
+    # Navigation boundaries via resolve_scene_selector.
+    workspace.restore_focused(scenes[0])
+    start_boundary = workspace.resolve_scene_selector(CanvasSceneSelector.PREVIOUS)
+    assert start_boundary.reason == "startOfWorkspace"
+    assert start_boundary.scene is None
+    assert workspace.focused_scene_id == scenes[0].scene_id
+
+    workspace.restore_focused(scenes[2])
+    end_boundary = workspace.resolve_scene_selector(CanvasSceneSelector.NEXT)
+    assert end_boundary.reason == "endOfWorkspace"
+    assert end_boundary.scene is None
+    assert workspace.focused_scene_id == scenes[2].scene_id
+
+
+def test_semantic_selector_rejects_unsynchronized_navigation() -> None:
+    workspace = SvgCanvasWorkspace()
+    workspace.restore_focused(_active(1))
+
+    for selector in (
+        CanvasSceneSelector.CURRENT,
+        CanvasSceneSelector.NEXT,
+        CanvasSceneSelector.PREVIOUS,
+        CanvasSceneSelector.FIRST,
+        CanvasSceneSelector.LAST,
+        CanvasSceneSelector.POSITION,
+        CanvasSceneSelector.TITLE,
+    ):
+        assert (
+            workspace.resolve_scene_selector(
+                selector, position=1, title="Diagram 1"
+            ).reason
+            == "workspaceNotSynchronized"
+        )

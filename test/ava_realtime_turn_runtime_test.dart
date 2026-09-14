@@ -24,6 +24,71 @@ const _offerSdp = 'v=0\r\n'
     'm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n';
 
 void main() {
+  test('owned planning-only completion is valid without PCM', () async {
+    final output = _RecordingPcmOutput();
+    final runtime = _runtimeWith(
+      transport: DeterministicAvaRealtimeRawTransportV4([
+        ..._preamble().take(4),
+        _control({
+          'protocolVersion': 4,
+          'event': 'turnCompleted',
+          'sessionId': _sessionId,
+          'turnId': _turnId,
+          'sequence': 4,
+          'revision': 4,
+          'deliveredSampleCount': 0,
+          'deliveredText': '',
+        }),
+      ]),
+      output: output,
+    );
+
+    await expectLater(
+      runtime.run(),
+      throwsA(
+        isA<AvaRealtimeRuntimeException>().having(
+          (error) => error.message,
+          'message',
+          contains('closed after a turn'),
+        ),
+      ),
+    );
+
+    expect(runtime.snapshot.phase, AvaRealtimeTurnPhase.completed);
+    expect(runtime.snapshot.receivedSampleCount, 0);
+    expect(output.finishCalls, 0);
+    expect(output.fadeStopCalls, 0);
+    await runtime.close();
+  });
+
+  test('arbitrary listening-only empty completion remains invalid', () async {
+    final runtime = _runtime([
+      ..._preamble().take(3),
+      _control({
+        'protocolVersion': 4,
+        'event': 'turnCompleted',
+        'sessionId': _sessionId,
+        'turnId': _turnId,
+        'sequence': 3,
+        'revision': 3,
+        'deliveredSampleCount': 0,
+        'deliveredText': '',
+      }),
+    ]);
+
+    await expectLater(
+      runtime.run(),
+      throwsA(
+        isA<AvaRealtimeStateException>().having(
+          (error) => error.message,
+          'message',
+          contains('planning'),
+        ),
+      ),
+    );
+    await runtime.close();
+  });
+
   test('canvas draft event routes independently of a speech turn', () async {
     final svgBytes = Uint8List.fromList(
       utf8.encode('<svg xmlns="http://www.w3.org/2000/svg"></svg>'),
@@ -33,7 +98,7 @@ void main() {
       _control({
         'protocolVersion': 4,
         'event': 'canvasGenerationStarted',
-      'focusRevision': 0,
+        'focusRevision': 0,
         'sessionId': _sessionId,
         'sequence': 0,
         'revision': 1,

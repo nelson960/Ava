@@ -22,8 +22,8 @@ from .tool_contract import (
 )
 
 
-REALTIME_PROMPT_VERSION = "ava-realtime-v4.9"
-REALTIME_TOOL_CONTRACT_VERSION = "ava-realtime-tools-v4.6"
+REALTIME_PROMPT_VERSION = "ava-realtime-v4.16"
+REALTIME_TOOL_CONTRACT_VERSION = "ava-realtime-tools-v4.12"
 DEFAULT_REALTIME_REASONING_EFFORT: Literal["low"] = "low"
 
 
@@ -58,65 +58,53 @@ implementation terms, filler boilerplate, or private reasoning.""",
     ),
     PromptLayer(
         "interactive_canvas_tool",
-        f"""Ava can create and revise validated visuals in the lower panel with
-{INTERACTIVE_CANVAS_TOOL_NAME}. When the child's intended outcome is itself a
-visual, fulfill that intent through the canvas tool. When a visual was not
-explicitly intended and would only be helpful, tool choice remains semantic and
-optional. Spatial, cyclic, structural, comparative, and ordered relationships
-are strong candidates. Decide from the full conversation, never from isolated
-words or a keyword list.
+        f"""Ava can create and revise validated lower-panel visuals with
+{INTERACTIVE_CANVAS_TOOL_NAME}. Use it when a visual is the intended outcome; an
+unrequested merely helpful visual remains optional. Decide semantically from the full
+conversation, never keywords. Spatial, cyclic, structural, comparative, and ordered
+relationships are strong candidates.
 
-Choose operation=new for a separate visual or concept. Choose
-operation=reviseFocused only when modifying the active visual; merely
-discussing a pending or active visual is not a revision. Use {CANCEL_INTERACTIVE_CANVAS_TOOL_NAME} when the child semantically asks to stop
-an unpresented visual. Use {MANAGE_CANVAS_PRESENTATION_TOOL_NAME} for retained visuals:
-show an exact scene, navigate next|previous|first|last, or hide the panel. Realtime selects
-scene IDs semantically; the backend computes adjacency. Do not call {INTERACTIVE_CANVAS_TOOL_NAME}
-when the visual already exists in retained_visuals. In the brief, describe only the visual's
-concise semantic intent: essential purpose, objects, relationships, flow, and necessary
-labels without repeating full active visual context or enumerating unnecessary details.
-Choose interactionMode=none for static visuals, interactionMode=explore for tapping
-parts to learn, interactionMode=select for choosing one visible option, and
-interactionMode=steps for ordered Back/Next progression. When revising, preserve
-the current interaction mode unless interaction meaning changes. Keep the brief
-concise and under {INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS} characters. Never
-output geometry, coordinates, SVG, paths, code, styling, or scene identifiers.
+Use operation=new for a separate visual. For revision, express a semantic target with
+current, position, or title; omitted means the focused scene. Discussion is not revision. Use
+{CANCEL_INTERACTIVE_CANVAS_TOOL_NAME} to stop unpresented work. Use
+{MANAGE_CANVAS_PRESENTATION_TOOL_NAME} with one semantic presentation action from the
+retained Canvas directory. hide has no target. For showPosition or showTitle, use a
+position or selector-safe title exactly as supplied by that directory; never invent a
+title or reason in scene IDs. Canvas positions always use canonical retained order; the
+backend resolves identity and navigation. Canvas context is backend-maintained semantic
+information about retained diagrams and the focused diagram, not direct SVG pixel vision.
+If the directory cannot support a confident target, clarify or retrieve historical memory;
+never guess.
+Do not regenerate a retained visual.
 
-The application owns visual rendering and tool outcomes. An accepted canvas
-result means the application has begun generation asynchronously on the child's screen;
-it is not a promise that the visual is already visible. Ava has real visual drawing
-capability in the lower panel. When a canvas request is accepted, briefly let the
-child know you are making or drawing it (e.g., 'I'm drawing that now' or 'Let me make
-that for you'). Ava must never claim that she cannot draw, display, or show visuals,
-must never produce a verbal or text/ASCII substitute diagram, and must not claim the
-drawing is complete before actual presentation. Treat tool results as authoritative
-without retrying or describing internal mechanics. A Canvas tool call and its
-continuation are one conversational thought. After a successful tool result,
-continue the existing thought from the meaning established before the tool call.
-Do not greet again, repeat the child's request, add a second acknowledgment, or
-narrate application or tool internals.
+The brief contains only purpose, objects, relationships, flow, and necessary labels, under
+{INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS} characters; never coordinates, SVG, paths,
+code, styling, or identifiers. interactionMode is exactly none|explore|select|steps.
+continuousControl is exactly none|drag|slider|timeline and must be none unless mode is
+explore. Exact pairs: static none+none; select select+none; steps steps+none; continuous
+drag/slider/timeline explore plus that control. Preserve both choices on revision unless
+meaning changes; never convert continuous control to steps.
 
-Canvas context supplies bounded semantics for pending and active visuals
-(purpose, topic, state, title, description, visible labels, named objects, and
-interactions). canvas_presentation is authoritative current presentation state
-and outranks retained visuals, conversation, and memory. visible=false means no
-visual is currently visible; never infer otherwise from history. visible=true
-grounds "this" and "what am I looking at?" in its exact scene. Retained visuals
-are available choices, not visibility claims. Use canonical creation and modification
-metadata for temporal requests and show a suitable retained scene with
-{MANAGE_CANVAS_PRESENTATION_TOOL_NAME}; generate only when a new/different visual
-is wanted or no suitable retained scene exists.
-Normal conversation about a pending or active visual does not itself imply a
-revision. A validated canvas interaction establishes shared semantic focus:
-semantic_focus is the active referent, not a script to recite. Respond naturally
-through Ava's standard conversational character, with child speech always
-guiding conversational intent. Describe only interaction mechanics declared by
-the active Canvas contract: none is static; in explore the child may tap declared
-interactive parts; in select the child may choose declared visible options; in
-steps the child may use the declared ordered Back/Next progression. Do not claim
-zoom, pinch, pan, drag, rotate, or free editing unless a future validated Canvas
-capability explicitly exposes it. Application identifiers have no language
-meaning.""",
+For EVERY Canvas action explicitly choose completion. Use completion=requestComplete when
+the action itself satisfies the request: emit no preamble and stop after its result, including
+deterministic rejection. This normally covers show, hide, straightforward create/revise,
+presentation, and cancellation. Use completion=needsResultReasoning ONLY when the result
+is genuinely required to finish, never to acknowledge success; it authorizes one semantic
+continuation. accepted means generation began, not that it is visible or final evidence.
+There is no automatic done narration. Existing text is never suppressed. Never retry,
+narrate internals, claim completion before presentation, deny drawing capability, or use
+text/ASCII art as a substitute.
+
+Canvas context supplies bounded pending/active semantics. canvas_presentation is
+authoritative visibility and outranks history: visible=false means none is visible;
+visible=true grounds deictic references in that exact scene. Retained visuals are choices,
+not visibility claims. Generate only when a new/different visual is wanted or none fits.
+A validated interaction makes semantic_focus the referent, not a script. Respond naturally;
+child speech guides intent. Active context alone defines mechanics: none forbids continuous
+control; explore permits declared taps and only declared track/checkpoint drag, slider, or
+timeline; select permits declared choices; steps permits Back/position/Next. Never claim
+zoom, pinch, pan, rotate, free editing, unconstrained movement, or absent capabilities.
+Application identifiers have no language meaning.""",
     ),
     PromptLayer(
         "historical_memory_and_time",
@@ -227,14 +215,15 @@ def build_interactive_canvas_tool() -> dict[str, Any]:
         ref_template="#/$defs/{model}",
     )
     _remove_schema_titles(parameters)
+    _remove_schema_descriptions(parameters)
+    _restore_canvas_contract_descriptions(parameters)
     return {
         "type": "function",
         "name": INTERACTIVE_CANVAS_TOOL_NAME,
         "description": (
-            "Create or revise a validated lower-panel visual. Use this when the "
-            "child's intended outcome is a visual, or when a visual is "
-            "semantically useful; choose a new scene or a revision of the "
-            "focused scene."
+            "Create or revise a validated lower-panel visual. Use operation='new' "
+            "to create a new scene, or operation='revise' with a semantic selector "
+            "to revise a retained scene."
         ),
         "parameters": parameters,
     }
@@ -246,6 +235,8 @@ def build_cancel_interactive_canvas_tool() -> dict[str, Any]:
         ref_template="#/$defs/{model}",
     )
     _remove_schema_titles(parameters)
+    _remove_schema_descriptions(parameters)
+    _restore_canvas_contract_descriptions(parameters)
     return {
         "type": "function",
         "name": CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
@@ -264,14 +255,15 @@ def build_manage_canvas_presentation_tool() -> dict[str, Any]:
         ref_template="#/$defs/{model}",
     )
     _remove_schema_titles(parameters)
+    _remove_schema_descriptions(parameters)
+    _restore_canvas_contract_descriptions(parameters)
     return {
         "type": "function",
         "name": MANAGE_CANVAS_PRESENTATION_TOOL_NAME,
         "description": (
-            "Control the canvas panel. Use operation='show' with an exact scene_id "
-            "semantically selected from retained_visuals; use operation='hide' to close "
-            "the panel; or use operation='navigate' with direction next, previous, first, "
-            "or last. The backend, not the model, computes workspace adjacency."
+            "Control the canvas panel with one semantic action from the retained "
+            "Canvas directory. hide needs no target; the backend resolves canonical "
+            "identity and navigation."
         ),
         "parameters": parameters,
     }
@@ -312,11 +304,55 @@ def build_get_current_time_tool() -> dict[str, Any]:
     }
 
 
-def _remove_schema_titles(value: object) -> None:
+def _remove_schema_titles(value: object, *, property_map: bool = False) -> None:
     if isinstance(value, dict):
-        value.pop("title", None)
-        for nested in value.values():
-            _remove_schema_titles(nested)
+        if not property_map:
+            value.pop("title", None)
+        for key, nested in value.items():
+            _remove_schema_titles(nested, property_map=key == "properties")
     elif isinstance(value, list):
         for nested in value:
-            _remove_schema_titles(nested)
+            _remove_schema_titles(nested, property_map=property_map)
+
+
+def _remove_schema_descriptions(value: object) -> None:
+    """Keep provider schemas bounded; stable instructions own field semantics."""
+    if isinstance(value, dict):
+        value.pop("description", None)
+        for nested in value.values():
+            _remove_schema_descriptions(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            _remove_schema_descriptions(nested)
+
+
+def _restore_canvas_contract_descriptions(parameters: dict[str, Any]) -> None:
+    properties = parameters.get("properties")
+    if not isinstance(properties, dict):
+        raise ValueError("Canvas tool schema omitted properties")
+    completion = properties.get("completion")
+    if not isinstance(completion, dict):
+        raise ValueError("Canvas tool schema omitted required completion")
+    completion["description"] = (
+        "Required: requestComplete stops; needsResultReasoning allows one "
+        "result-dependent continuation."
+    )
+    action = properties.get("action")
+    if isinstance(action, dict):
+        action["description"] = (
+            "Required semantic action: hide|showCurrent|showNext|showPrevious|"
+            "showFirst|showLast|showPosition|showTitle."
+        )
+    position = properties.get("position")
+    if isinstance(action, dict) and isinstance(position, dict):
+        position["description"] = "Required only with action=showPosition."
+    title = properties.get("title")
+    if isinstance(action, dict) and isinstance(title, dict):
+        title["description"] = (
+            "Required only with action=showTitle; copy a selector-safe title from "
+            "the retained Canvas directory."
+        )
+    for field_name in ("selector", "position", "title"):
+        field = properties.get(field_name)
+        if not isinstance(action, dict) and isinstance(field, dict):
+            field["description"] = "Semantic Canvas selector resolved by the backend."

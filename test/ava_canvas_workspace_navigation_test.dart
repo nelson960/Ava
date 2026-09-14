@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:ui';
@@ -109,7 +108,7 @@ void main() {
     host.dispose();
   });
 
-  test('previous/next navigation preserves workspace order and bound',
+  test('previous/next send semantic requests and do not select a local scene',
       () async {
     final doc1 = _document(scene: 1, revision: 1, manifestJson: _manifestJson1);
     final doc2 = _document(scene: 2, revision: 1, manifestJson: _manifestJson2);
@@ -118,39 +117,93 @@ void main() {
     final host = AvaSvgCanvasSessionHost(persistence: persistence);
     await host.restoration;
 
+    final commands = <AvaSvgCanvasClientCommand>[];
     final controller = AvaSvgCanvasController(
       documents: _DocumentLoader(doc2),
-      commandSink: (_) {},
+      commandSink: commands.add,
     );
     host.attach(controller);
 
-    // Initial state: scene 2 focused
+    // Local retention remains display-only; it cannot resolve adjacency.
     expect(host.currentSceneIndex, 1);
-    expect(host.canSelectPrevious, isTrue);
-    expect(host.canSelectNext, isTrue);
     expect(host.presentedDocument?.descriptor.sceneId, 'scene-2');
 
-    // 3. previous selects scene 1
-    await host.selectPreviousScene();
-    expect(host.currentSceneIndex, 0);
-    expect(host.presentedDocument?.descriptor.sceneId, 'scene-1');
-    expect(host.canSelectPrevious, isFalse);
-    expect(host.canSelectNext, isTrue);
+    host.requestPreviousScene();
+    host.requestNextScene();
 
-    // 5. next bounds clamped at ends
-    await host.selectPreviousScene(); // no-op
-    expect(host.currentSceneIndex, 0);
-
-    // Navigate to end
-    await host.selectNextScene();
     expect(host.currentSceneIndex, 1);
-    await host.selectNextScene();
-    expect(host.currentSceneIndex, 2);
-    expect(host.presentedDocument?.descriptor.sceneId, 'scene-3');
-    expect(host.canSelectNext, isFalse);
+    expect(host.presentedDocument?.descriptor.sceneId, 'scene-2');
+    expect(
+      commands.map((command) => command.toEventBody()),
+      [
+        {
+          'event': 'canvasPresentationRequested',
+          'operation': 'show',
+          'selector': 'previous'
+        },
+        {
+          'event': 'canvasPresentationRequested',
+          'operation': 'show',
+          'selector': 'next'
+        },
+      ],
+    );
 
-    await host.selectNextScene(); // no-op
-    expect(host.currentSceneIndex, 2);
+    host.dispose();
+  });
+
+  test('close sends semantic hide request and does not mutate local presentation before backend response', () async {
+    final doc1 = _document(scene: 1, revision: 1);
+    final commands = <AvaSvgCanvasClientCommand>[];
+    final controller = AvaSvgCanvasController(
+      documents: _DocumentLoader(doc1),
+      commandSink: commands.add,
+    );
+    final persistence = _FakePersistence([doc1], 'scene-1');
+    final host = AvaSvgCanvasSessionHost(persistence: persistence);
+    host.attach(controller);
+
+    // Make panel visible
+    controller.restoreRetainedActive(doc1);
+    expect(host.panelVisible, isTrue);
+
+    // Child taps Close (X) button
+    host.dismissPanel();
+
+    // Semantic hide request emitted over the wire
+    expect(
+      commands.map((command) => command.toEventBody()),
+      [
+        {
+          'event': 'canvasPresentationRequested',
+          'operation': 'hide',
+        },
+      ],
+    );
+
+    // Panel remains visible until backend presentation command arrives
+    expect(host.panelVisible, isTrue);
+
+    // Backend presentation command hide arrives
+    controller.receivePresentationCommand({
+      'protocolVersion': 4,
+      'event': 'canvasPresentationCommand',
+      'sessionId': 'session-1',
+      'sequence': 1,
+      'revision': 1,
+      'commandId': 'cmd-hide-1',
+      'action': 'hide',
+    });
+
+    // Panel is now dismissed and ACK is emitted
+    expect(host.panelVisible, isFalse);
+    expect(host.panelDismissed, isTrue);
+    expect(
+      commands.last.type,
+      AvaSvgCanvasCommandType.canvasPresentationAcknowledged,
+    );
+    expect(commands.last.fields['commandId'], 'cmd-hide-1');
+    expect(commands.last.fields['applied'], isTrue);
 
     host.dispose();
   });
@@ -181,53 +234,6 @@ void main() {
     });
 
     expect(controller.hasPendingVisual, isTrue);
-    expect(host.canSelectPrevious, isTrue);
-    expect(host.canSelectNext, isFalse);
-
-    host.dispose();
-  });
-
-  test('focus transition: ordering, failure recovery, and persistence',
-      () async {
-    final doc1 = _document(scene: 1, revision: 1);
-    final doc2 = _document(scene: 2, revision: 1);
-    final persistence = _FakePersistence([doc1, doc2], 'scene-2');
-    final host = AvaSvgCanvasSessionHost(persistence: persistence);
-    await host.restoration;
-
-    var focusSuccess = true;
-    final commands = <String>[];
-
-    final controller = AvaSvgCanvasController(
-      documents: _DocumentLoader(doc2),
-      commandSink: (cmd) {},
-    );
-    host.attach(
-      controller,
-      runtimeFocusSink: (target, focusRevision) async {
-        commands.add(target.descriptor.sceneId);
-        if (!focusSuccess) {
-          throw Exception('Focus switch network error');
-        }
-      },
-    );
-
-    // 8. focus transition ordering
-    final switchFuture = host.selectPreviousScene();
-    expect(host.focusTransitionPending, isTrue);
-    expect(host.canSelectPrevious, isFalse);
-    await switchFuture;
-    expect(host.focusTransitionPending, isFalse);
-    expect(host.presentedDocument?.descriptor.sceneId, 'scene-1');
-    expect(commands, ['scene-1']);
-
-    // 9. focus transition failure recovery
-    focusSuccess = false;
-    await expectLater(host.selectNextScene(), throwsA(isA<Exception>()));
-    expect(host.focusTransitionPending, isFalse);
-    // A semantic sync failure cannot roll back device focus.
-    expect(host.presentedDocument?.descriptor.sceneId, 'scene-2');
-
     host.dispose();
   });
 
@@ -379,7 +385,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(prevButton.onPressed, isNotNull);
-    expect(nextButton.onPressed, isNull);
+    expect(nextButton.onPressed, isNotNull);
     expect(saveButton.onPressed, isNotNull);
     expect(closeButton.onPressed, isNotNull);
 
@@ -591,94 +597,6 @@ void main() {
       }
     }
   });
-
-  test('hanging persistence does not delay focus sync', () async {
-    final doc1 = _document(scene: 1, revision: 1);
-    final doc2 = _document(scene: 2, revision: 1);
-    final persistence = _HangingPersistence([doc1, doc2], 'scene-1');
-    final host = AvaSvgCanvasSessionHost(persistence: persistence);
-    await host.restoration;
-
-    final commands = <AvaSvgCanvasClientCommand>[];
-    final controller = AvaSvgCanvasController(
-      documents: _DocumentLoader(doc2),
-      commandSink: commands.add,
-    );
-    final syncedRevisions = <int>[];
-    host.attach(
-      controller,
-      runtimeFocusSink: (target, revision) async {
-        syncedRevisions.add(revision);
-      },
-    );
-
-    final switchFuture = host.selectNextScene();
-    await switchFuture;
-
-    expect(host.focusTransitionPending, isFalse);
-    expect(host.presentedDocument?.descriptor.sceneId, 'scene-2');
-    expect(syncedRevisions, [1]);
-    expect(
-      controller.semanticTransportState,
-      AvaSvgSemanticTransportState.unaccepted,
-    );
-
-    controller.reportBinding(doc2.manifest.bindings.values.first);
-    expect(commands, isEmpty);
-
-    host.dispose();
-  });
-
-  test(
-      'session host: rapid switching fences late sink completions across revisions',
-      () async {
-    final doc1 = _document(scene: 1, revision: 1);
-    final doc2 = _document(scene: 2, revision: 1);
-    final persistence = _FakePersistence([doc1, doc2], 'scene-1');
-    final host = AvaSvgCanvasSessionHost(persistence: persistence);
-    await host.restoration;
-
-    final commands = <AvaSvgCanvasClientCommand>[];
-    final controller = AvaSvgCanvasController(
-      documents: _DocumentLoader(doc2),
-      commandSink: commands.add,
-    );
-
-    Completer<void>? firstSinkCompleter;
-    final sinkCalls = <String>[];
-    host.attach(
-      controller,
-      runtimeFocusSink: (target, revision) async {
-        sinkCalls.add('${target.descriptor.sceneId}:$revision');
-        if (revision == 1) {
-          firstSinkCompleter = Completer<void>();
-          await firstSinkCompleter!.future;
-        }
-      },
-    );
-
-    final switch1 = host.selectNextScene();
-    expect(host.presentedDocument?.descriptor.sceneId, 'scene-2');
-    expect(controller.activeFocusRevision, 1);
-
-    final switch2 = host.selectPreviousScene();
-    expect(host.presentedDocument?.descriptor.sceneId, 'scene-1');
-    expect(controller.activeFocusRevision, 2);
-    expect(sinkCalls, ['scene-2:1', 'scene-1:2']);
-
-    firstSinkCompleter!.complete();
-    await switch1;
-
-    await switch2;
-    expect(host.presentedDocument?.descriptor.sceneId, 'scene-1');
-    expect(controller.activeFocusRevision, 2);
-    expect(
-      controller.semanticTransportState,
-      AvaSvgSemanticTransportState.unaccepted,
-    );
-
-    host.dispose();
-  });
 }
 
 final class _FakePersistence implements AvaCanvasPersistence {
@@ -700,31 +618,6 @@ final class _FakePersistence implements AvaCanvasPersistence {
 
   @override
   Future<void> persistFocus(String sceneId) async {}
-
-  @override
-  Future<void> reset() async {}
-}
-
-final class _HangingPersistence implements AvaCanvasPersistence {
-  _HangingPersistence(this.documents, this.focusedSceneId);
-
-  final List<AvaValidatedSvgCanvasDocument> documents;
-  final String? focusedSceneId;
-  final Completer<void> persistFocusCompleter = Completer<void>();
-
-  @override
-  Future<AvaRestoredCanvasWorkspace> loadWorkspace() async =>
-      AvaRestoredCanvasWorkspace(
-        documents: documents,
-        focusedSceneId: focusedSceneId,
-      );
-
-  @override
-  Future<void> persistActive(AvaValidatedSvgCanvasDocument document,
-      {bool focused = true}) async {}
-
-  @override
-  Future<void> persistFocus(String sceneId) => persistFocusCompleter.future;
 
   @override
   Future<void> reset() async {}

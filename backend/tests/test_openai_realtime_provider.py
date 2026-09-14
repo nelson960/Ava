@@ -22,13 +22,17 @@ from ava_backend.protocol import AgeBand
 from ava_backend.providers import openai_realtime_provider
 from ava_backend.providers.openai_realtime_provider import (
     MAX_OPENAI_REALTIME_CLIENT_ITEM_ID_CHARS,
+    RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME,
+    _SEMANTIC_CAPTURE_MAX_OUTPUT_TOKENS,
+    OpenAIRealtimeConnectionClosedError,
     OpenAIRealtimeProbeRequest,
     OpenAIRealtimeProtocolError,
-    OpenAIRealtimeConnectionClosedError,
+    OpenAIRealtimeProviderError,
     OpenAIRealtimeProviderSession,
     OpenAIRealtimeRouterBackpressureError,
     OpenAIRealtimeUnavailableError,
     _OpenAIRealtimeEventChannel,
+    _OpenAIRealtimeReceiveTimeout,
     _session_update,
 )
 from ava_backend.realtime.harness import build_realtime_harness
@@ -37,12 +41,21 @@ from ava_backend.realtime.context_assembler import (
     DynamicContextBuildReason,
 )
 from ava_backend.realtime.fakes import DETERMINISTIC_AUDIO_OFFER_SDP
-from ava_backend.realtime.memory import AuthoritativeMemorySnapshot
+from ava_backend.realtime.memory import (
+    MAX_SEMANTIC_MEMORY_PROPOSAL_UTF8_BYTES,
+    AuthoritativeMemorySnapshot,
+    DialogueFrameState,
+    SemanticCaptureDisposition,
+    SemanticCaptureFunctionArguments,
+    SemanticCaptureJournalDraft,
+    SemanticJournalEventFamily,
+)
 from ava_backend.realtime.provider_session import (
     RealtimeContextInstallationStatus,
     RealtimeNegotiationResponseError,
     RealtimeProviderInputEvent,
     RealtimeProviderResponseIncompleteError,
+    SemanticCaptureEvidence,
 )
 from ava_backend.realtime.tool_contract import (
     CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
@@ -52,7 +65,6 @@ from ava_backend.realtime.tool_contract import (
     GET_CURRENT_TIME_TOOL_NAME,
     SEARCH_MEMORY_TOOL_NAME,
     GetCurrentTimeToolOutputV4,
-    InteractiveCanvasToolOutput,
     InteractiveCanvasToolOutputV4,
     InteractiveCanvasCancellationToolOutputV4,
     ManageCanvasPresentationStatus,
@@ -62,6 +74,7 @@ from ava_backend.realtime.tool_contract import (
     RealtimeRejectedCanvasToolCall,
     RealtimeGetCurrentTimeToolCall,
     RealtimeManageCanvasPresentationToolCall,
+    RealtimeRejectedManageCanvasPresentationToolCall,
     RealtimeRejectedUtilityToolCall,
     RealtimeSearchMemoryToolCall,
     RejectedUtilityToolOutputV4,
@@ -503,7 +516,7 @@ async def test_canvas_control_call_retains_response_and_continuation_correlation
     channel, _ = _channel(
         [
             *_canvas_response_events(
-                arguments='{"operation":"hide"}',
+                arguments='{"action":"hide","completion":"needsResultReasoning"}',
                 function_name=MANAGE_CANVAS_PRESENTATION_TOOL_NAME,
                 preamble="I’ll close it. ",
             ),
@@ -547,6 +560,768 @@ async def test_canvas_control_call_retains_response_and_continuation_correlation
         "continuationResponseId": CONTINUATION_RESPONSE_ID,
     }
     await channel.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["new", "revise"])
+async def test_successful_canvas_action_only_stops_after_one_function_output(
+    operation: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.openai_realtime")
+    arguments = json.dumps(
+        {
+            "operation": operation,
+            **({"targetSceneId": "scene-retained"} if operation == "revise" else {}),
+            "brief": "Show the water cycle.",
+            "interactionMode": "none",
+            "continuousControl": "none",
+            "completion": "requestComplete",
+        },
+        separators=(",", ":"),
+    )
+    channel, socket = _channel(
+        _canvas_response_events(arguments=arguments, preamble="")
+    )
+
+    received = []
+    async for event in channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-canvas-action-only",
+    ):
+        received.append(event)
+        if isinstance(event, RealtimeCanvasToolCall):
+            output = InteractiveCanvasToolOutputV4.model_validate(
+                {"status": "accepted", "generationId": "generation-action-only"}
+            )
+            await channel.complete_canvas_tool(
+                turn_id="turn-canvas-action-only",
+                call_id=event.call_id,
+                output=output,
+            )
+            with pytest.raises(OpenAIRealtimeProtocolError, match="completed twice"):
+                await channel.complete_canvas_tool(
+                    turn_id="turn-canvas-action-only",
+                    call_id=event.call_id,
+                    output=output,
+                )
+
+    assert [type(event) for event in received] == [RealtimeCanvasToolCall]
+    function_outputs = [
+        sent
+        for sent in socket.sent
+        if isinstance(sent.get("item"), dict)
+        and sent["item"].get("type") == "function_call_output"
+    ]
+    assert len(function_outputs) == 1
+    assert not [sent for sent in socket.sent if sent.get("type") == "response.create"]
+    disposition = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage().startswith("openai_realtime_canvas_disposition_resolved")
+    )
+    assert disposition["consumerTurnId"] == "turn-canvas-action-only"
+    assert disposition["responseId"] == RESPONSE_ID
+    assert disposition["callId"] == FUNCTION_CALL_ID
+    assert disposition["toolKind"] == INTERACTIVE_CANVAS_TOOL_NAME
+    assert disposition["requestedCompletion"] == "requestComplete"
+    assert disposition["toolResultStatus"] == "accepted"
+    assert disposition["continuationCreated"] is False
+
+
+@pytest.mark.asyncio
+async def test_successful_manage_canvas_action_only_stops_without_narration() -> None:
+    channel, socket = _channel(
+        _canvas_response_events(
+            arguments='{"action":"hide","completion":"requestComplete"}',
+            function_name=MANAGE_CANVAS_PRESENTATION_TOOL_NAME,
+            preamble="",
+        )
+    )
+
+    received = []
+    async for event in channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-manage-action-only",
+    ):
+        received.append(event)
+        if isinstance(event, RealtimeManageCanvasPresentationToolCall):
+            await channel.complete_manage_canvas_presentation_tool(
+                turn_id="turn-manage-action-only",
+                call_id=event.call_id,
+                output=ManageCanvasPresentationToolOutputV4(
+                    status=ManageCanvasPresentationStatus.ACCEPTED,
+                    operation="hide",
+                    changed=True,
+                    visible=False,
+                ),
+            )
+
+    assert [type(event) for event in received] == [
+        RealtimeManageCanvasPresentationToolCall
+    ]
+    assert (
+        len(
+            [
+                sent
+                for sent in socket.sent
+                if isinstance(sent.get("item"), dict)
+                and sent["item"].get("type") == "function_call_output"
+            ]
+        )
+        == 1
+    )
+    assert not [sent for sent in socket.sent if sent.get("type") == "response.create"]
+
+
+@pytest.mark.asyncio
+async def test_canvas_boundary_noop_action_only_stops_without_continuation() -> None:
+    channel, socket = _channel(
+        _canvas_response_events(
+            arguments='{"action":"hide","completion":"requestComplete"}',
+            function_name=MANAGE_CANVAS_PRESENTATION_TOOL_NAME,
+            preamble="",
+        )
+    )
+
+    async for event in channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-manage-boundary-action-only",
+    ):
+        assert isinstance(event, RealtimeManageCanvasPresentationToolCall)
+        await channel.complete_manage_canvas_presentation_tool(
+            turn_id="turn-manage-boundary-action-only",
+            call_id=event.call_id,
+            output=ManageCanvasPresentationToolOutputV4(
+                status=ManageCanvasPresentationStatus.ACCEPTED,
+                operation="hide",
+                changed=False,
+                visible=False,
+            ),
+        )
+
+    function_outputs = [
+        sent
+        for sent in socket.sent
+        if isinstance(sent.get("item"), dict)
+        and sent["item"].get("type") == "function_call_output"
+    ]
+    assert len(function_outputs) == 1
+    assert not [sent for sent in socket.sent if sent.get("type") == "response.create"]
+
+
+@pytest.mark.asyncio
+async def test_successful_canvas_cancellation_action_only_stops_without_narration() -> (
+    None
+):
+    channel, socket = _channel(
+        _canvas_response_events(
+            arguments='{"completion":"requestComplete"}',
+            function_name=CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
+            preamble="",
+        )
+    )
+
+    received = []
+    async for event in channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-cancel-action-only",
+    ):
+        received.append(event)
+        if isinstance(event, RealtimeCancelCanvasToolCall):
+            await channel.complete_canvas_tool(
+                turn_id="turn-cancel-action-only",
+                call_id=event.call_id,
+                output=InteractiveCanvasCancellationToolOutputV4.model_validate(
+                    {"status": "accepted"}
+                ),
+            )
+
+    assert [type(event) for event in received] == [RealtimeCancelCanvasToolCall]
+    function_outputs = [
+        sent
+        for sent in socket.sent
+        if isinstance(sent.get("item"), dict)
+        and sent["item"].get("type") == "function_call_output"
+    ]
+    assert len(function_outputs) == 1
+    assert not [sent for sent in socket.sent if sent.get("type") == "response.create"]
+
+
+@pytest.mark.asyncio
+async def test_failed_canvas_action_only_stops_after_exact_function_output(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.openai_realtime")
+    arguments = (
+        '{"operation":"new","brief":"Show the water cycle.",'
+        '"interactionMode":"none","continuousControl":"none",'
+        '"completion":"requestComplete"}'
+    )
+    channel, socket = _channel(
+        _canvas_response_events(arguments=arguments, preamble="")
+    )
+
+    async for event in channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-failed-action-only",
+    ):
+        if isinstance(event, RealtimeCanvasToolCall):
+            await channel.complete_canvas_tool(
+                turn_id="turn-failed-action-only",
+                call_id=event.call_id,
+                output=InteractiveCanvasToolOutputV4.model_validate(
+                    {
+                        "status": "rejected",
+                        "reason": CANVAS_MODEL_SAFE_REJECTION_REASON,
+                    }
+                ),
+            )
+
+    response_creates = [
+        sent for sent in socket.sent if sent.get("type") == "response.create"
+    ]
+    assert response_creates == []
+    function_outputs = [
+        sent
+        for sent in socket.sent
+        if isinstance(sent.get("item"), dict)
+        and sent["item"].get("type") == "function_call_output"
+    ]
+    assert len(function_outputs) == 1
+    disposition = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage().startswith("openai_realtime_canvas_disposition_resolved")
+    )
+    assert disposition["requestedCompletion"] == "requestComplete"
+    assert disposition["toolResultStatus"] == "rejected"
+    assert disposition["continuationCreated"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        (
+            '{"operation":"new","brief":"Show the water cycle.",'
+            '"interactionMode":"none","continuousControl":"none"}'
+        ),
+        (
+            '{"operation":"new","brief":"Show the water cycle.",'
+            '"interactionMode":"none","continuousControl":"none",'
+            '"completion":"eventually"}'
+        ),
+    ],
+)
+async def test_missing_or_invalid_canvas_completion_is_rejected_without_fallback(
+    arguments: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.openai_realtime")
+    channel, socket = _channel(
+        _canvas_response_events(arguments=arguments, preamble="")
+    )
+
+    received = []
+    async for event in channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-invalid-response-mode",
+    ):
+        received.append(event)
+        assert isinstance(event, RealtimeRejectedCanvasToolCall)
+        await channel.complete_canvas_tool(
+            turn_id="turn-invalid-response-mode",
+            call_id=event.call_id,
+            output=InteractiveCanvasToolOutputV4.model_validate(
+                {
+                    "status": "rejected",
+                    "reason": CANVAS_MODEL_SAFE_REJECTION_REASON,
+                }
+            ),
+        )
+
+    assert [type(event) for event in received] == [RealtimeRejectedCanvasToolCall]
+    function_outputs = [
+        sent
+        for sent in socket.sent
+        if isinstance(sent.get("item"), dict)
+        and sent["item"].get("type") == "function_call_output"
+    ]
+    assert len(function_outputs) == 1
+    assert not [sent for sent in socket.sent if sent.get("type") == "response.create"]
+    disposition = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage().startswith("openai_realtime_canvas_disposition_resolved")
+    )
+    assert disposition["requestedCompletion"] is None
+    assert disposition["toolResultStatus"] == "rejected"
+    assert disposition["continuationCreated"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("function_name", "arguments"),
+    [
+        (CANCEL_INTERACTIVE_CANVAS_TOOL_NAME, "{}"),
+        (MANAGE_CANVAS_PRESENTATION_TOOL_NAME, '{"action":"hide"}'),
+    ],
+)
+async def test_missing_completion_rejects_other_canvas_actions_without_fallback(
+    function_name: str,
+    arguments: str,
+) -> None:
+    channel, socket = _channel(
+        _canvas_response_events(
+            arguments=arguments,
+            function_name=function_name,
+            preamble="",
+        )
+    )
+
+    received = []
+    async for event in channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-other-invalid-response-mode",
+    ):
+        received.append(event)
+        if isinstance(event, RealtimeRejectedManageCanvasPresentationToolCall):
+            await channel.complete_manage_canvas_presentation_tool(
+                turn_id="turn-other-invalid-response-mode",
+                call_id=event.call_id,
+                output=ManageCanvasPresentationToolOutputV4(
+                    status=ManageCanvasPresentationStatus.REJECTED,
+                    operation="hide",
+                    reason=CANVAS_MODEL_SAFE_REJECTION_REASON,
+                ),
+            )
+        else:
+            assert isinstance(event, RealtimeRejectedCanvasToolCall)
+            await channel.complete_canvas_tool(
+                turn_id="turn-other-invalid-response-mode",
+                call_id=event.call_id,
+                output=InteractiveCanvasCancellationToolOutputV4.model_validate(
+                    {
+                        "status": "rejected",
+                        "reason": CANVAS_MODEL_SAFE_REJECTION_REASON,
+                    }
+                ),
+            )
+
+    assert len(received) == 1
+    assert not any(
+        isinstance(
+            event,
+            (
+                RealtimeCanvasToolCall,
+                RealtimeCancelCanvasToolCall,
+                RealtimeManageCanvasPresentationToolCall,
+            ),
+        )
+        for event in received
+    )
+    function_outputs = [
+        sent
+        for sent in socket.sent
+        if isinstance(sent.get("item"), dict)
+        and sent["item"].get("type") == "function_call_output"
+    ]
+    assert len(function_outputs) == 1
+    assert not [sent for sent in socket.sent if sent.get("type") == "response.create"]
+
+
+@pytest.mark.asyncio
+async def test_canvas_action_only_settles_before_same_channel_speech_turn() -> None:
+    action_response_id = "resp_action_only_a"
+    action_call_id = "call_action_only_a"
+    speech_response_id = "resp_speech_b"
+    arguments = (
+        '{"operation":"new","brief":"Show the water cycle.",'
+        '"interactionMode":"none","continuousControl":"none",'
+        '"completion":"requestComplete"}'
+    )
+    channel, socket = _channel(
+        [
+            *_canvas_response_events(
+                arguments=arguments,
+                preamble="",
+                response_id=action_response_id,
+                call_id=action_call_id,
+            ),
+            {
+                "type": "input_audio_buffer.committed",
+                "item_id": "item_speech_b",
+            },
+            *_text_response_events(
+                response_id=speech_response_id,
+                text="Here is an ordinary next-turn answer.",
+            ),
+        ]
+    )
+
+    turn_a = []
+    async for event in channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-action-only-a",
+        text_input="Draw the water cycle.",
+    ):
+        turn_a.append(event)
+        if isinstance(event, RealtimeCanvasToolCall):
+            await channel.complete_canvas_tool(
+                turn_id="turn-action-only-a",
+                call_id=event.call_id,
+                output=InteractiveCanvasToolOutputV4.model_validate(
+                    {"status": "accepted", "generationId": "generation-a"}
+                ),
+            )
+
+    assert [type(event) for event in turn_a] == [RealtimeCanvasToolCall]
+    assert channel._active_turn_id is None
+    assert channel._active_response_id is None
+    assert channel._pending_canvas_call_id is None
+    assert channel._pending_canvas_completion is None
+    assert channel._completed_canvas_call_ids == set()
+    assert channel._completed_canvas_tools == {}
+    assert channel._active_response_request is None
+    assert channel._resource_deferred_turn_id is None
+    assert channel._response_create_pending is False
+    assert channel._awaiting_response_trigger_turn_id is None
+    resource = channel.session_health.resource_governor
+    assert resource is not None
+    assert resource.local_reserved_requests == 0
+    assert channel.session_health.continuation_count == 0
+    assert channel.session_health.pending_response_count == 0
+
+    turn_b = await _collect_turn_events(channel, turn_id="turn-speech-b")
+
+    assert turn_b == [
+        RealtimeSpeechTextDelta(delta="Here is an ordinary next-turn answer.")
+    ]
+    assert channel.conversation_ledger.response(action_response_id).local_turn_id == (
+        "turn-action-only-a"
+    )
+    assert channel.conversation_ledger.response(speech_response_id).local_turn_id == (
+        "turn-speech-b"
+    )
+    assert channel._input_item_turn_ids["item_speech_b"] == "turn-speech-b"
+    response_creates = [
+        event for event in socket.sent if event.get("type") == "response.create"
+    ]
+    assert len(response_creates) == 2
+    assert not any(
+        event["response"].get("tool_choice") == "none" for event in response_creates
+    )
+
+
+@pytest.mark.asyncio
+async def test_canvas_action_only_does_not_contaminate_same_channel_continue_call() -> (
+    None
+):
+    action_call_id = "call_action_only_first"
+    continue_call_id = "call_continue_second"
+    action_arguments = (
+        '{"operation":"new","brief":"Show a cloud.",'
+        '"interactionMode":"none","continuousControl":"none",'
+        '"completion":"requestComplete"}'
+    )
+    continue_arguments = (
+        '{"operation":"new","brief":"Show rain.",'
+        '"interactionMode":"none","continuousControl":"none",'
+        '"completion":"needsResultReasoning"}'
+    )
+    channel, socket = _channel(
+        [
+            *_canvas_response_events(
+                arguments=action_arguments,
+                preamble="",
+                response_id="resp_action_only_first",
+                call_id=action_call_id,
+            ),
+            *_canvas_response_events(
+                arguments=continue_arguments,
+                preamble="",
+                response_id="resp_continue_second",
+                call_id=continue_call_id,
+            ),
+            *_text_response_events(
+                response_id="resp_continue_narration",
+                text="The rain picture is on its way.",
+            ),
+        ]
+    )
+
+    async for event in channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-action-only-first",
+        text_input="Draw a cloud.",
+    ):
+        if isinstance(event, RealtimeCanvasToolCall):
+            await channel.complete_canvas_tool(
+                turn_id="turn-action-only-first",
+                call_id=event.call_id,
+                output=InteractiveCanvasToolOutputV4.model_validate(
+                    {"status": "accepted", "generationId": "generation-first"}
+                ),
+            )
+
+    turn_b = []
+    async for event in channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-continue-second",
+        text_input="Now draw rain.",
+    ):
+        turn_b.append(event)
+        if isinstance(event, RealtimeCanvasToolCall):
+            with pytest.raises(
+                OpenAIRealtimeProtocolError,
+                match="does not match the pending call",
+            ):
+                await channel.complete_canvas_tool(
+                    turn_id="turn-continue-second",
+                    call_id=action_call_id,
+                    output=InteractiveCanvasToolOutputV4.model_validate(
+                        {
+                            "status": "accepted",
+                            "generationId": "generation-stale",
+                        }
+                    ),
+                )
+            await channel.complete_canvas_tool(
+                turn_id="turn-continue-second",
+                call_id=event.call_id,
+                output=InteractiveCanvasToolOutputV4.model_validate(
+                    {"status": "accepted", "generationId": "generation-second"}
+                ),
+            )
+
+    assert [type(event) for event in turn_b] == [
+        RealtimeCanvasToolCall,
+        RealtimeSpeechTextDelta,
+    ]
+    assert turn_b[-1] == RealtimeSpeechTextDelta(
+        delta="The rain picture is on its way."
+    )
+    assert channel._completed_canvas_call_ids == set()
+    assert channel._completed_canvas_tools == {}
+    assert channel._pending_canvas_completion is None
+    assert channel._pending_canvas_control_completion is None
+    response_creates = [
+        event for event in socket.sent if event.get("type") == "response.create"
+    ]
+    assert len(response_creates) == 3
+    assert (
+        sum(
+            event["response"].get("tool_choice") == "none" for event in response_creates
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("function_name", "arguments"),
+    [
+        (
+            INTERACTIVE_CANVAS_TOOL_NAME,
+            '{"operation":"new","brief":"Show a cloud.",'
+            '"interactionMode":"none","continuousControl":"none",'
+            '"completion":"requestComplete"}',
+        ),
+        (
+            INTERACTIVE_CANVAS_TOOL_NAME,
+            '{"operation":"revise","targetSceneId":"scene-retained","brief":"Add rain.",'
+            '"interactionMode":"none","continuousControl":"none",'
+            '"completion":"requestComplete"}',
+        ),
+        (
+            CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
+            '{"completion":"requestComplete"}',
+        ),
+    ],
+)
+async def test_aborted_canvas_completion_discards_local_disposition(
+    function_name: str,
+    arguments: str,
+) -> None:
+    channel, socket = _channel(
+        _canvas_response_events(
+            function_name=function_name,
+            arguments=arguments,
+            preamble="",
+            response_id="resp_aborted_canvas",
+            call_id="call_aborted_canvas",
+        )
+    )
+    iterator = channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-aborted-canvas",
+    ).__aiter__()
+    call = await anext(iterator)
+    if isinstance(call, RealtimeCanvasToolCall):
+        output: (
+            InteractiveCanvasToolOutputV4 | InteractiveCanvasCancellationToolOutputV4
+        ) = InteractiveCanvasToolOutputV4.model_validate(
+            {"status": "accepted", "generationId": "generation-aborted"}
+        )
+    else:
+        assert isinstance(call, RealtimeCancelCanvasToolCall)
+        output = InteractiveCanvasCancellationToolOutputV4.model_validate(
+            {"status": "accepted"}
+        )
+    await channel.complete_canvas_tool(
+        turn_id="turn-aborted-canvas",
+        call_id=call.call_id,
+        output=output,
+    )
+    assert set(channel._completed_canvas_tools) == {"call_aborted_canvas"}
+    assert channel._completed_canvas_call_ids == {"call_aborted_canvas"}
+    assert channel._completed_canvas_control_tools == {}
+    assert channel._completed_canvas_control_call_ids == set()
+
+    await iterator.aclose()
+
+    assert channel._completed_canvas_tools == {}
+    assert channel._completed_canvas_call_ids == set()
+    assert channel._pending_canvas_completion is None
+
+    sent_before_cancel = len(socket.sent)
+    cancellation = asyncio.create_task(channel.cancel(turn_id="turn-aborted-canvas"))
+    await socket.wait_sent(sent_before_cancel + 1)
+    cancel_event = socket.sent[-1]
+    assert cancel_event["type"] == "response.cancel"
+    socket.push(
+        {
+            "type": "error",
+            "error": {
+                "event_id": cancel_event["event_id"],
+                "code": "response_cancel_not_active",
+                "message": "The completed response is no longer active.",
+            },
+        }
+    )
+    await cancellation
+    assert channel._active_turn_id is None
+    assert channel._active_response_id is None
+
+
+@pytest.mark.asyncio
+async def test_aborted_canvas_control_completion_is_cleared_on_channel_close() -> None:
+    channel, socket = _channel(
+        _canvas_response_events(
+            function_name=MANAGE_CANVAS_PRESENTATION_TOOL_NAME,
+            arguments='{"action":"hide","completion":"requestComplete"}',
+            preamble="",
+            response_id="resp_aborted_control",
+            call_id="call_aborted_control",
+        )
+    )
+    iterator = channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-aborted-control",
+    ).__aiter__()
+    call = await anext(iterator)
+    assert isinstance(call, RealtimeManageCanvasPresentationToolCall)
+    await channel.complete_manage_canvas_presentation_tool(
+        turn_id="turn-aborted-control",
+        call_id=call.call_id,
+        output=ManageCanvasPresentationToolOutputV4(
+            status=ManageCanvasPresentationStatus.ACCEPTED,
+            operation="hide",
+            changed=True,
+            visible=False,
+        ),
+    )
+    assert set(channel._completed_canvas_control_tools) == {"call_aborted_control"}
+    assert channel._completed_canvas_control_call_ids == {"call_aborted_control"}
+    assert channel._completed_canvas_tools == {}
+    assert channel._completed_canvas_call_ids == set()
+    assert (
+        len(
+            [
+                event
+                for event in socket.sent
+                if isinstance(event.get("item"), dict)
+                and event["item"].get("type") == "function_call_output"
+            ]
+        )
+        == 1
+    )
+
+    await iterator.aclose()
+    await channel.close()
+
+    assert channel._completed_canvas_control_tools == {}
+    assert channel._completed_canvas_control_call_ids == set()
+    assert channel._pending_canvas_control_completion is None
+
+
+@pytest.mark.asyncio
+async def test_repeated_aborted_canvas_completions_do_not_accumulate() -> None:
+    channel, socket = _channel([])
+
+    for index in range(3):
+        for event in _canvas_response_events(
+            arguments=(
+                '{"operation":"new","brief":"Show one cloud.",'
+                '"interactionMode":"none","continuousControl":"none",'
+                '"completion":"requestComplete"}'
+            ),
+            preamble="",
+            response_id=f"resp_aborted_repeat_{index}",
+            call_id=f"call_aborted_repeat_{index}",
+        ):
+            socket.push(event)
+        turn_id = f"turn-aborted-repeat-{index}"
+        iterator = channel.stream_turn(
+            harness=_harness(),
+            turn_id=turn_id,
+        ).__aiter__()
+        call = await anext(iterator)
+        assert isinstance(call, RealtimeCanvasToolCall)
+        await channel.complete_canvas_tool(
+            turn_id=turn_id,
+            call_id=call.call_id,
+            output=InteractiveCanvasToolOutputV4.model_validate(
+                {
+                    "status": "accepted",
+                    "generationId": f"generation-aborted-repeat-{index}",
+                }
+            ),
+        )
+        await iterator.aclose()
+        assert channel._completed_canvas_tools == {}
+        assert channel._completed_canvas_call_ids == set()
+
+        sent_before_cancel = len(socket.sent)
+        cancellation = asyncio.create_task(channel.cancel(turn_id=turn_id))
+        await socket.wait_sent(sent_before_cancel + 1)
+        cancel_event = socket.sent[-1]
+        socket.push(
+            {
+                "type": "error",
+                "error": {
+                    "event_id": cancel_event["event_id"],
+                    "code": "response_cancel_not_active",
+                    "message": "The completed response is no longer active.",
+                },
+            }
+        )
+        await cancellation
+
+    assert (
+        len(
+            [
+                event
+                for event in socket.sent
+                if isinstance(event.get("item"), dict)
+                and event["item"].get("type") == "function_call_output"
+            ]
+        )
+        == 3
+    )
+    assert channel._completed_canvas_tools == {}
+    assert channel._completed_canvas_call_ids == set()
 
 
 def _channel(
@@ -943,7 +1718,8 @@ async def test_duplicate_consumed_continuation_terminal_is_ignored_before_next_t
     caplog.set_level(logging.INFO, logger="ava_backend.openai_realtime")
     arguments = (
         '{"operation":"new","brief":"Show a simple solar-system orbit.",'
-        '"interactionMode":"none"}'
+        '"interactionMode":"none","continuousControl":"none",'
+        '"completion":"needsResultReasoning"}'
     )
     continuation_events = _text_response_events(
         response_id=CONTINUATION_RESPONSE_ID,
@@ -972,7 +1748,7 @@ async def test_duplicate_consumed_continuation_terminal_is_ignored_before_next_t
     await channel.complete_canvas_tool(
         turn_id="turn-canvas-a",
         call_id=canvas_call.call_id,
-        output=InteractiveCanvasToolOutput(
+        output=InteractiveCanvasToolOutputV4(
             status="rejected",
             reason="The optional visual was not available.",
         ),
@@ -1084,6 +1860,33 @@ def test_session_update_uses_text_output_and_bounded_semantic_tools() -> None:
         MANAGE_CANVAS_PRESENTATION_TOOL_NAME,
         SEARCH_MEMORY_TOOL_NAME,
         GET_CURRENT_TIME_TOOL_NAME,
+    ]
+    canvas_tool = session["tools"][0]
+    parameters = canvas_tool["parameters"]
+    assert parameters["required"] == [
+        "operation",
+        "brief",
+        "interactionMode",
+        "continuousControl",
+        "completion",
+    ]
+    assert parameters["properties"]["interactionMode"]["$ref"] == (
+        "#/$defs/InteractiveCanvasMode"
+    )
+    assert parameters["$defs"]["InteractiveCanvasMode"]["enum"] == [
+        "none",
+        "explore",
+        "select",
+        "steps",
+    ]
+    assert parameters["properties"]["continuousControl"]["$ref"] == (
+        "#/$defs/InteractiveCanvasContinuousControl"
+    )
+    assert parameters["$defs"]["InteractiveCanvasContinuousControl"]["enum"] == [
+        "none",
+        "drag",
+        "slider",
+        "timeline",
     ]
     turn_detection = session["audio"]["input"]["turn_detection"]
     assert session["audio"]["input"]["transcription"] == {"model": "gpt-transcribe"}
@@ -2032,7 +2835,7 @@ def test_live_matrix_request_is_strictly_bounded() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("operation", ["new", "reviseFocused"])
+@pytest.mark.parametrize("operation", ["new", "revise"])
 async def test_canvas_call_gets_one_output_then_tool_disabled_continuation(
     operation: str,
     caplog: pytest.LogCaptureFixture,
@@ -2044,8 +2847,11 @@ async def test_canvas_call_gets_one_output_then_tool_disabled_continuation(
     arguments = json.dumps(
         {
             "operation": operation,
+            **({"targetSceneId": "scene-retained"} if operation == "revise" else {}),
             "brief": brief_sentinel,
             "interactionMode": "explore",
+            "continuousControl": "none",
+            "completion": "needsResultReasoning",
         },
         separators=(",", ":"),
     )
@@ -2070,12 +2876,10 @@ async def test_canvas_call_gets_one_output_then_tool_disabled_continuation(
             await channel.complete_canvas_tool(
                 turn_id="turn-canvas",
                 call_id=event.call_id,
-                output=InteractiveCanvasToolOutput.model_validate(
+                output=InteractiveCanvasToolOutputV4.model_validate(
                     {
-                        "status": "ready",
-                        "sceneId": "water_cycle",
-                        "revision": 1,
-                        "summary": ("A labeled interactive water-cycle loop is ready."),
+                        "status": "accepted",
+                        "generationId": "generation-private",
                     }
                 ),
             )
@@ -2105,6 +2909,14 @@ async def test_canvas_call_gets_one_output_then_tool_disabled_continuation(
     assert continuation_requests[-1]["response"]["conversation"] == "auto"
     assert "instructions" not in continuation_requests[-1]["response"]
     assert "input" not in continuation_requests[-1]["response"]
+    disposition = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage().startswith("openai_realtime_canvas_disposition_resolved")
+    )
+    assert disposition["requestedCompletion"] == "needsResultReasoning"
+    assert disposition["toolResultStatus"] == "ready"
+    assert disposition["continuationCreated"] is True
     assert channel.last_usage is not None
     assert channel.last_usage.total_tokens == 23
     usage_records = [
@@ -2220,6 +3032,8 @@ async def test_current_time_then_canvas_is_the_maximum_allowed_tool_chain() -> N
             "operation": "new",
             "brief": "Show a simple morning and evening clock comparison.",
             "interactionMode": "none",
+            "continuousControl": "none",
+            "completion": "needsResultReasoning",
         },
         separators=(",", ":"),
     )
@@ -2306,7 +3120,8 @@ async def test_canvas_terminal_continuation_rejects_later_utility_calls(
             *_canvas_response_events(
                 arguments=(
                     '{"operation":"new","brief":"Show Saturn.",'
-                    '"interactionMode":"none"}'
+                    '"interactionMode":"none","continuousControl":"none",'
+                    '"completion":"needsResultReasoning"}'
                 ),
                 preamble="",
             ),
@@ -2348,7 +3163,7 @@ async def test_repeated_or_cross_utility_gets_one_rejection_then_no_tools() -> N
                 preamble="",
             ),
             *_canvas_response_events(
-                arguments="{}",
+                arguments='{"completion":"needsResultReasoning"}',
                 function_name=GET_CURRENT_TIME_TOOL_NAME,
                 response_id=CONTINUATION_RESPONSE_ID,
                 call_id="call_invalid_second_utility",
@@ -2401,7 +3216,7 @@ async def test_explicit_canvas_cancellation_call_gets_idempotent_tool_output() -
     channel, socket = _channel(
         [
             *_canvas_response_events(
-                arguments="{}",
+                arguments='{"completion":"needsResultReasoning"}',
                 function_name=CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
                 preamble="",
             ),
@@ -2441,12 +3256,17 @@ async def test_explicit_canvas_cancellation_call_gets_idempotent_tool_output() -
 
 
 @pytest.mark.asyncio
-async def test_rejected_canvas_continuation_is_outcome_owned_and_bounded() -> None:
+async def test_rejected_canvas_continuation_is_outcome_owned_and_bounded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.openai_realtime")
     arguments = json.dumps(
         {
             "operation": "new",
             "brief": "visual-brief-A",
             "interactionMode": "none",
+            "continuousControl": "none",
+            "completion": "needsResultReasoning",
         },
         separators=(",", ":"),
     )
@@ -2497,12 +3317,21 @@ async def test_rejected_canvas_continuation_is_outcome_owned_and_bounded() -> No
     assert continuation["conversation"] == "auto"
     assert "instructions" not in continuation
     assert "input" not in continuation
+    disposition = next(
+        record.ava_context
+        for record in caplog.records
+        if record.getMessage().startswith("openai_realtime_canvas_disposition_resolved")
+    )
+    assert disposition["requestedCompletion"] == "needsResultReasoning"
+    assert disposition["toolResultStatus"] == "rejected"
+    assert disposition["continuationCreated"] is True
 
 
 @pytest.mark.asyncio
 async def test_accepted_canvas_continuation_supplies_drawing_instructions() -> None:
     arguments = (
-        '{"operation":"new","brief":"Show a water cycle.","interactionMode":"none"}'
+        '{"operation":"new","brief":"Show a water cycle.","interactionMode":"none",'
+        '"continuousControl":"none","completion":"needsResultReasoning"}'
     )
     channel, socket = _channel(
         [
@@ -2803,7 +3632,8 @@ async def test_canvas_interaction_trigger_is_single_shot() -> None:
     [
         (
             INTERACTIVE_CANVAS_TOOL_NAME,
-            '{"operation":"new","brief":"Show a cell.","interactionMode":"none"}',
+            '{"operation":"new","brief":"Show a cell.","interactionMode":"none",'
+            '"continuousControl":"none","completion":"needsResultReasoning"}',
         ),
         (SEARCH_MEMORY_TOOL_NAME, '{"query":"cell history"}'),
         (GET_CURRENT_TIME_TOOL_NAME, "{}"),
@@ -3249,9 +4079,16 @@ async def test_response_events_require_created_before_done() -> None:
 @pytest.mark.parametrize(
     "arguments",
     [
-        '{"brief":"Show a water cycle."}',
-        '{"operation":"revise","brief":"Show a water cycle."}',
-        '{"operation":"new","brief":42}',
+        '{"brief":"Show a water cycle.","completion":"needsResultReasoning"}',
+        '{"operation":"revise","brief":"Show a water cycle.",'
+        '"completion":"needsResultReasoning"}',
+        '{"operation":"new","brief":42,"completion":"needsResultReasoning"}',
+        '{"operation":"new","brief":"Show a slider.",'
+        '"interactionMode":"slider","continuousControl":"slider",'
+        '"completion":"needsResultReasoning"}',
+        '{"operation":"new","brief":"Show ordered steps.",'
+        '"interactionMode":"steps","continuousControl":"slider",'
+        '"completion":"needsResultReasoning"}',
     ],
 )
 async def test_invalid_canvas_arguments_are_rejected_without_killing_speech(
@@ -3277,7 +4114,7 @@ async def test_invalid_canvas_arguments_are_rejected_without_killing_speech(
             await channel.complete_canvas_tool(
                 turn_id="turn-invalid",
                 call_id=event.call_id,
-                output=InteractiveCanvasToolOutput(
+                output=InteractiveCanvasToolOutputV4(
                     status="rejected",
                     reason=event.reason,
                 ),
@@ -3310,6 +4147,8 @@ async def test_canvas_validation_logs_issue_paths_without_raw_arguments(
                     {
                         "brief": raw_brief,
                         "interactionMode": "none",
+                        "continuousControl": "none",
+                        "completion": "needsResultReasoning",
                     }
                 ),
                 preamble="",
@@ -3351,10 +4190,64 @@ async def test_canvas_validation_logs_issue_paths_without_raw_arguments(
 
 
 @pytest.mark.asyncio
+async def test_canvas_presentation_validation_logs_content_free_argument_shape(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw_title = "private provider title"
+    channel, _socket = _channel(
+        _canvas_response_events(
+            arguments=json.dumps(
+                {
+                    "action": "hide",
+                    "title": raw_title,
+                    "completion": "requestComplete",
+                }
+            ),
+            function_name=MANAGE_CANVAS_PRESENTATION_TOOL_NAME,
+            preamble="",
+        )
+    )
+    caplog.set_level(logging.WARNING, logger="ava_backend.openai_realtime")
+
+    async for event in channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-invalid-presentation-shape",
+    ):
+        assert isinstance(event, RealtimeRejectedManageCanvasPresentationToolCall)
+        await channel.complete_manage_canvas_presentation_tool(
+            turn_id="turn-invalid-presentation-shape",
+            call_id=event.call_id,
+            output=ManageCanvasPresentationToolOutputV4(
+                status=ManageCanvasPresentationStatus.REJECTED,
+                operation="hide",
+                reason=CANVAS_MODEL_SAFE_REJECTION_REASON,
+            ),
+        )
+
+    record = next(
+        item
+        for item in caplog.records
+        if item.getMessage().startswith("openai_canvas_presentation_arguments_rejected")
+    )
+    context = record.ava_context  # type: ignore[attr-defined]
+    assert context["argumentShape"] == {
+        "rootShape": "object",
+        "action": "hide",
+        "hasPosition": False,
+        "hasTitle": True,
+        "hasCompletion": True,
+    }
+    assert context["issues"] == [{"path": "$", "code": "value_error"}]
+    assert raw_title not in caplog.text
+    assert raw_title not in str(context)
+
+
+@pytest.mark.asyncio
 async def test_canvas_function_must_be_completed_exactly_once() -> None:
     arguments = (
         '{"operation":"new","brief":"Show the moon phases in order.",'
-        '"interactionMode":"none"}'
+        '"interactionMode":"none","continuousControl":"none",'
+        '"completion":"needsResultReasoning"}'
     )
     channel, _ = _channel(_canvas_response_events(arguments=arguments))
     iterator = channel.stream_turn(
@@ -3365,7 +4258,7 @@ async def test_canvas_function_must_be_completed_exactly_once() -> None:
     assert isinstance(await iterator.__anext__(), RealtimeSpeechTextDelta)
     call = await iterator.__anext__()
     assert isinstance(call, RealtimeCanvasToolCall)
-    output = InteractiveCanvasToolOutput(
+    output = InteractiveCanvasToolOutputV4(
         status="rejected",
         reason="The scene did not pass validation.",
     )
@@ -3389,7 +4282,8 @@ async def test_cancelling_pending_canvas_returns_rejection_without_continuation(
 ):
     arguments = (
         '{"operation":"new","brief":"Show a simple solar-system orbit.",'
-        '"interactionMode":"none"}'
+        '"interactionMode":"none","continuousControl":"none",'
+        '"completion":"needsResultReasoning"}'
     )
     channel, socket = _channel(_canvas_response_events(arguments=arguments))
     iterator = channel.stream_turn(
@@ -3425,7 +4319,8 @@ async def test_cancelled_canvas_continuation_cannot_escape_into_next_turn(
     caplog.set_level(logging.INFO, logger="ava_backend.openai_realtime")
     arguments = (
         '{"operation":"new","brief":"Show a simple solar-system orbit.",'
-        '"interactionMode":"none"}'
+        '"interactionMode":"none","continuousControl":"none",'
+        '"completion":"needsResultReasoning"}'
     )
     channel, socket = _channel(_canvas_response_events(arguments=arguments))
     iterator = channel.stream_turn(
@@ -3439,7 +4334,7 @@ async def test_cancelled_canvas_continuation_cannot_escape_into_next_turn(
     await channel.complete_canvas_tool(
         turn_id="turn-canvas-a",
         call_id=call.call_id,
-        output=InteractiveCanvasToolOutput(
+        output=InteractiveCanvasToolOutputV4(
             status="rejected",
             reason="The optional visual was not available.",
         ),
@@ -4436,8 +5331,16 @@ async def test_accepted_canvas_tool_completion_contains_no_response_instructions
     channel, socket = _channel(
         [
             *_canvas_response_events(
-                arguments='{"operation":"new","brief":"Draw a star.","interactionMode":"none"}',
+                arguments=(
+                    '{"operation":"new","brief":"Draw a star.",'
+                    '"interactionMode":"none","continuousControl":"none",'
+                    '"completion":"needsResultReasoning"}'
+                ),
                 preamble="",
+            ),
+            *_text_response_events(
+                response_id=CONTINUATION_RESPONSE_ID,
+                text="The drawing has started.",
             ),
         ]
     )
@@ -4455,7 +5358,11 @@ async def test_accepted_canvas_tool_completion_contains_no_response_instructions
             {"status": "accepted", "generationId": "generation-p2"}
         ),
     )
-    await iterator.aclose()
+    assert await anext(iterator) == RealtimeSpeechTextDelta(
+        delta="The drawing has started."
+    )
+    with pytest.raises(StopAsyncIteration):
+        await anext(iterator)
 
     response_create_events = [
         msg for msg in socket.sent if msg.get("type") == "response.create"
@@ -4473,8 +5380,8 @@ async def test_accepted_canvas_tool_completion_contains_no_response_instructions
     # Harness prompt layer must still retain the drawing behavior
     harness = _harness()
     prompt_text = harness.instructions
-    assert "Ava has real visual drawing" in prompt_text
-    assert "never claim that she cannot draw" in prompt_text
+    assert "Ava can create and revise validated lower-panel visuals" in prompt_text
+    assert "deny drawing capability" in prompt_text
 
 
 @pytest.mark.asyncio
@@ -4787,6 +5694,8 @@ async def test_provider_ledger_and_health_follow_the_owned_tool_continuation(
             "operation": "new",
             "brief": "Show the water cycle.",
             "interactionMode": "none",
+            "continuousControl": "none",
+            "completion": "needsResultReasoning",
         },
         separators=(",", ":"),
     )
@@ -4873,12 +5782,10 @@ async def test_provider_ledger_and_health_follow_the_owned_tool_continuation(
     await channel.complete_canvas_tool(
         turn_id="turn-ledger-health",
         call_id=call.call_id,
-        output=InteractiveCanvasToolOutput.model_validate(
+        output=InteractiveCanvasToolOutputV4.model_validate(
             {
-                "status": "ready",
-                "sceneId": "water_cycle",
-                "revision": 1,
-                "summary": "A water-cycle scene is ready.",
+                "status": "accepted",
+                "generationId": "generation-private",
             }
         ),
     )
@@ -5307,6 +6214,64 @@ async def test_structured_rate_limit_retries_only_response_generation() -> None:
     assert resource is not None
     assert resource.rate_limit_recovery_count == 1
     assert resource.local_reserved_requests == 0
+    assert channel._semantic_response_count == 1
+
+
+@pytest.mark.asyncio
+async def test_three_actual_semantic_responses_are_allowed_and_fourth_is_bounded() -> (
+    None
+):
+    channel, socket = _channel([])
+    turn_id = "turn-semantic-chain-limit"
+    channel._active_turn_id = turn_id
+
+    for response_number in range(1, 4):
+        created, decision = await channel._create_response_locked(
+            turn_id=turn_id,
+            response_kind=f"testResponse{response_number}",
+            response={"max_output_tokens": 64},
+            output_token_limits=(64,),
+        )
+        assert created is True
+        assert decision is not None
+        assert decision.estimate.output_token_limits == (64,)
+        assert channel._semantic_response_count == response_number
+
+        provider_response_id = f"response-{response_number}"
+        channel._resource_governor.bind_provider_response(
+            turn_id=turn_id,
+            provider_response_id=provider_response_id,
+        )
+        channel._resource_governor.reconcile_response(
+            turn_id=turn_id,
+            provider_response_id=provider_response_id,
+            input_tokens=100 + response_number,
+            output_tokens=10,
+        )
+        channel._response_create_pending = False
+        channel._active_response_request = None
+        resource = channel.session_health.resource_governor
+        assert resource is not None
+        assert resource.local_reserved_requests == 0
+        assert resource.local_reserved_tokens == 0
+
+    with pytest.raises(
+        OpenAIRealtimeProtocolError,
+        match="logical turn exceeded Ava's semantic response chain",
+    ):
+        await channel._create_response_locked(
+            turn_id=turn_id,
+            response_kind="testResponse4",
+            response={"max_output_tokens": 64},
+            output_token_limits=(64,),
+        )
+
+    assert channel._semantic_response_count == 3
+    assert (
+        len([event for event in socket.sent if event.get("type") == "response.create"])
+        == 3
+    )
+    channel._resource_governor.release_turn(turn_id=turn_id)
 
 
 @pytest.mark.parametrize("limit_kind", ["tokens", "requests"])
@@ -5390,7 +6355,7 @@ async def test_rate_limit_fresh_insufficient_snapshot_waits_for_sufficient_truth
     await socket.wait_received(previous_received + 1)
     assert second_changed.is_set()
     await wait_results.put(True)
-    await socket.wait_sent(3)
+    await socket.wait_sent(4)
     for event in _text_response_events(
         response_id=f"response-{limit_kind}-recovered",
         text="Recovered from fresh provider truth.",
@@ -5463,6 +6428,7 @@ async def test_correlated_top_level_rate_limit_retries_with_new_client_event_id(
         and event["item"].get("role") == "user"
     ]
     assert len(user_items) == 1
+    assert channel._semantic_response_count == 1
 
 
 @pytest.mark.asyncio
@@ -5477,6 +6443,8 @@ async def test_correlated_top_level_rate_limit_after_function_output_retries_onl
             "operation": "new",
             "brief": "Show one triangle.",
             "interactionMode": "none",
+            "continuousControl": "none",
+            "completion": "needsResultReasoning",
         },
         separators=(",", ":"),
     )
@@ -5500,13 +6468,14 @@ async def test_correlated_top_level_rate_limit_after_function_output_retries_onl
             {"status": "accepted", "generationId": "generation-correlated"}
         ),
     )
+    pending = asyncio.create_task(anext(iterator))
+    await socket.wait_sent(5)
     response_creates = [
         event for event in socket.sent if event.get("type") == "response.create"
     ]
     assert len(response_creates) == 2
     continuation_event_id = response_creates[-1].get("event_id")
     assert isinstance(continuation_event_id, str)
-    pending = asyncio.create_task(anext(iterator))
     sent_before_error = len(socket.sent)
     socket.push(_top_level_rate_limit_error(event_id=continuation_event_id))
     await socket.wait_sent(sent_before_error + 1)
@@ -5532,6 +6501,7 @@ async def test_correlated_top_level_rate_limit_after_function_output_retries_onl
         len([event for event in socket.sent if event.get("type") == "response.create"])
         == 3
     )
+    assert channel._semantic_response_count == 2
 
 
 @pytest.mark.parametrize("error_event_id", [None, "mismatched-response-create"])
@@ -5605,6 +6575,8 @@ async def test_continuation_rechecks_latest_provider_capacity_without_replay(
             "operation": "new",
             "brief": "Show one triangle.",
             "interactionMode": "none",
+            "continuousControl": "none",
+            "completion": "needsResultReasoning",
         },
         separators=(",", ":"),
     )
@@ -5637,15 +6609,14 @@ async def test_continuation_rechecks_latest_provider_capacity_without_replay(
         }
     )
     await socket.wait_received(previous_received + 1)
-    completion = asyncio.create_task(
-        channel.complete_canvas_tool(
-            turn_id=f"turn-{limit_kind}-continuation-capacity",
-            call_id=call.call_id,
-            output=InteractiveCanvasToolOutputV4.model_validate(
-                {"status": "accepted", "generationId": "generation-capacity"}
-            ),
-        )
+    await channel.complete_canvas_tool(
+        turn_id=f"turn-{limit_kind}-continuation-capacity",
+        call_id=call.call_id,
+        output=InteractiveCanvasToolOutputV4.model_validate(
+            {"status": "accepted", "generationId": "generation-capacity"}
+        ),
     )
+    continuation = asyncio.create_task(anext(iterator))
     await waiter_entered.wait()
     function_outputs = [
         event
@@ -5676,7 +6647,7 @@ async def test_continuation_rechecks_latest_provider_capacity_without_replay(
     )
     await socket.wait_received(previous_received + 1)
     permit_retry.set()
-    await completion
+    await socket.wait_sent(5)
     assert (
         len([event for event in socket.sent if event.get("type") == "response.create"])
         == 2
@@ -5686,7 +6657,7 @@ async def test_continuation_rechecks_latest_provider_capacity_without_replay(
         text="Continuation admitted once.",
     ):
         socket.push(event)
-    assert await anext(iterator) == RealtimeSpeechTextDelta(
+    assert await continuation == RealtimeSpeechTextDelta(
         delta="Continuation admitted once."
     )
     with pytest.raises(StopAsyncIteration):
@@ -5760,7 +6731,7 @@ async def test_search_memory_exact_output_defers_continuation_without_duplicate_
                 {
                     "name": "tokens",
                     "limit": 40_000,
-                    "remaining": 10_000,
+                    "remaining": 1_000,
                     "reset_seconds": 60,
                 }
             ],
@@ -5793,10 +6764,8 @@ async def test_search_memory_exact_output_defers_continuation_without_duplicate_
     resource = channel.session_health.resource_governor
     assert resource is not None
     expected_input = 10 + 4 + output_utf8_bytes
-    assert resource.estimated_logical_turn_responses == 2
-    assert resource.estimated_logical_turn_tokens == (
-        (expected_input + 512) + (expected_input + 512 + 512)
-    )
+    assert resource.estimated_logical_turn_responses == 1
+    assert resource.estimated_logical_turn_tokens == expected_input + 512
 
     previous_received = socket.received_count
     socket.push(
@@ -5853,6 +6822,8 @@ async def test_rate_limited_canvas_continuation_does_not_duplicate_tool_work() -
             "operation": "new",
             "brief": "Show one triangle.",
             "interactionMode": "none",
+            "continuousControl": "none",
+            "completion": "needsResultReasoning",
         },
         separators=(",", ":"),
     )
@@ -6064,3 +7035,1743 @@ async def test_repeated_rate_limits_exhaust_bound_without_wedging_next_turn() ->
         )
     ]
     assert next_events == [RealtimeSpeechTextDelta(delta="The next turn works.")]
+
+
+def _semantic_capture_response_events(
+    *,
+    response_id: str = "resp-capture-1",
+    source_turn_id: str = "turn-cap-1",
+    arguments: str = '{"disposition":"noChange"}',
+    input_tokens: int = 100,
+    output_tokens: int = 20,
+) -> list[dict[str, object]]:
+    return [
+        {
+            "type": "response.created",
+            "response": {
+                "id": response_id,
+                "metadata": {
+                    "purpose": "semantic_capture",
+                    "source_turn_id": source_turn_id,
+                },
+            },
+        },
+        {
+            "type": "response.output_item.added",
+            "response_id": response_id,
+            "item": {
+                "type": "function_call",
+                "name": RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME,
+                "call_id": f"call_{response_id}",
+            },
+        },
+        {
+            "type": "response.function_call_arguments.delta",
+            "response_id": response_id,
+            "call_id": f"call_{response_id}",
+            "delta": arguments,
+        },
+        {
+            "type": "response.function_call_arguments.done",
+            "response_id": response_id,
+            "name": RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME,
+            "call_id": f"call_{response_id}",
+            "arguments": arguments,
+        },
+        {
+            "type": "response.output_item.done",
+            "response_id": response_id,
+            "item": {
+                "type": "function_call",
+                "name": RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME,
+                "call_id": f"call_{response_id}",
+                "arguments": arguments,
+            },
+        },
+        {
+            "type": "response.done",
+            "response": {
+                "id": response_id,
+                "status": "completed",
+                "usage": _usage(input_tokens, output_tokens),
+            },
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_semantic_capture_payload_is_hermetic() -> None:
+    channel, socket = _channel([])
+    evidence = SemanticCaptureEvidence(
+        source_turn_id="turn-hermetic-1",
+        current_frame=DialogueFrameState(),
+        child_utterance="I like Jupiter.",
+        spoken_response_prefix="Jupiter is a giant gas planet.",
+        interrupted=False,
+    )
+    capture_task = asyncio.create_task(
+        channel.capture_semantic_memory(evidence=evidence)
+    )
+    await socket.wait_sent(1)
+    sent_create = socket.sent[-1]
+
+    assert sent_create["type"] == "response.create"
+    response_spec = sent_create["response"]
+    assert isinstance(response_spec, dict)
+    assert response_spec["conversation"] == "none"
+    assert response_spec["input"] == []
+    assert response_spec["output_modalities"] == ["text"]
+    assert "modalities" not in response_spec
+    governor = channel._resource_governor
+    assert governor._capture_reservation is not None
+    governor_capture_limit = governor._capture_reservation.estimate.output_token_limits[
+        0
+    ]
+    assert (
+        response_spec["max_output_tokens"]
+        == governor_capture_limit
+        == _SEMANTIC_CAPTURE_MAX_OUTPUT_TOKENS
+        == MAX_SEMANTIC_MEMORY_PROPOSAL_UTF8_BYTES
+        == 4096
+    )
+    assert response_spec["tool_choice"] == {
+        "type": "function",
+        "name": RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME,
+    }
+    assert response_spec["metadata"] == {
+        "source_turn_id": "turn-hermetic-1",
+        "purpose": "semantic_capture",
+    }
+    tools = response_spec["tools"]
+    assert isinstance(tools, list) and len(tools) == 1
+    assert tools[0]["type"] == "function"
+    assert tools[0]["name"] == RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME
+
+    for event in _semantic_capture_response_events(
+        response_id="resp-cap-hermetic-1",
+        source_turn_id="turn-hermetic-1",
+    ):
+        socket.push(event)
+
+    result = await capture_task
+    assert isinstance(result, SemanticCaptureFunctionArguments)
+    assert result.disposition == SemanticCaptureDisposition.NO_CHANGE
+
+    assert channel._active_semantic_capture is None
+    assert len(channel._capture_response_id_to_registration) == 0
+    governor = channel.session_health.resource_governor
+    assert governor is not None
+    assert governor.local_reserved_requests == 0
+
+
+@pytest.mark.asyncio
+async def test_event_demux_routes_normal_and_capture_events_independently() -> None:
+    channel, socket = _channel([], max_output_tokens=2000)
+    stream = channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-normal-1",
+        text_input="Hello Ava!",
+        response_max_output_tokens=400,
+    )
+
+    evidence = SemanticCaptureEvidence(
+        source_turn_id="turn-cap-demux-1",
+        current_frame=DialogueFrameState(),
+        child_utterance="Tell me about Mars.",
+    )
+    capture_task = asyncio.create_task(
+        channel.capture_semantic_memory(evidence=evidence)
+    )
+    await socket.wait_sent(1)
+
+    # Interleave normal router events, rate limits, and capture events
+    socket.push(
+        {
+            "type": "input_audio_buffer.speech_started",
+            "audio_start_ms": 100,
+            "item_id": "item_speech_1",
+        }
+    )
+    socket.push(
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp-cap-demux-1",
+                "metadata": {
+                    "purpose": "semantic_capture",
+                    "source_turn_id": "turn-cap-demux-1",
+                },
+            },
+        }
+    )
+    socket.push(
+        {
+            "type": "response.created",
+            "response": {"id": "resp-normal-1"},
+        }
+    )
+    socket.push(
+        {
+            "type": "rate_limits.updated",
+            "rate_limits": [
+                {
+                    "name": "tokens",
+                    "limit": 1000,
+                    "remaining": 950,
+                    "reset_seconds": 0.5,
+                }
+            ],
+        }
+    )
+    socket.push(
+        {
+            "type": "response.output_text.delta",
+            "response_id": "resp-normal-1",
+            "delta": "Hello child!",
+        }
+    )
+    socket.push(
+        {
+            "type": "response.output_item.added",
+            "response_id": "resp-cap-demux-1",
+            "item": {
+                "type": "function_call",
+                "name": RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME,
+                "call_id": "call-cap-demux-1",
+            },
+        }
+    )
+    socket.push(
+        {
+            "type": "response.function_call_arguments.done",
+            "response_id": "resp-cap-demux-1",
+            "name": RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME,
+            "call_id": "call-cap-demux-1",
+            "arguments": '{"disposition":"noChange"}',
+        }
+    )
+    socket.push(
+        {
+            "type": "response.output_item.done",
+            "response_id": "resp-cap-demux-1",
+            "item": {
+                "type": "function_call",
+                "name": RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME,
+                "call_id": "call-cap-demux-1",
+                "arguments": '{"disposition":"noChange"}',
+            },
+        }
+    )
+    socket.push(
+        {
+            "type": "response.output_text.done",
+            "response_id": "resp-normal-1",
+            "text": "Hello child!",
+        }
+    )
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp-normal-1",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Hello child!"}],
+                    }
+                ],
+                "usage": _usage(10, 4),
+            },
+        }
+    )
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp-cap-demux-1",
+                "status": "completed",
+                "usage": _usage(50, 10),
+            },
+        }
+    )
+
+    normal_events: list[object] = []
+    async for event in stream:
+        normal_events.append(event)
+
+    assert normal_events == [RealtimeSpeechTextDelta(delta="Hello child!")]
+    input_event = await channel.next_input_event()
+    assert input_event == RealtimeProviderInputEvent(
+        event_type="input_audio_buffer.speech_started",
+        item_id="item_speech_1",
+        audio_start_ms=100,
+    )
+
+    capture_res = await capture_task
+    assert capture_res.disposition == SemanticCaptureDisposition.NO_CHANGE
+
+    assert channel._active_semantic_capture is None
+    assert len(channel._capture_response_id_to_registration) == 0
+
+
+@pytest.mark.asyncio
+async def test_rapid_next_turn_independent_of_open_semantic_capture() -> None:
+    channel, socket = _channel([], max_output_tokens=2000)
+
+    # Turn 1 semantic capture starts and stays open
+    evidence = SemanticCaptureEvidence(
+        source_turn_id="turn-open-1",
+        current_frame=DialogueFrameState(),
+    )
+    capture_task = asyncio.create_task(
+        channel.capture_semantic_memory(evidence=evidence)
+    )
+    await socket.wait_sent(1)
+    socket.push(
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp-cap-open-1",
+                "metadata": {
+                    "purpose": "semantic_capture",
+                    "source_turn_id": "turn-open-1",
+                },
+            },
+        }
+    )
+
+    # Turn 2 child turn starts while capture is still pending
+    for ev in _text_response_events(
+        response_id="resp-child-2",
+        text="Turn 2 reply.",
+    ):
+        socket.push(ev)
+
+    t2_events = [
+        event
+        async for event in channel.stream_turn(
+            harness=_harness(),
+            turn_id="turn-child-2",
+            text_input="Turn 2 text",
+            response_max_output_tokens=400,
+        )
+    ]
+    assert t2_events == [RealtimeSpeechTextDelta(delta="Turn 2 reply.")]
+
+    # Now finish the open capture response
+    socket.push(
+        {
+            "type": "response.output_item.added",
+            "response_id": "resp-cap-open-1",
+            "item": {
+                "type": "function_call",
+                "name": RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME,
+                "call_id": "call-open-1",
+            },
+        }
+    )
+    socket.push(
+        {
+            "type": "response.function_call_arguments.done",
+            "response_id": "resp-cap-open-1",
+            "name": RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME,
+            "call_id": "call-open-1",
+            "arguments": '{"disposition":"noChange"}',
+        }
+    )
+    socket.push(
+        {
+            "type": "response.output_item.done",
+            "response_id": "resp-cap-open-1",
+            "item": {
+                "type": "function_call",
+                "name": RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME,
+                "call_id": "call-open-1",
+                "arguments": '{"disposition":"noChange"}',
+            },
+        }
+    )
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp-cap-open-1",
+                "status": "completed",
+                "usage": _usage(50, 10),
+            },
+        }
+    )
+
+    capture_res = await capture_task
+    assert capture_res.disposition == SemanticCaptureDisposition.NO_CHANGE
+    assert channel._active_semantic_capture is None
+
+
+@pytest.mark.asyncio
+async def test_capture_correlated_error_routes_to_capture_and_raises() -> None:
+    channel, socket = _channel([])
+    evidence = SemanticCaptureEvidence(
+        source_turn_id="turn-err-1",
+        current_frame=DialogueFrameState(),
+    )
+    capture_task = asyncio.create_task(
+        channel.capture_semantic_memory(evidence=evidence)
+    )
+    await socket.wait_sent(1)
+    sent_create = socket.sent[-1]
+    client_event_id = sent_create.get("event_id")
+    assert isinstance(client_event_id, str)
+
+    # Inject correlated error referencing event_id
+    socket.push(
+        {
+            "type": "error",
+            "event_id": client_event_id,
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_parameters",
+                "message": "Capture parameters invalid",
+                "event_id": client_event_id,
+            },
+        }
+    )
+
+    with pytest.raises(OpenAIRealtimeProviderError) as exc_info:
+        await capture_task
+
+    assert "invalid_parameters" in str(exc_info.value)
+    assert channel._active_semantic_capture is None
+    assert len(channel._capture_response_id_to_registration) == 0
+    governor = channel.session_health.resource_governor
+    assert governor is not None
+    assert governor.local_reserved_requests == 0
+
+
+@pytest.mark.asyncio
+async def test_capture_route_cleanup_and_governor_release_on_timeout_and_cancel() -> (
+    None
+):
+    # 1. Test timeout cleanup: reservation remains active until session close
+    channel_timeout, socket_timeout = _channel([], max_output_tokens=100)
+    channel_timeout._turn_timeout_seconds = 0.05
+    evidence_to = SemanticCaptureEvidence(
+        source_turn_id="turn-timeout-1",
+        current_frame=DialogueFrameState(),
+    )
+    with pytest.raises(_OpenAIRealtimeReceiveTimeout):
+        await channel_timeout.capture_semantic_memory(evidence=evidence_to)
+
+    assert channel_timeout._active_semantic_capture is None
+    assert len(channel_timeout._capture_response_id_to_registration) == 0
+    gov_to = channel_timeout.session_health.resource_governor
+    assert gov_to is not None
+    assert gov_to.local_reserved_requests == 1
+    await channel_timeout.close()
+    assert channel_timeout.session_health.resource_governor.local_reserved_requests == 0
+
+    # 2. Test cancellation cleanup: reservation remains active until session close
+    channel_cancel, socket_cancel = _channel([])
+    evidence_cancel = SemanticCaptureEvidence(
+        source_turn_id="turn-cancel-1",
+        current_frame=DialogueFrameState(),
+    )
+    cancel_task = asyncio.create_task(
+        channel_cancel.capture_semantic_memory(evidence=evidence_cancel)
+    )
+    await socket_cancel.wait_sent(1)
+
+    cancel_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancel_task
+
+    assert channel_cancel._active_semantic_capture is None
+    assert len(channel_cancel._capture_response_id_to_registration) == 0
+    gov_cancel = channel_cancel.session_health.resource_governor
+    assert gov_cancel is not None
+    assert gov_cancel.local_reserved_requests == 1
+    await channel_cancel.close()
+    assert channel_cancel.session_health.resource_governor.local_reserved_requests == 0
+
+
+@pytest.mark.asyncio
+async def test_capture_tolerates_private_message_text_before_function_call_and_isolates_child_turn() -> (
+    None
+):
+    channel, socket = _channel([], max_output_tokens=2000)
+
+    evidence = SemanticCaptureEvidence(
+        source_turn_id="turn-live-seq-1",
+        current_frame=DialogueFrameState(),
+        child_utterance="I like stars.",
+    )
+    capture_task = asyncio.create_task(
+        channel.capture_semantic_memory(evidence=evidence)
+    )
+    await socket.wait_sent(1)
+
+    stream_b = channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-child-live-b",
+        text_input="What is a supernova?",
+        response_max_output_tokens=400,
+    )
+
+    # Capture A emits response.created
+    socket.push(
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp-cap-live-A",
+                "metadata": {
+                    "purpose": "semantic_capture",
+                    "source_turn_id": "turn-live-seq-1",
+                },
+            },
+        }
+    )
+
+    # Capture A emits private message item and text (the live failure trigger)
+    socket.push(
+        {
+            "type": "response.output_item.added",
+            "response_id": "resp-cap-live-A",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+            },
+        }
+    )
+    socket.push(
+        {
+            "type": "response.output_text.delta",
+            "response_id": "resp-cap-live-A",
+            "delta": "I am thinking about stars...",
+        }
+    )
+    socket.push(
+        {
+            "type": "response.output_text.done",
+            "response_id": "resp-cap-live-A",
+            "text": "I am thinking about stars...",
+        }
+    )
+    socket.push(
+        {
+            "type": "response.output_item.done",
+            "response_id": "resp-cap-live-A",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "I am thinking about stars..."}
+                ],
+            },
+        }
+    )
+
+    # Interleave normal child response B events
+    socket.push(
+        {
+            "type": "response.created",
+            "response": {"id": "resp-child-live-B"},
+        }
+    )
+    socket.push(
+        {
+            "type": "response.output_text.delta",
+            "response_id": "resp-child-live-B",
+            "delta": "A supernova is an explosion.",
+        }
+    )
+
+    await asyncio.sleep(0)
+    # Verify route ownership of A is still maintained while A is generating
+    assert "resp-cap-live-A" in channel._capture_response_id_to_registration
+
+    # THEN LATER Capture A emits valid function call
+    socket.push(
+        {
+            "type": "response.output_item.added",
+            "response_id": "resp-cap-live-A",
+            "item": {
+                "type": "function_call",
+                "name": RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME,
+                "call_id": "call-cap-live-A",
+            },
+        }
+    )
+    socket.push(
+        {
+            "type": "response.function_call_arguments.delta",
+            "response_id": "resp-cap-live-A",
+            "call_id": "call-cap-live-A",
+            "delta": '{"disposition":"noChange"}',
+        }
+    )
+    socket.push(
+        {
+            "type": "response.function_call_arguments.done",
+            "response_id": "resp-cap-live-A",
+            "name": RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME,
+            "call_id": "call-cap-live-A",
+            "arguments": '{"disposition":"noChange"}',
+        }
+    )
+    socket.push(
+        {
+            "type": "response.output_item.done",
+            "response_id": "resp-cap-live-A",
+            "item": {
+                "type": "function_call",
+                "name": RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME,
+                "call_id": "call-cap-live-A",
+                "arguments": '{"disposition":"noChange"}',
+            },
+        }
+    )
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp-cap-live-A",
+                "status": "completed",
+                "usage": _usage(50, 15),
+            },
+        }
+    )
+
+    # Normal child response B finishes
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp-child-live-B",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "A supernova is an explosion.",
+                            }
+                        ],
+                    }
+                ],
+                "usage": _usage(20, 6),
+            },
+        }
+    )
+
+    b_events = [event async for event in stream_b]
+    assert b_events == [RealtimeSpeechTextDelta(delta="A supernova is an explosion.")]
+
+    capture_res = await capture_task
+    assert isinstance(capture_res, SemanticCaptureFunctionArguments)
+    assert capture_res.disposition == SemanticCaptureDisposition.NO_CHANGE
+
+    assert channel._active_semantic_capture is None
+    assert "resp-cap-live-A" not in channel._capture_response_id_to_registration
+    assert len(channel._capture_response_id_to_registration) == 0
+
+
+@pytest.mark.asyncio
+async def test_invalid_capture_only_text_fails_at_terminal_and_preserves_next_turn() -> (
+    None
+):
+    channel, socket = _channel([], max_output_tokens=2000)
+    evidence = SemanticCaptureEvidence(
+        source_turn_id="turn-invalid-text-1",
+        current_frame=DialogueFrameState(),
+    )
+    capture_task = asyncio.create_task(
+        channel.capture_semantic_memory(evidence=evidence)
+    )
+    await socket.wait_sent(1)
+
+    socket.push(
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp-cap-text-only",
+                "metadata": {
+                    "purpose": "semantic_capture",
+                    "source_turn_id": "turn-invalid-text-1",
+                },
+            },
+        }
+    )
+    socket.push(
+        {
+            "type": "response.output_item.added",
+            "response_id": "resp-cap-text-only",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+            },
+        }
+    )
+    socket.push(
+        {
+            "type": "response.output_text.delta",
+            "response_id": "resp-cap-text-only",
+            "delta": "Just text, no tool call.",
+        }
+    )
+    socket.push(
+        {
+            "type": "response.output_text.done",
+            "response_id": "resp-cap-text-only",
+            "text": "Just text, no tool call.",
+        }
+    )
+
+    await asyncio.sleep(0)
+    # Route remains quarantined, not failed yet
+    assert "resp-cap-text-only" in channel._capture_response_id_to_registration
+    assert not capture_task.done()
+
+    # Now emit response.done
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp-cap-text-only",
+                "status": "completed",
+                "usage": _usage(30, 5),
+            },
+        }
+    )
+
+    # Capture fails only after response.done
+    with pytest.raises(OpenAIRealtimeProtocolError) as exc_info:
+        await capture_task
+    assert "did not invoke record_semantic_turn_capture" in str(exc_info.value)
+
+    # Mapping cleaned afterward
+    assert "resp-cap-text-only" not in channel._capture_response_id_to_registration
+    assert len(channel._capture_response_id_to_registration) == 0
+
+    # Next child turn remains healthy, no owner mismatch
+    for ev in _text_response_events(
+        response_id="resp-child-next",
+        text="Next turn reply.",
+    ):
+        socket.push(ev)
+
+    events = [
+        event
+        async for event in channel.stream_turn(
+            harness=_harness(),
+            turn_id="turn-child-next",
+            text_input="Next input",
+            response_max_output_tokens=400,
+        )
+    ]
+    assert events == [RealtimeSpeechTextDelta(delta="Next turn reply.")]
+
+
+@pytest.mark.asyncio
+async def test_malformed_function_capture_fails_at_terminal_and_child_turn_unaffected() -> (
+    None
+):
+    channel, socket = _channel([], max_output_tokens=2000)
+    evidence = SemanticCaptureEvidence(
+        source_turn_id="turn-malformed-1",
+        current_frame=DialogueFrameState(),
+    )
+    capture_task = asyncio.create_task(
+        channel.capture_semantic_memory(evidence=evidence)
+    )
+    await socket.wait_sent(1)
+
+    socket.push(
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp-cap-malformed",
+                "metadata": {
+                    "purpose": "semantic_capture",
+                    "source_turn_id": "turn-malformed-1",
+                },
+            },
+        }
+    )
+    socket.push(
+        {
+            "type": "response.output_item.added",
+            "response_id": "resp-cap-malformed",
+            "item": {
+                "type": "function_call",
+                "name": "unexpected_wrong_tool",
+                "call_id": "call-wrong-1",
+            },
+        }
+    )
+    socket.push(
+        {
+            "type": "response.function_call_arguments.delta",
+            "response_id": "resp-cap-malformed",
+            "call_id": "call-wrong-1",
+            "delta": '{"foo": "bar"}',
+        }
+    )
+    socket.push(
+        {
+            "type": "response.function_call_arguments.done",
+            "response_id": "resp-cap-malformed",
+            "name": "unexpected_wrong_tool",
+            "call_id": "call-wrong-1",
+            "arguments": '{"foo": "bar"}',
+        }
+    )
+    socket.push(
+        {
+            "type": "response.output_item.done",
+            "response_id": "resp-cap-malformed",
+            "item": {
+                "type": "function_call",
+                "name": "unexpected_wrong_tool",
+                "call_id": "call-wrong-1",
+                "arguments": '{"foo": "bar"}',
+            },
+        }
+    )
+
+    await asyncio.sleep(0)
+    assert "resp-cap-malformed" in channel._capture_response_id_to_registration
+    assert not capture_task.done()
+
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp-cap-malformed",
+                "status": "completed",
+                "usage": _usage(40, 10),
+            },
+        }
+    )
+
+    with pytest.raises(OpenAIRealtimeProtocolError) as exc_info:
+        await capture_task
+    assert "unexpected tool 'unexpected_wrong_tool'" in str(exc_info.value)
+    assert len(channel._capture_response_id_to_registration) == 0
+
+    for ev in _text_response_events(
+        response_id="resp-child-after-malformed",
+        text="Normal response.",
+    ):
+        socket.push(ev)
+
+    events = [
+        event
+        async for event in channel.stream_turn(
+            harness=_harness(),
+            turn_id="turn-child-after-malformed",
+            text_input="Child input",
+            response_max_output_tokens=400,
+        )
+    ]
+    assert events == [RealtimeSpeechTextDelta(delta="Normal response.")]
+
+
+@pytest.mark.asyncio
+async def test_timeout_abandoned_capture_response_quarantined_until_terminal() -> None:
+    channel, socket = _channel([], max_output_tokens=2000)
+    evidence = SemanticCaptureEvidence(
+        source_turn_id="turn-abandoned-1",
+        current_frame=DialogueFrameState(),
+    )
+    capture_task = asyncio.create_task(
+        channel.capture_semantic_memory(evidence=evidence)
+    )
+    await socket.wait_sent(1)
+
+    socket.push(
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp-cap-abandoned-1",
+                "metadata": {
+                    "purpose": "semantic_capture",
+                    "source_turn_id": "turn-abandoned-1",
+                },
+            },
+        }
+    )
+
+    # Let response.created be processed by capture task
+    await asyncio.sleep(0)
+    assert "resp-cap-abandoned-1" in channel._capture_response_id_to_registration
+
+    # Cause local capture abandonment (e.g. cancellation/timeout)
+    capture_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await capture_task
+
+    # Crucial: route mapping MUST remain present and marked abandoned
+    assert "resp-cap-abandoned-1" in channel._capture_response_id_to_registration
+    assert (
+        channel._capture_response_id_to_registration["resp-cap-abandoned-1"].abandoned
+        is True
+    )
+
+    # Emit more capture response events
+    socket.push(
+        {
+            "type": "response.output_text.delta",
+            "response_id": "resp-cap-abandoned-1",
+            "delta": "Post-timeout private text.",
+        }
+    )
+
+    # Interleave normal child response concurrently
+    for ev in _text_response_events(
+        response_id="resp-child-interleaved-1",
+        text="Child speaks during abandoned capture.",
+    ):
+        socket.push(ev)
+
+    child_events = [
+        event
+        async for event in channel.stream_turn(
+            harness=_harness(),
+            turn_id="turn-child-interleaved-1",
+            text_input="Child question",
+            response_max_output_tokens=400,
+        )
+    ]
+    assert child_events == [
+        RealtimeSpeechTextDelta(delta="Child speaks during abandoned capture.")
+    ]
+
+    # Mapping is still present before terminal
+    assert "resp-cap-abandoned-1" in channel._capture_response_id_to_registration
+
+    # Finally emit capture response terminal
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp-cap-abandoned-1",
+                "status": "completed",
+                "usage": _usage(50, 10),
+            },
+        }
+    )
+
+    await asyncio.sleep(0)
+
+    # Mapping is removed at terminal
+    assert "resp-cap-abandoned-1" not in channel._capture_response_id_to_registration
+    assert len(channel._capture_response_id_to_registration) == 0
+    gov = channel.session_health.resource_governor
+    assert gov is not None
+    assert gov.local_reserved_requests == 0
+
+
+@pytest.mark.asyncio
+async def test_late_response_created_after_abandonment_is_quarantined() -> None:
+    channel, socket = _channel([], max_output_tokens=2000)
+    evidence = SemanticCaptureEvidence(
+        source_turn_id="turn-late-created-1",
+        current_frame=DialogueFrameState(),
+    )
+    capture_task = asyncio.create_task(
+        channel.capture_semantic_memory(evidence=evidence)
+    )
+    await socket.wait_sent(1)
+
+    # Cancel before response.created ever arrives
+    capture_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await capture_task
+
+    # Now late response.created arrives
+    socket.push(
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp-late-created-1",
+                "metadata": {
+                    "purpose": "semantic_capture",
+                    "source_turn_id": "turn-late-created-1",
+                },
+            },
+        }
+    )
+    await asyncio.sleep(0)
+
+    # It was quarantined and not leaked to _router_events
+    assert "resp-late-created-1" in channel._capture_response_id_to_registration
+
+    # Normal child turn streams without issue
+    for ev in _text_response_events(
+        response_id="resp-child-normal-after-late",
+        text="Normal child turn.",
+    ):
+        socket.push(ev)
+
+    child_events = [
+        event
+        async for event in channel.stream_turn(
+            harness=_harness(),
+            turn_id="turn-child-normal-after-late",
+            text_input="Child question",
+            response_max_output_tokens=400,
+        )
+    ]
+    assert child_events == [RealtimeSpeechTextDelta(delta="Normal child turn.")]
+
+    # Emit terminal for the late capture
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp-late-created-1",
+                "status": "completed",
+                "usage": _usage(50, 10),
+            },
+        }
+    )
+    await asyncio.sleep(0)
+    assert "resp-late-created-1" not in channel._capture_response_id_to_registration
+
+
+@pytest.mark.asyncio
+async def test_capture_resource_governor_lifecycle_for_valid_invalid_and_abandoned() -> (
+    None
+):
+    channel, socket = _channel([], max_output_tokens=2000)
+
+    # Case 1: Valid capture keeps reservation until terminal and reconciles usage
+    evidence1 = SemanticCaptureEvidence(
+        source_turn_id="turn-gov-valid-1",
+        current_frame=DialogueFrameState(),
+    )
+    task1 = asyncio.create_task(channel.capture_semantic_memory(evidence=evidence1))
+    await socket.wait_sent(1)
+    gov1 = channel.session_health.resource_governor
+    assert gov1 is not None and gov1.local_reserved_requests == 1
+
+    for ev in _semantic_capture_response_events(
+        response_id="resp-gov-valid-1",
+        source_turn_id="turn-gov-valid-1",
+        input_tokens=120,
+        output_tokens=30,
+    ):
+        socket.push(ev)
+
+    res1 = await task1
+    assert res1.disposition == SemanticCaptureDisposition.NO_CHANGE
+    gov1_done = channel.session_health.resource_governor
+    assert gov1_done is not None and gov1_done.local_reserved_requests == 0
+    assert channel._resource_governor.latest_actual_input_tokens == 120
+    assert channel._resource_governor.latest_actual_output_tokens == 30
+
+    # Case 2: Semantically invalid capture (only text) retains reservation until response.done
+    evidence2 = SemanticCaptureEvidence(
+        source_turn_id="turn-gov-invalid-2",
+        current_frame=DialogueFrameState(),
+    )
+    task2 = asyncio.create_task(channel.capture_semantic_memory(evidence=evidence2))
+    await socket.wait_sent(2)
+    gov2 = channel.session_health.resource_governor
+    assert gov2 is not None and gov2.local_reserved_requests == 1
+
+    socket.push(
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp-gov-invalid-2",
+                "metadata": {
+                    "purpose": "semantic_capture",
+                    "source_turn_id": "turn-gov-invalid-2",
+                },
+            },
+        }
+    )
+    socket.push(
+        {
+            "type": "response.output_text.delta",
+            "response_id": "resp-gov-invalid-2",
+            "delta": "invalid prose only",
+        }
+    )
+    await asyncio.sleep(0)
+    gov2_mid = channel.session_health.resource_governor
+    assert gov2_mid is not None and gov2_mid.local_reserved_requests == 1
+
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp-gov-invalid-2",
+                "status": "completed",
+                "usage": _usage(80, 25),
+            },
+        }
+    )
+    with pytest.raises(OpenAIRealtimeProtocolError):
+        await task2
+
+    gov2_done = channel.session_health.resource_governor
+    assert gov2_done is not None and gov2_done.local_reserved_requests == 0
+    assert channel._resource_governor.latest_actual_input_tokens == 80
+    assert channel._resource_governor.latest_actual_output_tokens == 25
+
+    # Case 3: Abandoned capture holds reservation until background receiver sees terminal
+    evidence3 = SemanticCaptureEvidence(
+        source_turn_id="turn-gov-abandoned-3",
+        current_frame=DialogueFrameState(),
+    )
+    task3 = asyncio.create_task(channel.capture_semantic_memory(evidence=evidence3))
+    await socket.wait_sent(3)
+    gov3 = channel.session_health.resource_governor
+    assert gov3 is not None and gov3.local_reserved_requests == 1
+
+    socket.push(
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp-gov-abandoned-3",
+                "metadata": {
+                    "purpose": "semantic_capture",
+                    "source_turn_id": "turn-gov-abandoned-3",
+                },
+            },
+        }
+    )
+    await asyncio.sleep(0)
+
+    task3.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task3
+
+    gov3_mid = channel.session_health.resource_governor
+    assert gov3_mid is not None and gov3_mid.local_reserved_requests == 1
+
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp-gov-abandoned-3",
+                "status": "completed",
+                "usage": _usage(60, 15),
+            },
+        }
+    )
+    await asyncio.sleep(0)
+
+    gov3_done = channel.session_health.resource_governor
+    assert gov3_done is not None and gov3_done.local_reserved_requests == 0
+    assert channel._resource_governor.latest_actual_input_tokens == 60
+    assert channel._resource_governor.latest_actual_output_tokens == 15
+
+
+@pytest.mark.asyncio
+async def test_capture_abandoned_before_response_created_keeps_reservation_active() -> (
+    None
+):
+    channel, socket = _channel([], max_output_tokens=1000)
+    evidence = SemanticCaptureEvidence(
+        source_turn_id="turn-abandoned-pre-created-1",
+        current_frame=DialogueFrameState(),
+    )
+    task = asyncio.create_task(channel.capture_semantic_memory(evidence=evidence))
+    await socket.wait_sent(1)
+
+    # Abandon the task locally before response.created arrives
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Registration must be quarantined with abandoned=True
+    assert channel._active_semantic_capture is None
+    quarantined = channel._quarantined_capture_by_source_turn_id.get(
+        "turn-abandoned-pre-created-1"
+    )
+    assert quarantined is not None
+    assert quarantined.abandoned is True
+    assert (
+        quarantined.client_event_id in channel._quarantined_capture_by_client_event_id
+    )
+
+    # The ResourceGovernor reservation must remain ACTIVE (not released early)
+    gov = channel.session_health.resource_governor
+    assert gov is not None
+    assert gov.local_reserved_requests == 1
+
+
+@pytest.mark.asyncio
+async def test_capture_abandoned_before_response_created_late_response_created_and_done() -> (
+    None
+):
+    channel, socket = _channel([], max_output_tokens=1000)
+    evidence = SemanticCaptureEvidence(
+        source_turn_id="turn-abandoned-late-done-1",
+        current_frame=DialogueFrameState(),
+    )
+    task = asyncio.create_task(channel.capture_semantic_memory(evidence=evidence))
+    await socket.wait_sent(1)
+
+    # Cancel before response.created arrives
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    gov = channel.session_health.resource_governor
+    assert gov is not None
+    assert gov.local_reserved_requests == 1
+
+    # Late response.created arrives from provider
+    socket.push(
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp-late-created-done-1",
+                "metadata": {
+                    "purpose": "semantic_capture",
+                    "source_turn_id": "turn-abandoned-late-done-1",
+                },
+            },
+        }
+    )
+    await asyncio.sleep(0)
+
+    # Quarantined capture moves to response_id mapping, reservation is still held
+    assert (
+        "turn-abandoned-late-done-1"
+        not in channel._quarantined_capture_by_source_turn_id
+    )
+    assert "resp-late-created-done-1" in channel._capture_response_id_to_registration
+    assert gov.local_reserved_requests == 1
+
+    # Late response.done arrives with token usage
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp-late-created-done-1",
+                "status": "completed",
+                "usage": _usage(120, 35),
+            },
+        }
+    )
+    await asyncio.sleep(0)
+
+    # Terminal settles the reservation, reconciles usage, and cleans up registration
+    gov_done = channel.session_health.resource_governor
+    assert gov_done is not None and gov_done.local_reserved_requests == 0
+    assert channel._resource_governor.latest_actual_input_tokens == 120
+    assert channel._resource_governor.latest_actual_output_tokens == 35
+    assert (
+        "resp-late-created-done-1" not in channel._capture_response_id_to_registration
+    )
+
+
+@pytest.mark.asyncio
+async def test_capture_abandoned_before_response_created_then_channel_close() -> None:
+    channel, socket = _channel([], max_output_tokens=1000)
+    evidence = SemanticCaptureEvidence(
+        source_turn_id="turn-abandoned-close-1",
+        current_frame=DialogueFrameState(),
+    )
+    task = asyncio.create_task(channel.capture_semantic_memory(evidence=evidence))
+    await socket.wait_sent(1)
+
+    # Cancel before response.created arrives
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    gov = channel.session_health.resource_governor
+    assert gov is not None
+    assert gov.local_reserved_requests == 1
+
+    # Closing the channel/session releases all orphaned/quarantined reservations
+    await channel.close()
+    assert channel.session_health.resource_governor.local_reserved_requests == 0
+    assert len(channel._quarantined_capture_by_source_turn_id) == 0
+    assert len(channel._quarantined_capture_by_client_event_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_capture_abandoned_before_response_created_correlated_provider_error() -> (
+    None
+):
+    channel, socket = _channel([], max_output_tokens=1000)
+    evidence = SemanticCaptureEvidence(
+        source_turn_id="turn-abandoned-error-1",
+        current_frame=DialogueFrameState(),
+    )
+    task = asyncio.create_task(channel.capture_semantic_memory(evidence=evidence))
+    await socket.wait_sent(1)
+
+    sent_create = socket.sent[-1]
+    client_event_id = sent_create.get("event_id")
+    assert isinstance(client_event_id, str)
+
+    # Cancel before response.created arrives
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    gov = channel.session_health.resource_governor
+    assert gov is not None
+    assert gov.local_reserved_requests == 1
+    assert client_event_id in channel._quarantined_capture_by_client_event_id
+
+    # Provider emits correlated error referencing client_event_id proving no response will be created
+    socket.push(
+        {
+            "type": "error",
+            "event_id": client_event_id,
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_value",
+                "message": "Capture request rejected before response creation",
+                "event_id": client_event_id,
+            },
+        }
+    )
+    await asyncio.sleep(0)
+
+    # Error settles and releases the reservation
+    gov_done = channel.session_health.resource_governor
+    assert gov_done is not None and gov_done.local_reserved_requests == 0
+    assert client_event_id not in channel._quarantined_capture_by_client_event_id
+    assert (
+        "turn-abandoned-error-1" not in channel._quarantined_capture_by_source_turn_id
+    )
+
+
+async def _execute_capture_with_raw_arguments(
+    arguments: str,
+    source_turn_id: str,
+) -> SemanticCaptureFunctionArguments:
+    channel, socket = _channel([])
+    evidence = SemanticCaptureEvidence(
+        source_turn_id=source_turn_id,
+        current_frame=DialogueFrameState(),
+    )
+    capture_task = asyncio.create_task(
+        channel.capture_semantic_memory(evidence=evidence)
+    )
+    await socket.wait_sent(1)
+    for event in _semantic_capture_response_events(
+        response_id=f"resp-{source_turn_id}",
+        source_turn_id=source_turn_id,
+        arguments=arguments,
+    ):
+        socket.push(event)
+    return await capture_task
+
+
+@pytest.mark.asyncio
+async def test_raw_wire_capture_journal_events_null_with_changed_disposition() -> None:
+    raw_json = json.dumps(
+        {
+            "disposition": "changed",
+            "dialogueFrame": {
+                "activeTopics": ["astronomy"],
+            },
+            "journalEvents": None,
+        }
+    )
+    args = await _execute_capture_with_raw_arguments(
+        raw_json, source_turn_id="turn-raw-a"
+    )
+    assert args.disposition == SemanticCaptureDisposition.CHANGED
+    assert args.journal_events == ()
+    assert args.dialogue_frame is not None
+    assert args.dialogue_frame.active_topics == ("astronomy",)
+
+
+@pytest.mark.asyncio
+async def test_raw_wire_capture_canonical_canvas_references_null_on_draft() -> None:
+    raw_json = json.dumps(
+        {
+            "disposition": "changed",
+            "journalEvents": [
+                {
+                    "family": "userPreference",
+                    "semanticKey": "favorite_color",
+                    "summary": "Loves blue.",
+                    "canonicalCanvasReferences": None,
+                }
+            ],
+        }
+    )
+    args = await _execute_capture_with_raw_arguments(
+        raw_json, source_turn_id="turn-raw-b"
+    )
+    assert args.disposition == SemanticCaptureDisposition.CHANGED
+    assert len(args.journal_events) == 1
+    draft = args.journal_events[0]
+    assert draft.canonical_canvas_references == ()
+    assert draft.semantic_key == "favorite_color"
+    assert draft.summary == "Loves blue."
+
+
+@pytest.mark.asyncio
+async def test_raw_wire_capture_key_canonicalization_and_collision_detection() -> None:
+    raw_json = json.dumps(
+        {
+            "disposition": "changed",
+            "journalEvents": [
+                {
+                    "family": "userPreference",
+                    "semanticKey": "volcanicFeaturesInOtherWorlds",
+                    "summary": "Interested in cryovolcanoes on Titan.",
+                }
+            ],
+        }
+    )
+    args = await _execute_capture_with_raw_arguments(
+        raw_json, source_turn_id="turn-raw-c1"
+    )
+    assert args.journal_events[0].semantic_key == "volcanic_features_in_other_worlds"
+
+    raw_collision = json.dumps(
+        {
+            "disposition": "changed",
+            "journalEvents": [
+                {
+                    "family": "userPreference",
+                    "semanticKey": "favorite_color",
+                    "summary": "Loves cobalt blue.",
+                },
+                {
+                    "family": "userPreference",
+                    "semanticKey": "favoriteColor",
+                    "summary": "Loves cerulean blue.",
+                },
+            ],
+        }
+    )
+    with pytest.raises(
+        OpenAIRealtimeProtocolError, match="duplicate semantic identities"
+    ):
+        await _execute_capture_with_raw_arguments(
+            raw_collision, source_turn_id="turn-raw-c2"
+        )
+
+
+@pytest.mark.asyncio
+async def test_raw_wire_capture_dialogue_frame_list_bound_clamping_preserves_priority() -> (
+    None
+):
+    referents = [f"referent_{i}" for i in range(6)]
+    entities = [f"entity_{i}" for i in range(9)]
+    raw_json = json.dumps(
+        {
+            "disposition": "changed",
+            "dialogueFrame": {
+                "currentReferents": referents,
+                "recentEntities": entities,
+            },
+        }
+    )
+    args = await _execute_capture_with_raw_arguments(
+        raw_json, source_turn_id="turn-raw-d"
+    )
+    assert args.dialogue_frame is not None
+    assert args.dialogue_frame.current_referents == tuple(referents[:4])
+    assert args.dialogue_frame.recent_entities == tuple(entities[:8])
+
+
+@pytest.mark.asyncio
+async def test_raw_wire_capture_malformed_canvas_reference_discarded() -> None:
+    raw_json = json.dumps(
+        {
+            "disposition": "changed",
+            "dialogueFrame": {
+                "relevantCanvasReferences": [
+                    {
+                        "sceneId": "scene-solar-system",
+                        "sceneRevision": 1,
+                        "relation": "The active solar system map",
+                    },
+                    {
+                        "sceneId": "scene-corrupted",
+                        "sceneRevision": 1,
+                        "relation": "corrupted item",
+                        "continue_placeholder": "corrupted_token",
+                    },
+                    {
+                        "corruptField": "not_a_valid_ref",
+                    },
+                ],
+            },
+            "journalEvents": [
+                {
+                    "family": "userPreference",
+                    "semanticKey": "planet_choice",
+                    "summary": "Prefers Mars.",
+                    "canonicalCanvasReferences": [
+                        {
+                            "sceneId": "scene-mars",
+                            "sceneRevision": 2,
+                            "relation": "Mars scene",
+                        },
+                        {
+                            "sceneId": "scene-mars-corrupted",
+                            "sceneRevision": 2,
+                            "relation": "broken",
+                            "extra_noise": 123,
+                        },
+                        {
+                            "garbage": True,
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+    args = await _execute_capture_with_raw_arguments(
+        raw_json, source_turn_id="turn-raw-e"
+    )
+    assert args.dialogue_frame is not None
+    assert len(args.dialogue_frame.relevant_canvas_references) == 1
+    ref = args.dialogue_frame.relevant_canvas_references[0]
+    assert ref.scene_id == "scene-solar-system"
+    assert ref.scene_revision == 1
+    assert ref.relation == "The active solar system map"
+
+    assert len(args.journal_events) == 1
+    assert len(args.journal_events[0].canonical_canvas_references) == 1
+    draft_ref = args.journal_events[0].canonical_canvas_references[0]
+    assert draft_ref.scene_id == "scene-mars"
+    assert draft_ref.scene_revision == 2
+
+
+@pytest.mark.asyncio
+async def test_capture_incomplete_response_diagnostic_includes_reason() -> None:
+    channel, socket = _channel([])
+    evidence = SemanticCaptureEvidence(
+        source_turn_id="turn-inc-1",
+        current_frame=DialogueFrameState(),
+    )
+    capture_task = asyncio.create_task(
+        channel.capture_semantic_memory(evidence=evidence)
+    )
+    await socket.wait_sent(1)
+
+    socket.push(
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp-cap-inc-1",
+                "metadata": {
+                    "purpose": "semantic_capture",
+                    "source_turn_id": "turn-inc-1",
+                },
+            },
+        }
+    )
+    socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp-cap-inc-1",
+                "status": "incomplete",
+                "status_details": {
+                    "reason": "max_output_tokens",
+                },
+            },
+        }
+    )
+
+    with pytest.raises(RealtimeProviderResponseIncompleteError) as exc_info:
+        await capture_task
+
+    assert exc_info.value.reason == "max_output_tokens"
+    assert "max_output_tokens" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_raw_wire_capture_all_dialogue_frame_collection_bounds_clamped_to_prefix() -> (
+    None
+):
+    # Test A: every bounded text collection with one item beyond its canonical count
+    raw_payload = {
+        "disposition": "changed",
+        "dialogueFrame": {
+            "activeTopics": [f"topic_{i}" for i in range(5)],
+            "activeGoals": [f"goal_{i}" for i in range(5)],
+            "unresolvedQuestions": [f"question_{i}" for i in range(5)],
+            "currentReferents": [f"referent_{i}" for i in range(5)],
+            "recentEntities": [f"entity_{i}" for i in range(9)],
+            "avaCommitments": [f"commitment_{i}" for i in range(5)],
+            "explicitUserPreferences": [f"user_pref_{i}" for i in range(5)],
+            "temporaryInteractionPreferences": [f"temp_pref_{i}" for i in range(5)],
+            "recentToolReferences": [f"tool_ref_{i}" for i in range(5)],
+        },
+    }
+    args = await _execute_capture_with_raw_arguments(
+        json.dumps(raw_payload), source_turn_id="turn-raw-all-collections"
+    )
+    assert args.dialogue_frame is not None
+    assert args.dialogue_frame.active_topics == tuple(f"topic_{i}" for i in range(4))
+    assert args.dialogue_frame.active_goals == tuple(f"goal_{i}" for i in range(4))
+    assert args.dialogue_frame.unresolved_questions == tuple(
+        f"question_{i}" for i in range(4)
+    )
+    assert args.dialogue_frame.current_referents == tuple(
+        f"referent_{i}" for i in range(4)
+    )
+    assert args.dialogue_frame.recent_entities == tuple(f"entity_{i}" for i in range(8))
+    assert args.dialogue_frame.ava_commitments == tuple(
+        f"commitment_{i}" for i in range(4)
+    )
+    assert args.dialogue_frame.explicit_user_preferences == tuple(
+        f"user_pref_{i}" for i in range(4)
+    )
+    assert args.dialogue_frame.temporary_interaction_preferences == tuple(
+        f"temp_pref_{i}" for i in range(4)
+    )
+    assert args.dialogue_frame.recent_tool_references == tuple(
+        f"tool_ref_{i}" for i in range(4)
+    )
+    assert args.dialogue_frame.relevant_canvas_references == ()
+
+
+@pytest.mark.asyncio
+async def test_raw_wire_capture_overlong_dialogue_frame_item_discarded() -> None:
+    # Test B: overlong item discarded, short items survive unchanged, no truncated version
+    overlong_item = "x" * 161
+    raw_payload = {
+        "disposition": "changed",
+        "dialogueFrame": {
+            "activeGoals": [
+                "Understand orbital resonance",
+                overlong_item,
+                "Explore Europa's ice surface",
+            ],
+        },
+    }
+    args = await _execute_capture_with_raw_arguments(
+        json.dumps(raw_payload), source_turn_id="turn-raw-overlong-discard"
+    )
+    assert args.dialogue_frame is not None
+    assert args.dialogue_frame.active_goals == (
+        "Understand orbital resonance",
+        "Explore Europa's ice surface",
+    )
+    for goal in args.dialogue_frame.active_goals:
+        assert not goal.startswith("x" * 10)
+        assert len(goal) <= 160
+
+
+@pytest.mark.asyncio
+async def test_raw_wire_capture_exact_text_boundary_preserved() -> None:
+    # Test C: item exactly at the 160-char bound survives byte-for-byte unchanged
+    exact_160 = "a" * 160
+    raw_payload = {
+        "disposition": "changed",
+        "dialogueFrame": {
+            "activeTopics": [exact_160],
+        },
+    }
+    args = await _execute_capture_with_raw_arguments(
+        json.dumps(raw_payload), source_turn_id="turn-raw-exact-boundary"
+    )
+    assert args.dialogue_frame is not None
+    assert len(args.dialogue_frame.active_topics) == 1
+    assert args.dialogue_frame.active_topics[0] == exact_160
+    assert len(args.dialogue_frame.active_topics[0]) == 160
+
+
+@pytest.mark.asyncio
+async def test_raw_wire_capture_relevant_canvas_references_clamped_to_prefix() -> None:
+    # Test D: 6 canvas references clamped to prefix of 4, no IDs or relations rewritten
+    refs = [
+        {
+            "sceneId": f"scene-{i}",
+            "sceneRevision": i + 1,
+            "relation": f"Showing relation {i}",
+        }
+        for i in range(6)
+    ]
+    raw_payload = {
+        "disposition": "changed",
+        "dialogueFrame": {
+            "relevantCanvasReferences": refs,
+        },
+    }
+    args = await _execute_capture_with_raw_arguments(
+        json.dumps(raw_payload), source_turn_id="turn-raw-canvas-clamp"
+    )
+    assert args.dialogue_frame is not None
+    assert len(args.dialogue_frame.relevant_canvas_references) == 4
+    for i in range(4):
+        ref = args.dialogue_frame.relevant_canvas_references[i]
+        assert ref.scene_id == f"scene-{i}"
+        assert ref.scene_revision == i + 1
+        assert ref.relation == f"Showing relation {i}"
+
+
+@pytest.mark.asyncio
+async def test_raw_wire_capture_live_regression_shape() -> None:
+    # Test G: live failure shape (5 activeGoals, overlong activeGoal)
+    live_count_payload = {
+        "disposition": "changed",
+        "dialogueFrame": {
+            "activeGoals": [
+                "Explain the lunar phases to the child",
+                "Describe how tides correlate with the Moon",
+                "Answer questions about gravity in space",
+                "Keep responses encouraging and interactive",
+                "Prepare transition to the planetary map",
+            ],
+        },
+    }
+    args_count = await _execute_capture_with_raw_arguments(
+        json.dumps(live_count_payload), source_turn_id="turn-raw-live-count"
+    )
+    assert args_count.dialogue_frame is not None
+    assert len(args_count.dialogue_frame.active_goals) == 4
+    assert (
+        args_count.dialogue_frame.active_goals[0]
+        == "Explain the lunar phases to the child"
+    )
+    assert (
+        args_count.dialogue_frame.active_goals[3]
+        == "Keep responses encouraging and interactive"
+    )
+
+    overlong_semantic_goal = (
+        "Discuss whether future astronauts could set up permanent habitats on the Moon "
+        "and explore deep subterranean lava tubes that offer natural radiation protection "
+        "and thermal insulation from extreme surface cycles."
+    )
+    assert len(overlong_semantic_goal) > 160
+
+    live_overlong_payload = {
+        "disposition": "changed",
+        "dialogueFrame": {
+            "activeGoals": [
+                "Explain the lunar phases to the child",
+                "Describe how tides correlate with the Moon",
+                "Answer questions about gravity in space",
+                overlong_semantic_goal,
+            ],
+        },
+    }
+    args_overlong = await _execute_capture_with_raw_arguments(
+        json.dumps(live_overlong_payload), source_turn_id="turn-raw-live-overlong"
+    )
+    assert args_overlong.dialogue_frame is not None
+    assert len(args_overlong.dialogue_frame.active_goals) == 3
+    assert args_overlong.dialogue_frame.active_goals == (
+        "Explain the lunar phases to the child",
+        "Describe how tides correlate with the Moon",
+        "Answer questions about gravity in space",
+    )

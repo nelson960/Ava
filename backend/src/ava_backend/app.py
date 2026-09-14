@@ -528,6 +528,7 @@ def create_app(
                 message="Ava's conversation memory is temporarily unavailable.",
             )
         app.state.svg_canvas_workspaces.clear_subject(client.subject)
+        await app.state.svg_canvas_documents.clear_subject(subject=client.subject)
         realtime_sessions: RealtimeSessionRegistry | None = (
             app.state.realtime_v4_sessions
         )
@@ -638,6 +639,124 @@ def create_app(
             status_code=200,
             content={"status": "accepted", "changed": adopted},
             headers={"Cache-Control": "no-store", "X-Ava-Protocol-Version": "4"},
+        )
+
+    @app.put(
+        "/v4/realtime/sessions/{session_id}/canvas-retained",
+        name="retain_realtime_canvas_scene_v4",
+    )
+    async def retain_realtime_canvas_scene_v4(
+        request: Request,
+        session_id: str,
+        canvas_token: str | None = Header(default=None, alias="X-Ava-Canvas-Token"),
+        protocol_header: str | None = Header(
+            default=None,
+            alias="X-Ava-Protocol-Version",
+        ),
+        generation_id: str | None = Header(default=None, alias="X-Ava-Generation-ID"),
+        source_turn_id: str | None = Header(default=None, alias="X-Ava-Source-Turn-ID"),
+        scene_id: str | None = Header(default=None, alias="X-Ava-Scene-ID"),
+        scene_revision: str | None = Header(default=None, alias="X-Ava-Scene-Revision"),
+        svg_sha256: str | None = Header(default=None, alias="X-Ava-SVG-SHA256"),
+        manifest_sha256: str | None = Header(
+            default=None, alias="X-Ava-Manifest-SHA256"
+        ),
+    ) -> Response:
+        """Register one persisted Flutter scene as the backend hydration source."""
+        if protocol_header != "4":
+            return _error_response(
+                request,
+                status_code=409,
+                code=ErrorCode.PROTOCOL_MISMATCH,
+                message="X-Ava-Protocol-Version must be exactly 4.",
+            )
+        if (
+            request.headers.get("content-type", "").split(";", maxsplit=1)[0].strip()
+            != "application/octet-stream"
+        ):
+            return _error_response(
+                request,
+                status_code=415,
+                code=ErrorCode.INVALID_REQUEST,
+                message="Canvas retained scene registration requires application/octet-stream.",
+            )
+        try:
+            client = await app.state.authenticator.authenticate(request)
+        except PermissionError:
+            return _error_response(
+                request,
+                status_code=401,
+                code=ErrorCode.UNAUTHORIZED,
+                message="A valid Ava client session is required.",
+            )
+        registry: RealtimeSessionRegistry | None = app.state.realtime_v4_sessions
+        if registry is None or canvas_token is None:
+            return _error_response(
+                request,
+                status_code=401 if canvas_token is None else 503,
+                code=(
+                    ErrorCode.UNAUTHORIZED
+                    if canvas_token is None
+                    else ErrorCode.PROVIDER_UNAVAILABLE
+                ),
+                message="Canvas retained scene authorization is unavailable.",
+            )
+        try:
+            validated_generation_id = _restore_identifier(generation_id, "generation")
+            validated_source_turn_id = _restore_identifier(
+                source_turn_id, "source turn"
+            )
+            validated_scene_id = _restore_identifier(scene_id, "scene")
+            validated_scene_revision = int(scene_revision or "")
+            if not 1 <= validated_scene_revision <= 10_001:
+                raise ValueError("scene revision is outside its bound")
+            validated_svg_sha256 = _restore_sha256(svg_sha256)
+            validated_manifest_sha256 = _restore_sha256(manifest_sha256)
+            svg_bytes = await _read_bounded_request_body(
+                request, SVG_PROTOCOL_MAX_BYTES
+            )
+            scene = await registry.retain_canvas_scene(
+                session_id=session_id,
+                token=canvas_token,
+                subject=client.subject,
+                generation_id=validated_generation_id,
+                source_turn_id=validated_source_turn_id,
+                scene_id=validated_scene_id,
+                scene_revision=validated_scene_revision,
+                expected_svg_sha256=validated_svg_sha256,
+                expected_manifest_sha256=validated_manifest_sha256,
+                svg_bytes=svg_bytes,
+            )
+            await app.state.svg_canvas_documents.retain_scene(
+                subject=client.subject,
+                scene=scene,
+            )
+        except RealtimeSessionAuthenticationError:
+            return _error_response(
+                request,
+                status_code=401,
+                code=ErrorCode.UNAUTHORIZED,
+                message="The Canvas retained scene token or lifecycle is invalid.",
+            )
+        except (SvgDocumentValidationError, UnicodeDecodeError, ValueError) as exc:
+            LOGGER.warning(
+                "canvas_retained_scene_rejected session_id=%s error_type=%s reason=%s",
+                session_id,
+                type(exc).__name__,
+                exc,
+            )
+            return _error_response(
+                request,
+                status_code=422,
+                code=ErrorCode.INVALID_REQUEST,
+                message="The retained Canvas document is invalid.",
+            )
+        return Response(
+            status_code=204,
+            headers={
+                "Cache-Control": "no-store",
+                "X-Ava-Protocol-Version": "4",
+            },
         )
 
     @app.put(

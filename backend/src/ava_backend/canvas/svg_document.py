@@ -418,6 +418,93 @@ class ValidatedSvgDocument:
     controls: Mapping[str, SvgContinuousControl]
 
 
+def validate_svg_request_document_agreement(
+    document: ValidatedSvgDocument,
+    *,
+    interaction_mode: str,
+    continuous_control: str,
+) -> None:
+    if document.interaction_mode.value != interaction_mode:
+        raise SvgDocumentValidationError(
+            "interactionModeMismatch",
+            "validated SVG interaction mode does not match the request",
+            category=None,
+            attribute="data-ava-interaction-mode",
+            observed_value=document.interaction_mode.value,
+            limit_name="requestedInteractionMode",
+            limit_value=interaction_mode,
+        )
+    control_kinds = {control.kind.value for control in document.controls.values()}
+    if continuous_control == "none":
+        if document.controls:
+            raise SvgDocumentValidationError(
+                "continuousControlMismatch",
+                "validated SVG contains controls when none were requested",
+                category=None,
+                attribute="data-ava-control-kind",
+                observed_value=",".join(sorted(control_kinds)),
+                limit_name="requestedContinuousControl",
+                limit_value=continuous_control,
+            )
+        return
+    if not document.controls:
+        raise SvgDocumentValidationError(
+            "continuousControlMissing",
+            "validated SVG has no continuous control for the requested kind",
+            category=None,
+            attribute="data-ava-control-kind",
+            observed_value="none",
+            limit_name="requestedContinuousControl",
+            limit_value=continuous_control,
+        )
+    if control_kinds != {continuous_control}:
+        raise SvgDocumentValidationError(
+            "continuousControlMismatch",
+            "validated SVG continuous control kind does not match the request",
+            category=None,
+            attribute="data-ava-control-kind",
+            observed_value=",".join(sorted(control_kinds)),
+            limit_name="requestedContinuousControl",
+            limit_value=continuous_control,
+        )
+
+
+def validate_svg_binding_continuity(
+    base: ValidatedSvgDocument,
+    revised: ValidatedSvgDocument,
+) -> None:
+    base_by_target: dict[str, set[str]] = defaultdict(set)
+    revised_by_target: dict[str, set[str]] = defaultdict(set)
+    for binding in base.bindings.values():
+        base_by_target[binding.target_id].add(binding.binding_id)
+    for binding in revised.bindings.values():
+        revised_by_target[binding.target_id].add(binding.binding_id)
+    for target_id in base_by_target.keys() & revised_by_target.keys():
+        if base_by_target[target_id] != revised_by_target[target_id]:
+            raise SvgDocumentValidationError(
+                "bindingContinuityTargetMismatch",
+                "a retained targetId must preserve its bindingId",
+                category=None,
+                attribute="data-ava-binding",
+                observed_value=",".join(sorted(revised_by_target[target_id])),
+                limit_name="previousBindingId",
+                limit_value=",".join(sorted(base_by_target[target_id])),
+            )
+    for binding_id in base.bindings.keys() & revised.bindings.keys():
+        base_target = base.bindings[binding_id].target_id
+        revised_target = revised.bindings[binding_id].target_id
+        if base_target != revised_target:
+            raise SvgDocumentValidationError(
+                "bindingContinuityReuseMismatch",
+                "an existing bindingId cannot be reused for a different targetId",
+                category=None,
+                attribute="data-ava-target",
+                observed_value=revised_target,
+                limit_name="previousTargetId",
+                limit_value=base_target,
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class SafeSvgDraftDocument:
     """Exact safe-to-mount bytes with no canonical or interaction authority."""

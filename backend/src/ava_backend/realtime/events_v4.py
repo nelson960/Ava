@@ -16,6 +16,7 @@ from pydantic import (
 from ..canvas.render_profile import CanvasRenderProfile
 from ..canvas.svg_document import SVG_MAX_MANIFEST_BYTES, SVG_PROTOCOL_MAX_BYTES
 from ..canvas.svg_session import SvgCanvasStateErrorCode
+from ..canvas.svg_workspace import CanvasSceneSelector
 from .common import NonEmptyText, ProtocolIdentifier, RealtimeProtocolModel
 from .speech_contract import (
     MAX_SPEECH_ALIGNMENT_SPANS,
@@ -400,7 +401,7 @@ class AvaClientEventTypeV4(StrEnum):
     CANVAS_RUNTIME_FAILED = "canvasRuntimeFailed"
     CANVAS_PRESENTED = "canvasPresented"
     CANVAS_RETAINED = "canvasRetained"
-    CANVAS_PRESENTATION_UPDATED = "canvasPresentationUpdated"
+    CANVAS_PRESENTATION_REQUESTED = "canvasPresentationRequested"
     CANVAS_PRESENTATION_ACKNOWLEDGED = "canvasPresentationAcknowledged"
     CANVAS_INTERACTION = "canvasInteraction"
     CANCEL_TURN = "cancelTurn"
@@ -531,20 +532,27 @@ class CanvasRetainedEventV4(AvaClientEventV4):
     manifest_sha256: Sha256Digest
 
 
-class CanvasPresentationUpdatedEventV4(AvaClientEventV4):
-    event: Literal[AvaClientEventTypeV4.CANVAS_PRESENTATION_UPDATED]
-    visible: bool
-    scene_id: ProtocolIdentifier | None = None
-    focus_revision: int | None = Field(default=None, ge=1, le=10_001)
-    client_operation_id: ProtocolIdentifier
+class CanvasPresentationRequestedEventV4(AvaClientEventV4):
+    """Semantic user presentation intent; identity remains backend-owned."""
+
+    event: Literal[AvaClientEventTypeV4.CANVAS_PRESENTATION_REQUESTED]
+    operation: Literal["show", "hide"]
+    selector: CanvasSceneSelector | None = None
+    position: int | None = Field(default=None, ge=1, le=10)
 
     @model_validator(mode="after")
-    def validate_visible_state(self) -> CanvasPresentationUpdatedEventV4:
-        if self.visible:
-            if not self.scene_id or self.focus_revision is None:
-                raise ValueError(
-                    "canvasPresentationUpdated with visible=True requires scene_id and focus_revision"
-                )
+    def validate_semantic_request(self) -> CanvasPresentationRequestedEventV4:
+        if self.operation == "hide":
+            if self.selector is not None or self.position is not None:
+                raise ValueError("hide presentation request cannot include a selector")
+            return self
+        selector = self.selector or CanvasSceneSelector.CURRENT
+        if (selector is CanvasSceneSelector.POSITION) != (self.position is not None):
+            raise ValueError("position is required only with selector=position")
+        if selector is not CanvasSceneSelector.POSITION and self.position is not None:
+            raise ValueError("position is required only with selector=position")
+        if selector is CanvasSceneSelector.TITLE:
+            raise ValueError("Flutter presentation requests do not support title")
         return self
 
 
@@ -575,6 +583,7 @@ class CanvasInteractionEventV4(AvaClientEventV4):
     event: Literal[AvaClientEventTypeV4.CANVAS_INTERACTION]
     scene_id: ProtocolIdentifier
     scene_revision: int = Field(ge=1, le=10_001)
+    focus_revision: int = Field(ge=0, le=1_000_000)
     interaction_revision: int = Field(ge=1, le=1_000_000)
     svg_sha256: Sha256Digest
     manifest_sha256: Sha256Digest
@@ -610,7 +619,7 @@ AvaClientEventUnionV4 = Annotated[
     | CanvasRuntimeFailedEventV4
     | CanvasPresentedEventV4
     | CanvasRetainedEventV4
-    | CanvasPresentationUpdatedEventV4
+    | CanvasPresentationRequestedEventV4
     | CanvasPresentationAcknowledgedEventV4
     | CanvasInteractionEventV4
     | CancelTurnEventV4,

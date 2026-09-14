@@ -491,6 +491,65 @@ class RealtimeSessionRegistry:
             record.canvas_restored = True
         return scene
 
+    async def retain_canvas_scene(
+        self,
+        *,
+        session_id: str,
+        token: str,
+        subject: str,
+        generation_id: str,
+        source_turn_id: str,
+        scene_id: str,
+        scene_revision: int,
+        expected_svg_sha256: str,
+        expected_manifest_sha256: str,
+        svg_bytes: bytes,
+    ) -> ActiveSvgCanvasScene:
+        """Validate one persisted Flutter document without changing runtime focus."""
+        now = self._now()
+        self._token_codec.verify(
+            token,
+            expected_session_id=session_id,
+            expected_scope="canvas",
+            now=now,
+        )
+        token_digest = hashlib.sha256(token.encode("utf-8")).digest()
+        async with self._lock:
+            record = self._require_canvas_restore_owner(
+                session_id=session_id,
+                subject=subject,
+                token_digest=token_digest,
+                now=now,
+            )
+
+        try:
+            svg_text = svg_bytes.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise ValueError("retained Canvas SVG must be strict UTF-8") from error
+        document = self._canvas_restore_validator.validate(svg_text)
+        if (
+            document.svg_sha256 != expected_svg_sha256
+            or document.manifest_sha256 != expected_manifest_sha256
+        ):
+            raise ValueError("retained Canvas hashes do not match validation output")
+        scene = ActiveSvgCanvasScene(
+            generation_id=generation_id,
+            source_turn_id=source_turn_id,
+            scene_id=scene_id,
+            revision=scene_revision,
+            document=document,
+            first_rendered_sample=0,
+        )
+        async with self._lock:
+            record = self._require_canvas_restore_owner(
+                session_id=session_id,
+                subject=subject,
+                token_digest=token_digest,
+                now=self._now(),
+            )
+            record.coordinator.validate_retained_canvas_scene(scene)
+        return scene
+
     async def synchronize_canvas_workspace(
         self,
         *,

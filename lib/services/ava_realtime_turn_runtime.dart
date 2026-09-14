@@ -1242,14 +1242,28 @@ final class AvaRealtimeTurnRuntime {
   }
 
   void _acceptCompleted(AvaRealtimeServerEventV4 event) {
-    if (_requirePhase() != AvaRealtimeTurnPhase.speaking) {
+    final phase = _requirePhase();
+    final silentAction = phase == AvaRealtimeTurnPhase.planning;
+    if (phase != AvaRealtimeTurnPhase.planning &&
+        phase != AvaRealtimeTurnPhase.speaking) {
       throw const AvaRealtimeStateException(
-        'turnCompleted requires speaking.',
+        'turnCompleted requires speaking or owned planning-only action.',
       );
     }
     _acceptTerminalRevision(event.revision);
     _validateDeliveredSamples(event.deliveredSampleCount!);
-    if (_nextAudioChunkIndex == 0) {
+    if (silentAction) {
+      if (_nextSegmentIndex != 0 ||
+          _validatedAudioStreamId != null ||
+          _nextAudioChunkIndex != 0 ||
+          _receivedSampleCount != 0 ||
+          event.deliveredSampleCount != 0 ||
+          event.deliveredText!.isNotEmpty) {
+        throw const AvaRealtimeStateException(
+          'Planning-only completion requires empty text and zero speech/audio.',
+        );
+      }
+    } else if (_nextAudioChunkIndex == 0) {
       throw const AvaRealtimeStateException(
         'turnCompleted requires received audio.',
       );
@@ -1390,7 +1404,7 @@ final class AvaRealtimeTurnRuntime {
   void _enqueueCanvasCommand(AvaSvgCanvasClientCommand command) {
     if (_closed) return;
     if (!_clientReadyEnqueued) {
-      if (command.type == AvaSvgCanvasCommandType.canvasPresentationUpdated ||
+      if (command.type == AvaSvgCanvasCommandType.canvasPresentationRequested ||
           command.type == AvaSvgCanvasCommandType.canvasInteraction) {
         return;
       }

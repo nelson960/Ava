@@ -88,6 +88,15 @@ final class AvaRealtimeRuntimeFactoryV4 implements AvaRealtimeRuntimeBuilder {
         manifest: _canvasHost.workspaceManifestJson(),
       ),
     );
+    for (final document in _canvasHost.workspaceDocuments) {
+      await trace.measure(
+        'canvas.retained.register',
+        () => _canvasRestoreService.retainScene(
+          bootstrap: bootstrap,
+          document: document,
+        ),
+      );
+    }
     final restoredFocused = _canvasHost.presentedDocument;
     if (restoredFocused != null) {
       try {

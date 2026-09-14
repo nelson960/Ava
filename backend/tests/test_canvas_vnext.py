@@ -68,18 +68,20 @@ def test_invalid_control_metadata_fails_without_repair(checkpoints: str) -> None
         SvgDocumentValidator().validate(control_svg(checkpoints=checkpoints))
 
 
-def test_specialist_request_has_no_transcription_field() -> None:
+def test_specialist_request_carries_exact_continuous_control_without_transcript() -> None:
     request = SvgCanvasSpecialistRequest.model_validate(
         {
             "generationId": "generation-semantic",
             "sourceTurnId": "turn-semantic",
             "brief": "The resolved visual purpose.",
             "interactionMode": "none",
+            "continuousControl": "none",
             "ageBand": "middleChildhood",
         }
     )
     assert "source_transcript" not in type(request).model_fields
     assert "current_scene" not in request.model_input()
+    assert '<interaction mode="none" continuous_control="none"/>' in request.model_input()
 
 
 @pytest.mark.asyncio
@@ -455,8 +457,8 @@ async def test_normal_callers_cannot_bypass_unacknowledged_context() -> None:
 
 
 @pytest.mark.asyncio
-async def test_post_refocus_interaction_revision_accepted() -> None:
-    coordinator, provider, _, _, _, jobs = await _create_real_coordinator()
+async def test_a_b_a_refocus_rejects_delayed_interaction_then_accepts_current() -> None:
+    coordinator, _provider, canvas_events, _, _, jobs = await _create_real_coordinator()
     doc_a = SvgDocumentValidator().validate(VALID_SVG)
     doc_b = SvgDocumentValidator().validate(VALID_SVG_2)
     scene_a = ActiveSvgCanvasScene(
@@ -509,6 +511,7 @@ async def test_post_refocus_interaction_revision_accepted() -> None:
                 "sequence": 1,
                 "sceneId": "scene-a",
                 "sceneRevision": 1,
+                "focusRevision": 1,
                 "interactionRevision": 1,
                 "svgSha256": doc_a.svg_sha256,
                 "manifestSha256": doc_a.manifest_sha256,
@@ -516,6 +519,31 @@ async def test_post_refocus_interaction_revision_accepted() -> None:
             }
         )
     )
+    assert jobs.state.last_interaction is None
+    assert coordinator._latest_canvas_interaction_intent is None
+    rejected = canvas_events._events.get_nowait()
+    assert rejected["event"] == "interactionRejected"
+    assert rejected["rejectionCode"] == "focusRevisionMismatch"
+
+    await coordinator.receive(
+        AVA_CLIENT_EVENT_ADAPTER_V4.validate_python(
+            {
+                "protocolVersion": 4,
+                "event": "canvasInteraction",
+                "sessionId": "session-real-coord",
+                "sequence": 2,
+                "sceneId": "scene-a",
+                "sceneRevision": 1,
+                "focusRevision": 3,
+                "interactionRevision": 1,
+                "svgSha256": doc_a.svg_sha256,
+                "manifestSha256": doc_a.manifest_sha256,
+                "bindingId": binding_id,
+            }
+        )
+    )
+    assert jobs.state.last_interaction is not None
+    assert jobs.state.last_interaction.binding_id == binding_id
     assert coordinator._session_reusable is True
     await coordinator.close()
 
@@ -603,6 +631,7 @@ def test_specialist_revise_focused_includes_exact_svg_and_no_transcript() -> Non
             "sourceTurnId": "turn-revise-1",
             "brief": "Highlight the left ventricle in blue.",
             "interactionMode": "none",
+            "continuousControl": "none",
             "ageBand": "middleChildhood",
             "currentSceneId": "scene-heart-1",
             "currentRevision": 2,

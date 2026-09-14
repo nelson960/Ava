@@ -152,15 +152,14 @@ class _MainScreenState extends ConsumerState<MainScreen>
               LivingWorldInteractionLayer(
                 controller: _livingWorldController,
               ),
-              AnimatedPositioned(
-                duration: AvaDurations.sheet,
-                curve: Curves.easeOutCubic,
-                left: 0,
-                right: 0,
-                height: dashboardHeight,
-                bottom: dashboardVisible ? 0 : -dashboardHeight,
-                child: AvaSvgCanvasPanel(host: canvasHost),
-              ),
+              if (dashboardVisible)
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  height: dashboardHeight,
+                  bottom: 0,
+                  child: AvaSvgCanvasPanel(host: canvasHost),
+                ),
               AnimatedPositioned(
                 duration: AvaDurations.sheet,
                 curve: Curves.easeOutCubic,

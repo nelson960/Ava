@@ -12,6 +12,7 @@ from ..protocol import AgeBand
 from ..realtime.common import NonEmptyText, ProtocolIdentifier, RealtimeProtocolModel
 from ..realtime.tool_contract import (
     INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS,
+    InteractiveCanvasContinuousControl,
     InteractiveCanvasMode,
 )
 from .render_profile import CanvasRenderProfile
@@ -22,7 +23,7 @@ from .svg_document import (
     ValidatedSvgDocument,
 )
 
-SVG_CANVAS_SPECIALIST_PROMPT_VERSION = "ava-svg-canvas-vnext-5"
+SVG_CANVAS_SPECIALIST_PROMPT_VERSION = "ava-svg-canvas-vnext-6"
 SVG_CANVAS_SPECIALIST_BRIEF_MAX_CHARACTERS = INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS
 
 
@@ -92,6 +93,7 @@ class SvgCanvasSpecialistRequest(RealtimeProtocolModel):
         StringConstraints(max_length=SVG_CANVAS_SPECIALIST_BRIEF_MAX_CHARACTERS),
     ]
     interaction_mode: InteractiveCanvasMode
+    continuous_control: InteractiveCanvasContinuousControl
     age_band: AgeBand
     render_profile: CanvasRenderProfile | None = None
     current_scene_id: ProtocolIdentifier | None = None
@@ -105,6 +107,13 @@ class SvgCanvasSpecialistRequest(RealtimeProtocolModel):
 
     @model_validator(mode="after")
     def fields_are_atomic(self) -> SvgCanvasSpecialistRequest:
+        if (
+            self.interaction_mode != InteractiveCanvasMode.EXPLORE
+            and self.continuous_control != InteractiveCanvasContinuousControl.NONE
+        ):
+            raise ValueError(
+                "continuousControl must be none unless interactionMode is explore"
+            )
         values = (
             self.current_scene_id,
             self.current_revision,
@@ -154,7 +163,8 @@ class SvgCanvasSpecialistRequest(RealtimeProtocolModel):
             f"{render_profile}"
             '<visual_brief trust="realtime_visual_planning_data">'
             f"{escape(self.brief)}</visual_brief>\n"
-            f'<interaction mode="{escape(str(self.interaction_mode))}"/>\n'
+            f'<interaction mode="{escape(str(self.interaction_mode))}" '
+            f'continuous_control="{escape(str(self.continuous_control))}"/>\n'
             f"{current}"
             "</canvas_request>"
         )
@@ -244,10 +254,16 @@ SEMANTIC AUTHORITY
   a competing request from previous artwork.
 - A current_scene is supplied only for reviseFocused. Preserve its exact context
   while applying the requested revision. A new request has no previous artwork.
+- For reviseFocused, preserve the targetId and bindingId of every conceptual
+  interactive target that remains the same. Do not gratuitously rename either,
+  and never reuse an existing bindingId for a different targetId.
 
 INTERACTION METADATA
-- EXPLORE may use drag, slider, or timeline control kinds under controlsContract.
-  Put data-ava-control, data-ava-control-kind, data-ava-track, and
+- Copy the requested interactionMode and continuousControl exactly. If
+  continuousControl is none, author zero continuous controls. If it is drag,
+  slider, or timeline, interactionMode must be explore, author at least one
+  continuous control, and give every continuous control exactly the requested kind.
+- Put data-ava-control, data-ava-control-kind, data-ava-track, and
   data-ava-checkpoints on the authored handle with an id and aria-label.
   Checkpoints are normalized value=bindingId pairs separated by semicolons;
   each references an existing semantic binding. The first sorted checkpoint

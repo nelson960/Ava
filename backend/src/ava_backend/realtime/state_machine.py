@@ -218,11 +218,27 @@ class RealtimeTurnStateMachine:
         )
 
     def _accept_completed(self, event: TurnCompletedEventV4) -> None:
-        if self._require_phase() != SpeechPhase.SPEAKING:
-            raise RealtimeStateError("turnCompleted requires speaking phase")
+        phase = self._require_phase()
+        silent_action = phase == SpeechPhase.PLANNING
+        if phase not in {SpeechPhase.PLANNING, SpeechPhase.SPEAKING}:
+            raise RealtimeStateError(
+                "turnCompleted requires speaking or owned planning-only action phase"
+            )
         self._accept_terminal_revision(event.revision)
         self._validate_delivered_samples(event.delivered_sample_count)
-        if self._next_audio_chunk_index == 0:
+        if silent_action:
+            if (
+                self._next_segment_index != 0
+                or self._audio_stream_id is not None
+                or self._next_audio_chunk_index != 0
+                or self._received_sample_count != 0
+                or event.delivered_sample_count != 0
+                or event.delivered_text
+            ):
+                raise RealtimeStateError(
+                    "planning-only completion requires empty text and zero speech/audio"
+                )
+        elif self._next_audio_chunk_index == 0:
             raise RealtimeStateError("turnCompleted requires received audio")
         self._phase = SpeechPhase.COMPLETED
         self._terminal = True

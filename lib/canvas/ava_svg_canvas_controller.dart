@@ -43,7 +43,7 @@ enum AvaSvgCanvasCommandType {
   canvasRetained,
   canvasRuntimeFailed,
   canvasInteraction,
-  canvasPresentationUpdated,
+  canvasPresentationRequested,
   canvasPresentationAcknowledged,
 }
 
@@ -90,6 +90,7 @@ final class AvaSvgCanvasCandidateState {
   const AvaSvgCanvasCandidateState({
     required this.descriptor,
     required this.phase,
+    required this.focusRevision,
     this.document,
     this.presentationSampleOffset,
     this.firstRenderedSample,
@@ -97,6 +98,7 @@ final class AvaSvgCanvasCandidateState {
 
   final AvaSvgCanvasDocumentDescriptorV4 descriptor;
   final AvaSvgCanvasCandidatePhase phase;
+  final int focusRevision;
   final AvaValidatedSvgCanvasDocument? document;
   final int? presentationSampleOffset;
   final int? firstRenderedSample;
@@ -110,6 +112,7 @@ final class AvaSvgCanvasCandidateState {
       AvaSvgCanvasCandidateState(
         descriptor: descriptor,
         phase: phase ?? this.phase,
+        focusRevision: focusRevision,
         document: document ?? this.document,
         presentationSampleOffset:
             presentationSampleOffset ?? this.presentationSampleOffset,
@@ -236,28 +239,11 @@ final class AvaSvgCanvasController extends ChangeNotifier {
   })? structuralMutationCompletion;
   AvaPresentationCommandHandler? presentationCommandHandler;
   AvaPresentationChangedHandler? presentationChangedHandler;
-  bool get generationMayFocus =>
-      _generation == null ||
-      (currentFocusRevision?.call() ?? 0) == _generation!.focusRevision;
-
-  void emitPresentationUpdated({
-    required bool visible,
-    String? sceneId,
-    int? focusRevision,
-    required String clientOperationId,
-  }) {
-    _ensureOpen();
-    _emit(
-      AvaSvgCanvasClientCommand(
-        AvaSvgCanvasCommandType.canvasPresentationUpdated,
-        {
-          'visible': visible,
-          if (visible && sceneId != null) 'sceneId': sceneId,
-          if (visible && focusRevision != null) 'focusRevision': focusRevision,
-          'clientOperationId': clientOperationId,
-        },
-      ),
-    );
+  bool get generationMayFocus {
+    final acceptedFocusRevision =
+        _candidate?.focusRevision ?? _generation?.focusRevision;
+    return acceptedFocusRevision == null ||
+        (currentFocusRevision?.call() ?? 0) == acceptedFocusRevision;
   }
 
   void emitPresentationAcknowledged({
@@ -277,6 +263,24 @@ final class AvaSvgCanvasController extends ChangeNotifier {
           if (sceneId != null) 'sceneId': sceneId,
           if (focusRevision != null) 'focusRevision': focusRevision,
           if (reason != null) 'reason': reason,
+        },
+      ),
+    );
+  }
+
+  void emitPresentationRequested({
+    required String operation,
+    String? selector,
+    int? position,
+  }) {
+    _ensureOpen();
+    _emit(
+      AvaSvgCanvasClientCommand(
+        AvaSvgCanvasCommandType.canvasPresentationRequested,
+        {
+          'operation': operation,
+          if (selector != null) 'selector': selector,
+          if (position != null) 'position': position,
         },
       ),
     );
@@ -638,6 +642,7 @@ final class AvaSvgCanvasController extends ChangeNotifier {
     _candidate = AvaSvgCanvasCandidateState(
       descriptor: descriptor,
       phase: AvaSvgCanvasCandidatePhase.fetching,
+      focusRevision: generation.focusRevision,
     );
     _lastIssue = null;
     _lastPendingOutcome = null;
@@ -953,7 +958,7 @@ final class AvaSvgCanvasController extends ChangeNotifier {
         document: document,
         firstRenderedSample: candidate.firstRenderedSample!,
       );
-      _activeFocusRevision = _generation?.focusRevision ?? 0;
+      _activeFocusRevision = candidate.focusRevision;
       _semanticTransportState = AvaSvgSemanticTransportState.ready;
     }
     _candidate = null;
@@ -999,6 +1004,7 @@ final class AvaSvgCanvasController extends ChangeNotifier {
       {
         'sceneId': descriptor.sceneId,
         'sceneRevision': descriptor.sceneRevision,
+        'focusRevision': _activeFocusRevision,
         'interactionRevision': _interactionRevision,
         'svgSha256': descriptor.svgSha256,
         'manifestSha256': descriptor.manifestSha256,

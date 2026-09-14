@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
+import re
 
 import pytest
 
@@ -15,6 +17,7 @@ from ava_backend.realtime.context_assembler import (
 )
 from ava_backend.realtime.memory import (
     DeliveredConversationTurn,
+    DialogueFrame,
     MemorySearchCandidate,
 )
 
@@ -62,15 +65,18 @@ def _assemble(
     canvas_context: str | None = None,
     max_bytes: int = MAX_DYNAMIC_CONTEXT_UTF8_BYTES,
     build_id: str = "ctx-1",
+    dialogue_frame: DialogueFrame | None = None,
+    current_time_utc: datetime = NOW,
 ) -> AssembledRealtimeContext:
     return DynamicContextAssembler(max_dynamic_utf8_bytes=max_bytes).assemble(
         build_id=build_id,
         reason=reason,
         age_band=AgeBand.MIDDLE_CHILDHOOD,
         timezone_id="Asia/Kolkata",
-        current_time_utc=NOW,
+        current_time_utc=current_time_utc,
         bootstrap_turns=turns,
         warm_memories=references,
+        dialogue_frame=dialogue_frame,
         canvas_context=canvas_context,
     )
 
@@ -82,9 +88,72 @@ def test_context_build_identity_is_metadata_not_serialized_content() -> None:
     assert first.build_id == "ctx-17"
     assert second.build_id == "ctx-18"
     assert first.content == second.content
+    assert first.content_fingerprint == second.content_fingerprint
     assert "ctx-17" not in first.content
     assert "ctx-18" not in second.content
     assert first.final_utf8_bytes == len(first.content.encode("utf-8"))
+
+
+def test_content_fingerprint_is_exact_lowercase_sha256() -> None:
+    context = _assemble()
+
+    assert (
+        context.content_fingerprint
+        == sha256(context.content.encode("utf-8")).hexdigest()
+    )
+    assert re.fullmatch(r"[0-9a-f]{64}", context.content_fingerprint)
+
+
+def test_build_reason_alone_does_not_change_content_fingerprint() -> None:
+    committed = _assemble(reason=DynamicContextBuildReason.TURN_COMMITTED)
+    focused = _assemble(reason=DynamicContextBuildReason.CANVAS_FOCUSED)
+
+    assert committed.content == focused.content
+    assert committed.content_fingerprint == focused.content_fingerprint
+
+
+def test_dialogue_frame_change_changes_content_fingerprint() -> None:
+    original = _assemble(dialogue_frame=DialogueFrame())
+    changed = _assemble(
+        dialogue_frame=DialogueFrame.model_validate(
+            {"revision": 1, "activeTopics": ["Saturn"]}
+        )
+    )
+
+    assert original.content_fingerprint != changed.content_fingerprint
+
+
+def test_canvas_semantic_context_change_changes_content_fingerprint() -> None:
+    first = _assemble(
+        canvas_context=(
+            '<active_canvas trust="validated_scene_data" scene_id="first" '
+            'revision="1">First</active_canvas>'
+        )
+    )
+    second = _assemble(
+        canvas_context=(
+            '<active_canvas trust="validated_scene_data" scene_id="second" '
+            'revision="1">Second</active_canvas>'
+        )
+    )
+
+    assert first.content_fingerprint != second.content_fingerprint
+
+
+def test_memory_reference_change_changes_content_fingerprint() -> None:
+    first = _assemble(references=(_reference(1, text="Earlier Saturn evidence."),))
+    second = _assemble(references=(_reference(1, text="Earlier Jupiter evidence."),))
+
+    assert first.content_fingerprint != second.content_fingerprint
+
+
+def test_relevant_local_date_and_daypart_changes_change_fingerprint() -> None:
+    original = _assemble(current_time_utc=NOW)
+    later_daypart = _assemble(current_time_utc=NOW + timedelta(hours=8))
+    next_date = _assemble(current_time_utc=NOW + timedelta(days=1))
+
+    assert original.content_fingerprint != later_daypart.content_fingerprint
+    assert original.content_fingerprint != next_date.content_fingerprint
 
 
 def test_bootstrap_includes_durable_turns_in_chronological_order() -> None:

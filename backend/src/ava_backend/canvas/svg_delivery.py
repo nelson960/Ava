@@ -11,6 +11,7 @@ from .svg_document import (
 )
 from .svg_session import SvgCanvasCandidate
 from .svg_specialist import SvgCanvasVisibleDraft
+from .svg_workspace import ActiveSvgCanvasScene, CanvasWorkspaceManifestScene
 
 _IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9._:-]{0,63}$")
 
@@ -69,14 +70,52 @@ class StoredSvgCanvasDraft:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class StoredRetainedSvgCanvasScene:
+    """Validated retained content supplied by the durable Flutter workspace."""
+
+    subject: str
+    scene: ActiveSvgCanvasScene
+
+
+def _retained_scene_matches_manifest(
+    scene: ActiveSvgCanvasScene,
+    manifest: CanvasWorkspaceManifestScene,
+) -> bool:
+    document = scene.document
+    return (
+        scene.scene_id == manifest.scene_id
+        and scene.revision == manifest.scene_revision
+        and scene.generation_id == manifest.generation_id
+        and scene.source_turn_id == manifest.source_turn_id
+        and document.svg_sha256 == manifest.svg_sha256
+        and document.manifest_sha256 == manifest.manifest_sha256
+        and len(document.svg_bytes) == manifest.svg_byte_length
+        and len(document.manifest_bytes) == manifest.manifest_byte_length
+        and document.manifest["rendererCapabilityVersion"]
+        == manifest.renderer_capability_version
+        and document.manifest["validatorVersion"] == manifest.validator_version
+        and document.manifest["manifestVersion"] == manifest.manifest_version
+        and document.title == manifest.title
+        and document.description == manifest.summary
+    )
+
+
 class SvgCanvasDocumentStore:
-    """Bounded exact-byte store consumed over HTTP, never the PCM socket."""
+    """Bounded exact-byte transport store and retained-scene source.
+
+    Flutter remains the durable workspace owner.  At session startup it submits
+    the exact persisted retained documents here after the manifest is adopted;
+    this store is the backend's validated, session-independent read-through
+    source for on-demand workspace hydration.
+    """
 
     def __init__(
         self,
         *,
         max_documents: int = 256,
         max_documents_per_session: int = 3,
+        max_retained_scenes_per_subject: int = 10,
         max_drafts: int = 1_024,
         max_drafts_per_generation: int = 8,
         max_document_bytes: int = SVG_DEFAULT_MAX_BYTES,
@@ -85,6 +124,10 @@ class SvgCanvasDocumentStore:
             raise ValueError("max_documents must be between 1 and 10000")
         if not 1 <= max_documents_per_session <= 8:
             raise ValueError("max_documents_per_session must be between 1 and 8")
+        if not 1 <= max_retained_scenes_per_subject <= 10:
+            raise ValueError(
+                "max_retained_scenes_per_subject must be between 1 and 10"
+            )
         if not 1 <= max_drafts <= 10_000:
             raise ValueError("max_drafts must be between 1 and 10000")
         if not 1 <= max_drafts_per_generation <= 32:
@@ -93,11 +136,13 @@ class SvgCanvasDocumentStore:
             raise ValueError("max_document_bytes exceeds the protocol ceiling")
         self._max_documents = max_documents
         self._max_documents_per_session = max_documents_per_session
+        self._max_retained_scenes_per_subject = max_retained_scenes_per_subject
         self._max_drafts = max_drafts
         self._max_drafts_per_generation = max_drafts_per_generation
         self._max_document_bytes = max_document_bytes
         self._documents: dict[tuple[str, str], StoredSvgCanvasDocument] = {}
         self._drafts: dict[tuple[str, str, int], StoredSvgCanvasDraft] = {}
+        self._retained_scenes: dict[tuple[str, str], StoredRetainedSvgCanvasScene] = {}
         self._lock = asyncio.Lock()
 
     @property
@@ -107,6 +152,77 @@ class SvgCanvasDocumentStore:
     @property
     def draft_count(self) -> int:
         return len(self._drafts)
+
+    @property
+    def retained_scene_count(self) -> int:
+        return len(self._retained_scenes)
+
+    async def retain_scene(
+        self,
+        *,
+        subject: str,
+        scene: ActiveSvgCanvasScene,
+    ) -> StoredRetainedSvgCanvasScene:
+        """Record one exact validated Flutter-retained scene by subject/identity."""
+        if not subject.strip():
+            raise ValueError("retained canvas subject cannot be empty")
+        _require_identifier(scene.scene_id, label="scene_id")
+        _require_identifier(scene.generation_id, label="generation_id")
+        if len(scene.document.svg_bytes) > self._max_document_bytes:
+            raise SvgDocumentStoreCapacityError(
+                "retained SVG document exceeds the configured byte limit"
+            )
+        key = (subject, scene.scene_id)
+        stored = StoredRetainedSvgCanvasScene(subject=subject, scene=scene)
+        async with self._lock:
+            existing = self._retained_scenes.get(key)
+            if existing is not None:
+                if existing == stored:
+                    return existing
+                if existing.scene.revision == scene.revision:
+                    raise SvgDocumentStoreError(
+                        "retained SVG scene revision was reused for different content"
+                    )
+                if existing.scene.revision > scene.revision:
+                    return existing
+            subject_count = sum(
+                1 for stored_subject, _ in self._retained_scenes if stored_subject == subject
+            )
+            if (
+                existing is None
+                and subject_count >= self._max_retained_scenes_per_subject
+            ):
+                raise SvgDocumentStoreCapacityError(
+                    "retained SVG scene capacity is exhausted for this subject"
+                )
+            if existing is None and len(self._retained_scenes) >= self._max_documents:
+                raise SvgDocumentStoreCapacityError(
+                    "global retained SVG scene capacity is exhausted"
+                )
+            self._retained_scenes[key] = stored
+        return stored
+
+    async def load_retained_scene(
+        self,
+        *,
+        subject: str,
+        manifest_scene: CanvasWorkspaceManifestScene,
+    ) -> ActiveSvgCanvasScene | None:
+        """Return a retained document only when it exactly matches the manifest."""
+        async with self._lock:
+            stored = self._retained_scenes.get((subject, manifest_scene.scene_id))
+        if stored is None or not _retained_scene_matches_manifest(
+            stored.scene, manifest_scene
+        ):
+            return None
+        return stored.scene
+
+    async def clear_subject(self, *, subject: str) -> int:
+        async with self._lock:
+            keys = [key for key in self._retained_scenes if key[0] == subject]
+            for key in keys:
+                del self._retained_scenes[key]
+        return len(keys)
 
     async def publish(
         self,

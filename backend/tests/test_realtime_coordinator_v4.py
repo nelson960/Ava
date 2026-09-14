@@ -32,6 +32,7 @@ from ava_backend.realtime.events_v4 import (
     CanvasActivatedEventV4,
     CanvasDocumentAvailableEventV4,
     CanvasPresentationCueEventV4,
+    CanvasPresentationRequestedEventV4,
     TurnPhaseChangedEventV4,
 )
 from ava_backend.realtime.fakes import (
@@ -43,7 +44,10 @@ from ava_backend.realtime.harness import build_realtime_harness
 from ava_backend.realtime.memory import DevelopmentAuthoritativeMemoryStore
 from ava_backend.realtime.plan import AvaTurnPlan
 from ava_backend.realtime.svg_canvas_jobs import SvgCanvasJobCoordinator
-from ava_backend.realtime.tool_contract import InteractiveCanvasToolOutputV4
+from ava_backend.realtime.tool_contract import (
+    InteractiveCanvasRequest,
+    InteractiveCanvasToolOutputV4,
+)
 from ava_backend.realtime.websocket_v4 import (
     AvaServerControlFrameV4,
     AvaServerPcmFrameV4,
@@ -93,6 +97,31 @@ def _client(
             **payload,
         }
     )
+
+
+def test_client_semantic_presentation_request_has_no_scene_identity() -> None:
+    event = _client(
+        1,
+        {
+            "event": "canvasPresentationRequested",
+            "operation": "show",
+            "selector": "next",
+        },
+    )
+
+    assert isinstance(event, CanvasPresentationRequestedEventV4)
+    assert event.selector == "next"
+    assert "sceneId" not in event.model_dump(by_alias=True, exclude_none=True)
+
+    with pytest.raises(ValueError, match="selector"):
+        _client(
+            2,
+            {
+                "event": "canvasPresentationRequested",
+                "operation": "hide",
+                "selector": "current",
+            },
+        )
 
 
 async def test_canvas_event_backpressure_fails_instead_of_blocking_lifecycle() -> None:
@@ -195,7 +224,8 @@ async def test_restored_focused_canvas_is_in_initial_provider_context() -> None:
         assert len(realtime.prepared_session_updates) == 1
         instructions = realtime.prepared_session_updates[0]["session"]["instructions"]
         assert isinstance(instructions, str)
-        assert "<retained_visuals" in instructions
+        assert "<focused_scene" in instructions
+        assert "scene-restored-context" not in instructions
         assert state.render_realtime_context() in instructions
     finally:
         await coordinator.close()
@@ -211,6 +241,15 @@ async def test_v4_coordinator_runs_exact_svg_lifecycle_without_pcm_interleaving(
         plan,
         child_text="How does a plant cell work?",
         canvas_brief="Draw a labeled plant cell with a tappable nucleus label.",
+    )
+    realtime._canvas_request = InteractiveCanvasRequest.model_validate(
+        {
+            "operation": "new",
+            "brief": "Draw a labeled plant cell with a tappable nucleus label.",
+            "interactionMode": "select",
+            "continuousControl": "none",
+            "completion": "needsResultReasoning",
+        }
     )
     speech = DeterministicStreamingSpeechSynthesizer(chunk_sample_count=31)
     svg_specialist = _SvgSpecialist()

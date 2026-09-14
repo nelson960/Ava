@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from time import monotonic
-from typing import Protocol, TypeVar
+from typing import Any, Protocol, TypeVar, cast
 from urllib.parse import quote, urlsplit
 from uuid import uuid4
 from xml.sax.saxutils import escape
@@ -21,7 +22,6 @@ from ..canvas.svg_workspace import RecordedSvgCanvasInteraction
 from ..config import (
     DEFAULT_OPENAI_REALTIME_RATE_LIMIT_FALLBACK_WAIT_SECONDS,
     DEFAULT_OPENAI_REALTIME_RATE_LIMIT_MAX_RECOVERY_ATTEMPTS,
-    DEFAULT_OPENAI_REALTIME_RATE_LIMIT_MAX_RECOVERY_SECONDS,
     DEFAULT_OPENAI_REALTIME_TRUNCATION_POST_INSTRUCTIONS_TOKENS,
     DEFAULT_OPENAI_REALTIME_TRUNCATION_RETENTION_RATIO,
 )
@@ -39,8 +39,10 @@ from ..realtime.provider_session import (
     RealtimeProviderInputEvent,
     RealtimeProviderTurnEvent,
     RealtimeCommittedInput,
+    SemanticCaptureEvidence,
     validate_sdp,
 )
+from ..realtime.memory import SemanticCaptureFunctionArguments
 from ..realtime.provider_observability import (
     ProviderConversationLedger,
     ProviderRateLimitObservation,
@@ -57,12 +59,13 @@ from ..realtime.tool_contract import (
     GET_CURRENT_TIME_TOOL_NAME,
     INTERACTIVE_CANVAS_TOOL_NAME,
     MANAGE_CANVAS_PRESENTATION_TOOL_NAME,
+    RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME,
     SEARCH_MEMORY_TOOL_NAME,
+    CanvasActionCompletion,
     GetCurrentTimeRequest,
     InteractiveCanvasCancellationRequest,
     InteractiveCanvasCancellationToolOutputV4,
     InteractiveCanvasRequest,
-    InteractiveCanvasToolOutput,
     InteractiveCanvasToolOutputV4,
     ManageCanvasPresentationAction,
     ManageCanvasPresentationRequest,
@@ -100,6 +103,7 @@ _OPENAI_REALTIME_RESPONSE_CREATE_EVENT_ID_PREFIX = "ava_resp_"
 _OPENAI_REALTIME_RESPONSE_CREATE_EVENT_ID_CHARS = 32
 _CANVAS_INTERACTION_RESPONSE_MAX_OUTPUT_TOKENS = 256
 _CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS = 512
+_SEMANTIC_CAPTURE_MAX_OUTPUT_TOKENS = 4096
 _MAX_CONSUMED_TERMINAL_RESPONSE_IDS = 64
 _CANVAS_TOOL_NAMES = frozenset(
     {INTERACTIVE_CANVAS_TOOL_NAME, CANCEL_INTERACTIVE_CANVAS_TOOL_NAME}
@@ -195,6 +199,17 @@ class _ResolvedCancelOutcome:
 
 
 @dataclass(slots=True)
+class _RegisteredSemanticCapture:
+    source_turn_id: str
+    client_event_id: str
+    queue: asyncio.Queue[dict[str, object] | object]
+    capture_turn_id: str = ""
+    response_id: str | None = None
+    abandoned: bool = False
+    terminal_observed: bool = False
+
+
+@dataclass(slots=True)
 class _ResponseLifecycle:
     response_id: str
     owner_turn_id: str | None = None
@@ -209,6 +224,7 @@ class _ResponseLifecycle:
 @dataclass(frozen=True, slots=True)
 class _ResponseRequest:
     turn_id: str
+    response_kind: str
     payload: dict[str, object]
     output_token_limits: tuple[int, ...]
     input_growth_token_limits: tuple[int, ...]
@@ -221,6 +237,14 @@ class _ResponseRequest:
 @dataclass(frozen=True, slots=True)
 class _StructuredRateLimitFailure:
     limit_kind: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletedCanvasTool:
+    turn_id: str
+    completion: CanvasActionCompletion | None
+    tool_result_status: str
+    serialized_output: str
 
 
 _MAX_OUTSTANDING_CANCEL_OUTCOMES = 64
@@ -363,9 +387,6 @@ class _OpenAIRealtimeEventChannel:
         rate_limit_max_recovery_attempts: int = (
             DEFAULT_OPENAI_REALTIME_RATE_LIMIT_MAX_RECOVERY_ATTEMPTS
         ),
-        rate_limit_max_recovery_seconds: float = (
-            DEFAULT_OPENAI_REALTIME_RATE_LIMIT_MAX_RECOVERY_SECONDS
-        ),
         rate_limit_fallback_wait_seconds: float = (
             DEFAULT_OPENAI_REALTIME_RATE_LIMIT_FALLBACK_WAIT_SECONDS
         ),
@@ -383,7 +404,6 @@ class _OpenAIRealtimeEventChannel:
         self._observability_warning_emitted = False
         self._resource_governor = ResourceGovernor(
             max_recovery_attempts=rate_limit_max_recovery_attempts,
-            max_recovery_seconds=rate_limit_max_recovery_seconds,
             fallback_wait_seconds=rate_limit_fallback_wait_seconds,
         )
         self._resource_capacity_waiter = resource_capacity_waiter
@@ -392,6 +412,7 @@ class _OpenAIRealtimeEventChannel:
         self._pending_primary_admission_wait_seconds: float | None = None
         self._resource_recovery_probe_turn_id: str | None = None
         self._active_response_request: _ResponseRequest | None = None
+        self._semantic_response_count = 0
         self._model = model
         self._transcription_model = _required_name(
             transcription_model,
@@ -435,6 +456,17 @@ class _OpenAIRealtimeEventChannel:
         self._receiver_error: BaseException | None = None
         self._receiver_terminal = object()
         self._closed = False
+        self._capture_lock = asyncio.Lock()
+        self._active_semantic_capture: _RegisteredSemanticCapture | None = None
+        self._capture_response_id_to_registration: dict[
+            str, _RegisteredSemanticCapture
+        ] = {}
+        self._quarantined_capture_by_source_turn_id: OrderedDict[
+            str, _RegisteredSemanticCapture
+        ] = OrderedDict()
+        self._quarantined_capture_by_client_event_id: OrderedDict[
+            str, _RegisteredSemanticCapture
+        ] = OrderedDict()
         self._active_turn_id: str | None = None
         self._active_response_id: str | None = None
         self._awaiting_response_trigger_turn_id: str | None = None
@@ -465,10 +497,14 @@ class _OpenAIRealtimeEventChannel:
         self._pending_desired_build_ids: list[str] = []
         self._cancelled_turn_ids: set[str] = set()
         self._pending_canvas_call_id: str | None = None
+        self._pending_canvas_completion: CanvasActionCompletion | None = None
         self._completed_canvas_call_ids: set[str] = set()
+        self._completed_canvas_tools: dict[str, _CompletedCanvasTool] = {}
         self._pending_canvas_control_call_id: str | None = None
+        self._pending_canvas_control_completion: CanvasActionCompletion | None = None
         self._pending_canvas_control_continuation_call_id: str | None = None
         self._completed_canvas_control_call_ids: set[str] = set()
+        self._completed_canvas_control_tools: dict[str, _CompletedCanvasTool] = {}
         self._pending_utility_call_id: str | None = None
         self._completed_utility_call_ids: set[str] = set()
         self.last_usage: OpenAIRealtimeUsage | None = None
@@ -691,6 +727,149 @@ class _OpenAIRealtimeEventChannel:
                         active_turn_id=self._active_turn_id,
                         active_response_id=self._active_response_id,
                     )
+                if event_type == "error":
+                    error_event_id = _provider_error_event_id(event)
+                    resp_id = _response_id_from_event(event)
+                    capture = self._active_semantic_capture
+                    matched_capture: _RegisteredSemanticCapture | None = None
+                    if capture is not None and (
+                        (
+                            error_event_id is not None
+                            and error_event_id == capture.client_event_id
+                        )
+                        or (resp_id is not None and resp_id == capture.response_id)
+                    ):
+                        matched_capture = capture
+                    elif (
+                        resp_id is not None
+                        and resp_id in self._capture_response_id_to_registration
+                    ):
+                        matched_capture = self._capture_response_id_to_registration[
+                            resp_id
+                        ]
+                    elif (
+                        error_event_id is not None
+                        and error_event_id
+                        in self._quarantined_capture_by_client_event_id
+                    ):
+                        matched_capture = self._quarantined_capture_by_client_event_id[
+                            error_event_id
+                        ]
+
+                    if matched_capture is not None:
+                        matched_capture.terminal_observed = True
+                        if matched_capture.abandoned:
+                            self._resource_governor.release_turn(
+                                turn_id=matched_capture.capture_turn_id
+                            )
+                            if matched_capture.response_id is not None:
+                                self._capture_response_id_to_registration.pop(
+                                    matched_capture.response_id, None
+                                )
+                            self._quarantined_capture_by_client_event_id.pop(
+                                matched_capture.client_event_id, None
+                            )
+                            self._quarantined_capture_by_source_turn_id.pop(
+                                matched_capture.source_turn_id, None
+                            )
+                            self._resource_capacity_changed.set()
+                        else:
+                            matched_capture.queue.put_nowait(event)
+                        continue
+
+                if event_type == "response.created":
+                    resp_obj = event.get("response")
+                    metadata = (
+                        resp_obj.get("metadata") if isinstance(resp_obj, dict) else None
+                    )
+                    if (
+                        isinstance(metadata, dict)
+                        and metadata.get("purpose") == "semantic_capture"
+                    ):
+                        source_turn_id = metadata.get("source_turn_id")
+                        capture = self._active_semantic_capture
+                        if (
+                            capture is None or capture.source_turn_id != source_turn_id
+                        ) and isinstance(source_turn_id, str):
+                            capture = self._quarantined_capture_by_source_turn_id.get(
+                                source_turn_id
+                            )
+
+                        resp_id = _response_id_from_event(event)
+                        if capture is not None:
+                            if resp_id is not None:
+                                capture.response_id = resp_id
+                                self._capture_response_id_to_registration[resp_id] = (
+                                    capture
+                                )
+                                self._response_owner_by_id[resp_id] = (
+                                    capture.capture_turn_id
+                                )
+                                try:
+                                    self._resource_governor.bind_provider_response(
+                                        turn_id=capture.capture_turn_id,
+                                        provider_response_id=resp_id,
+                                    )
+                                except ValueError:
+                                    pass
+                            if not capture.abandoned:
+                                capture.queue.put_nowait(event)
+                            else:
+                                if isinstance(source_turn_id, str):
+                                    self._quarantined_capture_by_source_turn_id.pop(
+                                        source_turn_id, None
+                                    )
+                                self._quarantined_capture_by_client_event_id.pop(
+                                    capture.client_event_id, None
+                                )
+                        elif resp_id is not None:
+                            unregistered = _RegisteredSemanticCapture(
+                                source_turn_id=str(source_turn_id or ""),
+                                client_event_id="",
+                                capture_turn_id=f"capture_{source_turn_id or 'unknown'}",
+                                queue=asyncio.Queue(),
+                                response_id=resp_id,
+                                abandoned=True,
+                            )
+                            self._capture_response_id_to_registration[resp_id] = (
+                                unregistered
+                            )
+                            self._response_owner_by_id[resp_id] = (
+                                unregistered.capture_turn_id
+                            )
+                        continue
+
+                if event_type.startswith("response."):
+                    resp_id = _response_id_from_event(event)
+                    if (
+                        resp_id is not None
+                        and resp_id in self._capture_response_id_to_registration
+                    ):
+                        capture = self._capture_response_id_to_registration[resp_id]
+                        if event_type == "response.done":
+                            capture.terminal_observed = True
+                            usage = _parse_optional_usage(event)
+                            if usage is not None:
+                                self._resource_governor.observe_actual_usage(
+                                    turn_id=capture.capture_turn_id,
+                                    input_tokens=usage.input_tokens,
+                                    output_tokens=usage.output_tokens,
+                                )
+                            if capture.abandoned:
+                                self._resource_governor.release_turn(
+                                    turn_id=capture.capture_turn_id
+                                )
+                                self._consumed_terminal_response_owner_by_id[
+                                    resp_id
+                                ] = capture.capture_turn_id
+                                self._capture_response_id_to_registration.pop(
+                                    resp_id, None
+                                )
+                                self._resource_capacity_changed.set()
+                        if not capture.abandoned:
+                            capture.queue.put_nowait(event)
+                        continue
+
                 try:
                     self._router_events.put_nowait(event)
                 except asyncio.QueueFull as error:
@@ -719,6 +898,12 @@ class _OpenAIRealtimeEventChannel:
     def _put_receiver_terminal(self) -> None:
         for event in self._child_transcription_events_by_turn.values():
             event.set()
+        capture = self._active_semantic_capture
+        if capture is not None:
+            try:
+                capture.queue.put_nowait(self._receiver_terminal)
+            except asyncio.QueueFull:
+                pass
         for queue in (self._router_events, self._input_events):
             try:
                 queue.put_nowait(self._receiver_terminal)
@@ -920,6 +1105,7 @@ class _OpenAIRealtimeEventChannel:
         self.last_first_delta_ms = None
         self.last_completed_ms = None
         self._received_event_count = 0
+        self._semantic_response_count = 0
 
         response_completed = False
         try:
@@ -947,6 +1133,7 @@ class _OpenAIRealtimeEventChannel:
                 )
                 await self._create_response(
                     turn_id=turn_id,
+                    response_kind="primaryText",
                     response={
                         "output_modalities": ["text"],
                         "tool_choice": harness.tool_choice,
@@ -956,13 +1143,6 @@ class _OpenAIRealtimeEventChannel:
                     },
                     output_token_limits=(
                         response_max_output_tokens or self._max_output_tokens,
-                        *(
-                            min(
-                                _CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS,
-                                self._max_output_tokens,
-                            ),
-                        )
-                        * (_MAX_TOOL_CAPABLE_RESPONSE_CHAIN - 1),
                     ),
                 )
 
@@ -974,6 +1154,7 @@ class _OpenAIRealtimeEventChannel:
                 yield event
             response_completed = True
         finally:
+            self._discard_completed_canvas_tools(turn_id=turn_id)
             # An interrupted/erroring async generator deliberately retains the
             # turn and reservation boundary until cancel() drains the provider
             # response. In particular, response.created may already be queued
@@ -990,6 +1171,7 @@ class _OpenAIRealtimeEventChannel:
         self,
         *,
         turn_id: str,
+        response_kind: str,
         response: dict[str, object],
         output_token_limits: tuple[int, ...],
         input_growth_token_limits: tuple[int, ...] = (),
@@ -1006,6 +1188,13 @@ class _OpenAIRealtimeEventChannel:
             or self._response_create_pending
         ):
             return False, None
+        if (
+            retry_request is None
+            and self._semantic_response_count >= _MAX_TOOL_CAPABLE_RESPONSE_CHAIN
+        ):
+            raise OpenAIRealtimeProtocolError(
+                "logical turn exceeded Ava's semantic response chain"
+            )
         tpm, rpm = self._resource_rate_limit_windows()
         decision = self._resource_governor.admit(
             turn_id=turn_id,
@@ -1020,6 +1209,12 @@ class _OpenAIRealtimeEventChannel:
             operation="logResourceAdmission",
             action=lambda: self._log_resource_decision(
                 turn_id=turn_id,
+                response_kind=response_kind,
+                semantic_response_number=(
+                    self._semantic_response_count
+                    if retry_request is not None
+                    else self._semantic_response_count + 1
+                ),
                 decision=decision,
             ),
         )
@@ -1028,6 +1223,7 @@ class _OpenAIRealtimeEventChannel:
         if retry_request is not None:
             if (
                 retry_request.turn_id != turn_id
+                or retry_request.response_kind != response_kind
                 or retry_request.payload != response
                 or retry_request.output_token_limits != output_token_limits
                 or retry_request.input_growth_token_limits != input_growth_token_limits
@@ -1048,6 +1244,7 @@ class _OpenAIRealtimeEventChannel:
         self._response_create_pending = True
         self._active_response_request = _ResponseRequest(
             turn_id=turn_id,
+            response_kind=response_kind,
             payload=dict(response),
             output_token_limits=output_token_limits,
             input_growth_token_limits=input_growth_token_limits,
@@ -1069,12 +1266,15 @@ class _OpenAIRealtimeEventChannel:
             self._active_response_request = None
             self._resource_governor.release_turn(turn_id=turn_id)
             raise
+        if retry_request is None:
+            self._semantic_response_count += 1
         return True, decision
 
     async def _create_response(
         self,
         *,
         turn_id: str,
+        response_kind: str,
         response: dict[str, object],
         output_token_limits: tuple[int, ...],
         input_growth_token_limits: tuple[int, ...] = (),
@@ -1087,6 +1287,7 @@ class _OpenAIRealtimeEventChannel:
             async with self._response_create_lock:
                 created, decision = await self._create_response_locked(
                     turn_id=turn_id,
+                    response_kind=response_kind,
                     response=response,
                     output_token_limits=output_token_limits,
                     input_growth_token_limits=input_growth_token_limits,
@@ -1137,14 +1338,7 @@ class _OpenAIRealtimeEventChannel:
             "parallel_tool_calls": False,
             "max_output_tokens": self._max_output_tokens,
         }
-        continuation_limit = min(
-            _CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS,
-            self._max_output_tokens,
-        )
-        output_token_limits = (
-            self._max_output_tokens,
-            *(continuation_limit,) * (_MAX_TOOL_CAPABLE_RESPONSE_CHAIN - 1),
-        )
+        output_token_limits = (self._max_output_tokens,)
         recovery_probe = self._resource_recovery_probe_turn_id == turn_id
         self._resource_capacity_changed.clear()
         async with self._response_create_lock:
@@ -1166,6 +1360,7 @@ class _OpenAIRealtimeEventChannel:
                 )
             sent, decision = await self._create_response_locked(
                 turn_id=turn_id,
+                response_kind="primaryVoice",
                 response=response,
                 output_token_limits=output_token_limits,
                 recovery_probe=recovery_probe,
@@ -1228,9 +1423,7 @@ class _OpenAIRealtimeEventChannel:
         turn_id: str,
         call_id: str,
         output: (
-            InteractiveCanvasToolOutput
-            | InteractiveCanvasToolOutputV4
-            | InteractiveCanvasCancellationToolOutputV4
+            InteractiveCanvasToolOutputV4 | InteractiveCanvasCancellationToolOutputV4
         ),
     ) -> None:
         if self._closed:
@@ -1247,6 +1440,7 @@ class _OpenAIRealtimeEventChannel:
             raise OpenAIRealtimeProtocolError(
                 "canvas tool completion does not match the pending call"
             )
+        requested_completion = self._pending_canvas_completion
         serialized_output = output.model_dump_json(
             by_alias=True,
             exclude_none=True,
@@ -1265,41 +1459,12 @@ class _OpenAIRealtimeEventChannel:
         # create or execute the tool output a second time while admission waits.
         self._completed_canvas_call_ids.add(call_id)
         self._pending_canvas_call_id = None
-        response_payload: dict[str, object] = {
-            "conversation": "auto",
-            "output_modalities": ["text"],
-            "tool_choice": "none",
-            "max_output_tokens": min(
-                _CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS,
-                self._max_output_tokens,
-            ),
-        }
-
-        continuation_created = await self._create_response(
+        self._pending_canvas_completion = None
+        self._completed_canvas_tools[call_id] = _CompletedCanvasTool(
             turn_id=turn_id,
-            response=response_payload,
-            output_token_limits=(
-                min(
-                    _CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS,
-                    self._max_output_tokens,
-                ),
-            ),
-            initial_input_growth_tokens=_utf8_token_upper_bound(serialized_output),
-            continuation_call_id=call_id,
-        )
-        if continuation_created:
-            self._expect_observability_continuation(
-                turn_id=turn_id,
-                call_id=call_id,
-            )
-        _log_response_diagnostic(
-            "openai_realtime_canvas_continuation_requested",
-            event_type="response.create",
-            consumer_turn_id=turn_id,
-            consumer_phase="canvasContinuation",
-            active_turn_id=self._active_turn_id,
-            active_response_id=self._active_response_id,
-            call_id=call_id,
+            completion=requested_completion,
+            tool_result_status=str(output.status),
+            serialized_output=serialized_output,
         )
         self._interaction_response_readiness_changed.set()
 
@@ -1326,6 +1491,7 @@ class _OpenAIRealtimeEventChannel:
             raise OpenAIRealtimeProtocolError(
                 "canvas presentation tool completion does not match the pending call"
             )
+        requested_completion = self._pending_canvas_control_completion
         serialized_output = output.model_dump_json(
             by_alias=True,
             exclude_none=True,
@@ -1341,6 +1507,37 @@ class _OpenAIRealtimeEventChannel:
         )
         self._completed_canvas_control_call_ids.add(call_id)
         self._pending_canvas_control_call_id = None
+        self._pending_canvas_control_completion = None
+        self._completed_canvas_control_tools[call_id] = _CompletedCanvasTool(
+            turn_id=turn_id,
+            completion=requested_completion,
+            tool_result_status=str(output.status),
+            serialized_output=serialized_output,
+        )
+        self._interaction_response_readiness_changed.set()
+
+    def _discard_completed_canvas_tools(self, *, turn_id: str) -> None:
+        for completed, call_ids in (
+            (self._completed_canvas_tools, self._completed_canvas_call_ids),
+            (
+                self._completed_canvas_control_tools,
+                self._completed_canvas_control_call_ids,
+            ),
+        ):
+            for call_id, completion in tuple(completed.items()):
+                if completion.turn_id != turn_id:
+                    continue
+                completed.pop(call_id)
+                call_ids.discard(call_id)
+
+    async def _request_canvas_tool_continuation(
+        self,
+        *,
+        turn_id: str,
+        call_id: str,
+        completion: _CompletedCanvasTool,
+        presentation_control: bool,
+    ) -> bool:
         response_payload: dict[str, object] = {
             "conversation": "auto",
             "output_modalities": ["text"],
@@ -1350,11 +1547,12 @@ class _OpenAIRealtimeEventChannel:
                 self._max_output_tokens,
             ),
         }
-
-        self._pending_canvas_control_continuation_call_id = call_id
+        if presentation_control:
+            self._pending_canvas_control_continuation_call_id = call_id
         try:
             created = await self._create_response(
                 turn_id=turn_id,
+                response_kind="canvasContinuation",
                 response=response_payload,
                 output_token_limits=(
                     min(
@@ -1362,29 +1560,42 @@ class _OpenAIRealtimeEventChannel:
                         self._max_output_tokens,
                     ),
                 ),
-                initial_input_growth_tokens=_utf8_token_upper_bound(serialized_output),
+                initial_input_growth_tokens=_utf8_token_upper_bound(
+                    completion.serialized_output
+                ),
                 continuation_call_id=call_id,
             )
         except BaseException:
-            self._pending_canvas_control_continuation_call_id = None
+            if presentation_control:
+                self._pending_canvas_control_continuation_call_id = None
             raise
         if not created:
-            self._pending_canvas_control_continuation_call_id = None
-        else:
-            self._expect_observability_continuation(
-                turn_id=turn_id,
-                call_id=call_id,
-            )
+            if presentation_control:
+                self._pending_canvas_control_continuation_call_id = None
+            return False
+        self._expect_observability_continuation(
+            turn_id=turn_id,
+            call_id=call_id,
+        )
         _log_response_diagnostic(
-            "openai_realtime_canvas_presentation_continuation_requested",
+            (
+                "openai_realtime_canvas_presentation_continuation_requested"
+                if presentation_control
+                else "openai_realtime_canvas_continuation_requested"
+            ),
             event_type="response.create",
             consumer_turn_id=turn_id,
-            consumer_phase="canvasPresentationContinuation",
+            consumer_phase=(
+                "canvasPresentationContinuation"
+                if presentation_control
+                else "canvasContinuation"
+            ),
             active_turn_id=self._active_turn_id,
             active_response_id=self._active_response_id,
             call_id=call_id,
         )
         self._interaction_response_readiness_changed.set()
+        return True
 
     async def complete_utility_tool(
         self,
@@ -1446,15 +1657,13 @@ class _OpenAIRealtimeEventChannel:
             ]
         continuation_created = await self._create_response(
             turn_id=turn_id,
+            response_kind="utilityContinuation",
             response=response,
             output_token_limits=(
-                (
-                    min(
-                        _CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS,
-                        self._max_output_tokens,
-                    ),
-                )
-                * (1 if rejected else 2)
+                min(
+                    _CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS,
+                    self._max_output_tokens,
+                ),
             ),
             initial_input_growth_tokens=_utf8_token_upper_bound(serialized_output),
             continuation_call_id=call_id,
@@ -1535,6 +1744,7 @@ class _OpenAIRealtimeEventChannel:
         )
         await self._create_response(
             turn_id=turn_id,
+            response_kind="canvasInteraction",
             response={
                 "conversation": "auto",
                 "output_modalities": ["text"],
@@ -1709,6 +1919,7 @@ class _OpenAIRealtimeEventChannel:
     async def cancel(self, *, turn_id: str) -> None:
         if not turn_id.strip():
             raise ValueError("turn_id cannot be empty")
+        self._discard_completed_canvas_tools(turn_id=turn_id)
         if turn_id in self._cancelled_turn_ids:
             self._settle_observability_turn(turn_id=turn_id)
             return
@@ -1776,7 +1987,7 @@ class _OpenAIRealtimeEventChannel:
                 item={
                     "type": "function_call_output",
                     "call_id": call_id,
-                    "output": InteractiveCanvasToolOutput.model_validate(
+                    "output": InteractiveCanvasToolOutputV4.model_validate(
                         {
                             "status": "rejected",
                             "reason": "The child interrupted this visual request.",
@@ -1785,6 +1996,7 @@ class _OpenAIRealtimeEventChannel:
                 },
             )
             self._pending_canvas_call_id = None
+            self._pending_canvas_completion = None
             # The function-call response has already reached response.done and
             # no continuation is created for an interrupted visual request.
             self._active_response_id = None
@@ -1814,6 +2026,7 @@ class _OpenAIRealtimeEventChannel:
                 },
             )
             self._pending_canvas_control_call_id = None
+            self._pending_canvas_control_completion = None
             self._active_response_id = None
             self._active_turn_id = None
             self._cancelled_turn_ids.add(turn_id)
@@ -2737,6 +2950,8 @@ class _OpenAIRealtimeEventChannel:
         self,
         *,
         turn_id: str,
+        response_kind: str,
+        semantic_response_number: int,
         decision: ResourceAdmissionDecision,
     ) -> None:
         health = self.session_health
@@ -2755,6 +2970,11 @@ class _OpenAIRealtimeEventChannel:
                     "sessionId": self._session_id,
                     "providerCallId": self._provider_call_id,
                     "turnId": turn_id,
+                    "responseKind": response_kind,
+                    "concreteOutputTokenLimits": list(
+                        decision.estimate.output_token_limits
+                    ),
+                    "logicalSemanticResponseNumber": semantic_response_number,
                     "state": str(decision.state),
                     "admissionDecision": str(decision.action),
                     "admissionReason": str(decision.reason),
@@ -2765,8 +2985,14 @@ class _OpenAIRealtimeEventChannel:
                     "providerTpmRemaining": (
                         health.tpm.remaining if health.tpm is not None else None
                     ),
+                    "providerTpmResetSeconds": (
+                        health.tpm.reset_seconds if health.tpm is not None else None
+                    ),
                     "providerRpmRemaining": (
                         health.rpm.remaining if health.rpm is not None else None
+                    ),
+                    "providerRpmResetSeconds": (
+                        health.rpm.reset_seconds if health.rpm is not None else None
                     ),
                     "localReservedTokens": (
                         resource.local_reserved_tokens if resource is not None else 0
@@ -2901,6 +3127,7 @@ class _OpenAIRealtimeEventChannel:
             async with self._response_create_lock:
                 created, decision = await self._create_response_locked(
                     turn_id=turn_id,
+                    response_kind=request.response_kind,
                     response=request.payload,
                     output_token_limits=request.output_token_limits,
                     input_growth_token_limits=request.input_growth_token_limits,
@@ -3082,11 +3309,29 @@ class _OpenAIRealtimeEventChannel:
                 task.cancel()
             if task is not None:
                 await asyncio.gather(task, return_exceptions=True)
+            for capture in list(self._quarantined_capture_by_source_turn_id.values()):
+                self._resource_governor.release_turn(turn_id=capture.capture_turn_id)
+            for capture in list(self._capture_response_id_to_registration.values()):
+                self._resource_governor.release_turn(turn_id=capture.capture_turn_id)
+            if self._active_semantic_capture is not None:
+                self._resource_governor.release_turn(
+                    turn_id=self._active_semantic_capture.capture_turn_id
+                )
             self._resource_governor.close()
             self._active_response_request = None
             self._resource_deferred_turn_id = None
             self._pending_primary_admission_wait_seconds = None
             self._resource_recovery_probe_turn_id = None
+            self._pending_canvas_completion = None
+            self._pending_canvas_control_completion = None
+            self._completed_canvas_tools.clear()
+            self._completed_canvas_call_ids.clear()
+            self._completed_canvas_control_tools.clear()
+            self._completed_canvas_control_call_ids.clear()
+            self._active_semantic_capture = None
+            self._capture_response_id_to_registration.clear()
+            self._quarantined_capture_by_source_turn_id.clear()
+            self._quarantined_capture_by_client_event_id.clear()
             observability_closed = self._safe_observability_action(
                 operation="close",
                 action=self._observability.close,
@@ -3626,6 +3871,13 @@ class _OpenAIRealtimeEventChannel:
                             self._pending_canvas_call_id = completed_call_id
                             canvas_called = True
                             tool_steps_used += 1
+                            canvas_completion = _explicit_canvas_completion(
+                                completed_arguments
+                            )
+                            canvas_request: (
+                                InteractiveCanvasRequest
+                                | InteractiveCanvasCancellationRequest
+                            )
                             try:
                                 if completed_name == INTERACTIVE_CANVAS_TOOL_NAME:
                                     canvas_request = (
@@ -3634,7 +3886,7 @@ class _OpenAIRealtimeEventChannel:
                                         )
                                     )
                                 else:
-                                    InteractiveCanvasCancellationRequest.model_validate_json(
+                                    canvas_request = InteractiveCanvasCancellationRequest.model_validate_json(
                                         completed_arguments
                                     )
                             except ValidationError as error:
@@ -3653,6 +3905,7 @@ class _OpenAIRealtimeEventChannel:
                                         }
                                     },
                                 )
+                                self._pending_canvas_completion = canvas_completion
                                 yield RealtimeRejectedCanvasToolCall(
                                     call_id=completed_call_id,
                                     reason=(
@@ -3661,24 +3914,93 @@ class _OpenAIRealtimeEventChannel:
                                     ),
                                 )
                             else:
+                                canvas_completion = CanvasActionCompletion(
+                                    canvas_request.completion
+                                )
+                                self._pending_canvas_completion = canvas_completion
                                 if completed_name == INTERACTIVE_CANVAS_TOOL_NAME:
                                     yield RealtimeCanvasToolCall(
                                         call_id=completed_call_id,
-                                        request=canvas_request,
+                                        request=cast(
+                                            InteractiveCanvasRequest,
+                                            canvas_request,
+                                        ),
                                     )
                                 else:
                                     yield RealtimeCancelCanvasToolCall(
-                                        call_id=completed_call_id
+                                        call_id=completed_call_id,
+                                        request=cast(
+                                            InteractiveCanvasCancellationRequest,
+                                            canvas_request,
+                                        ),
                                     )
                             if completed_call_id not in self._completed_canvas_call_ids:
                                 raise OpenAIRealtimeProtocolError(
                                     "Ava did not return the canvas function output"
                                 )
+                            completion = self._completed_canvas_tools.pop(
+                                completed_call_id
+                            )
                             self._completed_canvas_call_ids.discard(completed_call_id)
+                            if completion.turn_id != turn_id:
+                                raise OpenAIRealtimeProtocolError(
+                                    "canvas completion changed Ava turn ownership"
+                                )
+                            if (
+                                completion.completion
+                                != CanvasActionCompletion.NEEDS_RESULT_REASONING
+                            ):
+                                _log_response_diagnostic(
+                                    "openai_realtime_canvas_disposition_resolved",
+                                    response_id=completed_response_id,
+                                    response_owner_turn_id=turn_id,
+                                    consumer_turn_id=turn_id,
+                                    consumer_phase="canvasToolResult",
+                                    active_turn_id=self._active_turn_id,
+                                    active_response_id=self._active_response_id,
+                                    call_id=completed_call_id,
+                                    tool_kind=completed_name,
+                                    requested_completion=completion.completion,
+                                    tool_result_status=completion.tool_result_status,
+                                    continuation_created=False,
+                                )
+                                self.last_response_id = completed_response_id
+                                self.last_usage = accumulated_usage
+                                self.last_completed_ms = (
+                                    monotonic() - trigger_started
+                                ) * 1000
+                                return
+                            continuation_created = (
+                                await self._request_canvas_tool_continuation(
+                                    turn_id=turn_id,
+                                    call_id=completed_call_id,
+                                    completion=completion,
+                                    presentation_control=False,
+                                )
+                            )
+                            _log_response_diagnostic(
+                                "openai_realtime_canvas_disposition_resolved",
+                                response_id=completed_response_id,
+                                response_owner_turn_id=turn_id,
+                                consumer_turn_id=turn_id,
+                                consumer_phase="canvasToolResult",
+                                active_turn_id=self._active_turn_id,
+                                active_response_id=self._active_response_id,
+                                call_id=completed_call_id,
+                                tool_kind=completed_name,
+                                requested_completion=completion.completion,
+                                tool_result_status=completion.tool_result_status,
+                                continuation_created=continuation_created,
+                            )
+                            if not continuation_created:
+                                return
                         elif completed_name in _CANVAS_CONTROL_TOOL_NAMES:
                             self._pending_canvas_control_call_id = completed_call_id
                             canvas_called = True
                             tool_steps_used += 1
+                            presentation_completion = _explicit_canvas_completion(
+                                completed_arguments
+                            )
                             try:
                                 presentation_request = (
                                     ManageCanvasPresentationRequest.model_validate_json(
@@ -3695,11 +4017,17 @@ class _OpenAIRealtimeEventChannel:
                                         "ava_context": {
                                             "callId": completed_call_id,
                                             "issueCount": error.error_count(),
+                                            "argumentShape": _content_free_presentation_argument_shape(
+                                                completed_arguments
+                                            ),
                                             "issues": _content_free_validation_issues(
                                                 error
                                             ),
                                         }
                                     },
+                                )
+                                self._pending_canvas_control_completion = (
+                                    presentation_completion
                                 )
                                 yield RealtimeRejectedManageCanvasPresentationToolCall(
                                     call_id=completed_call_id,
@@ -3710,6 +4038,12 @@ class _OpenAIRealtimeEventChannel:
                                     provider_response_id=completed_response_id,
                                 )
                             else:
+                                presentation_completion = CanvasActionCompletion(
+                                    presentation_request.completion
+                                )
+                                self._pending_canvas_control_completion = (
+                                    presentation_completion
+                                )
                                 yield RealtimeManageCanvasPresentationToolCall(
                                     call_id=completed_call_id,
                                     request=presentation_request,
@@ -3722,9 +4056,64 @@ class _OpenAIRealtimeEventChannel:
                                 raise OpenAIRealtimeProtocolError(
                                     "Ava did not return the canvas presentation function output"
                                 )
+                            completion = self._completed_canvas_control_tools.pop(
+                                completed_call_id
+                            )
                             self._completed_canvas_control_call_ids.discard(
                                 completed_call_id
                             )
+                            if completion.turn_id != turn_id:
+                                raise OpenAIRealtimeProtocolError(
+                                    "canvas presentation completion changed Ava turn ownership"
+                                )
+                            if (
+                                completion.completion
+                                != CanvasActionCompletion.NEEDS_RESULT_REASONING
+                            ):
+                                _log_response_diagnostic(
+                                    "openai_realtime_canvas_disposition_resolved",
+                                    response_id=completed_response_id,
+                                    response_owner_turn_id=turn_id,
+                                    consumer_turn_id=turn_id,
+                                    consumer_phase="canvasToolResult",
+                                    active_turn_id=self._active_turn_id,
+                                    active_response_id=self._active_response_id,
+                                    call_id=completed_call_id,
+                                    tool_kind=completed_name,
+                                    requested_completion=completion.completion,
+                                    tool_result_status=completion.tool_result_status,
+                                    continuation_created=False,
+                                )
+                                self.last_response_id = completed_response_id
+                                self.last_usage = accumulated_usage
+                                self.last_completed_ms = (
+                                    monotonic() - trigger_started
+                                ) * 1000
+                                return
+                            continuation_created = (
+                                await self._request_canvas_tool_continuation(
+                                    turn_id=turn_id,
+                                    call_id=completed_call_id,
+                                    completion=completion,
+                                    presentation_control=True,
+                                )
+                            )
+                            _log_response_diagnostic(
+                                "openai_realtime_canvas_disposition_resolved",
+                                response_id=completed_response_id,
+                                response_owner_turn_id=turn_id,
+                                consumer_turn_id=turn_id,
+                                consumer_phase="canvasToolResult",
+                                active_turn_id=self._active_turn_id,
+                                active_response_id=self._active_response_id,
+                                call_id=completed_call_id,
+                                tool_kind=completed_name,
+                                requested_completion=completion.completion,
+                                tool_result_status=completion.tool_result_status,
+                                continuation_created=continuation_created,
+                            )
+                            if not continuation_created:
+                                return
                         else:
                             utility_kind = RealtimeUtilityToolKind(completed_name)
                             repeated_or_cross_utility = utility_called
@@ -4094,6 +4483,386 @@ class _OpenAIRealtimeEventChannel:
         )
         return True
 
+    async def capture_semantic_memory(
+        self,
+        *,
+        evidence: SemanticCaptureEvidence,
+    ) -> SemanticCaptureFunctionArguments:
+        if self._closed:
+            raise OpenAIRealtimeUnavailableError(
+                "cannot perform semantic capture on a closed OpenAI Realtime channel"
+            )
+        async with self._capture_lock:
+            if self._closed:
+                raise OpenAIRealtimeUnavailableError(
+                    "cannot perform semantic capture on a closed OpenAI Realtime channel"
+                )
+            await self.start_receiver()
+            capture_turn_id = f"capture_{evidence.source_turn_id}"
+            tpm, rpm = self._resource_rate_limit_windows()
+            decision = self._resource_governor.admit(
+                turn_id=capture_turn_id,
+                output_token_limits=(_SEMANTIC_CAPTURE_MAX_OUTPUT_TOKENS,),
+                tpm=tpm,
+                rpm=rpm,
+            )
+            while decision.action is ResourceAdmissionAction.DEFER:
+                await self._resource_capacity_changed.wait()
+                self._resource_capacity_changed.clear()
+                tpm, rpm = self._resource_rate_limit_windows()
+                decision = self._resource_governor.admit(
+                    turn_id=capture_turn_id,
+                    output_token_limits=(_SEMANTIC_CAPTURE_MAX_OUTPUT_TOKENS,),
+                    tpm=tpm,
+                    rpm=rpm,
+                )
+
+            instructions = build_semantic_capture_instructions(evidence)
+            capture_tool = build_semantic_capture_tool()
+            client_event_id = _new_response_create_event_id()
+            capture_queue: asyncio.Queue[dict[str, object] | object] = asyncio.Queue(
+                maxsize=self._max_events_per_turn
+            )
+            registration = _RegisteredSemanticCapture(
+                source_turn_id=evidence.source_turn_id,
+                client_event_id=client_event_id,
+                capture_turn_id=capture_turn_id,
+                queue=capture_queue,
+            )
+            self._active_semantic_capture = registration
+
+            payload = {
+                "type": "response.create",
+                "event_id": client_event_id,
+                "response": {
+                    "conversation": "none",
+                    "input": [],
+                    "output_modalities": ["text"],
+                    "instructions": instructions,
+                    "tools": [capture_tool],
+                    "tool_choice": {
+                        "type": "function",
+                        "name": RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME,
+                    },
+                    "max_output_tokens": _SEMANTIC_CAPTURE_MAX_OUTPUT_TOKENS,
+                    "metadata": {
+                        "source_turn_id": evidence.source_turn_id,
+                        "purpose": "semantic_capture",
+                    },
+                },
+            }
+            try:
+                await self._send_json(payload)
+            except BaseException:
+                if self._active_semantic_capture is registration:
+                    self._active_semantic_capture = None
+                self._resource_governor.release_turn(turn_id=capture_turn_id)
+                raise
+
+            captured_response_id: str | None = None
+            function_call_name: str | None = None
+            function_call_arguments_chunks: list[str] = []
+            call_count = 0
+            observed_unexpected_private_text = False
+            semantic_validation_error: (
+                OpenAIRealtimeProtocolError
+                | RealtimeProviderResponseIncompleteError
+                | None
+            ) = None
+            terminal_observed = False
+            try:
+                while True:
+                    try:
+                        if self._turn_timeout_seconds is None:
+                            value = await capture_queue.get()
+                        else:
+                            async with asyncio.timeout(self._turn_timeout_seconds):
+                                value = await capture_queue.get()
+                    except TimeoutError as error:
+                        raise _OpenAIRealtimeReceiveTimeout(
+                            "OpenAI Realtime semantic capture event receive timed out"
+                        ) from error
+
+                    if value is self._receiver_terminal:
+                        if self._receiver_error is not None:
+                            raise self._receiver_error
+                        raise OpenAIRealtimeUnavailableError(
+                            "OpenAI Realtime sideband receiver stopped unexpectedly"
+                        )
+                    if not isinstance(value, dict):
+                        raise OpenAIRealtimeProtocolError(
+                            "OpenAI Realtime router produced an invalid provider event"
+                        )
+                    event = value
+                    event_type = _event_type(event)
+                    if event_type == "error":
+                        terminal_observed = True
+                        registration.terminal_observed = True
+                        raise _provider_error(event)
+                    resp_id = _response_id_from_event(event)
+
+                    if captured_response_id is None:
+                        if event_type == "response.created":
+                            resp_obj = event.get("response")
+                            metadata = (
+                                resp_obj.get("metadata")
+                                if isinstance(resp_obj, dict)
+                                else None
+                            )
+                            if (
+                                isinstance(metadata, dict)
+                                and metadata.get("purpose") == "semantic_capture"
+                                and metadata.get("source_turn_id")
+                                == evidence.source_turn_id
+                            ):
+                                captured_response_id = resp_id
+                                if captured_response_id is not None:
+                                    self._resource_governor.bind_provider_response(
+                                        turn_id=capture_turn_id,
+                                        provider_response_id=captured_response_id,
+                                    )
+                                    self._response_owner_by_id[captured_response_id] = (
+                                        capture_turn_id
+                                    )
+                                continue
+                        continue
+
+                    if resp_id != captured_response_id:
+                        continue
+
+                    if event_type == "response.output_item.added":
+                        item = event.get("item")
+                        if isinstance(item, dict):
+                            item_type = item.get("type")
+                            if item_type == "function_call":
+                                call_count += 1
+                                if call_count > 1 and semantic_validation_error is None:
+                                    semantic_validation_error = OpenAIRealtimeProtocolError(
+                                        "semantic capture emitted multiple function calls"
+                                    )
+                                name = cast(str, item.get("name"))
+                                function_call_name = name
+                                if (
+                                    name != RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME
+                                    and semantic_validation_error is None
+                                ):
+                                    semantic_validation_error = OpenAIRealtimeProtocolError(
+                                        f"semantic capture called unexpected tool {name!r}"
+                                    )
+                            elif item_type == "message":
+                                observed_unexpected_private_text = True
+                            else:
+                                if semantic_validation_error is None:
+                                    semantic_validation_error = OpenAIRealtimeProtocolError(
+                                        f"semantic capture emitted unexpected item type {item_type!r}"
+                                    )
+                    elif event_type == "response.output_text.delta":
+                        observed_unexpected_private_text = True
+                    elif event_type == "response.output_text.done":
+                        observed_unexpected_private_text = True
+                    elif event_type == "response.function_call_arguments.delta":
+                        delta = event.get("delta")
+                        if isinstance(delta, str) and call_count == 1:
+                            function_call_arguments_chunks.append(delta)
+                    elif event_type == "response.function_call_arguments.done":
+                        args_done = event.get("arguments")
+                        if (
+                            isinstance(args_done, str)
+                            and not function_call_arguments_chunks
+                            and call_count == 1
+                        ):
+                            function_call_arguments_chunks.append(args_done)
+                    elif event_type == "response.output_item.done":
+                        item = event.get("item")
+                        if (
+                            isinstance(item, dict)
+                            and item.get("type") == "function_call"
+                            and call_count == 1
+                        ):
+                            args = item.get("arguments")
+                            if (
+                                isinstance(args, str)
+                                and not function_call_arguments_chunks
+                            ):
+                                function_call_arguments_chunks.append(args)
+                    elif event_type == "response.done":
+                        terminal_observed = True
+                        registration.terminal_observed = True
+                        resp_obj = event.get("response")
+                        status = (
+                            resp_obj.get("status")
+                            if isinstance(resp_obj, dict)
+                            else None
+                        )
+                        usage = _parse_optional_usage(event)
+                        if usage is not None:
+                            self._resource_governor.observe_actual_usage(
+                                turn_id=capture_turn_id,
+                                input_tokens=usage.input_tokens,
+                                output_tokens=usage.output_tokens,
+                            )
+                        if captured_response_id is not None:
+                            self._consumed_terminal_response_owner_by_id[
+                                captured_response_id
+                            ] = capture_turn_id
+                        if status != "completed" and semantic_validation_error is None:
+                            status_details = (
+                                resp_obj.get("status_details")
+                                if isinstance(resp_obj, dict)
+                                else None
+                            )
+                            status_reason: str | None = None
+                            if isinstance(status_details, dict):
+                                raw_reason = status_details.get(
+                                    "reason"
+                                ) or status_details.get("type")
+                                if isinstance(raw_reason, str):
+                                    clean_reason = re.sub(
+                                        r"[^A-Za-z0-9_-]", "", raw_reason
+                                    )[:64]
+                                    if clean_reason:
+                                        status_reason = clean_reason
+                            detail_suffix = (
+                                f", reason={status_reason!r}" if status_reason else ""
+                            )
+                            if status == "incomplete":
+                                semantic_validation_error = (
+                                    RealtimeProviderResponseIncompleteError(
+                                        reason=status_reason or "incomplete"
+                                    )
+                                )
+                            else:
+                                semantic_validation_error = OpenAIRealtimeProtocolError(
+                                    f"semantic capture response was not completed (status={status!r}{detail_suffix})"
+                                )
+                        break
+            finally:
+                if registration.terminal_observed:
+                    self._resource_governor.release_turn(turn_id=capture_turn_id)
+                    if registration.response_id is not None:
+                        self._capture_response_id_to_registration.pop(
+                            registration.response_id, None
+                        )
+                    self._quarantined_capture_by_source_turn_id.pop(
+                        evidence.source_turn_id, None
+                    )
+                    self._quarantined_capture_by_client_event_id.pop(
+                        client_event_id, None
+                    )
+                else:
+                    registration.abandoned = True
+                    if registration.response_id is None:
+                        self._quarantined_capture_by_source_turn_id[
+                            evidence.source_turn_id
+                        ] = registration
+                        self._quarantined_capture_by_client_event_id[
+                            client_event_id
+                        ] = registration
+                        _retain_latest(
+                            self._quarantined_capture_by_source_turn_id,
+                            maximum=_MAX_RESPONSE_LIFECYCLES,
+                        )
+                        _retain_latest(
+                            self._quarantined_capture_by_client_event_id,
+                            maximum=_MAX_RESPONSE_LIFECYCLES,
+                        )
+
+                if self._active_semantic_capture is registration:
+                    self._active_semantic_capture = None
+
+            if semantic_validation_error is not None:
+                raise semantic_validation_error
+
+            if (
+                call_count != 1
+                or function_call_name != RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME
+            ):
+                raise OpenAIRealtimeProtocolError(
+                    "semantic capture response did not invoke record_semantic_turn_capture"
+                )
+            arguments_str = "".join(function_call_arguments_chunks)
+            try:
+                parsed_args = json.loads(arguments_str)
+            except Exception as error:
+                raise OpenAIRealtimeProtocolError(
+                    f"semantic capture returned invalid JSON arguments: {error}"
+                ) from error
+            try:
+                return SemanticCaptureFunctionArguments.model_validate(parsed_args)
+            except Exception as error:
+                raise OpenAIRealtimeProtocolError(
+                    f"semantic capture arguments failed validation: {error}"
+                ) from error
+
+
+def _remove_capture_schema_titles(value: object) -> None:
+    if isinstance(value, dict):
+        value.pop("title", None)
+        for nested in value.values():
+            _remove_capture_schema_titles(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            _remove_capture_schema_titles(nested)
+
+
+def build_semantic_capture_tool() -> dict[str, Any]:
+    parameters = SemanticCaptureFunctionArguments.model_json_schema(
+        by_alias=True,
+        ref_template="#/$defs/{model}",
+    )
+    _remove_capture_schema_titles(parameters)
+    return {
+        "type": "function",
+        "name": RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME,
+        "description": (
+            "Record semantic capture decision for the settled turn. "
+            "Emit disposition 'noChange' if working DialogueFrame and durable SemanticJournal are unchanged, "
+            "or 'changed' with full replacement dialogueFrame and/or journalEvents drafts."
+        ),
+        "parameters": parameters,
+    }
+
+
+def build_semantic_capture_instructions(evidence: SemanticCaptureEvidence) -> str:
+    frame_json = json.dumps(
+        evidence.current_frame.model_dump(mode="json", by_alias=True),
+        ensure_ascii=False,
+    )
+    lines = [
+        "You are Ava's post-delivery semantic capture evaluator.",
+        "Your task is to analyze the settled conversation turn and determine if Ava's working DialogueFrame or durable SemanticJournal should be updated.",
+        "You must call the tool `record_semantic_turn_capture` with your decision.",
+        "",
+        "## Current State",
+        f"- Working DialogueFrame: {frame_json}",
+        "",
+        "## Turn Evidence",
+        f"- Source Turn ID: {evidence.source_turn_id}",
+        f"- Child Utterance: {json.dumps(evidence.child_utterance, ensure_ascii=False) if evidence.child_utterance is not None else 'None (no speech)'}",
+        f"- Spoken Response (Delivered Prefix): {json.dumps(evidence.spoken_response_prefix, ensure_ascii=False) if evidence.spoken_response_prefix is not None else 'None'}",
+        f"- Interrupted: {'Yes' if evidence.interrupted else 'No'}",
+    ]
+    if evidence.settled_tool_outcomes:
+        lines.append("- Tool Outcomes:")
+        for outcome in evidence.settled_tool_outcomes:
+            detail_str = f" ({outcome.detail})" if outcome.detail else ""
+            lines.append(
+                f"  * {outcome.tool_name} [call_id={outcome.call_id}]: {outcome.outcome}{detail_str}"
+            )
+    else:
+        lines.append("- Tool Outcomes: None")
+    lines.extend(
+        [
+            "",
+            "## Rules",
+            "1. If the turn contains no meaningful dialogue progression, new user facts, new preferences, or commitments, emit disposition 'noChange' and omit dialogueFrame and journalEvents.",
+            "2. If dialogue state progressed (new topic, new goal, answered question, unresolved entities changed), provide the complete replacement working dialogueFrame. All DialogueFrame collections must be ordered highest-current-relevance first. DialogueFrame text items must be concise and within the existing 160-character bound.",
+            "3. If durable user preferences, facts, commitments, or canvas references emerged, provide 1 to 4 journalEvents drafts.",
+            "4. If both frame and journal changed, include both. If neither changed, emit 'noChange'.",
+        ]
+    )
+    return "\n".join(lines)
+
 
 class OpenAIRealtimeProviderSession:
     """Production WebRTC negotiation and server-side sideband implementation."""
@@ -4121,9 +4890,6 @@ class OpenAIRealtimeProviderSession:
         ),
         rate_limit_max_recovery_attempts: int = (
             DEFAULT_OPENAI_REALTIME_RATE_LIMIT_MAX_RECOVERY_ATTEMPTS
-        ),
-        rate_limit_max_recovery_seconds: float = (
-            DEFAULT_OPENAI_REALTIME_RATE_LIMIT_MAX_RECOVERY_SECONDS
         ),
         rate_limit_fallback_wait_seconds: float = (
             DEFAULT_OPENAI_REALTIME_RATE_LIMIT_FALLBACK_WAIT_SECONDS
@@ -4171,7 +4937,6 @@ class OpenAIRealtimeProviderSession:
             truncation_retention_ratio
         )
         self._rate_limit_max_recovery_attempts = rate_limit_max_recovery_attempts
-        self._rate_limit_max_recovery_seconds = rate_limit_max_recovery_seconds
         self._rate_limit_fallback_wait_seconds = rate_limit_fallback_wait_seconds
         self._api_origin = _validated_origin(api_origin, scheme="https")
         self._realtime_websocket_url = _validated_websocket_url(realtime_websocket_url)
@@ -4320,7 +5085,6 @@ class OpenAIRealtimeProviderSession:
                 rate_limit_max_recovery_attempts=(
                     self._rate_limit_max_recovery_attempts
                 ),
-                rate_limit_max_recovery_seconds=(self._rate_limit_max_recovery_seconds),
                 rate_limit_fallback_wait_seconds=(
                     self._rate_limit_fallback_wait_seconds
                 ),
@@ -4451,9 +5215,7 @@ class OpenAIRealtimeProviderSession:
         turn_id: str,
         call_id: str,
         output: (
-            InteractiveCanvasToolOutput
-            | InteractiveCanvasToolOutputV4
-            | InteractiveCanvasCancellationToolOutputV4
+            InteractiveCanvasToolOutputV4 | InteractiveCanvasCancellationToolOutputV4
         ),
     ) -> None:
         await self._require_channel().complete_canvas_tool(
@@ -4548,6 +5310,13 @@ class OpenAIRealtimeProviderSession:
             # There is no provider response to cancel in that lifecycle state.
             return
         await channel.cancel(turn_id=turn_id)
+
+    async def capture_semantic_memory(
+        self,
+        *,
+        evidence: SemanticCaptureEvidence,
+    ) -> SemanticCaptureFunctionArguments:
+        return await self._require_channel().capture_semantic_memory(evidence=evidence)
 
     async def close(self) -> None:
         if self._closed:
@@ -4786,7 +5555,7 @@ class OpenAIRealtimeLiveProbe:
                 await channel.complete_canvas_tool(
                     turn_id=request.turn_id,
                     call_id=event.call_id,
-                    output=InteractiveCanvasToolOutput.model_validate(
+                    output=InteractiveCanvasToolOutputV4.model_validate(
                         {
                             "status": "rejected",
                             "reason": (
@@ -4822,7 +5591,7 @@ class OpenAIRealtimeLiveProbe:
                 await channel.complete_canvas_tool(
                     turn_id=request.turn_id,
                     call_id=event.call_id,
-                    output=InteractiveCanvasToolOutput.model_validate(
+                    output=InteractiveCanvasToolOutputV4.model_validate(
                         {
                             "status": "rejected",
                             "reason": event.reason,
@@ -4918,6 +5687,52 @@ def _content_free_validation_issues(
             }
         )
     return issues
+
+
+def _content_free_presentation_argument_shape(
+    serialized_arguments: str,
+) -> dict[str, str | bool | None]:
+    """Describe presentation argument structure without retaining model text."""
+
+    try:
+        arguments = json.loads(serialized_arguments)
+    except (json.JSONDecodeError, TypeError):
+        return {
+            "rootShape": "malformedJson",
+            "action": None,
+            "hasPosition": False,
+            "hasTitle": False,
+            "hasCompletion": False,
+        }
+    if not isinstance(arguments, dict):
+        return {
+            "rootShape": "nonObject",
+            "action": None,
+            "hasPosition": False,
+            "hasTitle": False,
+            "hasCompletion": False,
+        }
+
+    action = arguments.get("action")
+    return {
+        "rootShape": "object",
+        "action": action
+        if action
+        in {
+            "hide",
+            "showCurrent",
+            "showNext",
+            "showPrevious",
+            "showFirst",
+            "showLast",
+            "showPosition",
+            "showTitle",
+        }
+        else None,
+        "hasPosition": arguments.get("position") is not None,
+        "hasTitle": arguments.get("title") is not None,
+        "hasCompletion": arguments.get("completion") is not None,
+    }
 
 
 def _session_update(
@@ -5227,6 +6042,24 @@ def _utf8_token_upper_bound(serialized_input: str) -> int:
     return len(serialized_input.encode("utf-8"))
 
 
+def _explicit_canvas_completion(
+    serialized_arguments: str,
+) -> CanvasActionCompletion | None:
+    try:
+        arguments = json.loads(serialized_arguments)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    value = arguments.get("completion")
+    if not isinstance(value, str):
+        return None
+    try:
+        return CanvasActionCompletion(value)
+    except ValueError:
+        return None
+
+
 def _provider_error(event: Mapping[str, object]) -> OpenAIRealtimeProviderError:
     error = _optional_mapping(event.get("error"))
     code = error.get("code") if isinstance(error.get("code"), str) else "unknown"
@@ -5249,7 +6082,10 @@ def _provider_error_code(event: Mapping[str, object]) -> str:
 def _provider_error_event_id(event: Mapping[str, object]) -> str | None:
     error = _optional_mapping(event.get("error"))
     event_id = error.get("event_id")
-    return event_id if isinstance(event_id, str) and event_id else None
+    if isinstance(event_id, str) and event_id:
+        return event_id
+    top_event_id = event.get("event_id")
+    return top_event_id if isinstance(top_event_id, str) and top_event_id else None
 
 
 def _top_level_rate_limit_kind(event: Mapping[str, object]) -> str | None:
@@ -5542,6 +6378,10 @@ def _log_response_diagnostic(
     provider_call_id: str | None = None,
     active_context_build_id: str | None = None,
     status: str | None = None,
+    tool_kind: str | None = None,
+    requested_completion: CanvasActionCompletion | None = None,
+    tool_result_status: str | None = None,
+    continuation_created: bool | None = None,
 ) -> None:
     if event is not None:
         event_type = event_type or _event_type(event)
@@ -5566,6 +6406,16 @@ def _log_response_diagnostic(
         context["activeContextBuildId"] = active_context_build_id
     if status is not None:
         context["status"] = status
+    if tool_kind is not None:
+        context["toolKind"] = tool_kind
+    if requested_completion is not None:
+        context["requestedCompletion"] = requested_completion.value
+    elif tool_kind is not None:
+        context["requestedCompletion"] = None
+    if tool_result_status is not None:
+        context["toolResultStatus"] = tool_result_status
+    if continuation_created is not None:
+        context["continuationCreated"] = continuation_created
     LOGGER.log(
         level,
         "%s sideband_sequence=%s event_type=%s response_id=%s "

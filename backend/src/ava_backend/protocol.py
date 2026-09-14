@@ -171,28 +171,6 @@ class AvaResponse(ProtocolModel):
     diagram: DiagramSpec | None
 
 
-class ProtocolV1Lesson(AvaResponse):
-    """Compatibility shape consumed by the current Flutter client."""
-
-    domain: Literal[LearningDomain.GENERAL] = LearningDomain.GENERAL
-
-
-class LessonTurnResponse(ProtocolModel):
-    protocol_version: Literal[1] = 1
-    lesson: ProtocolV1Lesson
-
-
-def adapt_ava_response_to_protocol_v1(response: AvaResponse) -> LessonTurnResponse:
-    """Revalidate model output before adapting it to the existing wire contract.
-
-    Protocol v1 requires ``domain``, but ordinary conversation is not learning
-    evidence. Until progress has its own explicit signal, the adapter must not
-    infer a curriculum domain from generated text.
-    """
-
-    lesson = ProtocolV1Lesson.model_validate(response.model_dump())
-    return LessonTurnResponse(lesson=lesson)
-
 
 class AvaDelivery(StrEnum):
     """How a segment should feel, without prescribing animation mechanics."""

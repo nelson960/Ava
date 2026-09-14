@@ -133,147 +133,153 @@ final class AvaSvgCanvasPanel extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 2),
-          Expanded(
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                IgnorePointer(
-                  ignoring: !interactionsEnabled || isMaskActive,
-                  child: AvaSvgCanvasView(
-                    activeDocument: active,
-                    draft: draft,
-                    candidate: candidate,
-                    foregroundCandidate: mayFocus,
-                    onCandidateRetained: () => liveController()?.retainPreparedCandidate(),
-                    presentCandidate:
-                        liveController()?.shouldPresentCandidate ?? false,
-                    interactionsEnabled: interactionsEnabled,
-                    onDraftPresented: (presentedDraft) {
-                      final ownedController = liveController();
-                      if (ownedController?.draft?.document == presentedDraft) {
-                        ownedController!.draftPresented(presentedDraft);
-                      }
-                    },
-                    onCandidatePrepared: (preparedDocument) {
-                      final ownedController = liveController();
-                      final state = ownedController?.candidate;
-                      if (identical(state?.document, preparedDocument) &&
-                          state?.phase ==
-                              AvaSvgCanvasCandidatePhase.rendererPreparing) {
-                        ownedController!.rendererPrepared();
-                      }
-                    },
-                    onCandidateFirstFramePresented: (presentedDocument) {
-                      final ownedController = liveController();
-                      final state = ownedController?.candidate;
-                      if (identical(state?.document, presentedDocument) &&
-                          state?.phase ==
-                              AvaSvgCanvasCandidatePhase.presentationRequested) {
-                        ownedController!.firstFramePresented();
-                      }
-                    },
-                    onBinding: (binding) {
-                      final ownedController = liveController();
-                      if (interactionsEnabled && ownedController != null) {
-                        ownedController.reportBinding(binding);
-                      }
-                    },
-                    onError: (message, {generationId}) {
-                      final ownedController = liveController();
-                      if (ownedController == null) return;
-                      final targetGenerationId = generationId ??
-                          ownedController.candidate?.descriptor.generationId ??
-                          ownedController.draft?.document.descriptor.generationId ??
-                          ownedController.active?.document.descriptor.generationId;
-                      unawaited(
-                        ownedController.rendererFailed(
-                          message,
-                          generationId: targetGenerationId,
-                        ),
-                      );
-                    },
-                  ),
+              Expanded(
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    IgnorePointer(
+                      ignoring: !interactionsEnabled || isMaskActive,
+                      child: AvaSvgCanvasView(
+                        activeDocument: active,
+                        draft: draft,
+                        candidate: candidate,
+                        foregroundCandidate: mayFocus,
+                        onCandidateRetained: () =>
+                            liveController()?.retainPreparedCandidate(),
+                        presentCandidate:
+                            liveController()?.shouldPresentCandidate ?? false,
+                        interactionsEnabled: interactionsEnabled,
+                        onDraftPresented: (presentedDraft) {
+                          final ownedController = liveController();
+                          if (ownedController?.draft?.document ==
+                              presentedDraft) {
+                            ownedController!.draftPresented(presentedDraft);
+                          }
+                        },
+                        onCandidatePrepared: (preparedDocument) {
+                          final ownedController = liveController();
+                          final state = ownedController?.candidate;
+                          if (identical(state?.document, preparedDocument) &&
+                              state?.phase ==
+                                  AvaSvgCanvasCandidatePhase
+                                      .rendererPreparing) {
+                            ownedController!.rendererPrepared();
+                          }
+                        },
+                        onCandidateFirstFramePresented: (presentedDocument) {
+                          final ownedController = liveController();
+                          final state = ownedController?.candidate;
+                          if (identical(state?.document, presentedDocument) &&
+                              state?.phase ==
+                                  AvaSvgCanvasCandidatePhase
+                                      .presentationRequested) {
+                            ownedController!.firstFramePresented();
+                          }
+                        },
+                        onBinding: (binding) {
+                          final ownedController = liveController();
+                          if (interactionsEnabled && ownedController != null) {
+                            ownedController.reportBinding(binding);
+                          }
+                        },
+                        onError: (message, {generationId}) {
+                          final ownedController = liveController();
+                          if (ownedController == null) return;
+                          final targetGenerationId = generationId ??
+                              ownedController
+                                  .candidate?.descriptor.generationId ??
+                              ownedController
+                                  .draft?.document.descriptor.generationId ??
+                              ownedController
+                                  .active?.document.descriptor.generationId;
+                          unawaited(
+                            ownedController.rendererFailed(
+                              message,
+                              generationId: targetGenerationId,
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                    if (isMaskActive)
+                      const Positioned.fill(
+                        child: _TransientCanvasSurface(),
+                      ),
+                  ],
                 ),
-                if (isMaskActive)
-                  const Positioned.fill(
-                    child: _TransientCanvasSurface(),
-                  ),
-              ],
+              ),
+            ],
+          ),
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            height: 44,
+            child: SafeArea(
+              top: false,
+              bottom: false,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 6),
+                child: Row(
+                  children: [
+                    AvaCanvasNavbarButton(
+                      tooltip: 'Previous drawing',
+                      semanticsLabel: 'Previous drawing',
+                      onPressed: host.sceneCount > 0
+                          ? host.requestPreviousScene
+                          : null,
+                      icon: const Icon(CupertinoIcons.chevron_left, size: 18),
+                      color: AvaColors.ink.withValues(
+                        alpha: host.sceneCount > 0 ? 0.72 : 0.28,
+                      ),
+                    ),
+                    const Spacer(),
+                    AvaCanvasNavbarButton(
+                      tooltip: 'Next drawing',
+                      semanticsLabel: 'Next drawing',
+                      onPressed:
+                          host.sceneCount > 0 ? host.requestNextScene : null,
+                      icon: const Icon(CupertinoIcons.chevron_right, size: 18),
+                      color: AvaColors.ink.withValues(
+                        alpha: host.sceneCount > 0 ? 0.72 : 0.28,
+                      ),
+                    ),
+                    AvaCanvasNavbarButton(
+                      tooltip: 'Save drawing',
+                      semanticsLabel: 'Save drawing',
+                      onPressed: canSave
+                          ? () {
+                              developer.log('canvas_save_requested',
+                                  name: 'ava.canvas.save');
+                              unawaited(saveService.saveSvg(document: active));
+                            }
+                          : null,
+                      icon: const Icon(
+                        CupertinoIcons.arrow_down_doc,
+                        size: 18,
+                      ),
+                      color: AvaColors.ink.withValues(
+                        alpha: canSave ? 0.72 : 0.28,
+                      ),
+                    ),
+                    AvaCanvasNavbarButton(
+                      tooltip: 'Close drawing',
+                      semanticsLabel: 'Close drawing',
+                      onPressed: host.dismissPanel,
+                      icon: const Icon(
+                        CupertinoIcons.xmark_circle_fill,
+                        size: 18,
+                      ),
+                      color: AvaColors.ink.withValues(alpha: 0.72),
+                    ),
+                  ],
+                ),
+              ),
             ),
           ),
         ],
       ),
-      Positioned(
-        top: 0,
-        left: 0,
-        right: 0,
-        height: 44,
-        child: SafeArea(
-          top: false,
-          bottom: false,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 6),
-            child: Row(
-              children: [
-                AvaCanvasNavbarButton(
-                  tooltip: 'Previous drawing',
-                  semanticsLabel: 'Previous drawing',
-                  onPressed: host.canSelectPrevious
-                      ? () => unawaited(host.selectPreviousScene())
-                      : null,
-                  icon: const Icon(CupertinoIcons.chevron_left, size: 18),
-                  color: AvaColors.ink.withValues(
-                    alpha: host.canSelectPrevious ? 0.72 : 0.28,
-                  ),
-                ),
-                const Spacer(),
-                AvaCanvasNavbarButton(
-                  tooltip: 'Next drawing',
-                  semanticsLabel: 'Next drawing',
-                  onPressed: host.canSelectNext
-                      ? () => unawaited(host.selectNextScene())
-                      : null,
-                  icon: const Icon(CupertinoIcons.chevron_right, size: 18),
-                  color: AvaColors.ink.withValues(
-                    alpha: host.canSelectNext ? 0.72 : 0.28,
-                  ),
-                ),
-                AvaCanvasNavbarButton(
-                  tooltip: 'Save drawing',
-                  semanticsLabel: 'Save drawing',
-                  onPressed: canSave
-                      ? () {
-                          developer.log('canvas_save_requested',
-                              name: 'ava.canvas.save');
-                          unawaited(saveService.saveSvg(document: active));
-                        }
-                      : null,
-                  icon: const Icon(
-                    CupertinoIcons.arrow_down_doc,
-                    size: 18,
-                  ),
-                  color: AvaColors.ink.withValues(
-                    alpha: canSave ? 0.72 : 0.28,
-                  ),
-                ),
-                AvaCanvasNavbarButton(
-                  tooltip: 'Close drawing',
-                  semanticsLabel: 'Close drawing',
-                  onPressed: host.dismissPanel,
-                  icon: const Icon(
-                    CupertinoIcons.xmark_circle_fill,
-                    size: 18,
-                  ),
-                  color: AvaColors.ink.withValues(alpha: 0.72),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    ],
-  ),
-);
+    );
   }
 }
 
@@ -389,52 +395,53 @@ class _AvaCanvasNavbarButtonState extends State<AvaCanvasNavbarButton> {
             onExit: enabled ? (_) => setState(() => _isHovered = false) : null,
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
-            onTapDown:
-                enabled ? (_) => setState(() => _isPressed = true) : null,
-            onTapUp:
-                enabled ? (_) => setState(() => _isPressed = false) : null,
-            onTapCancel:
-                enabled ? () => setState(() => _isPressed = false) : null,
-            onTap: widget.onPressed,
-            child: ConstrainedBox(
-              constraints: widget.constraints ??
-                  const BoxConstraints(minWidth: 44, minHeight: 44),
-              child: SizedBox(
-                width: 44,
-                height: 44,
-                child: Stack(
-                  alignment: Alignment.topCenter,
-                  children: [
-                    Positioned(
-                      top: topOffset,
-                      left: leftOffset,
-                      width: widget.visualSize,
-                      height: widget.visualSize,
-                      child: AnimatedContainer(
-                        key: ValueKey('navbar_button_visual_${widget.tooltip}'),
-                        duration: const Duration(milliseconds: 100),
-                        decoration: ShapeDecoration(
-                          shape: const CircleBorder(),
-                          color: overlayColor,
-                        ),
-                        alignment: Alignment.center,
-                        child: IconTheme(
-                          data: IconThemeData(
-                            color: effectiveColor,
-                            size: 18,
+              onTapDown:
+                  enabled ? (_) => setState(() => _isPressed = true) : null,
+              onTapUp:
+                  enabled ? (_) => setState(() => _isPressed = false) : null,
+              onTapCancel:
+                  enabled ? () => setState(() => _isPressed = false) : null,
+              onTap: widget.onPressed,
+              child: ConstrainedBox(
+                constraints: widget.constraints ??
+                    const BoxConstraints(minWidth: 44, minHeight: 44),
+                child: SizedBox(
+                  width: 44,
+                  height: 44,
+                  child: Stack(
+                    alignment: Alignment.topCenter,
+                    children: [
+                      Positioned(
+                        top: topOffset,
+                        left: leftOffset,
+                        width: widget.visualSize,
+                        height: widget.visualSize,
+                        child: AnimatedContainer(
+                          key: ValueKey(
+                              'navbar_button_visual_${widget.tooltip}'),
+                          duration: const Duration(milliseconds: 100),
+                          decoration: ShapeDecoration(
+                            shape: const CircleBorder(),
+                            color: overlayColor,
                           ),
-                          child: widget.icon,
+                          alignment: Alignment.center,
+                          child: IconTheme(
+                            data: IconThemeData(
+                              color: effectiveColor,
+                              size: 18,
+                            ),
+                            child: widget.icon,
+                          ),
                         ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
             ),
           ),
         ),
       ),
-    ),
-  );
+    );
   }
 }

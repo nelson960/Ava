@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from hashlib import sha256
 from html import escape
 from math import ceil
 from zoneinfo import ZoneInfo
@@ -92,6 +93,7 @@ class MemoryReference(RealtimeProtocolModel):
 class AssembledRealtimeContext:
     build_id: str
     content: str
+    content_fingerprint: str
     final_utf8_bytes: int
     estimated_dynamic_tokens: int
     included_bootstrap_turns: int
@@ -147,7 +149,7 @@ class DynamicContextAssembler:
         validated_canvas = _validate_canvas_context(canvas_context)
         if validated_canvas is None:
             validated_canvas = (
-                '<canvas_context trust="untrusted_model_generated_data">'
+                '<canvas_context trust="backend_semantic_canvas_metadata">'
                 '<canvas_presentation trust="validated_current_state" visible="false"/>'
                 "</canvas_context>"
             )
@@ -213,9 +215,11 @@ class DynamicContextAssembler:
         if not isinstance(active_visual_present, bool):
             raise ValueError("active_visual_present must be a boolean")
 
+        content_bytes = content.encode("utf-8")
         return AssembledRealtimeContext(
             build_id=validated_build_id,
             content=content,
+            content_fingerprint=sha256(content_bytes).hexdigest(),
             final_utf8_bytes=serialized_utf8_bytes,
             estimated_dynamic_tokens=estimated_tokens,
             included_bootstrap_turns=len(retained_turns),
@@ -248,9 +252,8 @@ def _validate_canvas_context(value: str | None) -> str | None:
         return None
     if not isinstance(value, str) or len(value) > MAX_CANVAS_CONTEXT_CHARACTERS:
         raise ValueError("canvas_context is not bounded declared-trust context")
-    if not (
-        value.startswith('<active_canvas trust="validated_scene_data"')
-        or value.startswith('<canvas_context trust="untrusted_model_generated_data"')
+    if not value.startswith(
+        '<canvas_context trust="backend_semantic_canvas_metadata"'
     ):
         raise ValueError("canvas_context is not bounded declared-trust context")
     return value
@@ -383,9 +386,7 @@ def _serialize_dialogue_frame(frame: DialogueFrame) -> list[str]:
         lines.append("    <relevant_canvas_references>")
         for reference in frame.relevant_canvas_references:
             lines.append(
-                "      <canvas_reference "
-                f'scene_id="{escape(reference.scene_id, quote=True)}" '
-                f'scene_revision="{reference.scene_revision}">'
+                "      <canvas_reference>"
                 f"{escape(reference.relation, quote=False)}"
                 "</canvas_reference>"
             )

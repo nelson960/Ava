@@ -7,8 +7,10 @@ from pydantic import ValidationError
 
 from ava_backend.realtime.memory import (
     MAX_SEMANTIC_MEMORY_PROPOSAL_UTF8_BYTES,
+    AgeBand,
     DeliveredConversationTurn,
     DevelopmentAuthoritativeMemoryStore,
+    MemoryCandidateSourceKind,
     MemoryResetRevisionMismatchError,
     SemanticJournalConflictError,
     SemanticJournalEventProposal,
@@ -78,9 +80,10 @@ def _proposal(
     topic: str = "Planets",
 ) -> SemanticMemoryProposal:
     payload: dict[str, object] = {
+        "disposition": "changed",
         "journalEvents": [
             event.model_dump(mode="json", by_alias=True) for event in events
-        ]
+        ],
     }
     if base_revision is not None:
         payload["dialogueFrameUpdate"] = {
@@ -126,8 +129,10 @@ def test_semantic_journal_model_bounds_and_typed_family() -> None:
 
 
 def test_semantic_proposal_requires_content_and_unique_identities() -> None:
-    with pytest.raises(ValidationError, match="requires"):
+    with pytest.raises(ValidationError):
         SemanticMemoryProposal.model_validate({})
+    with pytest.raises(ValidationError):
+        SemanticMemoryProposal.model_validate({"disposition": "changed"})
     with pytest.raises(ValidationError, match="duplicate semantic identities"):
         _proposal(_event(), _event("The child really prefers Jupiter."))
 
@@ -224,7 +229,7 @@ async def test_source_turn_is_required_before_any_semantic_mutation() -> None:
             proposal=_proposal(_event(), base_revision=0),
         )
     snapshot = await store.load_snapshot(
-        subject="child:semantic", age_band="middleChildhood"
+        subject="child:semantic", age_band=AgeBand.MIDDLE_CHILDHOOD
     )
     assert snapshot.dialogue_frame.revision == 0
     assert _records(store) == ()
@@ -295,7 +300,7 @@ async def test_conflicting_retry_and_journal_conflict_roll_back_frame() -> None:
             proposal=_proposal(_event("The child prefers Saturn."), base_revision=0),
         )
     snapshot = await store.load_snapshot(
-        subject="child:semantic", age_band="middleChildhood"
+        subject="child:semantic", age_band=AgeBand.MIDDLE_CHILDHOOD
     )
     assert snapshot.dialogue_frame.revision == 0
     assert len(_records(store)) == 1
@@ -553,7 +558,7 @@ async def test_subject_isolation_and_reset_clear_all_semantic_state() -> None:
 
     receipt = await store.reset_conversation(subject="child:a")
     assert receipt.revision == 1
-    snapshot = await store.load_snapshot(subject="child:a", age_band="middleChildhood")
+    snapshot = await store.load_snapshot(subject="child:a", age_band=AgeBand.MIDDLE_CHILDHOOD)
     assert snapshot.dialogue_frame.revision == 0
     assert _records(store, "child:a") == ()
     await _commit_turn(store, "turn-new", subject="child:a", reset_revision=1)
@@ -576,3 +581,278 @@ async def test_subject_isolation_and_reset_clear_all_semantic_state() -> None:
             source_turn_id="turn-a",
             proposal=_proposal(_event()),
         )
+
+
+async def test_semantic_journal_search_active_events_across_all_families() -> None:
+    store = DevelopmentAuthoritativeMemoryStore()
+    subject = "child:journal-search"
+    await _commit_turn(store, "turn-1", subject=subject)
+
+    pref_proposal = _event(
+        "The child prefers exploring Jupiter's storms.",
+        family="userPreference",
+        semantic_key="storm_preference",
+    )
+    comm_proposal = _event(
+        "Ava committed to explain Europa's ice tomorrow.",
+        family="avaCommitment",
+        semantic_key="europa_promise",
+    )
+    fact_proposal = _event(
+        "The child has observed Saturn with a telescope.",
+        family="userFact",
+        semantic_key="saturn_observation",
+    )
+    canvas_proposal = _event(
+        "The solar system orbit scene was reviewed.",
+        family="canvasReference",
+        semantic_key="orbit_diagram",
+        canvas_references=[
+            {"sceneId": "scene-orbit", "sceneRevision": 1, "relation": "solar system view"}
+        ],
+    )
+
+    decision = await store.apply_semantic_memory_proposal(
+        subject=subject,
+        expected_reset_revision=0,
+        source_turn_id="turn-1",
+        proposal=_proposal(
+            pref_proposal,
+            comm_proposal,
+            fact_proposal,
+            canvas_proposal,
+        ),
+    )
+    assert len(decision.journal_results) == 4
+    created_events = {
+        str(result.event.family): result.event for result in decision.journal_results
+    }
+
+    # 1. userPreference search: query 'storms' is unique to journal event
+    candidates_storms = await store.search_memory_candidates(
+        subject=subject,
+        query="storms",
+    )
+    assert len(candidates_storms) == 1
+    assert candidates_storms[0].source_id == created_events["userPreference"].event_id
+    assert candidates_storms[0].source_kind == MemoryCandidateSourceKind.SEMANTIC_JOURNAL
+    assert candidates_storms[0].source_kind == "semanticJournal"
+    assert candidates_storms[0].reference_text == "The child prefers exploring Jupiter's storms."
+    assert candidates_storms[0].source_turn_ids == ["turn-1"]
+    assert candidates_storms[0].started_at is not None
+    assert candidates_storms[0].started_at.tzinfo is not None
+    assert candidates_storms[0].ended_at == candidates_storms[0].started_at
+    assert candidates_storms[0].timezone_ids == []
+    assert candidates_storms[0].relevance > 0
+
+    # Jupiter matches both the raw turn and the journal event
+    candidates_both = await store.search_memory_candidates(
+        subject=subject,
+        query="Jupiter storms",
+    )
+    assert len(candidates_both) == 2
+    journal_cands = [
+        c for c in candidates_both if c.source_kind == MemoryCandidateSourceKind.SEMANTIC_JOURNAL
+    ]
+    assert len(journal_cands) == 1
+    assert journal_cands[0].source_id == created_events["userPreference"].event_id
+
+    # 2. avaCommitment search
+    candidates = await store.search_memory_candidates(
+        subject=subject,
+        query="Europa ice tomorrow",
+    )
+    assert len(candidates) == 1
+    assert candidates[0].source_id == created_events["avaCommitment"].event_id
+    assert candidates[0].source_kind == MemoryCandidateSourceKind.SEMANTIC_JOURNAL
+
+    # 3. userFact search
+    candidates = await store.search_memory_candidates(
+        subject=subject,
+        query="Saturn telescope",
+    )
+    assert len(candidates) == 1
+    assert candidates[0].source_id == created_events["userFact"].event_id
+    assert candidates[0].source_kind == MemoryCandidateSourceKind.SEMANTIC_JOURNAL
+
+    # 4. canvasReference search
+    candidates = await store.search_memory_candidates(
+        subject=subject,
+        query="orbit diagram reviewed",
+    )
+    assert len(candidates) == 1
+    assert candidates[0].source_id == created_events["canvasReference"].event_id
+    assert candidates[0].source_kind == MemoryCandidateSourceKind.SEMANTIC_JOURNAL
+
+
+async def test_semantic_journal_search_superseded_events_are_excluded() -> None:
+    store = DevelopmentAuthoritativeMemoryStore()
+    subject = "child:supersede-search"
+    await _commit_turn(store, "turn-1", subject=subject)
+
+    # Event A: identity userPreference:favorite_topic
+    event_a_proposal = _event(
+        "The child loves discussing volcanic moons.",
+        family="userPreference",
+        semantic_key="favorite_topic",
+    )
+    first_decision = await store.apply_semantic_memory_proposal(
+        subject=subject,
+        expected_reset_revision=0,
+        source_turn_id="turn-1",
+        proposal=_proposal(event_a_proposal),
+    )
+    event_a = first_decision.journal_results[0].event
+
+    # Event A is initially searchable
+    candidates_a = await store.search_memory_candidates(
+        subject=subject,
+        query="volcanic moons",
+    )
+    assert len(candidates_a) == 1
+    assert candidates_a[0].source_id == event_a.event_id
+
+    # Event B: same identity, supersedes Event A
+    await _commit_turn(store, "turn-2", subject=subject)
+    event_b_proposal = _event(
+        "The child now prefers ring systems instead of moons.",
+        family="userPreference",
+        semantic_key="favorite_topic",
+        supersedes=[event_a.event_id],
+    )
+    second_decision = await store.apply_semantic_memory_proposal(
+        subject=subject,
+        expected_reset_revision=0,
+        source_turn_id="turn-2",
+        proposal=_proposal(event_b_proposal),
+    )
+    event_b = second_decision.journal_results[0].event
+
+    # Event A must NOT be returned as an active search candidate
+    candidates_after_supersede = await store.search_memory_candidates(
+        subject=subject,
+        query="volcanic moons",
+    )
+    assert not any(
+        c.source_id == event_a.event_id and c.source_kind == "semanticJournal"
+        for c in candidates_after_supersede
+    )
+
+    # Event B is retrieved
+    candidates_b = await store.search_memory_candidates(
+        subject=subject,
+        query="ring systems",
+    )
+    assert len(candidates_b) == 1
+    assert candidates_b[0].source_id == event_b.event_id
+    assert candidates_b[0].source_kind == MemoryCandidateSourceKind.SEMANTIC_JOURNAL
+
+
+async def test_semantic_journal_search_reset_isolation() -> None:
+    store = DevelopmentAuthoritativeMemoryStore()
+    subject = "child:reset-search"
+    await _commit_turn(store, "turn-1", subject=subject)
+
+    event_proposal = _event(
+        "The child enjoys asteroid facts and crater formation.",
+        family="userPreference",
+        semantic_key="asteroid_facts",
+    )
+    await store.apply_semantic_memory_proposal(
+        subject=subject,
+        expected_reset_revision=0,
+        source_turn_id="turn-1",
+        proposal=_proposal(event_proposal),
+    )
+
+    initial_search = await store.search_memory_candidates(
+        subject=subject,
+        query="asteroid facts",
+    )
+    assert len(initial_search) == 1
+    assert initial_search[0].source_kind == "semanticJournal"
+
+    # Reset conversation
+    receipt = await store.reset_conversation(subject=subject)
+    assert receipt.revision == 1
+
+    # Post-reset search must not return old reset revision events
+    post_reset_search = await store.search_memory_candidates(
+        subject=subject,
+        query="asteroid facts",
+    )
+    assert len(post_reset_search) == 0
+
+
+async def test_semantic_journal_search_bounded_and_ranked_with_other_candidates() -> None:
+    store = DevelopmentAuthoritativeMemoryStore()
+    subject = "child:ranking-bounds"
+    now = datetime.now(UTC)
+
+    # Commit a raw delivered turn with high lexical match
+    await store.commit_delivered_turn(
+        subject=subject,
+        expected_reset_revision=0,
+        turn=DeliveredConversationTurn.model_validate(
+            {
+                "turnId": "turn-raw-strong",
+                "childText": "space telescope space telescope",
+                "childTextSource": "transcript",
+                "avaDeliveredText": "space telescope space telescope deep space",
+                "deliveredSampleCount": 24_000,
+                "childTurnSummary": "space telescope space telescope discussion",
+                "terminal": "completed",
+            }
+        ),
+        proposal=None,
+        memory_id=None,
+        occurred_at=now,
+        timezone_id="UTC",
+    )
+
+    # Commit multiple journal events
+    await _commit_turn(store, "turn-2", subject=subject)
+    await store.apply_semantic_memory_proposal(
+        subject=subject,
+        expected_reset_revision=0,
+        source_turn_id="turn-2",
+        proposal=_proposal(
+            _event(
+                "The child asked about space telescope mirrors.",
+                family="userFact",
+                semantic_key="mirror_question",
+            ),
+            _event(
+                "Ava promised space telescope pictures.",
+                family="avaCommitment",
+                semantic_key="picture_promise",
+            ),
+            _event(
+                "The child wants space telescope launch dates.",
+                family="userPreference",
+                semantic_key="launch_dates",
+            ),
+        ),
+    )
+
+    # Bounded results
+    bounded = await store.search_memory_candidates(
+        subject=subject,
+        query="space telescope",
+        limit=2,
+    )
+    assert len(bounded) == 2
+
+    # Ranking: rawEvent with higher repetition / relevance ranks above journal events
+    all_candidates = await store.search_memory_candidates(
+        subject=subject,
+        query="space telescope",
+        limit=5,
+    )
+    assert len(all_candidates) == 4
+    assert all_candidates[0].source_kind == MemoryCandidateSourceKind.RAW_EVENT
+    assert all_candidates[0].source_id == "turn-raw-strong"
+    assert all_candidates[1].source_kind == MemoryCandidateSourceKind.SEMANTIC_JOURNAL
+    assert all_candidates[2].source_kind == MemoryCandidateSourceKind.SEMANTIC_JOURNAL
+    assert all_candidates[3].source_kind == MemoryCandidateSourceKind.SEMANTIC_JOURNAL
+

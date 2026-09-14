@@ -16,7 +16,9 @@ from ..providers.openai_realtime_provider import OpenAIRealtimeProviderSession
 from ..providers.openai_svg_canvas_provider import OpenAISvgCanvasSpecialist
 from ..security import safety_identifier
 from .caption_preview import DevelopmentCaptionPreviewSynthesizer
-from .coordinator import DeterministicRealtimeSessionCoordinator
+from .coordinator import (
+    DeterministicRealtimeSessionCoordinator,
+)
 from .context_assembler import DynamicContextAssembler
 from .coordinator_v4 import ProtocolV4CanvasEventSink
 from .delivery import StreamingSpeechSynthesizer
@@ -92,9 +94,6 @@ class LiveRealtimeCoordinatorFactoryV4:
             rate_limit_max_recovery_attempts=(
                 self._settings.openai_realtime_rate_limit_max_recovery_attempts
             ),
-            rate_limit_max_recovery_seconds=(
-                self._settings.openai_realtime_rate_limit_max_recovery_seconds
-            ),
             rate_limit_fallback_wait_seconds=(
                 self._settings.openai_realtime_rate_limit_fallback_wait_seconds
             ),
@@ -144,6 +143,12 @@ class LiveRealtimeCoordinatorFactoryV4:
             turn_id_factory=lambda: f"turn-{uuid4().hex}",
             request_id_factory=lambda: f"request-{uuid4().hex}",
             stream_id_factory=lambda: f"stream-{uuid4().hex}",
+            retained_scene_loader=lambda manifest_scene: (
+                self._documents.load_retained_scene(
+                    subject=subject,
+                    manifest_scene=manifest_scene,
+                )
+            ),
         )
 
     def _create_speech_synthesizer(self) -> StreamingSpeechSynthesizer:

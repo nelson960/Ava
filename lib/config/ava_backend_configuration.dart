@@ -85,6 +85,11 @@ class AvaBackendConfiguration {
         'v4/realtime/sessions/$sessionId/canvas-restore',
       );
 
+  Uri canvasRetainedSceneEndpoint(String sessionId) =>
+      _requireBaseUri().resolve(
+        'v4/realtime/sessions/$sessionId/canvas-retained',
+      );
+
   Uri canvasWorkspaceEndpoint(String sessionId) => _requireBaseUri().resolve(
         'v4/realtime/sessions/$sessionId/canvas-workspace',
       );

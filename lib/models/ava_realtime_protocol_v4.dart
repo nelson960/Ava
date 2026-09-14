@@ -847,6 +847,7 @@ final class AvaRealtimeServerEventV4 {
             'noActiveScene',
             'sceneMismatch',
             'sceneRevisionMismatch',
+            'focusRevisionMismatch',
             'interactionRevisionStale',
             'bindingUnknown',
             'bindingLocalOnly',
@@ -1213,25 +1214,6 @@ final class AvaRealtimeClientEventV4 {
         'reason': reason,
       });
 
-  factory AvaRealtimeClientEventV4.canvasPresentationUpdated({
-    required String sessionId,
-    required int sequence,
-    required bool visible,
-    String? sceneId,
-    int? focusRevision,
-    required String clientOperationId,
-  }) =>
-      AvaRealtimeClientEventV4._validated({
-        'protocolVersion': avaRealtimeProtocolVersionV4,
-        'event': 'canvasPresentationUpdated',
-        'sessionId': sessionId,
-        'sequence': sequence,
-        'visible': visible,
-        if (visible && sceneId != null) 'sceneId': sceneId,
-        if (visible && focusRevision != null) 'focusRevision': focusRevision,
-        'clientOperationId': clientOperationId,
-      });
-
   factory AvaRealtimeClientEventV4.canvasPresentationAcknowledged({
     required String sessionId,
     required int sequence,
@@ -1550,6 +1532,7 @@ void _validateClientEvent(Map<String, Object?> json) {
           ...common,
           'sceneId',
           'sceneRevision',
+          'focusRevision',
           'interactionRevision',
           'svgSha256',
           'manifestSha256',
@@ -1567,6 +1550,13 @@ void _validateClientEvent(Map<String, Object?> json) {
       );
       _boundedInt(
         json,
+        'focusRevision',
+        event,
+        minimum: 0,
+        maximum: 1000000,
+      );
+      _boundedInt(
+        json,
         'interactionRevision',
         event,
         minimum: 1,
@@ -1576,24 +1566,44 @@ void _validateClientEvent(Map<String, Object?> json) {
       _digest(json, 'manifestSha256', event);
       _identifier(json, 'bindingId', event);
       break;
-    case 'canvasPresentationUpdated':
+    case 'canvasPresentationRequested':
       _requireExactKeys(
         json,
         {
           ...common,
-          'visible',
-          if (json.containsKey('sceneId')) 'sceneId',
-          if (json.containsKey('focusRevision')) 'focusRevision',
-          'clientOperationId',
+          'operation',
+          if (json.containsKey('selector')) 'selector',
+          if (json.containsKey('position')) 'position',
         },
         event,
       );
-      final visible = _requiredBool(json, 'visible', event);
-      if (visible) {
-        _identifier(json, 'sceneId', event);
-        _boundedInt(json, 'focusRevision', event, minimum: 1, maximum: 10001);
+      final operation = _allowedString(
+        json,
+        'operation',
+        event,
+        const {'show', 'hide'},
+      );
+      if (operation == 'hide') {
+        if (json.containsKey('selector') || json.containsKey('position')) {
+          throw const FormatException(
+              'hide presentation request cannot include a selector.');
+        }
+      } else if (json.containsKey('selector')) {
+        final selector = _allowedString(
+          json,
+          'selector',
+          event,
+          const {'current', 'next', 'previous', 'first', 'last', 'position'},
+        );
+        if (selector == 'position') {
+          _boundedInt(json, 'position', event, minimum: 1, maximum: 10);
+        } else if (json.containsKey('position')) {
+          throw const FormatException(
+              'position is required only with selector=position.');
+        }
+      } else if (json.containsKey('position')) {
+        throw const FormatException('position requires selector=position.');
       }
-      _identifier(json, 'clientOperationId', event);
       break;
     case 'canvasPresentationAcknowledged':
       _requireExactKeys(

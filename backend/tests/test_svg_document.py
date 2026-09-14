@@ -14,6 +14,7 @@ from ava_backend.canvas.svg_document import (
     SvgDocumentValidator,
     SvgDraftSafetyValidator,
     SvgValidationLimits,
+    validate_svg_binding_continuity,
 )
 
 
@@ -31,6 +32,68 @@ def _document(body: str, *, root_attributes: str = "") -> str:
         f"{body}"
         "</svg>"
     )
+
+
+def _binding_document(*bindings: tuple[str, str], label: str = "Target"):
+    body = "".join(
+        f'<g id="{target_id}" data-ava-binding="{binding_id}" '
+        f'data-ava-target="{target_id}" aria-label="{label} {target_id}"/>'
+        for target_id, binding_id in bindings
+    )
+    return SvgDocumentValidator().validate(
+        _document(body, root_attributes='data-ava-interaction-mode="select"')
+    )
+
+
+def test_revise_binding_continuity_accepts_stable_target_and_binding() -> None:
+    base = _binding_document(("target-a", "binding-a"), label="Old")
+    revised = _binding_document(("target-a", "binding-a"), label="Improved")
+
+    validate_svg_binding_continuity(base, revised)
+
+
+def test_revise_binding_continuity_rejects_changed_binding_for_retained_target() -> (
+    None
+):
+    base = _binding_document(("target-a", "binding-a"))
+    revised = _binding_document(("target-a", "binding-renamed"))
+
+    with pytest.raises(SvgDocumentValidationError) as raised:
+        validate_svg_binding_continuity(base, revised)
+
+    assert raised.value.code == "bindingContinuityTargetMismatch"
+
+
+def test_revise_binding_continuity_rejects_reused_binding_for_different_target() -> (
+    None
+):
+    base = _binding_document(("target-a", "binding-a"))
+    revised = _binding_document(("target-b", "binding-a"))
+
+    with pytest.raises(SvgDocumentValidationError) as raised:
+        validate_svg_binding_continuity(base, revised)
+
+    assert raised.value.code == "bindingContinuityReuseMismatch"
+
+
+def test_revise_binding_continuity_allows_removed_target() -> None:
+    base = _binding_document(
+        ("target-a", "binding-a"),
+        ("target-b", "binding-b"),
+    )
+    revised = _binding_document(("target-a", "binding-a"))
+
+    validate_svg_binding_continuity(base, revised)
+
+
+def test_revise_binding_continuity_allows_new_target() -> None:
+    base = _binding_document(("target-a", "binding-a"))
+    revised = _binding_document(
+        ("target-a", "binding-a"),
+        ("target-b", "binding-b"),
+    )
+
+    validate_svg_binding_continuity(base, revised)
 
 
 def test_validator_preserves_exact_provider_unicode_bytes() -> None:

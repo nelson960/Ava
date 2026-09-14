@@ -249,6 +249,52 @@ void main() {
     controller.dispose();
   });
 
+  for (final focusRevision in const [0, 4]) {
+    test(
+        'accepted generation focusRevision=$focusRevision survives candidate activation',
+        () async {
+      final commands = <AvaSvgCanvasClientCommand>[];
+      final controller = AvaSvgCanvasController(
+        documents: _Loader(Future.value(document)),
+        commandSink: commands.add,
+      )..currentFocusRevision = () => focusRevision;
+      controller.beginPlaybackClock(document.descriptor.sourceTurnId);
+      _announceGeneration(
+        controller,
+        document,
+        focusRevision: focusRevision,
+      );
+
+      await controller.receiveDocumentAvailable(serverEvents[0]);
+
+      expect(controller.generation, isNull);
+      expect(controller.candidate?.focusRevision, focusRevision);
+      controller.rendererPrepared();
+      controller.receivePresentationCue(serverEvents[1]);
+      controller.updateRenderedSample(
+        turnId: document.descriptor.sourceTurnId,
+        renderedSample: 4812,
+      );
+      controller.firstFramePresented();
+      controller.receiveActivated(serverEvents[2]);
+
+      expect(controller.activeFocusRevision, focusRevision);
+      final workspaceRevision =
+          controller.structuralMutationCompletion?.workspaceRevision;
+      commands.clear();
+      controller.reportBinding(document.manifest.bindings['select-cloud']!);
+
+      expect(commands, hasLength(1));
+      expect(commands.single.fields['focusRevision'], focusRevision);
+      expect(commands.single.fields['interactionRevision'], 1);
+      expect(
+        controller.structuralMutationCompletion?.workspaceRevision,
+        workspaceRevision,
+      );
+      controller.dispose();
+    });
+  }
+
   test('production_order_initial_activation_populates_workspace', () async {
     final host = AvaSvgCanvasSessionHost();
     final controller = AvaSvgCanvasController(
@@ -746,6 +792,7 @@ void main() {
     final payload = commands.last.toEventBody();
     expect(payload['event'], 'canvasInteraction');
     expect(payload['bindingId'], 'select-cloud');
+    expect(payload['focusRevision'], 0);
     expect(payload['interactionRevision'], 1);
     expect(payload['svgSha256'], document.descriptor.svgSha256);
     expect(payload, isNot(contains('label')));
@@ -838,23 +885,7 @@ void main() {
     );
   });
 
-  test('dismissed active drawing can be reopened from the session host',
-      () async {
-    final controller = await _activate(document, serverEvents, []);
-    final host = AvaSvgCanvasSessionHost()..attach(controller);
-
-    expect(host.panelVisible, isTrue);
-    host.dismissPanel();
-    expect(host.panelVisible, isFalse);
-    expect(host.canReopen, isTrue);
-    host.reopenPanel();
-    expect(host.panelVisible, isTrue);
-
-    host.dispose();
-    controller.dispose();
-  });
-
-  test('active_canvas_survives_runtime_detach', () async {
+  test('runtime detach hides presentation while retaining its document', () async {
     final controller = await _activate(document, serverEvents, []);
     final host = AvaSvgCanvasSessionHost()..attach(controller);
 
@@ -866,27 +897,8 @@ void main() {
 
     expect(host.controller, isNull);
     expect(_documentForDisplay(host), same(document));
-    expect(host.panelVisible, isTrue);
+    expect(host.panelVisible, isFalse);
     expect(host.canReopen, isFalse);
-    host.dispose();
-  });
-
-  test('dismissed_active_canvas_remains_reopenable_after_detach', () async {
-    final controller = await _activate(document, serverEvents, []);
-    final host = AvaSvgCanvasSessionHost()..attach(controller);
-
-    host.dismissPanel();
-    expect(host.panelVisible, isFalse);
-    expect(host.canReopen, isTrue);
-
-    host.detach(controller);
-    controller.dispose();
-
-    expect(host.panelVisible, isFalse);
-    expect(host.canReopen, isTrue);
-    host.reopenPanel();
-    expect(host.panelVisible, isTrue);
-    expect(_documentForDisplay(host), same(document));
     host.dispose();
   });
 
@@ -907,7 +919,7 @@ void main() {
     expect(host.controller, same(newController));
     expect(newController.active?.document, same(document));
     expect(_documentForDisplay(host), same(document));
-    expect(host.panelVisible, isTrue);
+    expect(host.panelVisible, isFalse);
     expect(commands, isEmpty);
     host.detach(newController);
     newController.dispose();
@@ -1052,7 +1064,7 @@ void main() {
     expect(host.controller, isNull);
     expect(host.generating, isFalse);
     expect(_documentForDisplay(host), same(document));
-    expect(host.panelVisible, isTrue);
+    expect(host.panelVisible, isFalse);
     expect(commands, isEmpty);
     host.dispose();
   });
@@ -1066,8 +1078,7 @@ void main() {
     host.detach(controller);
     controller.dispose();
     host.dismissPanel();
-    expect(host.canReopen, isTrue);
-    host.reopenPanel();
+    expect(host.canReopen, isFalse);
 
     expect(_documentForDisplay(host), same(document));
     expect(host.controller, isNull);
@@ -1314,9 +1325,7 @@ void main() {
     expect(host.workspaceDocuments, orderedEquals(documents));
     expect(host.presentedDocument, same(documents[2]));
     expect(host.panelVisible, isFalse);
-    expect(host.canReopen, isTrue);
-    host.reopenPanel();
-    expect(host.panelVisible, isTrue);
+    expect(host.canReopen, isFalse);
     host.dispose();
   });
 
@@ -1603,9 +1612,9 @@ void main() {
     expect(host.workspaceDocuments, orderedEquals(workspaceBefore));
     expect(host.presentedDocument, same(presentedBefore));
     expect(host.controller, same(controller));
-    expect(host.panelVisible, isFalse);
-    expect(host.canReopen, isTrue);
-    expect(host.panelDismissed, isTrue);
+    expect(host.panelVisible, isTrue);
+    expect(host.canReopen, isFalse);
+    expect(host.panelDismissed, isFalse);
     host.detach(controller);
     controller.dispose();
     host.dispose();
@@ -1792,6 +1801,8 @@ void main() {
     controller.dispose();
     commands.clear();
 
+    expect(host.panelVisible, isFalse);
+
     await tester.pumpWidget(
       MaterialApp(
         home: SizedBox(
@@ -1880,6 +1891,7 @@ void main() {
     expect(commands.single.fields, {
       'sceneId': restored.descriptor.sceneId,
       'sceneRevision': restored.descriptor.sceneRevision,
+      'focusRevision': 0,
       'interactionRevision': 1,
       'svgSha256': restored.descriptor.svgSha256,
       'manifestSha256': restored.descriptor.manifestSha256,
@@ -2221,6 +2233,7 @@ void main() {
     );
     controller.reportBinding(docB.manifest.bindings['binding-B1']!);
     expect(commands, hasLength(1));
+    expect(commands.single.fields['focusRevision'], 3);
 
     controller.dispose();
   });
@@ -2396,12 +2409,13 @@ Future<void> _driveActivation(
 
 void _announceGeneration(
   AvaSvgCanvasController controller,
-  AvaValidatedSvgCanvasDocument document,
-) {
+  AvaValidatedSvgCanvasDocument document, {
+  int focusRevision = 0,
+}) {
   controller.receiveGenerationStarted({
     'protocolVersion': 4,
     'event': 'canvasGenerationStarted',
-    'focusRevision': 0,
+    'focusRevision': focusRevision,
     'sessionId': 'session-1234',
     'sequence': 0,
     'revision': 1,

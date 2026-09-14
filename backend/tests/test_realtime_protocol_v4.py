@@ -386,6 +386,50 @@ def test_v4_turn_state_machine_accepts_speech_and_isolates_memory_warning() -> N
         machine.accept(events[-1])
 
 
+def test_v4_turn_state_machine_accepts_owned_planning_only_completion() -> None:
+    payloads = _speech_turn_payloads()
+    machine = RealtimeTurnStateMachine()
+    for payload in payloads[:4]:
+        machine.accept(AVA_SERVER_EVENT_ADAPTER_V4.validate_python(payload))
+
+    snapshot = machine.accept(
+        AVA_SERVER_EVENT_ADAPTER_V4.validate_python(
+            {
+                **payloads[-1],
+                "sequence": 4,
+                "revision": 4,
+                "deliveredSampleCount": 0,
+                "deliveredText": "",
+            }
+        )
+    )
+
+    assert snapshot.phase == SpeechPhase.COMPLETED
+    assert snapshot.received_sample_count == 0
+    assert snapshot.segment_count == 0
+    assert snapshot.terminal is True
+
+
+def test_v4_turn_state_machine_rejects_arbitrary_empty_completion() -> None:
+    payloads = _speech_turn_payloads()
+    machine = RealtimeTurnStateMachine()
+    for payload in payloads[:3]:
+        machine.accept(AVA_SERVER_EVENT_ADAPTER_V4.validate_python(payload))
+
+    with pytest.raises(RealtimeStateError, match="planning"):
+        machine.accept(
+            AVA_SERVER_EVENT_ADAPTER_V4.validate_python(
+                {
+                    **payloads[-1],
+                    "sequence": 3,
+                    "revision": 3,
+                    "deliveredSampleCount": 0,
+                    "deliveredText": "",
+                }
+            )
+        )
+
+
 def test_v4_turn_state_machine_rejects_late_pcm_and_stale_turn_identity() -> None:
     payloads = _speech_turn_payloads()
     machine = RealtimeTurnStateMachine()

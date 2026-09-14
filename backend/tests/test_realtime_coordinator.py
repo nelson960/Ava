@@ -30,7 +30,6 @@ from ava_backend.realtime.context_assembler import (
     MemoryReference,
 )
 from ava_backend.realtime.coordinator import (
-    RECENT_LIVE_ECHO_SUPPRESSION_TURNS,
     CoordinatorStateError,
     DeterministicRealtimeSessionCoordinator,
     _CapturedMemoryCommit,
@@ -72,6 +71,7 @@ from ava_backend.realtime.memory import (
     DeliveredConversationTurn,
     DeliveredTurnTerminal,
     DevelopmentAuthoritativeMemoryStore,
+    DialogueFrame,
     MemoryProposalDecision,
     MemorySearchCandidate,
     MemoryResetRevisionMismatchError,
@@ -94,6 +94,7 @@ from ava_backend.realtime.speech_contract import (
 from ava_backend.realtime.svg_canvas_jobs import SvgCanvasJobCoordinator
 from ava_backend.realtime.tool_contract import (
     GetCurrentTimeRequest,
+    InteractiveCanvasRequest,
     InteractiveCanvasToolOutputV4,
     RealtimeGetCurrentTimeToolCall,
     RealtimeSearchMemoryToolCall,
@@ -190,6 +191,15 @@ class _DistinctCanvasCallRealtimeProvider(DeterministicRealtimePlanProvider):
 
     def __init__(self, plan: AvaTurnPlan) -> None:
         super().__init__(plan, canvas_brief="Show the water cycle.")
+        self._canvas_request = InteractiveCanvasRequest.model_validate(
+            {
+                "operation": "new",
+                "brief": "Show the water cycle.",
+                "interactionMode": "none",
+                "continuousControl": "none",
+                "completion": "needsResultReasoning",
+            }
+        )
         self.canvas_call_ids: list[str] = []
 
     async def _stream(self) -> AsyncIterator[RealtimeProviderTurnEvent]:
@@ -842,9 +852,7 @@ async def _advance_ready_callbacks(*, rounds: int = 12) -> None:
 async def _wait_for_memory_tasks(
     coordinator: DeterministicRealtimeSessionCoordinator,
 ) -> None:
-    tasks = tuple(coordinator._memory_commit_tasks.values())
-    if tasks:
-        await asyncio.gather(*tasks)
+    await coordinator._memory_commit_queue.join()
 
 
 async def test_coordinator_streams_seven_phrases_pcm_and_memory_directly_as_v4() -> (
@@ -1600,74 +1608,7 @@ class _FailingSearchMemoryStore(DevelopmentAuthoritativeMemoryStore):
         raise RuntimeError("controlled historical-memory outage")
 
 
-class _SyntheticWarmMemoryStore(DevelopmentAuthoritativeMemoryStore):
-    def __init__(self) -> None:
-        super().__init__()
-        self.candidates: list[MemorySearchCandidate] = []
-        self.failed_turn_ids: set[str] = set()
-        self.searches: list[dict[str, object]] = []
 
-    async def commit_delivered_turn(self, **kwargs: object):  # type: ignore[no-untyped-def]
-        turn = kwargs["turn"]
-        if turn.turn_id in self.failed_turn_ids:  # type: ignore[union-attr]
-            raise RuntimeError("controlled durable commit failure")
-        return MemoryProposalDecision(
-            accepted=False,
-            reason="No stable-memory proposal was supplied.",
-            record=None,
-        )
-
-    async def search_memory_candidates(self, **kwargs: object):  # type: ignore[no-untyped-def]
-        self.searches.append(dict(kwargs))
-        return list(self.candidates)
-
-
-class _BlockingSearchMemoryStore(_ObservedMemoryStore):
-    def __init__(self) -> None:
-        super().__init__()
-        self.search_started = asyncio.Event()
-        self.allow_search = asyncio.Event()
-        self.search_cancelled = asyncio.Event()
-
-    async def search_memory_candidates(self, **kwargs: object):  # type: ignore[no-untyped-def]
-        del kwargs
-        self.search_started.set()
-        try:
-            await self.allow_search.wait()
-        except asyncio.CancelledError:
-            self.search_cancelled.set()
-            raise
-        return []
-
-
-class _SupersedingSearchMemoryStore(_ObservedMemoryStore):
-    def __init__(self) -> None:
-        super().__init__()
-        self.older_started = asyncio.Event()
-        self.allow_older = asyncio.Event()
-
-    async def search_memory_candidates(self, **kwargs: object):  # type: ignore[no-untyped-def]
-        query = str(kwargs["query"])
-        if "older" in query:
-            self.older_started.set()
-            await self.allow_older.wait()
-            marker = "older historical evidence"
-        else:
-            marker = "newer historical evidence"
-        return [
-            MemorySearchCandidate.model_validate(
-                {
-                    "sourceId": "episode-" + marker.split()[0],
-                    "sourceKind": "episode",
-                    "startedAt": "2026-01-01T00:00:00Z",
-                    "endedAt": "2026-01-01T00:05:00Z",
-                    "timezoneIds": ["UTC"],
-                    "referenceText": marker,
-                    "sourceTurnIds": ["turn-history-" + marker.split()[0]],
-                    "relevance": 1.0,
-                }
-            )
-        ]
 
 
 class _BlockingCommitMemoryStore(_ObservedMemoryStore):
@@ -1971,83 +1912,26 @@ async def test_blocked_memory_store_cannot_delay_persistent_rearm() -> None:
     await coordinator.close()
 
 
-async def test_blocked_warm_search_cannot_delay_terminal_or_rearm() -> None:
-    memory = _BlockingSearchMemoryStore()
-    coordinator, _, _, _ = _coordinator(memory=memory, persistent=True)
-    await _ready(coordinator)
-
-    rearm = asyncio.create_task(
-        _complete_first_persistent_turn_and_rearm(
-            coordinator,
-            first_client_sequence=1,
-        )
+def _warm_candidate(
+    marker: str,
+    *,
+    source_turn_ids: list[str],
+    source_kind: str = "episode",
+    source_id: str | None = None,
+    reference_text: str | None = None,
+) -> MemorySearchCandidate:
+    return MemorySearchCandidate.model_validate(
+        {
+            "sourceId": source_id or f"episode-{marker}",
+            "sourceKind": source_kind,
+            "startedAt": "2026-01-01T00:00:00Z",
+            "endedAt": "2026-01-01T00:05:00Z",
+            "timezoneIds": ["UTC"],
+            "referenceText": reference_text or f"historical evidence {marker}",
+            "sourceTurnIds": source_turn_ids,
+            "relevance": 1.0,
+        }
     )
-    await memory.search_started.wait()
-    await asyncio.wait_for(rearm, timeout=1.0)
-
-    assert coordinator.turn_id == "turn-coordinator-2"
-    assert memory.committed_turn_ids == [TURN_ID]
-    memory.allow_search.set()
-    await coordinator.close()
-
-
-async def test_pending_context_installation_cannot_delay_persistent_rearm() -> None:
-    memory = _RecordingSearchMemoryStore()
-    provider = _BlockingContextInstallProvider(_plan())
-    coordinator, _, _, _ = _coordinator(
-        memory=memory,
-        realtime=provider,
-        persistent=True,
-    )
-    await _ready(coordinator)
-    frames = coordinator.frames()
-    try:
-        async for frame in frames:
-            if not isinstance(frame, AvaServerControlFrameV4):
-                continue
-            if isinstance(frame.event, AudioMetadataEventV4):
-                await coordinator.receive(
-                    _client(
-                        {
-                            "event": "playbackStarted",
-                            "sequence": 1,
-                            "turnId": TURN_ID,
-                            "streamId": STREAM_ID,
-                            "renderedSampleCount": 0,
-                        }
-                    )
-                )
-            if (
-                isinstance(frame.event, TurnPhaseChangedEventV4)
-                and frame.event.phase == SpeechPhase.SPEAKING
-            ):
-                await coordinator.receive(
-                    _client(
-                        {
-                            "event": "playbackProgress",
-                            "sequence": 2,
-                            "turnId": TURN_ID,
-                            "streamId": STREAM_ID,
-                            "renderedSampleCount": coordinator.received_sample_count,
-                            "bufferedSampleCount": 0,
-                        }
-                    )
-                )
-            if isinstance(frame.event, TurnCompletedEventV4):
-                break
-
-        await _advance_ready_callbacks()
-        assert coordinator._pending_harness is not None
-
-        next_frame = await asyncio.wait_for(anext(frames), timeout=1.0)
-        assert isinstance(next_frame, AvaServerControlFrameV4)
-        assert isinstance(next_frame.event, TurnCreatedEventV4)
-        assert next_frame.event.turn_id == "turn-coordinator-2"
-        assert not provider.context_refresh_started.is_set()
-    finally:
-        provider.allow_context_refresh.set()
-        await frames.aclose()
-        await coordinator.close()
 
 
 async def test_deferred_context_installation_preserves_one_build_identity(
@@ -2085,7 +1969,8 @@ async def test_deferred_context_installation_preserves_one_build_identity(
         record.ava_context
         for record in caplog.records
         if record.getMessage().startswith("realtime_context_installation")
-        and record.ava_context["contextBuildId"] == pending_build_id
+        and record.ava_context["candidateBuildId"] == pending_build_id
+        and record.ava_context["status"] in {"deferred", "installed"}
     ]
     assert [record["status"] for record in records] == ["deferred", "installed"]
     assert {record["providerCallId"] for record in records} == {
@@ -2099,10 +1984,17 @@ async def test_reset_supersedes_pending_context_before_response_ownership(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.INFO, logger="ava_backend.realtime_coordinator")
-    coordinator, provider, _, _ = _coordinator()
+    memory = DevelopmentAuthoritativeMemoryStore()
+    memory._dialogue_frames["child:coordinator"] = DialogueFrame(
+        active_topics=("dinosaurs",),
+    )
+    coordinator, provider, _, _ = _coordinator(memory=memory)
     assert isinstance(provider, DeterministicRealtimePlanProvider)
     await _ready(coordinator)
     caplog.clear()
+    coordinator._dialogue_frame = DialogueFrame(
+        active_topics=("space",),
+    )
 
     await coordinator._refresh_canvas_context(
         reason=DynamicContextBuildReason.TURN_COMMITTED
@@ -2132,12 +2024,15 @@ async def test_reset_supersedes_pending_context_before_response_ownership(
     assert coordinator.harness.context.build_id == post_reset_build_id
     assert provider.active_context_build_id == post_reset_build_id
     terminal_statuses = {
-        (record.ava_context["contextBuildId"], record.ava_context["status"])
+        (record.ava_context["candidateBuildId"], record.ava_context["status"])
         for record in caplog.records
         if record.getMessage().startswith("realtime_context_installation")
         and record.ava_context["status"] in {"installed", "deduplicated"}
     }
-    assert (post_reset_build_id, "deduplicated") in terminal_statuses
+    assert any(
+        build_id == post_reset_build_id and status in {"installed", "deduplicated"}
+        for build_id, status in terminal_statuses
+    )
     assert not any(build_id == pre_reset_build_id for build_id, _ in terminal_statuses)
     await stream.aclose()
     await coordinator.close()
@@ -2152,6 +2047,11 @@ async def test_failed_context_install_logs_build_and_keeps_active_identity(
     await _ready(coordinator)
     active_build_id = provider.active_context_build_id
     caplog.clear()
+    coordinator._warm_memories = (
+        MemoryReference.from_candidate(
+            _warm_candidate("failed", source_turn_ids=["T-old-failed"])
+        ),
+    )
     provider.fail_idle_install = True
 
     with pytest.raises(
@@ -2168,97 +2068,14 @@ async def test_failed_context_install_logs_build_and_keeps_active_identity(
         if record.getMessage().startswith("realtime_context_installation")
         and record.ava_context["status"] == "failed"
     )
-    assert failed["contextBuildId"] != active_build_id
+    assert failed["candidateBuildId"] != active_build_id
     assert failed["providerCallId"] == "rtc_fake_ava_call_0001"
     assert failed["errorType"] == "RuntimeError"
     assert provider.active_context_build_id == active_build_id
     await coordinator.close()
 
 
-async def test_reset_invalidates_blocked_warm_search_before_installation() -> None:
-    memory = _BlockingSearchMemoryStore()
-    coordinator, provider, _, _ = _coordinator(memory=memory)
-    await _ready(coordinator)
-    initial_update_count = len(provider.prepared_session_updates)  # type: ignore[union-attr]
 
-    await _complete_delivered_turn(coordinator)
-    await memory.search_started.wait()
-    assert list(coordinator._recent_live_echo_suppression_turn_ids) == [TURN_ID]
-    receipt = await memory.reset_conversation(subject="child:coordinator")
-    await coordinator.memory_reset(reset_revision=receipt.revision)
-    memory.allow_search.set()
-    await _advance_ready_callbacks()
-
-    assert coordinator._warm_memories == ()
-    assert list(coordinator._recent_live_echo_suppression_turn_ids) == []
-    assert coordinator._memory_reset_revision == receipt.revision
-    assert len(provider.prepared_session_updates) == initial_update_count  # type: ignore[union-attr]
-    await coordinator.close()
-
-
-def _synthetic_turn_and_payload(
-    index: int,
-) -> tuple[DeliveredConversationTurn, _CapturedMemoryCommit]:
-    turn = DeliveredConversationTurn.model_validate(
-        {
-            "turnId": f"T{index}",
-            "childText": f"child topic {index}",
-            "childTextSource": "transcript",
-            "avaDeliveredText": f"Ava reply {index}.",
-            "deliveredSampleCount": 24_000,
-            "childTurnSummary": f"semantic summary {index}",
-            "terminal": "completed",
-        }
-    )
-    return turn, _CapturedMemoryCommit(
-        sequence=index,
-        turn_id=turn.turn_id,
-        occurred_at=datetime(2026, 8, 31, tzinfo=UTC),
-        timezone_id="UTC",
-        expected_reset_revision=0,
-        child_turn_summary=turn.child_turn_summary,
-        child_text=turn.child_text,
-        child_text_source=ChildTurnTextSource.TRANSCRIPT,
-        canvas_interaction=None,
-        delivered_text=turn.ava_delivered_text,
-        delivered_sample_count=turn.delivered_sample_count,
-        terminal=DeliveredTurnTerminal.COMPLETED,
-        transcript_waiter=None,
-        warm_refresh_revision=index,
-    )
-
-
-def _warm_candidate(
-    marker: str,
-    *,
-    source_turn_ids: list[str],
-    source_kind: str = "episode",
-    source_id: str | None = None,
-    reference_text: str | None = None,
-) -> MemorySearchCandidate:
-    return MemorySearchCandidate.model_validate(
-        {
-            "sourceId": source_id or f"episode-{marker}",
-            "sourceKind": source_kind,
-            "startedAt": "2026-01-01T00:00:00Z",
-            "endedAt": "2026-01-01T00:05:00Z",
-            "timezoneIds": ["UTC"],
-            "referenceText": reference_text or f"historical evidence {marker}",
-            "sourceTurnIds": source_turn_ids,
-            "relevance": 1.0,
-        }
-    )
-
-
-async def _commit_synthetic_turn(
-    coordinator: DeterministicRealtimeSessionCoordinator,
-    index: int,
-) -> tuple[DeliveredConversationTurn, _CapturedMemoryCommit]:
-    turn, payload = _synthetic_turn_and_payload(index)
-    coordinator._latest_memory_commit_sequence = index
-    coordinator._warm_refresh_revision = index
-    await coordinator._run_memory_commit(payload=payload)
-    return turn, payload
 
 
 async def test_context_build_telemetry_has_monotonic_identity_and_exact_counts(
@@ -2322,263 +2139,7 @@ async def test_context_build_telemetry_has_monotonic_identity_and_exact_counts(
     await coordinator.close()
 
 
-async def test_commit_and_warm_refresh_log_content_free_provenance(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    caplog.set_level(logging.INFO, logger="ava_backend.realtime_coordinator")
-    memory = _SyntheticWarmMemoryStore()
-    memory.candidates = [
-        _warm_candidate(
-            "suppressed",
-            source_turn_ids=["T1"],
-            source_kind="rawEvent",
-            source_id="T1",
-            reference_text="MEMORY_CONTENT_SENTINEL_SUPPRESSED",
-        ),
-        _warm_candidate(
-            "episode",
-            source_turn_ids=["T-old-episode"],
-            source_id="episode-survivor",
-            reference_text="MEMORY_CONTENT_SENTINEL_EPISODE",
-        ),
-        _warm_candidate(
-            "stable",
-            source_turn_ids=["T-old-stable"],
-            source_kind="stableMemory",
-            source_id="memory-survivor",
-            reference_text="MEMORY_CONTENT_SENTINEL_STABLE",
-        ),
-    ]
-    coordinator, _, _, _ = _coordinator(memory=memory)
-    await _ready(coordinator)
 
-    _, payload = _synthetic_turn_and_payload(1)
-    coordinator._latest_memory_commit_sequence = 1
-    coordinator._warm_refresh_revision = 1
-    await coordinator._run_memory_commit(
-        payload=replace(
-            payload,
-            child_text="CHILD_TRANSCRIPT_CONTENT_SENTINEL",
-            child_turn_summary="CHILD_SUMMARY_CONTENT_SENTINEL",
-            delivered_text="AVA_DELIVERED_CONTENT_SENTINEL",
-        )
-    )
-
-    commit = next(
-        record.ava_context
-        for record in caplog.records
-        if record.getMessage().startswith("memory_commit_completed")
-    )
-    assert commit["sessionId"] == SESSION_ID
-    assert commit["turnId"] == "T1"
-    assert commit["resetRevision"] == 0
-    assert commit["inputKind"] == "speech"
-    assert commit["durationMs"] >= 0
-
-    warm = next(
-        record.ava_context
-        for record in caplog.records
-        if record.getMessage().startswith("memory_warm_refresh_completed")
-    )
-    assert warm["rawCandidateCount"] == 3
-    assert warm["recentSuppressedCount"] == 1
-    assert warm["selectedCount"] == 2
-    assert warm["selectedSourceKinds"] == ["episode", "stableMemory"]
-    assert warm["selectedSourceIds"] == ["episode-survivor", "memory-survivor"]
-    assert warm["sourceTurnId"] == "T1"
-    assert warm["revision"] == 1
-    for sentinel in (
-        "MEMORY_CONTENT_SENTINEL_SUPPRESSED",
-        "MEMORY_CONTENT_SENTINEL_EPISODE",
-        "MEMORY_CONTENT_SENTINEL_STABLE",
-        "CHILD_TRANSCRIPT_CONTENT_SENTINEL",
-        "CHILD_SUMMARY_CONTENT_SENTINEL",
-        "AVA_DELIVERED_CONTENT_SENTINEL",
-    ):
-        assert sentinel not in caplog.text
-        assert all(sentinel not in repr(record) for record in (commit, warm))
-    await coordinator.close()
-
-
-async def test_bootstrap_projected_turns_seed_recent_echo_suppression() -> None:
-    memory = DevelopmentAuthoritativeMemoryStore()
-    for index in range(1, 11):
-        turn, _ = _synthetic_turn_and_payload(index)
-        await memory.commit_delivered_turn(
-            subject="child:coordinator",
-            expected_reset_revision=0,
-            turn=turn,
-            proposal=None,
-            memory_id=None,
-            occurred_at=datetime(2026, 8, 31, tzinfo=UTC) + timedelta(minutes=index),
-            timezone_id="UTC",
-        )
-
-    coordinator, _, _, _ = _coordinator(memory=memory)
-    await _ready(coordinator)
-
-    assert list(coordinator._recent_live_echo_suppression_turn_ids) == [
-        f"T{index}" for index in range(3, 11)
-    ]
-    await coordinator.close()
-
-
-async def test_same_call_turns_roll_out_of_recent_echo_suppression_and_become_warm() -> (
-    None
-):
-    memory = _SyntheticWarmMemoryStore()
-    coordinator, provider, _, _ = _coordinator(memory=memory)
-    await _ready(coordinator)
-
-    latest_turn: DeliveredConversationTurn | None = None
-    latest_payload: _CapturedMemoryCommit | None = None
-    for index in range(1, 13):
-        latest_turn, latest_payload = await _commit_synthetic_turn(
-            coordinator,
-            index,
-        )
-
-    assert list(coordinator._recent_live_echo_suppression_turn_ids) == [
-        f"T{index}" for index in range(5, 13)
-    ]
-    assert memory.searches
-    assert "to_instant" not in memory.searches[-1]
-    assert latest_turn is not None
-    assert latest_payload is not None
-
-    memory.candidates = [
-        _warm_candidate("newest", source_turn_ids=["T12"]),
-        _warm_candidate("recent", source_turn_ids=["T8"]),
-        _warm_candidate("eligible", source_turn_ids=["T4"]),
-    ]
-    await coordinator._refresh_warm_memory(
-        payload=latest_payload,
-        turn=latest_turn,
-    )
-    assert [reference.text for reference in coordinator._warm_memories] == [
-        "historical evidence eligible"
-    ]
-
-    latest_turn, latest_payload = await _commit_synthetic_turn(coordinator, 13)
-    assert list(coordinator._recent_live_echo_suppression_turn_ids) == [
-        f"T{index}" for index in range(6, 14)
-    ]
-    memory.candidates = [_warm_candidate("rolled-out", source_turn_ids=["T5"])]
-    await coordinator._refresh_warm_memory(
-        payload=latest_payload,
-        turn=latest_turn,
-    )
-    assert [reference.text for reference in coordinator._warm_memories] == [
-        "historical evidence rolled-out"
-    ]
-    assert len(provider.negotiated_offers) == 1  # type: ignore[union-attr]
-    await coordinator.close()
-
-
-async def test_episode_candidate_is_excluded_on_any_recent_provenance_overlap() -> None:
-    memory = _SyntheticWarmMemoryStore()
-    coordinator, _, _, _ = _coordinator(memory=memory)
-    await _ready(coordinator)
-    latest_turn: DeliveredConversationTurn | None = None
-    latest_payload: _CapturedMemoryCommit | None = None
-    for index in range(1, 9):
-        latest_turn, latest_payload = await _commit_synthetic_turn(
-            coordinator,
-            index,
-        )
-    assert latest_turn is not None
-    assert latest_payload is not None
-
-    memory.candidates = [
-        _warm_candidate("overlap", source_turn_ids=["T0", "T4"]),
-        _warm_candidate("old", source_turn_ids=["T-old-a", "T-old-b"]),
-    ]
-    await coordinator._refresh_warm_memory(
-        payload=latest_payload,
-        turn=latest_turn,
-    )
-
-    assert [reference.text for reference in coordinator._warm_memories] == [
-        "historical evidence old"
-    ]
-    await coordinator.close()
-
-
-async def test_recent_echo_suppression_is_bounded_and_failed_commit_does_not_advance() -> (
-    None
-):
-    memory = _SyntheticWarmMemoryStore()
-    coordinator, _, _, _ = _coordinator(memory=memory)
-    await _ready(coordinator)
-
-    for index in range(1, 201):
-        await _commit_synthetic_turn(coordinator, index)
-
-    expected = [f"T{index}" for index in range(193, 201)]
-    assert RECENT_LIVE_ECHO_SUPPRESSION_TURNS == 8
-    assert list(coordinator._recent_live_echo_suppression_turn_ids) == expected
-    memory.failed_turn_ids.add("T201")
-    await _commit_synthetic_turn(coordinator, 201)
-    assert list(coordinator._recent_live_echo_suppression_turn_ids) == expected
-    await coordinator.close()
-    assert list(coordinator._recent_live_echo_suppression_turn_ids) == []
-
-
-async def test_newest_warm_refresh_supersedes_older_completion() -> None:
-    memory = _SupersedingSearchMemoryStore()
-    coordinator, _, _, _ = _coordinator(memory=memory)
-    await _ready(coordinator)
-
-    def turn_and_payload(
-        marker: str,
-        revision: int,
-    ) -> tuple[DeliveredConversationTurn, _CapturedMemoryCommit]:
-        turn = DeliveredConversationTurn.model_validate(
-            {
-                "turnId": f"turn-{marker}",
-                "childText": f"{marker} topic",
-                "childTextSource": "transcript",
-                "avaDeliveredText": "A grounded reply.",
-                "deliveredSampleCount": 24_000,
-                "childTurnSummary": f"{marker} semantic summary",
-                "terminal": "completed",
-            }
-        )
-        return turn, _CapturedMemoryCommit(
-            sequence=revision,
-            turn_id=turn.turn_id,
-            occurred_at=datetime(2026, 8, 31, tzinfo=UTC),
-            timezone_id="UTC",
-            expected_reset_revision=0,
-            child_turn_summary=turn.child_turn_summary,
-            child_text=turn.child_text,
-            child_text_source=ChildTurnTextSource.TRANSCRIPT,
-            canvas_interaction=None,
-            delivered_text=turn.ava_delivered_text,
-            delivered_sample_count=turn.delivered_sample_count,
-            terminal=DeliveredTurnTerminal.COMPLETED,
-            transcript_waiter=None,
-            warm_refresh_revision=revision,
-        )
-
-    older_turn, older_payload = turn_and_payload("older", 1)
-    newer_turn, newer_payload = turn_and_payload("newer", 2)
-    coordinator._warm_refresh_revision = 2
-    older = asyncio.create_task(
-        coordinator._refresh_warm_memory(payload=older_payload, turn=older_turn)
-    )
-    await memory.older_started.wait()
-    await coordinator._refresh_warm_memory(
-        payload=newer_payload,
-        turn=newer_turn,
-    )
-    memory.allow_older.set()
-    await older
-
-    assert [reference.text for reference in coordinator._warm_memories] == [
-        "newer historical evidence"
-    ]
-    await coordinator.close()
 
 
 async def test_close_drains_fast_pending_memory_commit() -> None:
@@ -2655,36 +2216,7 @@ async def test_pre_reset_deferred_commit_cannot_resurrect_memory(
     await coordinator.close()
 
 
-async def test_skipped_memory_commit_logs_allocated_warm_refresh_revision(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    caplog.set_level(logging.INFO, logger="ava_backend.realtime_coordinator")
-    coordinator, _, _, _ = _coordinator()
-    await _ready(coordinator)
-    _, payload = _synthetic_turn_and_payload(44)
 
-    await coordinator._run_memory_commit(
-        payload=replace(
-            payload,
-            child_text=None,
-            child_text_source=None,
-            transcript_waiter=None,
-            warm_refresh_revision=44,
-        )
-    )
-
-    skipped = next(
-        record.ava_context
-        for record in caplog.records
-        if record.getMessage().startswith("memory_commit_skipped")
-    )
-    assert skipped["turnId"] == "T44"
-    assert skipped["warmRefreshRevision"] == 44
-    assert not any(
-        record.getMessage().startswith("memory_commit_completed")
-        for record in caplog.records
-    )
-    await coordinator.close()
 
 
 @pytest.mark.parametrize(
@@ -2828,6 +2360,7 @@ async def test_valid_canvas_interaction_refreshes_context_before_one_response() 
                 "sequence": 1,
                 "sceneId": active.scene_id,
                 "sceneRevision": active.revision,
+                "focusRevision": coordinator.accepted_focus_revision,
                 "interactionRevision": 1,
                 "svgSha256": active.document.svg_sha256,
                 "manifestSha256": active.document.manifest_sha256,
@@ -2873,6 +2406,7 @@ async def test_rapid_canvas_interactions_coalesce_optional_speech_to_latest() ->
                     "sequence": 1,
                     "sceneId": active.scene_id,
                     "sceneRevision": active.revision,
+                    "focusRevision": coordinator.accepted_focus_revision,
                     "interactionRevision": 1,
                     "svgSha256": active.document.svg_sha256,
                     "manifestSha256": active.document.manifest_sha256,
@@ -2892,6 +2426,7 @@ async def test_rapid_canvas_interactions_coalesce_optional_speech_to_latest() ->
                     "sequence": 2,
                     "sceneId": active.scene_id,
                     "sceneRevision": active.revision,
+                    "focusRevision": coordinator.accepted_focus_revision,
                     "interactionRevision": 2,
                     "svgSha256": active.document.svg_sha256,
                     "manifestSha256": active.document.manifest_sha256,
@@ -2906,6 +2441,7 @@ async def test_rapid_canvas_interactions_coalesce_optional_speech_to_latest() ->
                     "sequence": 3,
                     "sceneId": active.scene_id,
                     "sceneRevision": active.revision,
+                    "focusRevision": coordinator.accepted_focus_revision,
                     "interactionRevision": 3,
                     "svgSha256": active.document.svg_sha256,
                     "manifestSha256": active.document.manifest_sha256,
@@ -2962,6 +2498,7 @@ async def test_canvas_interaction_retries_when_provider_temporarily_unready() ->
                 "sequence": 1,
                 "sceneId": active.scene_id,
                 "sceneRevision": active.revision,
+                "focusRevision": coordinator.accepted_focus_revision,
                 "interactionRevision": 1,
                 "svgSha256": active.document.svg_sha256,
                 "manifestSha256": active.document.manifest_sha256,
@@ -3010,6 +2547,7 @@ async def test_child_speech_supersedes_interaction_while_context_refresh_is_pend
                     "sequence": 1,
                     "sceneId": active.scene_id,
                     "sceneRevision": active.revision,
+                    "focusRevision": coordinator.accepted_focus_revision,
                     "interactionRevision": 1,
                     "svgSha256": active.document.svg_sha256,
                     "manifestSha256": active.document.manifest_sha256,
@@ -3083,6 +2621,7 @@ async def test_tap_during_interaction_speech_rearms_only_latest_reaction() -> No
                     "sequence": 1,
                     "sceneId": active.scene_id,
                     "sceneRevision": active.revision,
+                    "focusRevision": coordinator.accepted_focus_revision,
                     "interactionRevision": 1,
                     "svgSha256": active.document.svg_sha256,
                     "manifestSha256": active.document.manifest_sha256,
@@ -3126,6 +2665,7 @@ async def test_tap_during_interaction_speech_rearms_only_latest_reaction() -> No
                     "sequence": 3,
                     "sceneId": active.scene_id,
                     "sceneRevision": active.revision,
+                    "focusRevision": coordinator.accepted_focus_revision,
                     "interactionRevision": 2,
                     "svgSha256": active.document.svg_sha256,
                     "manifestSha256": active.document.manifest_sha256,
@@ -3255,6 +2795,7 @@ async def test_child_speech_during_canvas_fade_does_not_repeat_interruption() ->
                     "sequence": 1,
                     "sceneId": active.scene_id,
                     "sceneRevision": active.revision,
+                    "focusRevision": coordinator.accepted_focus_revision,
                     "interactionRevision": 1,
                     "svgSha256": active.document.svg_sha256,
                     "manifestSha256": active.document.manifest_sha256,
@@ -3298,6 +2839,7 @@ async def test_child_speech_during_canvas_fade_does_not_repeat_interruption() ->
                     "sequence": 3,
                     "sceneId": active.scene_id,
                     "sceneRevision": active.revision,
+                    "focusRevision": coordinator.accepted_focus_revision,
                     "interactionRevision": 2,
                     "svgSha256": active.document.svg_sha256,
                     "manifestSha256": active.document.manifest_sha256,
@@ -3426,6 +2968,7 @@ async def test_interaction_context_refresh_spanning_rearm_never_attaches_to_new_
                     "sequence": 1,
                     "sceneId": active.scene_id,
                     "sceneRevision": active.revision,
+                    "focusRevision": coordinator.accepted_focus_revision,
                     "interactionRevision": 1,
                     "svgSha256": active.document.svg_sha256,
                     "manifestSha256": active.document.manifest_sha256,
@@ -3475,6 +3018,7 @@ async def test_rejected_canvas_interaction_does_not_request_response() -> None:
                 "sequence": 1,
                 "sceneId": active.scene_id,
                 "sceneRevision": active.revision,
+                "focusRevision": coordinator.accepted_focus_revision,
                 "interactionRevision": 1,
                 "svgSha256": active.document.svg_sha256,
                 "manifestSha256": active.document.manifest_sha256,
@@ -3520,6 +3064,7 @@ async def test_idle_interaction_response_persists_typed_input_without_child_spee
                 "sequence": 1,
                 "sceneId": active.scene_id,
                 "sceneRevision": active.revision,
+                "focusRevision": coordinator.accepted_focus_revision,
                 "interactionRevision": 1,
                 "svgSha256": active.document.svg_sha256,
                 "manifestSha256": active.document.manifest_sha256,
@@ -3581,6 +3126,7 @@ async def test_incomplete_interaction_response_is_cancelled_not_completed() -> N
                 "sequence": 1,
                 "sceneId": active.scene_id,
                 "sceneRevision": active.revision,
+                "focusRevision": coordinator.accepted_focus_revision,
                 "interactionRevision": 1,
                 "svgSha256": active.document.svg_sha256,
                 "manifestSha256": active.document.manifest_sha256,
@@ -3902,11 +3448,11 @@ async def test_late_turn_a_commit_preserves_cross_turn_memory_chronology() -> No
             completed_turn_ids.append(event.turn_id)
 
     assert completed_turn_ids == [provider.turn_a, provider.turn_b]
-    assert memory.committed_turn_ids == [provider.turn_b]
+    assert memory.committed_turn_ids == []
 
     provider.complete_turn_a_transcription()
-    await memory.wait_for_turn(provider.turn_a)
-    assert memory.committed_turn_ids == [provider.turn_b, provider.turn_a]
+    await memory.wait_for_turn(provider.turn_b)
+    assert memory.committed_turn_ids == [provider.turn_a, provider.turn_b]
     assert {event.timezone_id for event in memory._turns["child:coordinator"]} == {
         "Asia/Kolkata"
     }

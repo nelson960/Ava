@@ -8,9 +8,9 @@ from typing import Protocol
 
 from ..canvas.svg_workspace import RecordedSvgCanvasInteraction
 from .harness import RealtimeHarness
+from .memory import DialogueFrameState, SemanticCaptureFunctionArguments
 from .tool_contract import (
     InteractiveCanvasCancellationToolOutputV4,
-    InteractiveCanvasToolOutput,
     InteractiveCanvasToolOutputV4,
     ManageCanvasPresentationToolOutputV4,
     RealtimeUtilityToolOutputV4,
@@ -119,6 +119,26 @@ class RealtimeCommittedInput:
 type RealtimeProviderTurnEvent = RealtimeTurnEvent | RealtimeCommittedInput
 
 
+@dataclass(frozen=True, slots=True)
+class SettledSemanticToolOutcome:
+    tool_name: str
+    call_id: str
+    outcome: str
+    detail: str | None = None
+    canonical_scene_id: str | None = None
+    canonical_scene_revision: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticCaptureEvidence:
+    source_turn_id: str
+    current_frame: DialogueFrameState
+    child_utterance: str | None = None
+    spoken_response_prefix: str | None = None
+    interrupted: bool = False
+    settled_tool_outcomes: tuple[SettledSemanticToolOutcome, ...] = ()
+
+
 class RealtimeProviderSession(Protocol):
     """One OpenAI Realtime media/sideband session owned by Ava's backend."""
 
@@ -182,8 +202,7 @@ class RealtimeProviderSession(Protocol):
         turn_id: str,
         call_id: str,
         output: (
-            InteractiveCanvasToolOutput
-            | InteractiveCanvasToolOutputV4
+            InteractiveCanvasToolOutputV4
             | InteractiveCanvasCancellationToolOutputV4
         ),
     ) -> None: ...
@@ -237,6 +256,12 @@ class RealtimeProviderSession(Protocol):
         ...
 
     async def cancel(self, *, turn_id: str) -> None: ...
+
+    async def capture_semantic_memory(
+        self,
+        *,
+        evidence: SemanticCaptureEvidence,
+    ) -> SemanticCaptureFunctionArguments: ...
 
     async def close(self) -> None: ...
 

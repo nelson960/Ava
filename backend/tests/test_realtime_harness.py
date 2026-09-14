@@ -24,6 +24,10 @@ from ava_backend.realtime.tool_contract import (
     INTERACTIVE_CANVAS_TOOL_NAME,
     MANAGE_CANVAS_PRESENTATION_TOOL_NAME,
     InteractiveCanvasRequest,
+    InteractiveCanvasCancellationRequest,
+    InteractiveCanvasToolOutputV4,
+    InteractiveCanvasToolStatusV4,
+    ManageCanvasPresentationRequest,
 )
 
 
@@ -87,8 +91,8 @@ def test_v4_prompt_is_conversation_first_and_semantically_canvas_aware() -> None
     instructions = render_stable_instructions()
     normalized = " ".join(instructions.split())
 
-    assert REALTIME_PROMPT_VERSION == "ava-realtime-v4.9"
-    assert REALTIME_TOOL_CONTRACT_VERSION == "ava-realtime-tools-v4.6"
+    assert REALTIME_PROMPT_VERSION == "ava-realtime-v4.16"
+    assert REALTIME_TOOL_CONTRACT_VERSION == "ava-realtime-tools-v4.12"
     assert {layer.name for layer in PROMPT_LAYERS} == {
         "identity_and_personality",
         "natural_conversation",
@@ -102,26 +106,35 @@ def test_v4_prompt_is_conversation_first_and_semantically_canvas_aware() -> None
     assert "Acknowledgment is optional" in normalized
     assert "Avoid repetitive conversational openings" in normalized
     assert "spoken and conversational rather than lecture-like" in normalized
-    assert "semantic and optional" in normalized
-    assert "intended outcome is itself a visual" in normalized
-    assert (
-        "Normal conversation about a pending or active visual does not itself imply a revision"
-        in normalized
-    )
+    assert "unrequested merely helpful visual remains optional" in normalized
+    assert "visual is the intended outcome" in normalized
+    assert "Discussion is not revision" in normalized
     assert CANCEL_INTERACTIVE_CANVAS_TOOL_NAME in normalized
     assert "operation=new" in normalized
-    assert "operation=reviseFocused" in normalized
-    assert "semantic_focus is the active referent" in normalized
-    assert "one conversational thought" in normalized
-    assert "continue the existing thought" in normalized
-    assert "Do not greet again" in normalized
-    assert "repeat the child's request" in normalized
-    assert "second acknowledgment" in normalized
-    assert "narrate application or tool internals" in normalized
-    assert "tap declared interactive parts" in normalized
-    assert "choose declared visible options" in normalized
-    assert "ordered Back/Next progression" in normalized
-    assert "zoom, pinch, pan, drag, rotate, or free editing" in normalized
+    assert "semantic target" in normalized
+    assert "semantic_focus the referent" in normalized
+    assert "completion=requestComplete" in normalized
+    assert "For EVERY Canvas action" in normalized
+    assert "including deterministic rejection" in normalized
+    assert (
+        "completion=needsResultReasoning ONLY when the result is genuinely required"
+        in normalized
+    )
+    assert "never to acknowledge success" in normalized
+    assert "no automatic done narration" in normalized
+    assert "continuousControl" in normalized
+    assert "explore permits declared taps" in normalized
+    assert "track/checkpoint drag, slider, or timeline" in normalized
+    assert "select permits declared choices" in normalized
+    assert "steps permits Back/position/Next" in normalized
+    assert "interactionMode is exactly none|explore|select|steps" in normalized
+    assert "continuousControl is exactly none|drag|slider|timeline" in normalized
+    assert "must be none unless mode is explore" in normalized
+    assert "select select+none" in normalized
+    assert "steps steps+none" in normalized
+    assert "never convert continuous control to steps" in normalized
+    assert "zoom, pinch, pan, rotate, free editing" in normalized
+    assert "unconstrained movement" in normalized
     assert "Application identifiers have no language meaning" in normalized
     assert "function_call_output" not in normalized
     assert "historical detail" in normalized
@@ -159,11 +172,22 @@ def test_harness_exposes_bounded_semantic_canvas_actions() -> None:
     parameters = tool["parameters"]
     assert parameters["type"] == "object"
     assert parameters["additionalProperties"] is False
-    assert parameters["required"] == ["operation", "brief", "interactionMode"]
-    assert set(parameters["properties"]) == {
+    assert parameters["required"] == [
         "operation",
         "brief",
         "interactionMode",
+        "continuousControl",
+        "completion",
+    ]
+    assert set(parameters["properties"]) == {
+        "operation",
+        "selector",
+        "position",
+        "title",
+        "brief",
+        "interactionMode",
+        "continuousControl",
+        "completion",
     }
     operation_schema = parameters["$defs"]["InteractiveCanvasOperation"]
     assert parameters["properties"]["operation"]["$ref"] == (
@@ -171,28 +195,90 @@ def test_harness_exposes_bounded_semantic_canvas_actions() -> None:
     )
     assert operation_schema["enum"] == [
         "new",
-        "reviseFocused",
+        "revise",
     ]
+    assert parameters["properties"]["interactionMode"]["$ref"] == (
+        "#/$defs/InteractiveCanvasMode"
+    )
+    assert parameters["$defs"]["InteractiveCanvasMode"]["enum"] == [
+        "none",
+        "explore",
+        "select",
+        "steps",
+    ]
+    assert parameters["properties"]["continuousControl"]["$ref"] == (
+        "#/$defs/InteractiveCanvasContinuousControl"
+    )
+    assert parameters["$defs"]["InteractiveCanvasContinuousControl"]["enum"] == [
+        "none",
+        "drag",
+        "slider",
+        "timeline",
+    ]
+    assert parameters["properties"]["completion"]["$ref"] == (
+        "#/$defs/CanvasActionCompletion"
+    )
+    assert parameters["$defs"]["CanvasActionCompletion"]["enum"] == [
+        "requestComplete",
+        "needsResultReasoning",
+    ]
+    assert parameters["properties"]["completion"]["description"] == (
+        "Required: requestComplete stops; needsResultReasoning allows one "
+        "result-dependent continuation."
+    )
     cancellation = harness.tools[1]
     assert cancellation["name"] == CANCEL_INTERACTIVE_CANVAS_TOOL_NAME
     assert cancellation["type"] == "function"
     assert cancellation["parameters"]["type"] == "object"
     assert cancellation["parameters"]["additionalProperties"] is False
-    assert cancellation["parameters"]["properties"] == {}
+    assert set(cancellation["parameters"]["properties"]) == {"completion"}
+    assert cancellation["parameters"]["required"] == ["completion"]
+    assert (
+        cancellation["parameters"]["properties"]["completion"]["description"]
+        == parameters["properties"]["completion"]["description"]
+    )
     presentation = harness.tools[2]
     assert presentation["name"] == MANAGE_CANVAS_PRESENTATION_TOOL_NAME
     assert presentation["type"] == "function"
     assert set(presentation["parameters"]["properties"]) == {
-        "operation",
-        "sceneId",
-        "direction",
+        "action",
+        "position",
+        "title",
+        "completion",
     }
-    assert presentation["parameters"]["required"] == ["operation"]
-    assert "canvas_presentation is authoritative" in harness.instructions
+    assert presentation["parameters"]["required"] == ["action", "completion"]
+    assert presentation["parameters"]["$defs"]["ManageCanvasPresentationIntent"][
+        "enum"
+    ] == [
+        "hide",
+        "showCurrent",
+        "showNext",
+        "showPrevious",
+        "showFirst",
+        "showLast",
+        "showPosition",
+        "showTitle",
+    ]
+    assert (
+        presentation["parameters"]["properties"]["completion"]["description"]
+        == parameters["properties"]["completion"]["description"]
+    )
+    presentation_desc = presentation["description"]
+    assert "one semantic action" in presentation_desc
+    assert "hide" in presentation_desc
+    assert "semantic" in presentation_desc
+    assert "scene_id" not in presentation_desc
+
+    canvas_desc = tool["description"]
+    assert "target_scene_id" not in canvas_desc
+    assert "semantic selector" in canvas_desc
+    assert "canvas_presentation is authoritative visibility" in " ".join(
+        harness.instructions.split()
+    )
     assert "visible=false means no" in harness.instructions
     assert "Retained visuals" in harness.instructions
-    assert "available choices, not visibility claims" in harness.instructions
-    assert "generate only when a new/different visual" in harness.instructions
+    assert "Retained visuals are choices" in harness.instructions
+    assert "Generate only when a new/different visual" in harness.instructions
     assert harness.tools[3]["name"] == "search_memory"
     assert harness.tools[3]["parameters"]["required"] == ["query"]
     assert set(harness.tools[3]["parameters"]["properties"]) == {
@@ -204,9 +290,8 @@ def test_harness_exposes_bounded_semantic_canvas_actions() -> None:
     assert harness.tools[4]["parameters"]["properties"] == {}
     assert parameters["properties"]["brief"]["maxLength"] == 1000
     serialized = str(tool)
-    assert "'title':" not in serialized
+    assert "targetSceneId" not in serialized
     for forbidden_field in (
-        "sceneId",
         "sceneRevision",
         "focusedSceneId",
         "currentSvg",
@@ -245,6 +330,8 @@ def test_tool_brief_character_bounds(brief_len: int, should_succeed: bool) -> No
         "operation": "new",
         "brief": brief_text,
         "interactionMode": "explore",
+        "continuousControl": "none",
+        "completion": "needsResultReasoning",
     }
     if should_succeed:
         req = InteractiveCanvasRequest.model_validate(payload)
@@ -255,28 +342,34 @@ def test_tool_brief_character_bounds(brief_len: int, should_succeed: bool) -> No
 
 
 def test_consecutive_and_revision_requests_accept_bounded_briefs() -> None:
-    for operation in ("new", "new", "new", "reviseFocused"):
+    for operation in ("new", "new", "new", "revise"):
         req = InteractiveCanvasRequest.model_validate(
             {
                 "operation": operation,
+                **({"selector": "current"} if operation == "revise" else {}),
                 "brief": (
                     "Show an interactive model of the solar system with central "
                     "Sun, revolving terrestrial planets, gas giants, asteroid belt, "
                     "and orbital ellipses with labeled orbital speeds."
                 ),
                 "interactionMode": "explore",
+                "continuousControl": "none",
+                "completion": "needsResultReasoning",
             }
         )
         assert req.operation == operation
 
 
-@pytest.mark.parametrize("operation", ["new", "reviseFocused"])
+@pytest.mark.parametrize("operation", ["new", "revise"])
 def test_tool_operation_allows_only_exact_enum(operation: str) -> None:
     request = InteractiveCanvasRequest.model_validate(
         {
             "operation": operation,
+            **({"selector": "current"} if operation == "revise" else {}),
             "brief": "Show a clear water cycle.",
             "interactionMode": "none",
+            "continuousControl": "none",
+            "completion": "needsResultReasoning",
         }
     )
 
@@ -287,7 +380,7 @@ def test_tool_operation_allows_only_exact_enum(operation: str) -> None:
     "payload",
     [
         {"brief": "Show a clear water cycle."},
-        {"operation": "revise", "brief": "Show a clear water cycle."},
+        {"operation": "reviseFocused", "brief": "Show a clear water cycle."},
         {"operation": "update", "brief": "Show a clear water cycle."},
         {"operation": "newScene", "brief": "Show a clear water cycle."},
         {"operation": "", "brief": "Show a clear water cycle."},
@@ -305,10 +398,110 @@ def test_interaction_mode_is_required_and_exact(interaction_mode: str) -> None:
         "operation": "new",
         "brief": "Show a clear water cycle.",
         "interactionMode": interaction_mode,
+        "continuousControl": "none",
+        "completion": "needsResultReasoning",
     }
     request = InteractiveCanvasRequest.model_validate(payload)
 
     assert request.interaction_mode == interaction_mode
+
+
+@pytest.mark.parametrize("invalid_mode", ["drag", "slider", "timeline", "other"])
+def test_interaction_mode_rejects_control_values_without_coercion(
+    invalid_mode: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        InteractiveCanvasRequest.model_validate(
+            {
+                "operation": "new",
+                "brief": "Show a changing state.",
+                "interactionMode": invalid_mode,
+                "continuousControl": "none",
+                "completion": "needsResultReasoning",
+            }
+        )
+
+
+@pytest.mark.parametrize("continuous_control", ["none", "drag", "slider", "timeline"])
+def test_explore_accepts_each_exact_continuous_control(
+    continuous_control: str,
+) -> None:
+    request = InteractiveCanvasRequest.model_validate(
+        {
+            "operation": "new",
+            "brief": "Show a changing state.",
+            "interactionMode": "explore",
+            "continuousControl": continuous_control,
+            "completion": "needsResultReasoning",
+        }
+    )
+
+    assert request.continuous_control == continuous_control
+
+
+@pytest.mark.parametrize("interaction_mode", ["none", "select", "steps"])
+@pytest.mark.parametrize("continuous_control", ["drag", "slider", "timeline"])
+def test_non_explore_rejects_continuous_control(
+    interaction_mode: str,
+    continuous_control: str,
+) -> None:
+    with pytest.raises(ValidationError, match="continuousControl must be none"):
+        InteractiveCanvasRequest.model_validate(
+            {
+                "operation": "new",
+                "brief": "Show a changing state.",
+                "interactionMode": interaction_mode,
+                "continuousControl": continuous_control,
+                "completion": "needsResultReasoning",
+            }
+        )
+
+
+def test_continuous_control_is_required() -> None:
+    with pytest.raises(ValidationError):
+        InteractiveCanvasRequest.model_validate(
+            {
+                "operation": "new",
+                "brief": "Show a changing state.",
+                "interactionMode": "explore",
+                "completion": "needsResultReasoning",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("request_type", "payload"),
+    [
+        (
+            InteractiveCanvasRequest,
+            {
+                "operation": "new",
+                "brief": "Show a changing state.",
+                "interactionMode": "none",
+                "continuousControl": "none",
+            },
+        ),
+        (InteractiveCanvasCancellationRequest, {}),
+        (ManageCanvasPresentationRequest, {"action": "hide"}),
+    ],
+)
+def test_canvas_action_completion_is_explicit_and_has_no_default(
+    request_type: type[object],
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        request_type.model_validate(payload)  # type: ignore[attr-defined]
+
+    for completion in ("requestComplete", "needsResultReasoning"):
+        request = request_type.model_validate(  # type: ignore[attr-defined]
+            {**payload, "completion": completion}
+        )
+        assert request.completion == completion
+
+    with pytest.raises(ValidationError):
+        request_type.model_validate(  # type: ignore[attr-defined]
+            {**payload, "completion": "silentIfConvenient"}
+        )
 
 
 def test_removed_interaction_goal_is_rejected_instead_of_disagreeing_with_schema() -> (
@@ -320,6 +513,8 @@ def test_removed_interaction_goal_is_rejected_instead_of_disagreeing_with_schema
                 "operation": "new",
                 "brief": "Show a clear process.",
                 "interactionMode": "explore",
+                "continuousControl": "none",
+                "completion": "needsResultReasoning",
                 "interactionGoal": "This field is no longer part of the contract.",
             }
         )
@@ -414,17 +609,36 @@ def test_prompt_budget_and_canvas_context_remain_bounded() -> None:
     budget = estimate_harness_token_budget(harness)
 
     assert budget.instruction_characters < 8_000
-    assert budget.tool_schema_characters < 4_200
+    assert budget.tool_schema_characters < 5_000
     assert budget.estimated_fixed_tokens < 3_200
 
     canvas_context = (
-        '<active_canvas trust="validated_scene_data" scene_id="water" '
-        'revision="2">Water cycle</active_canvas>'
+        '<canvas_context trust="backend_semantic_canvas_metadata">'
+        '<canvas retained_count="1" focused_position="1"/>'
+        '<focused_scene position="1"><title>Water cycle</title>'
+        "</focused_scene></canvas_context>"
     )
     with_canvas = _harness(canvas_context=canvas_context)
     assert canvas_context in with_canvas.instructions
     with pytest.raises(ValueError, match="canvas_context"):
         _harness(canvas_context="draw anything")
+    with pytest.raises(ValueError, match="canvas_context"):
+        _harness(
+            canvas_context=(
+                '<active_canvas trust="validated_scene_data" scene_id="water"/>'
+            )
+        )
+
+
+def test_canvas_tool_result_hides_backend_generation_identity() -> None:
+    output = InteractiveCanvasToolOutputV4.model_validate(
+        {"status": "accepted", "generationId": "generation-private"}
+    )
+
+    assert output.generation_id == "generation-private"
+    assert output.model_dump(by_alias=True, exclude_none=True) == {
+        "status": InteractiveCanvasToolStatusV4.ACCEPTED
+    }
 
 
 def test_context_limits_fail_loudly() -> None:

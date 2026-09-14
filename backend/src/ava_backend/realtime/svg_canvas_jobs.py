@@ -14,6 +14,12 @@ from ..canvas.svg_delivery import (
     SvgCanvasDocumentStore,
 )
 from ..canvas.render_profile import CanvasRenderProfile
+from ..canvas.svg_document import (
+    SvgDocumentValidationError,
+    ValidatedSvgDocument,
+    validate_svg_binding_continuity,
+    validate_svg_request_document_agreement,
+)
 from ..canvas.svg_session import (
     ActiveSvgCanvasScene,
     RecordedSvgCanvasInteraction,
@@ -127,6 +133,7 @@ class _AcceptedCanvasJob:
     source_turn_id: str
     request: SvgCanvasSpecialistRequest
     accepted_workspace_epoch: int
+    base_document: ValidatedSvgDocument | None
     workspace_owned: bool = False
     task: asyncio.Task[None] | None = None
 
@@ -213,6 +220,7 @@ class SvgCanvasJobCoordinator:
         source_transcript: str | None = None,
         call: RealtimeCanvasToolCall,
         complete_tool: CompleteCanvasTool,
+        resolved_target_scene_id: str | None = None,
     ) -> InteractiveCanvasToolOutputV4:
         rejection_message: str | None = None
         async with self._lock:
@@ -225,16 +233,13 @@ class SvgCanvasJobCoordinator:
                     }
                 )
             elif (
-                call.request.operation == InteractiveCanvasOperation.REVISE_FOCUSED
-                and self._state.focused_scene is None
-                and not any(
-                    job.workspace_owned
-                    and job.generation_id not in self._cancelled_generations
-                    for job in self._jobs.values()
+                call.request.operation == InteractiveCanvasOperation.REVISE
+                and (
+                    resolved_target_scene_id is None
+                    or self._state.workspace.scene(resolved_target_scene_id) is None
                 )
-                and self._state.candidate is None
             ):
-                rejection_message = "There is no current canvas to revise."
+                rejection_message = "The selected retained canvas is not available to revise."
                 output = InteractiveCanvasToolOutputV4.model_validate(
                     {
                         "status": InteractiveCanvasToolStatusV4.REJECTED,
@@ -243,12 +248,18 @@ class SvgCanvasJobCoordinator:
                 )
             else:
                 generation_id = self._generation_id_factory()
-                active = (
-                    self._state.focused_scene
-                    if call.request.operation
-                    == InteractiveCanvasOperation.REVISE_FOCUSED
-                    else None
-                )
+                active = None
+                if call.request.operation == InteractiveCanvasOperation.REVISE:
+                    target_scene_id = resolved_target_scene_id
+                    if target_scene_id is None:
+                        raise AssertionError(
+                            "validated canvas revision lost its exact target"
+                        )
+                    active = self._state.workspace.scene(target_scene_id)
+                    if active is None:
+                        raise AssertionError(
+                            "validated canvas revision lost its exact target"
+                        )
                 accepted_workspace_epoch = self._state.workspace.reset_epoch
                 request = SvgCanvasSpecialistRequest.model_validate(
                     {
@@ -256,6 +267,7 @@ class SvgCanvasJobCoordinator:
                         "sourceTurnId": source_turn_id,
                         "brief": call.request.brief,
                         "interactionMode": call.request.interaction_mode,
+                        "continuousControl": call.request.continuous_control,
                         "ageBand": self._age_band,
                         "renderProfile": (
                             self._render_profile.model_dump(
@@ -278,6 +290,7 @@ class SvgCanvasJobCoordinator:
                     source_turn_id=source_turn_id,
                     request=request,
                     accepted_workspace_epoch=accepted_workspace_epoch,
+                    base_document=active.document if active else None,
                 )
                 self._jobs[generation_id] = job
                 self._traces[generation_id] = _CanvasGenerationTrace(
@@ -369,7 +382,11 @@ class SvgCanvasJobCoordinator:
                 self._state.workspace.start_execution(
                     generation_id=reserved_job.generation_id,
                     source_turn_id=reserved_job.source_turn_id,
-                    operation=str(call.request.operation),
+                    operation=(
+                        "reviseFocused"
+                        if call.request.operation == InteractiveCanvasOperation.REVISE
+                        else "new"
+                    ),
                 )
             except SvgCanvasWorkspaceError:
                 self._jobs.pop(output.generation_id, None)
@@ -437,7 +454,12 @@ class SvgCanvasJobCoordinator:
                     source_turn_id=source_turn_id,
                     operation=cast(
                         Literal["new", "reviseFocused"],
-                        str(call.request.operation),
+                        (
+                            "reviseFocused"
+                            if call.request.operation
+                            == InteractiveCanvasOperation.REVISE
+                            else "new"
+                        ),
                     ),
                 )
                 self._log(
@@ -818,6 +840,7 @@ class SvgCanvasJobCoordinator:
                 return self._state.record_interaction(
                     scene_id=event.scene_id,
                     scene_revision=event.scene_revision,
+                    focus_revision=event.focus_revision,
                     interaction_revision=event.interaction_revision,
                     svg_sha256=event.svg_sha256,
                     manifest_sha256=event.manifest_sha256,
@@ -1089,6 +1112,22 @@ class SvgCanvasJobCoordinator:
                 job.request,
                 draft_sink=lambda draft: self._publish_visible_draft(job, draft),
             )
+            try:
+                validate_svg_request_document_agreement(
+                    generation.document,
+                    interaction_mode=str(job.request.interaction_mode),
+                    continuous_control=str(job.request.continuous_control),
+                )
+                if job.base_document is not None:
+                    validate_svg_binding_continuity(
+                        job.base_document,
+                        generation.document,
+                    )
+            except SvgDocumentValidationError as error:
+                raise SvgCanvasSpecialistInvalidError(
+                    "SVG canvas specialist returned a rejected semantic document "
+                    f"(reason={error.code})"
+                ) from error
             async with self._lock:
                 if (
                     job.generation_id not in self._jobs

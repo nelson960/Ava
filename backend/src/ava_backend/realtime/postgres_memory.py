@@ -34,6 +34,7 @@ from .memory import (
     MemorySearchCandidate,
     MemoryResetRevisionMismatchError,
     MemoryProposalDecision,
+    SemanticCaptureDisposition,
     SemanticJournalEventDisposition,
     SemanticJournalEventRecord,
     SemanticJournalEventResult,
@@ -41,6 +42,7 @@ from .memory import (
     SemanticMemoryCommitStatus,
     SemanticMemoryProposal,
     SemanticMemoryProposalConflictError,
+    SemanticMemoryReceipt,
     SemanticMemorySourceTurnMissingError,
     StoredDeliveredConversationEvent,
     WeeklyConversationRecap,
@@ -50,6 +52,7 @@ from .memory import (
     _validate_search_bounds,
     _validate_search_limit,
     _validate_search_query,
+    _validate_semantic_journal_identity_key,
     _validate_subject,
     _validate_weekly_summary,
     build_conversation_episodes,
@@ -124,19 +127,19 @@ class PostgresAuthoritativeMemoryStore:
                     """
                     select version
                     from ava_private.schema_migrations
-                    where name = 'realtime_memory_v8'
+                    where name = 'semantic_capture_receipt_disposition'
                     """
                 )
                 row = await cursor.fetchone()
         except (PsycopgError, PoolTimeout) as error:
             await self._pool.close()
             raise PostgresMemoryStoreError(
-                "PostgreSQL memory is unavailable or its v8 migration is missing"
+                "PostgreSQL memory is unavailable or its semantic_capture_receipt_disposition migration is missing"
             ) from error
         if row is None or cast(int, row["version"]) != 1:
             await self._pool.close()
             raise PostgresMemoryStoreError(
-                "PostgreSQL memory schema realtime_memory_v8 version 1 is required"
+                "PostgreSQL memory schema capability semantic_capture_receipt_disposition version 1 is required"
             )
         self._opened = True
 
@@ -390,9 +393,10 @@ class PostgresAuthoritativeMemoryStore:
         )
         proposal = SemanticMemoryProposal.model_validate(
             {
+                "disposition": "changed",
                 "dialogueFrameUpdate": validated_update.model_dump(
                     mode="json", by_alias=True
-                )
+                ),
             }
         )
         try:
@@ -426,6 +430,157 @@ class PostgresAuthoritativeMemoryStore:
             proposal=proposal,
             allow_m1_frame_retry=False,
         )
+
+    async def load_semantic_memory_receipt(
+        self,
+        *,
+        subject: str,
+        expected_reset_revision: int,
+        source_turn_id: str,
+    ) -> SemanticMemoryReceipt | None:
+        normalized_subject = _validate_subject(subject)
+        validated_expected_reset_revision = _validate_reset_revision(
+            expected_reset_revision,
+            field_name="expected_reset_revision",
+        )
+        validated_source_turn_id = _validate_protocol_identifier(
+            source_turn_id, field_name="source_turn_id"
+        )
+        async with self._connection() as connection:
+            state_cursor = await connection.execute(
+                """
+                select reset_revision
+                from ava_private.memory_state
+                where subject = %s
+                """,
+                (normalized_subject,),
+            )
+            state = await state_cursor.fetchone()
+            current_reset_revision = (
+                0 if state is None else cast(int, state["reset_revision"])
+            )
+            if current_reset_revision != validated_expected_reset_revision:
+                raise MemoryResetRevisionMismatchError(
+                    expected_reset_revision=validated_expected_reset_revision,
+                    current_reset_revision=current_reset_revision,
+                )
+            receipt_cursor = await connection.execute(
+                """
+                select disposition, proposal_fingerprint, result_event_ids,
+                       result_dispositions, resulting_frame_revision, applied_at
+                from ava_private.semantic_memory_receipts
+                where subject = %s and source_turn_id = %s
+                """,
+                (normalized_subject, validated_source_turn_id),
+            )
+            receipt = await receipt_cursor.fetchone()
+            if receipt is not None:
+                event_ids = cast(list[str], receipt["result_event_ids"])
+                dispositions = cast(list[str], receipt["result_dispositions"])
+                event_results = tuple(
+                    (event_id, SemanticJournalEventDisposition(disp))
+                    for event_id, disp in zip(event_ids, dispositions, strict=True)
+                )
+                return SemanticMemoryReceipt(
+                    source_turn_id=validated_source_turn_id,
+                    disposition=SemanticCaptureDisposition(
+                        cast(str, receipt["disposition"])
+                    ),
+                    proposal_fingerprint=cast(str, receipt["proposal_fingerprint"]),
+                    event_results=event_results,
+                    resulting_frame_revision=cast(
+                        int, receipt["resulting_frame_revision"]
+                    ),
+                    applied_at=cast(datetime, receipt["applied_at"]),
+                )
+            legacy_receipt_cursor = await connection.execute(
+                """
+                select update_fingerprint, applied_revision, applied_at
+                from ava_private.dialogue_frame_receipts
+                where subject = %s and source_turn_id = %s
+                """,
+                (normalized_subject, validated_source_turn_id),
+            )
+            legacy_receipt = await legacy_receipt_cursor.fetchone()
+            if legacy_receipt is not None:
+                return SemanticMemoryReceipt(
+                    source_turn_id=validated_source_turn_id,
+                    disposition=SemanticCaptureDisposition.CHANGED,
+                    proposal_fingerprint=cast(str, legacy_receipt["update_fingerprint"]),
+                    event_results=(),
+                    resulting_frame_revision=cast(
+                        int, legacy_receipt["applied_revision"]
+                    ),
+                    applied_at=cast(datetime, legacy_receipt["applied_at"]),
+                )
+            return None
+
+    async def get_active_semantic_journal_event(
+        self,
+        *,
+        subject: str,
+        expected_reset_revision: int,
+        identity_key: str,
+    ) -> SemanticJournalEventRecord | None:
+        normalized_subject = _validate_subject(subject)
+        validated_expected_reset_revision = _validate_reset_revision(
+            expected_reset_revision,
+            field_name="expected_reset_revision",
+        )
+        validated_identity_key = _validate_semantic_journal_identity_key(identity_key)
+        async with self._connection() as connection:
+            state_cursor = await connection.execute(
+                """
+                select reset_revision
+                from ava_private.memory_state
+                where subject = %s
+                """,
+                (normalized_subject,),
+            )
+            state = await state_cursor.fetchone()
+            current_reset_revision = (
+                0 if state is None else cast(int, state["reset_revision"])
+            )
+            if current_reset_revision != validated_expected_reset_revision:
+                raise MemoryResetRevisionMismatchError(
+                    expected_reset_revision=validated_expected_reset_revision,
+                    current_reset_revision=current_reset_revision,
+                )
+            cursor = await connection.execute(
+                """
+                select e.event_id, e.subject, e.reset_revision, e.family,
+                       e.semantic_key, e.summary, e.identity_key, e.fingerprint,
+                       e.canonical_canvas_references, e.created_at
+                from ava_private.semantic_journal_events e
+                left join ava_private.semantic_journal_supersessions s
+                  on s.subject = e.subject
+                 and s.reset_revision = e.reset_revision
+                 and s.superseded_event_id = e.event_id
+                where e.subject = %s
+                  and e.reset_revision = %s
+                  and e.identity_key = %s
+                  and s.superseded_event_id is null
+                limit 1
+                """,
+                (normalized_subject, current_reset_revision, validated_identity_key),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            return SemanticJournalEventRecord.model_validate(
+                {
+                    "eventId": row["event_id"],
+                    "subject": row["subject"],
+                    "resetRevision": row["reset_revision"],
+                    "family": row["family"],
+                    "semanticKey": row["semantic_key"],
+                    "summary": row["summary"],
+                    "identityKey": row["identity_key"],
+                    "fingerprint": row["fingerprint"],
+                    "canonicalCanvasReferences": row["canonical_canvas_references"],
+                    "createdAt": row["created_at"],
+                }
+            )
 
     async def _apply_semantic_memory_proposal(
         self,
@@ -559,6 +714,7 @@ class PostgresAuthoritativeMemoryStore:
                         subject=normalized_subject,
                         source_turn_id=validated_source_turn_id,
                         reset_revision=current_reset_revision,
+                        disposition=SemanticCaptureDisposition.CHANGED,
                         proposal_fingerprint=proposal_fingerprint,
                         resulting_frame_revision=cast(
                             int, legacy_receipt["applied_revision"]
@@ -567,6 +723,23 @@ class PostgresAuthoritativeMemoryStore:
                     )
                     return _semantic_memory_decision(
                         SemanticMemoryCommitStatus.IDEMPOTENT,
+                        current_frame,
+                        (),
+                    )
+
+                if validated_proposal.disposition == SemanticCaptureDisposition.NO_CHANGE:
+                    await self._insert_semantic_memory_receipt(
+                        connection,
+                        subject=normalized_subject,
+                        source_turn_id=validated_source_turn_id,
+                        reset_revision=current_reset_revision,
+                        disposition=SemanticCaptureDisposition.NO_CHANGE,
+                        proposal_fingerprint=proposal_fingerprint,
+                        resulting_frame_revision=current_frame.revision,
+                        results=(),
+                    )
+                    return _semantic_memory_decision(
+                        SemanticMemoryCommitStatus.APPLIED,
                         current_frame,
                         (),
                     )
@@ -777,6 +950,7 @@ class PostgresAuthoritativeMemoryStore:
                     subject=normalized_subject,
                     source_turn_id=validated_source_turn_id,
                     reset_revision=current_reset_revision,
+                    disposition=SemanticCaptureDisposition.CHANGED,
                     proposal_fingerprint=proposal_fingerprint,
                     resulting_frame_revision=replacement.revision,
                     results=results,
@@ -943,12 +1117,58 @@ class PostgresAuthoritativeMemoryStore:
                          < %s
                     )
                 ),
+                journal_candidates as (
+                  select
+                    event.event_id as source_id,
+                    'semanticJournal'::text as source_kind,
+                    event.created_at as started_at,
+                    event.created_at as ended_at,
+                    array[]::text[] as timezone_ids,
+                    left(event.summary, 1200) as reference_text,
+                    coalesce(
+                      (
+                        select array_agg(sub.source_turn_id)
+                        from (
+                          select sources.source_turn_id
+                          from ava_private.semantic_journal_event_sources as sources
+                          where sources.subject = event.subject
+                            and sources.reset_revision = event.reset_revision
+                            and sources.event_id = event.event_id
+                          order by sources.source_turn_id
+                          limit 16
+                        ) as sub
+                      ),
+                      array[]::text[]
+                    ) as source_turn_ids,
+                    ts_rank_cd(
+                      to_tsvector('simple', event.summary),
+                      search_query.value
+                    ) as relevance
+                  from ava_private.semantic_journal_events as event
+                  cross join search_query
+                  join ava_private.memory_state as state
+                    on state.subject = event.subject
+                   and state.reset_revision = event.reset_revision
+                  where event.subject = %s
+                    and to_tsvector('simple', event.summary) @@ search_query.value
+                    and not exists (
+                      select 1
+                      from ava_private.semantic_journal_supersessions as s
+                      where s.subject = event.subject
+                        and s.reset_revision = event.reset_revision
+                        and s.superseded_event_id = event.event_id
+                    )
+                    and (%s::timestamptz is null or event.created_at >= %s)
+                    and (%s::timestamptz is null or event.created_at < %s)
+                ),
                 candidates as (
                   select * from raw_candidates
                   union all
                   select * from episode_candidates
                   union all
                   select * from stable_candidates
+                  union all
+                  select * from journal_candidates
                 )
                 select source_id, source_kind, started_at, ended_at,
                        timezone_ids, reference_text, source_turn_ids, relevance
@@ -958,6 +1178,11 @@ class PostgresAuthoritativeMemoryStore:
                 """,
                 (
                     query_text,
+                    normalized_subject,
+                    lower,
+                    lower,
+                    upper,
+                    upper,
                     normalized_subject,
                     lower,
                     lower,
@@ -1329,6 +1554,7 @@ class PostgresAuthoritativeMemoryStore:
         subject: str,
         source_turn_id: str,
         reset_revision: int,
+        disposition: SemanticCaptureDisposition,
         proposal_fingerprint: str,
         resulting_frame_revision: int,
         results: Sequence[SemanticJournalEventResult],
@@ -1336,14 +1562,15 @@ class PostgresAuthoritativeMemoryStore:
         await connection.execute(
             """
             insert into ava_private.semantic_memory_receipts (
-              subject, source_turn_id, reset_revision, proposal_fingerprint,
+              subject, source_turn_id, reset_revision, disposition, proposal_fingerprint,
               result_event_ids, result_dispositions, resulting_frame_revision
-            ) values (%s, %s, %s, %s, %s, %s, %s)
+            ) values (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 subject,
                 source_turn_id,
                 reset_revision,
+                disposition.value,
                 proposal_fingerprint,
                 [result.event.event_id for result in results],
                 [result.disposition for result in results],

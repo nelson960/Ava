@@ -6,8 +6,9 @@ from enum import StrEnum
 import re
 from typing import Annotated
 
-from pydantic import AliasChoices, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import ConfigDict, Field, StringConstraints, model_validator
 
+from ..canvas.svg_workspace import CanvasSceneSelector
 from .common import NonEmptyText, RealtimeProtocolModel, _to_camel
 
 
@@ -16,6 +17,7 @@ CANCEL_INTERACTIVE_CANVAS_TOOL_NAME = "cancel_interactive_canvas"
 MANAGE_CANVAS_PRESENTATION_TOOL_NAME = "manage_canvas_presentation"
 SEARCH_MEMORY_TOOL_NAME = "search_memory"
 GET_CURRENT_TIME_TOOL_NAME = "get_current_time"
+RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME = "record_semantic_turn_capture"
 INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS = 1000
 CANVAS_MODEL_SAFE_REJECTION_REASON = "visualUnavailable"
 SEARCH_MEMORY_MAX_REFERENCES = 5
@@ -34,7 +36,7 @@ _CALL_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 class InteractiveCanvasOperation(StrEnum):
     NEW = "new"
-    REVISE_FOCUSED = "reviseFocused"
+    REVISE = "revise"
 
 
 class InteractiveCanvasMode(StrEnum):
@@ -44,47 +46,130 @@ class InteractiveCanvasMode(StrEnum):
     STEPS = "steps"
 
 
+class InteractiveCanvasContinuousControl(StrEnum):
+    NONE = "none"
+    DRAG = "drag"
+    SLIDER = "slider"
+    TIMELINE = "timeline"
+
+
+class CanvasActionCompletion(StrEnum):
+    REQUEST_COMPLETE = "requestComplete"
+    NEEDS_RESULT_REASONING = "needsResultReasoning"
+
+
 class InteractiveCanvasRequest(RealtimeProtocolModel):
     operation: InteractiveCanvasOperation = Field(
-        description=(
-            "Use new for a separate visual or different concept. Use "
-            "reviseFocused only to modify the current focused visual."
-        )
+        description="new creates a visual; revise semantically targets a retained scene."
+    )
+    selector: CanvasSceneSelector | None = Field(
+        default=None,
+        description="Optional semantic revise target; omitted means the focused scene.",
+    )
+    position: int | None = Field(
+        default=None,
+        ge=1,
+        le=10,
+        description="One-based retained position; required only with selector=position.",
+    )
+    title: Annotated[NonEmptyText, StringConstraints(max_length=120)] | None = Field(
+        default=None,
+        description="Exact semantic title; required only with selector=title.",
     )
     brief: Annotated[
         NonEmptyText,
         StringConstraints(max_length=INTERACTIVE_CANVAS_BRIEF_MAX_CHARACTERS),
     ] = Field(
         description=(
-            "Describe the visual's conversational purpose, essential objects, "
-            "relationships, flow, and labels. Do not repeat full context or "
-            "provide coordinates, SVG, styles, code, scene IDs, or revisions."
+            "The visual purpose, objects, relationships, flow, and labels; no "
+            "coordinates, markup, styling, code, or identifiers."
         )
     )
     interaction_mode: InteractiveCanvasMode = Field(
         description=(
-            "Use none for a static visual, explore for tapping parts to learn, "
-            "select for choosing one visible option, or steps for ordered "
-            "Back/Next progression."
+            "Semantic mode; exactly none|explore|select|steps. Never use drag, "
+            "slider, or timeline here."
         )
     )
+    continuous_control: InteractiveCanvasContinuousControl = Field(
+        description=(
+            "Separate control axis; exactly none|drag|slider|timeline. drag, slider, "
+            "and timeline require interactionMode=explore."
+        )
+    )
+    completion: CanvasActionCompletion = Field(
+        description=(
+            "Required. requestComplete stops after the result; needsResultReasoning "
+            "authorizes one inference that requires the result."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_interaction_control_combination(self) -> InteractiveCanvasRequest:
+        if self.operation == InteractiveCanvasOperation.NEW:
+            if any(
+                value is not None
+                for value in (self.selector, self.position, self.title)
+            ):
+                raise ValueError(
+                    "selector, position, and title are forbidden when operation is new"
+                )
+        else:
+            selector = CanvasSceneSelector(self.selector or CanvasSceneSelector.CURRENT)
+            if selector not in {
+                CanvasSceneSelector.CURRENT,
+                CanvasSceneSelector.POSITION,
+                CanvasSceneSelector.TITLE,
+            }:
+                raise ValueError("revise selector must be current, position, or title")
+            if (selector is CanvasSceneSelector.POSITION) != (
+                self.position is not None
+            ):
+                raise ValueError("position is required only with selector=position")
+            if (selector is CanvasSceneSelector.TITLE) != (self.title is not None):
+                raise ValueError("title is required only with selector=title")
+            if (
+                selector is not CanvasSceneSelector.POSITION
+                and self.position is not None
+            ):
+                raise ValueError("position is required only with selector=position")
+            if selector is not CanvasSceneSelector.TITLE and self.title is not None:
+                raise ValueError("title is required only with selector=title")
+        if (
+            self.interaction_mode != InteractiveCanvasMode.EXPLORE
+            and self.continuous_control != InteractiveCanvasContinuousControl.NONE
+        ):
+            raise ValueError(
+                "continuousControl must be none unless interactionMode is explore"
+            )
+        return self
 
 
 class InteractiveCanvasCancellationRequest(RealtimeProtocolModel):
     """Explicit semantic request to stop unpresented canvas work."""
 
+    completion: CanvasActionCompletion = Field(
+        description=(
+            "Required. requestComplete stops after the result; needsResultReasoning "
+            "authorizes one inference that requires the result."
+        ),
+    )
+
 
 class ManageCanvasPresentationAction(StrEnum):
     SHOW = "show"
     HIDE = "hide"
-    NAVIGATE = "navigate"
 
 
-class ManageCanvasNavigationDirection(StrEnum):
-    NEXT = "next"
-    PREVIOUS = "previous"
-    FIRST = "first"
-    LAST = "last"
+class ManageCanvasPresentationIntent(StrEnum):
+    HIDE = "hide"
+    SHOW_CURRENT = "showCurrent"
+    SHOW_NEXT = "showNext"
+    SHOW_PREVIOUS = "showPrevious"
+    SHOW_FIRST = "showFirst"
+    SHOW_LAST = "showLast"
+    SHOW_POSITION = "showPosition"
+    SHOW_TITLE = "showTitle"
 
 
 class ManageCanvasPresentationStatus(StrEnum):
@@ -102,41 +187,56 @@ class ManageCanvasPresentationRequest(RealtimeProtocolModel):
         use_enum_values=True,
     )
 
-    operation: ManageCanvasPresentationAction = Field(
-        validation_alias=AliasChoices("operation", "action"),
-        serialization_alias="operation",
-        description="Use show for an exact scene, hide to close the panel, or navigate for deterministic workspace movement.",
+    action: ManageCanvasPresentationIntent = Field(
+        description="One semantic Canvas presentation action. hide has no target.",
     )
-    scene_id: str | None = Field(
+    position: int | None = Field(
         default=None,
-        min_length=1,
-        max_length=80,
-        description="The scene_id to show. Required for show and forbidden for hide or navigate.",
+        ge=1,
+        le=10,
+        description="One-based retained position; required only with action=showPosition.",
     )
-    direction: ManageCanvasNavigationDirection | None = Field(
+    title: Annotated[NonEmptyText, StringConstraints(max_length=160)] | None = Field(
         default=None,
-        description="Required only for navigate: next, previous, first, or last.",
+        description="Exact selector-safe title from the retained directory; required only with action=showTitle.",
     )
-
-    @property
-    def action(self) -> ManageCanvasPresentationAction:
-        return ManageCanvasPresentationAction(self.operation)
+    completion: CanvasActionCompletion = Field(
+        description=(
+            "Required. requestComplete stops after the result; needsResultReasoning "
+            "authorizes one inference that requires the result."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_action_fields(self) -> ManageCanvasPresentationRequest:
-        if self.operation == ManageCanvasPresentationAction.SHOW:
-            if not self.scene_id:
-                raise ValueError("scene_id is required when action is show")
-            if self.direction is not None:
-                raise ValueError("direction is forbidden when action is show")
-        elif self.operation == ManageCanvasPresentationAction.HIDE:
-            if self.scene_id is not None:
-                raise ValueError("scene_id is forbidden when action is hide")
-            if self.direction is not None:
-                raise ValueError("direction is forbidden when action is hide")
-        elif self.scene_id is not None or self.direction is None:
-            raise ValueError("navigate requires direction and forbids scene_id")
+        requires_position = self.action == ManageCanvasPresentationIntent.SHOW_POSITION
+        requires_title = self.action == ManageCanvasPresentationIntent.SHOW_TITLE
+        if requires_position != (self.position is not None):
+            raise ValueError("position is required only with action=showPosition")
+        if requires_title != (self.title is not None):
+            raise ValueError("title is required only with action=showTitle")
         return self
+
+    @property
+    def presentation_operation(self) -> ManageCanvasPresentationAction:
+        return (
+            ManageCanvasPresentationAction.HIDE
+            if self.action == ManageCanvasPresentationIntent.HIDE
+            else ManageCanvasPresentationAction.SHOW
+        )
+
+    @property
+    def presentation_selector(self) -> CanvasSceneSelector | None:
+        selectors = {
+            ManageCanvasPresentationIntent.SHOW_CURRENT: CanvasSceneSelector.CURRENT,
+            ManageCanvasPresentationIntent.SHOW_NEXT: CanvasSceneSelector.NEXT,
+            ManageCanvasPresentationIntent.SHOW_PREVIOUS: CanvasSceneSelector.PREVIOUS,
+            ManageCanvasPresentationIntent.SHOW_FIRST: CanvasSceneSelector.FIRST,
+            ManageCanvasPresentationIntent.SHOW_LAST: CanvasSceneSelector.LAST,
+            ManageCanvasPresentationIntent.SHOW_POSITION: CanvasSceneSelector.POSITION,
+            ManageCanvasPresentationIntent.SHOW_TITLE: CanvasSceneSelector.TITLE,
+        }
+        return selectors.get(self.action)
 
 
 class SearchMemoryRequest(RealtimeProtocolModel):
@@ -266,21 +366,25 @@ type RealtimeUtilityToolOutputV4 = (
 )
 
 
-class InteractiveCanvasToolStatus(StrEnum):
-    READY = "ready"
-    REJECTED = "rejected"
-
-
 class InteractiveCanvasToolStatusV4(StrEnum):
     ACCEPTED = "accepted"
     REJECTED = "rejected"
 
 
 class InteractiveCanvasToolOutputV4(RealtimeProtocolModel):
-    """Immediate function result; SVG generation is always asynchronous."""
+    """Immediate function result; SVG generation is always asynchronous.
+
+    ``generation_id`` is retained only while the backend schedules the accepted
+    job.  It is deliberately excluded from the provider-visible function result.
+    """
 
     status: InteractiveCanvasToolStatusV4
-    generation_id: str | None = Field(default=None, min_length=1, max_length=64)
+    generation_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        exclude=True,
+    )
     reason: (
         Annotated[
             str,
@@ -337,21 +441,14 @@ class ManageCanvasPresentationToolOutputV4(RealtimeProtocolModel):
     )
 
     status: ManageCanvasPresentationStatus
-    operation: ManageCanvasPresentationAction = Field(
-        validation_alias=AliasChoices("operation", "action"),
-        serialization_alias="operation",
-    )
-    direction: ManageCanvasNavigationDirection | None = None
+    operation: ManageCanvasPresentationAction
     changed: bool = False
     visible: bool | None = None
-    scene_id: str | None = Field(default=None, min_length=1, max_length=80)
-    scene_revision: int | None = Field(default=None, ge=1, le=10_001)
     position: int | None = Field(default=None, ge=1, le=10)
     total: int | None = Field(default=None, ge=0, le=10)
     has_previous: bool | None = None
     has_next: bool | None = None
-    workspace_epoch: int | None = Field(default=None, ge=0)
-    workspace_revision: int | None = Field(default=None, ge=0)
+    title: Annotated[str, StringConstraints(max_length=160)] | None = None
     reason: (
         Annotated[
             str,
@@ -360,10 +457,6 @@ class ManageCanvasPresentationToolOutputV4(RealtimeProtocolModel):
         | None
     ) = None
 
-    @property
-    def action(self) -> ManageCanvasPresentationAction:
-        return ManageCanvasPresentationAction(self.operation)
-
     @model_validator(mode="after")
     def validate_atomic_status(self) -> ManageCanvasPresentationToolOutputV4:
         if self.status == ManageCanvasPresentationStatus.ACCEPTED:
@@ -371,53 +464,9 @@ class ManageCanvasPresentationToolOutputV4(RealtimeProtocolModel):
                 raise ValueError(
                     "accepted canvas presentation output cannot include reason"
                 )
-            if (
-                self.operation == ManageCanvasPresentationAction.SHOW
-                and not self.scene_id
-            ):
-                raise ValueError("accepted show presentation output requires scene_id")
-            if (
-                self.operation == ManageCanvasPresentationAction.HIDE
-                and self.scene_id is not None
-            ):
-                raise ValueError(
-                    "accepted hide presentation output cannot include scene_id"
-                )
-            if (
-                self.operation == ManageCanvasPresentationAction.NAVIGATE
-                and self.direction is None
-            ):
-                raise ValueError("accepted navigate output requires direction")
         else:
             if not self.reason:
                 raise ValueError("rejected canvas presentation output requires reason")
-        return self
-
-
-class InteractiveCanvasToolOutput(RealtimeProtocolModel):
-    status: InteractiveCanvasToolStatus
-    scene_id: str | None = Field(default=None, min_length=1, max_length=80)
-    revision: int | None = Field(default=None, ge=1, le=10_001)
-    summary: Annotated[str, StringConstraints(max_length=240)] | None = None
-    reason: Annotated[str, StringConstraints(max_length=240)] | None = None
-
-    @model_validator(mode="after")
-    def status_fields_are_atomic(self) -> InteractiveCanvasToolOutput:
-        if self.status == InteractiveCanvasToolStatus.READY:
-            if self.scene_id is None or self.revision is None or not self.summary:
-                raise ValueError(
-                    "ready canvas output requires sceneId, revision, and summary"
-                )
-            if self.reason is not None:
-                raise ValueError("ready canvas output cannot include reason")
-        else:
-            if not self.reason:
-                raise ValueError("rejected canvas output requires reason")
-            if any(
-                value is not None
-                for value in (self.scene_id, self.revision, self.summary)
-            ):
-                raise ValueError("rejected canvas output cannot include scene fields")
         return self
 
 
@@ -515,6 +564,7 @@ class RealtimeCanvasToolCall:
 @dataclass(frozen=True, slots=True)
 class RealtimeCancelCanvasToolCall:
     call_id: str
+    request: InteractiveCanvasCancellationRequest
 
     def __post_init__(self) -> None:
         if not _CALL_ID.fullmatch(self.call_id):

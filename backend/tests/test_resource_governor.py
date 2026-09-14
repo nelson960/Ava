@@ -9,11 +9,7 @@ from ava_backend.realtime.resource_governor import (
     ResourceGovernor,
     ResourceGovernorState,
 )
-from ava_backend.realtime.tool_contract import (
-    MAX_PRIMARY_TOOL_OUTPUT_UTF8_BYTES,
-    MAX_SEARCH_MEMORY_TOOL_OUTPUT_UTF8_BYTES,
-    MAX_TERMINAL_TOOL_OUTPUT_UTF8_BYTES,
-)
+import pytest
 
 
 class _ManualClock:
@@ -40,7 +36,6 @@ def _governor(
     current = clock or _ManualClock()
     return ResourceGovernor(
         max_recovery_attempts=max_attempts,
-        max_recovery_seconds=30,
         fallback_wait_seconds=1,
         monotonic_clock=current.monotonic,
         wall_clock=current.wall,
@@ -71,7 +66,7 @@ def test_sufficient_tpm_and_rpm_allow_one_owned_reservation() -> None:
 
     decision = governor.admit(
         turn_id="turn-a",
-        output_token_limits=(800, 512, 512),
+        output_token_limits=(800,),
         tpm=_limit(clock, remaining=20_000),
         rpm=_limit(clock, remaining=10, limit=100),
     )
@@ -84,7 +79,7 @@ def test_sufficient_tpm_and_rpm_allow_one_owned_reservation() -> None:
         rpm=_limit(clock, remaining=10, limit=100),
     )
     assert snapshot.local_reserved_tokens == decision.estimate.estimated_tokens
-    assert snapshot.local_reserved_requests == 3
+    assert snapshot.local_reserved_requests == 1
 
 
 def test_tpm_below_logical_turn_estimate_defers() -> None:
@@ -96,8 +91,8 @@ def test_tpm_below_logical_turn_estimate_defers() -> None:
 
     decision = governor.admit(
         turn_id="turn-low-tpm",
-        output_token_limits=(800, 512),
-        tpm=_limit(clock, remaining=5_000),
+        output_token_limits=(800,),
+        tpm=_limit(clock, remaining=4_899),
         rpm=_limit(clock, remaining=10, limit=100),
     )
 
@@ -149,7 +144,7 @@ def test_missing_tpm_uses_explicit_serial_bootstrap_fallback() -> None:
 
     decision = governor.admit(
         turn_id="turn-bootstrap",
-        output_token_limits=(800, 512, 512),
+        output_token_limits=(800,),
         tpm=None,
         rpm=_limit(clock, remaining=5, limit=100),
     )
@@ -231,7 +226,7 @@ def test_same_turn_reservation_rechecks_latest_tpm_and_rpm() -> None:
     )
     governor.admit(
         turn_id="turn-owner",
-        output_token_limits=(100, 100),
+        output_token_limits=(100,),
         tpm=_limit(clock, remaining=10_000),
         rpm=_limit(clock, remaining=10, limit=100),
     )
@@ -315,65 +310,35 @@ def test_cancellation_releases_only_its_turn_reservation() -> None:
     assert governor.snapshot(tpm=None, rpm=None).local_reserved_requests == 0
 
 
-def test_tool_capable_reservation_exceeds_single_inference_reservation() -> None:
+def test_hypothetical_multi_response_reservation_is_rejected() -> None:
     governor = _governor()
-    governor.observe_actual_usage(
-        turn_id="turn-calibration", input_tokens=1_000, output_tokens=100
-    )
-
-    single = governor.estimate(output_token_limits=(800,))
-    tool_capable = governor.estimate(output_token_limits=(800, 512, 512))
-
-    assert tool_capable.estimated_responses == 3
-    assert single.estimated_tokens is not None
-    assert tool_capable.estimated_tokens is not None
-    assert tool_capable.estimated_tokens > single.estimated_tokens
-
-    governor.admit(
-        turn_id="turn-tool-capable",
-        output_token_limits=(800, 512, 512),
-        tpm=None,
-        rpm=None,
-    )
-    governor.bind_provider_response(
-        turn_id="turn-tool-capable", provider_response_id="response-primary"
-    )
-    governor.reconcile_response(
-        turn_id="turn-tool-capable",
-        provider_response_id="response-primary",
-        input_tokens=1_000,
-        output_tokens=100,
-    )
-    remaining = governor.snapshot(tpm=None, rpm=None)
-    assert remaining.local_reserved_requests == 2
-    assert remaining.local_reserved_tokens == 3_736
+    with pytest.raises(ValueError, match="exactly one response"):
+        governor.estimate(output_token_limits=(800, 512, 512))
+    with pytest.raises(ValueError, match="future input growth"):
+        governor.estimate(
+            output_token_limits=(800,), input_growth_token_limits=(512,)
+        )
 
 
-def test_primary_reserves_known_mechanics_without_unknown_tool_payload() -> None:
+def test_primary_is_admitted_from_only_its_concrete_estimate() -> None:
     clock = _ManualClock()
     governor = _governor(clock)
     governor.observe_actual_usage(
-        turn_id="turn-calibration", input_tokens=10_000, output_tokens=500
+        turn_id="turn-calibration", input_tokens=4_500, output_tokens=0
     )
 
     primary = governor.admit(
         turn_id="turn-primary",
-        output_token_limits=(800, 512, 512),
-        tpm=_limit(clock, remaining=40_000, limit=40_000),
+        output_token_limits=(500,),
+        tpm=_limit(clock, remaining=10_388, limit=40_000),
         rpm=None,
     )
 
     assert primary.action is ResourceAdmissionAction.ALLOW
-    assert primary.estimate.estimated_responses == 3
-    assert primary.estimate.input_growth_token_limits == (0, 0)
-    # Each later response includes the preceding configured model-output
-    # ceiling even though no future semantic tool payload is predicted.
-    assert primary.estimate.estimated_tokens == 35_436
-    assert MAX_SEARCH_MEMORY_TOOL_OUTPUT_UTF8_BYTES > 40_000
-    assert MAX_PRIMARY_TOOL_OUTPUT_UTF8_BYTES >= (
-        MAX_SEARCH_MEMORY_TOOL_OUTPUT_UTF8_BYTES
-    )
-    assert MAX_TERMINAL_TOOL_OUTPUT_UTF8_BYTES > 0
+    assert primary.estimate.estimated_responses == 1
+    assert primary.estimate.output_token_limits == (500,)
+    assert primary.estimate.input_growth_token_limits == ()
+    assert primary.estimate.estimated_tokens == 5_000
 
 
 def test_actual_function_output_is_charged_to_continuation() -> None:
@@ -396,47 +361,38 @@ def test_actual_function_output_is_charged_to_continuation() -> None:
     )
 
 
-def test_actual_usage_rebases_remaining_reservation_upward_and_downward() -> None:
-    def remaining_after(*, actual_input: int, actual_output: int) -> int:
-        governor = _governor()
-        governor.observe_actual_usage(
-            turn_id="turn-calibration", input_tokens=1_000, output_tokens=100
-        )
-        governor.admit(
-            turn_id="turn-owner",
-            output_token_limits=(800, 512),
-            input_growth_token_limits=(600,),
-            tpm=None,
-            rpm=None,
-        )
-        governor.bind_provider_response(
-            turn_id="turn-owner", provider_response_id="response-primary"
-        )
-        governor.reconcile_response(
-            turn_id="turn-owner",
-            provider_response_id="response-primary",
-            input_tokens=actual_input,
-            output_tokens=actual_output,
-        )
-        snapshot = governor.snapshot(
-            tpm=RateLimitWindow(
-                limit=10_000,
-                remaining=9_000,
-                reset_seconds=60,
-                observed_at=datetime(2026, 9, 7, tzinfo=UTC),
-            ),
-            rpm=None,
-        )
-        assert snapshot.provider_tpm_remaining == 9_000
-        return snapshot.local_reserved_tokens
+def test_reconciled_zero_reservation_accepts_fresh_same_turn_response() -> None:
+    clock = _ManualClock()
+    governor = _governor(clock)
+    governor.admit(
+        turn_id="turn-owner",
+        output_token_limits=(800,),
+        tpm=None,
+        rpm=None,
+    )
+    governor.bind_provider_response(
+        turn_id="turn-owner", provider_response_id="response-primary"
+    )
+    governor.reconcile_response(
+        turn_id="turn-owner",
+        provider_response_id="response-primary",
+        input_tokens=2_000,
+        output_tokens=200,
+    )
+    reconciled = governor.snapshot(tpm=None, rpm=None)
+    assert reconciled.local_reserved_requests == 0
+    assert reconciled.local_reserved_tokens == 0
 
-    prior_remaining_estimate = 1_000 + 100 + 800 + 600 + 512
-    assert remaining_after(actual_input=2_000, actual_output=200) > (
-        prior_remaining_estimate
+    continuation = governor.admit(
+        turn_id="turn-owner",
+        output_token_limits=(512,),
+        initial_input_growth_tokens=600,
+        tpm=_limit(clock, remaining=3_312),
+        rpm=_limit(clock, remaining=1, limit=100),
     )
-    assert remaining_after(actual_input=100, actual_output=10) < (
-        prior_remaining_estimate
-    )
+    assert continuation.action is ResourceAdmissionAction.ALLOW
+    assert continuation.estimate.estimated_tokens == 3_312
+    assert governor.snapshot(tpm=None, rpm=None).local_reserved_requests == 1
 
 
 def test_rate_limit_recovery_is_bounded_and_new_turn_is_not_poisoned() -> None:
@@ -496,7 +452,7 @@ def test_reset_deadline_replenishes_snapshot_without_mutating_provider_truth() -
     assert governor.snapshot(tpm=snapshot, rpm=None).provider_tpm_remaining == 0
 
 
-def test_recovery_wait_is_capped_by_the_configured_horizon() -> None:
+def test_recovery_wait_uses_provider_reset_beyond_thirty_seconds() -> None:
     clock = _ManualClock()
     governor = _governor(clock)
     governor.admit(
@@ -516,4 +472,32 @@ def test_recovery_wait_is_capped_by_the_configured_horizon() -> None:
         rpm=None,
     )
 
-    assert wait_seconds == 30
+    assert wait_seconds == 120
+
+
+def test_recovery_wait_without_provider_reset_uses_bounded_fallback() -> None:
+    clock = _ManualClock()
+    governor = _governor(clock)
+    governor.admit(
+        turn_id="turn-recovery",
+        output_token_limits=(256,),
+        tpm=None,
+        rpm=None,
+    )
+    governor.bind_provider_response(
+        turn_id="turn-recovery", provider_response_id="response-limited"
+    )
+    assert governor.mark_rate_limited(turn_id="turn-recovery") is True
+
+    wait_seconds = governor.recovery_wait_seconds(
+        limit_kind="tokens",
+        tpm=RateLimitWindow(
+            limit=10_000,
+            remaining=0,
+            reset_seconds=None,
+            observed_at=clock.wall(),
+        ),
+        rpm=None,
+    )
+
+    assert wait_seconds == 1

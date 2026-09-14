@@ -150,6 +150,39 @@ final class AvaCanvasRestoreService {
     }
   }
 
+  Future<void> retainScene({
+    required AvaSessionBootstrapV4 bootstrap,
+    required AvaValidatedSvgCanvasDocument document,
+  }) async {
+    final descriptor = document.descriptor;
+    final response = await _transport.putBytes(
+      endpoint: _configuration.canvasRetainedSceneEndpoint(bootstrap.sessionId),
+      headers: {
+        HttpHeaders.acceptHeader: 'application/json',
+        HttpHeaders.contentTypeHeader: 'application/octet-stream',
+        'x-ava-protocol-version': '$avaRealtimeProtocolVersionV4',
+        'x-ava-canvas-token': bootstrap.canvasToken,
+        'x-ava-generation-id': descriptor.generationId,
+        'x-ava-source-turn-id': descriptor.sourceTurnId,
+        'x-ava-scene-id': descriptor.sceneId,
+        'x-ava-scene-revision': '${descriptor.sceneRevision}',
+        'x-ava-svg-sha256': descriptor.svgSha256,
+        'x-ava-manifest-sha256': descriptor.manifestSha256,
+      },
+      body: document.svgBytes,
+      timeout: _configuration.requestTimeout,
+    );
+    await _drain(response.bytes);
+    if (response.statusCode != HttpStatus.noContent ||
+        response.protocolVersion != '$avaRealtimeProtocolVersionV4') {
+      throw AvaCanvasRestoreException(
+        message: 'Ava backend rejected a retained Canvas document.',
+        statusCode: response.statusCode,
+        requestId: response.requestId,
+      );
+    }
+  }
+
   Future<void> focusScene({
     required int focusRevision,
     required AvaSessionBootstrapV4 bootstrap,

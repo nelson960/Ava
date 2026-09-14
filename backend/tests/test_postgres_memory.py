@@ -37,6 +37,7 @@ from ava_backend.realtime.memory import (
     DialogueFrameUpdate,
     DialogueFrameUpdateConflictError,
     MAX_WEEKLY_RECORDS,
+    MemoryCandidateSourceKind,
     MemoryResetRevisionMismatchError,
     RAW_RETENTION_HIGH_WATER,
     RAW_RETENTION_LOW_WATER,
@@ -150,6 +151,8 @@ async def test_postgres_v8_schema_includes_semantic_journal() -> None:
             select
               (select version from ava_private.schema_migrations
                 where name = 'realtime_memory_v8'),
+              (select version from ava_private.schema_migrations
+                where name = 'semantic_capture_receipt_disposition'),
               to_regclass('ava_private.weekly_records'),
               to_regclass('ava_private.dialogue_frame_receipts'),
               to_regclass('ava_private.semantic_journal_events'),
@@ -163,6 +166,12 @@ async def test_postgres_v8_schema_includes_semantic_journal() -> None:
                   and column_name = 'dialogue_frame_payload'
               ),
               exists (
+                select 1 from information_schema.columns
+                where table_schema = 'ava_private'
+                  and table_name = 'semantic_memory_receipts'
+                  and column_name = 'disposition'
+              ),
+              exists (
                 select 1
                 from pg_catalog.pg_tables
                 where schemaname = 'ava_private'
@@ -172,12 +181,14 @@ async def test_postgres_v8_schema_includes_semantic_journal() -> None:
         )
         assert await cursor.fetchone() == (
             1,
+            1,
             None,
             "ava_private.dialogue_frame_receipts",
             "ava_private.semantic_journal_events",
             "ava_private.semantic_journal_event_sources",
             "ava_private.semantic_journal_supersessions",
             "ava_private.semantic_memory_receipts",
+            True,
             True,
             False,
         )
@@ -186,22 +197,24 @@ async def test_postgres_v8_schema_includes_semantic_journal() -> None:
         await store.close()
 
 
-async def test_postgres_startup_rejects_schema_without_v8_registration() -> None:
+async def test_postgres_startup_rejects_schema_without_disposition_registration() -> None:
     assert TEST_DATABASE_URL is not None
     connection = await AsyncConnection.connect(TEST_DATABASE_URL, autocommit=True)
     store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
     try:
         await connection.execute(
-            "delete from ava_private.schema_migrations where name = 'realtime_memory_v8'"
+            "delete from ava_private.schema_migrations where name = 'semantic_capture_receipt_disposition'"
         )
-        with pytest.raises(PostgresMemoryStoreError, match="v8"):
+        with pytest.raises(
+            PostgresMemoryStoreError, match="semantic_capture_receipt_disposition"
+        ):
             await store.open()
     finally:
         await store.close()
         await connection.execute(
             """
             insert into ava_private.schema_migrations (name, version)
-            values ('realtime_memory_v8', 1)
+            values ('semantic_capture_receipt_disposition', 1)
             on conflict (name) do update
             set version = excluded.version,
                 applied_at = now()
@@ -1262,6 +1275,7 @@ def _semantic_proposal(
     supersedes: list[str] | None = None,
 ) -> SemanticMemoryProposal:
     payload: dict[str, object] = {
+        "disposition": "changed",
         "journalEvents": [
             {
                 "family": "userPreference",
@@ -1269,7 +1283,7 @@ def _semantic_proposal(
                 "summary": summary,
                 "supersedesEventIds": supersedes or [],
             }
-        ]
+        ],
     }
     if base_revision is not None:
         payload["dialogueFrameUpdate"] = {
@@ -1419,6 +1433,99 @@ async def test_postgres_semantic_memory_supersession_and_reset_cascade() -> None
         )
         await connection.close()
         await store.close()
+
+
+async def test_postgres_semantic_journal_search_parity_supersession_and_reset() -> None:
+    assert TEST_DATABASE_URL is not None
+    store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
+    subject = f"test:{uuid4()}"
+    await store.open()
+    try:
+        await store.commit_delivered_turn(
+            subject=subject,
+            expected_reset_revision=0,
+            turn=_turn(1),
+            proposal=None,
+            memory_id=None,
+        )
+        first = await store.apply_semantic_memory_proposal(
+            subject=subject,
+            expected_reset_revision=0,
+            source_turn_id="turn-1",
+            proposal=_semantic_proposal("The child prefers volcanic Jupiter moons."),
+        )
+        first_id = first.journal_results[0].event.event_id
+
+        # 1. Search retrieves active journal record
+        initial_search = await store.search_memory_candidates(
+            subject=subject,
+            query="volcanic moons",
+        )
+        assert len(initial_search) == 1
+        assert initial_search[0].source_id == first_id
+        assert initial_search[0].source_kind == MemoryCandidateSourceKind.SEMANTIC_JOURNAL
+        assert initial_search[0].source_kind == "semanticJournal"
+        assert "volcanic Jupiter moons" in initial_search[0].reference_text
+        assert initial_search[0].source_turn_ids == ["turn-1"]
+        assert initial_search[0].started_at is not None
+        assert initial_search[0].ended_at == initial_search[0].started_at
+        assert initial_search[0].timezone_ids == []
+
+        # 2. Supersede with second event
+        await store.commit_delivered_turn(
+            subject=subject,
+            expected_reset_revision=0,
+            turn=_turn(2),
+            proposal=None,
+            memory_id=None,
+        )
+        second = await store.apply_semantic_memory_proposal(
+            subject=subject,
+            expected_reset_revision=0,
+            source_turn_id="turn-2",
+            proposal=_semantic_proposal(
+                "The child prefers Saturn icy ring systems.",
+                supersedes=[first_id],
+            ),
+        )
+        second_id = second.journal_results[0].event.event_id
+
+        # Superseded first event is excluded from search
+        superseded_search = await store.search_memory_candidates(
+            subject=subject,
+            query="volcanic moons",
+        )
+        assert not any(c.source_id == first_id for c in superseded_search)
+
+        # Second active event is retrieved
+        second_search = await store.search_memory_candidates(
+            subject=subject,
+            query="Saturn icy",
+        )
+        assert len(second_search) == 1
+        assert second_search[0].source_id == second_id
+        assert second_search[0].source_kind == MemoryCandidateSourceKind.SEMANTIC_JOURNAL
+
+        # 3. Reset conversation isolates old records
+        receipt = await store.reset_conversation(subject=subject)
+        assert receipt.revision == 1
+
+        post_reset_search = await store.search_memory_candidates(
+            subject=subject,
+            query="Saturn icy",
+        )
+        assert len(post_reset_search) == 0
+    finally:
+        connection = await AsyncConnection.connect(TEST_DATABASE_URL, autocommit=True)
+        await connection.execute(
+            "delete from ava_private.reset_log where subject = %s", (subject,)
+        )
+        await connection.execute(
+            "delete from ava_private.memory_state where subject = %s", (subject,)
+        )
+        await connection.close()
+        await store.close()
+
 
 
 async def test_postgres_semantic_memory_allows_immutable_a_b_a_recurrence() -> None:

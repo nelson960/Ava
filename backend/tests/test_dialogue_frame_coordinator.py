@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections import deque
 from datetime import UTC, datetime
 from types import MethodType, SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -15,22 +14,26 @@ from ava_backend.realtime.coordinator import (
     _TurnResult,
 )
 from ava_backend.realtime.context_assembler import DynamicContextBuildReason
+from ava_backend.realtime.fakes import DeterministicRealtimePlanProvider
 from ava_backend.realtime.memory import (
+    AgeBand,
     ChildTurnTextSource,
     DeliveredConversationTurn,
     DeliveredTurnTerminal,
     DevelopmentAuthoritativeMemoryStore,
     DialogueFrame,
+    DialogueFrameState,
     DialogueFrameUpdate,
+    SemanticCaptureDisposition,
+    SemanticCaptureFunctionArguments,
 )
 
 
-def _update(
+def _capture_result(
     topic: str,
     *,
-    base_revision: int = 0,
     canvas: tuple[str, int] | None = None,
-) -> DialogueFrameUpdate:
+) -> SemanticCaptureFunctionArguments:
     frame: dict[str, object] = {"activeTopics": [topic]}
     if canvas is not None:
         frame["relevantCanvasReferences"] = [
@@ -40,8 +43,9 @@ def _update(
                 "relation": "The visual currently under discussion",
             }
         ]
-    return DialogueFrameUpdate.model_validate(
-        {"baseRevision": base_revision, "frame": frame}
+    return SemanticCaptureFunctionArguments(
+        disposition=SemanticCaptureDisposition.CHANGED,
+        dialogue_frame=DialogueFrameState.model_validate(frame),
     )
 
 
@@ -72,6 +76,8 @@ def _bare_coordinator(
     *,
     memory: DevelopmentAuthoritativeMemoryStore | None = None,
     workspace: _Workspace | None = None,
+    realtime: DeterministicRealtimePlanProvider | None = None,
+    start_memory_worker: bool = False,
 ) -> DeterministicRealtimeSessionCoordinator:
     coordinator = cast(
         DeterministicRealtimeSessionCoordinator,
@@ -87,91 +93,44 @@ def _bare_coordinator(
     coordinator._memory = memory or DevelopmentAuthoritativeMemoryStore()
     coordinator._memory_reset_revision = 0
     coordinator._dialogue_frame = DialogueFrame()
-    coordinator._staged_semantic_memory_proposal = None
+    coordinator._turn_settled_tool_outcomes = []
     coordinator._canvas_jobs = _ResettableCanvasJobs(workspace or _Workspace())  # type: ignore[assignment]
     coordinator._canvas_context_lock = asyncio.Lock()
-    coordinator._warm_refresh_revision = 0
     coordinator._warm_memories = ()
-    coordinator._recent_live_echo_suppression_turn_ids = deque(maxlen=8)
     coordinator._last_memory_decision = None
-    coordinator._memory_commit_tasks = {}
+    coordinator._memory_commit_queue = asyncio.Queue()
+    coordinator._memory_commit_terminal = object()
+    if start_memory_worker:
+        coordinator._memory_commit_worker_task = asyncio.create_task(
+            coordinator._run_memory_commit_worker()
+        )
+    else:
+        coordinator._memory_commit_worker_task = None
+    coordinator._last_enqueued_memory_sequence = 0
+    coordinator._scheduled_memory_commit_turn_ids = set()
     coordinator._memory_commit_sequence = 0
     coordinator._latest_memory_commit_sequence = 0
+    coordinator._current_memory_commit_turn_id = None
+    coordinator._memory_commit_drain_timeout_seconds = 5.0
     coordinator._failure_id_factory = lambda: "failure-frame"
     coordinator._memory_snapshot = None
     coordinator._harness = None
+    coordinator._pending_harness = None
+    coordinator._latest_canvas_interaction_intent = None
+    coordinator._context_installation_task = None
+    coordinator._realtime = realtime or DeterministicRealtimePlanProvider()
+    coordinator._turn_id_factory = lambda: "turn-next"
+    coordinator._request_id_factory = lambda: "req-next"
+    coordinator._stream_id_factory = lambda: "stream-next"
+    coordinator._stream_id = "stream-1"
     return coordinator
-
-
-def test_current_turn_staging_is_idempotent_and_conflicts_are_rejected() -> None:
-    coordinator = _bare_coordinator()
-    update = _update("Moon")
-
-    with pytest.raises(CoordinatorStateError, match="active current turn"):
-        coordinator.stage_dialogue_frame_update(turn_id="turn-old", update=update)
-    coordinator.stage_dialogue_frame_update(turn_id="turn-1", update=update)
-    coordinator.stage_dialogue_frame_update(turn_id="turn-1", update=update)
-    with pytest.raises(CoordinatorStateError, match="different"):
-        coordinator.stage_dialogue_frame_update(
-            turn_id="turn-1", update=_update("Earth")
-        )
-
-
-def test_canvas_references_require_exact_canonical_retained_revision() -> None:
-    coordinator = _bare_coordinator(workspace=_Workspace({"scene-moon": 3}))
-
-    coordinator.stage_dialogue_frame_update(
-        turn_id="turn-1", update=_update("Moon", canvas=("scene-moon", 3))
-    )
-    coordinator._staged_semantic_memory_proposal = None
-    with pytest.raises(CoordinatorStateError, match="canonical retained"):
-        coordinator.stage_dialogue_frame_update(
-            turn_id="turn-1", update=_update("Moon", canvas=("scene-moon", 2))
-        )
-    with pytest.raises(CoordinatorStateError, match="canonical retained"):
-        coordinator.stage_dialogue_frame_update(
-            turn_id="turn-1", update=_update("Moon", canvas=("scene-missing", 1))
-        )
-
-
-async def test_schedule_captures_exact_staged_update_without_cross_turn_leak() -> None:
-    coordinator = _bare_coordinator()
-    coordinator._turn_occurred_at = datetime(2026, 9, 8, tzinfo=UTC)
-    coordinator._turn_canvas_interaction_input = None
-    coordinator._child_text = "Tell me about the Moon."
-    coordinator._child_text_source = ChildTurnTextSource.TRANSCRIPT
-    captured: list[_CapturedMemoryCommit] = []
-
-    async def capture(
-        _self: DeterministicRealtimeSessionCoordinator,
-        *,
-        payload: _CapturedMemoryCommit,
-    ) -> None:
-        captured.append(payload)
-
-    coordinator._run_memory_commit = MethodType(capture, coordinator)  # type: ignore[method-assign]
-    coordinator.stage_dialogue_frame_update(turn_id="turn-1", update=_update("Moon"))
-    coordinator._schedule_memory_commit(
-        turn_id="turn-1",
-        plan=_TurnResult(segments=(), child_turn_summary="Discussed the Moon."),
-        delivered_sample_count=24_000,
-        delivered_text="The Moon orbits Earth.",
-        terminal=DeliveredTurnTerminal.COMPLETED,
-    )
-    await asyncio.gather(*coordinator._memory_commit_tasks.values())
-
-    assert captured[0].turn_id == "turn-1"
-    assert captured[0].dialogue_frame_update == _update("Moon")
-    assert coordinator._staged_semantic_memory_proposal is None
-    coordinator._turn_id = "turn-2"
-    assert coordinator._staged_semantic_memory_proposal is None
 
 
 def _payload(
     *,
     turn_id: str,
-    update: DialogueFrameUpdate,
     sequence: int = 1,
+    terminal: DeliveredTurnTerminal = DeliveredTurnTerminal.COMPLETED,
 ) -> _CapturedMemoryCommit:
     return _CapturedMemoryCommit(
         sequence=sequence,
@@ -185,47 +144,137 @@ def _payload(
         canvas_interaction=None,
         delivered_text="Here is more.",
         delivered_sample_count=24_000,
-        terminal=DeliveredTurnTerminal.COMPLETED,
+        terminal=terminal,
         transcript_waiter=None,
-        warm_refresh_revision=1,
-        dialogue_frame_update=update,
+        interrupted=(terminal == DeliveredTurnTerminal.CANCELLED),
     )
 
 
+def _record_context_refreshes(
+    coordinator: DeterministicRealtimeSessionCoordinator,
+) -> list[tuple[int, DynamicContextBuildReason]]:
+    builds: list[tuple[int, DynamicContextBuildReason]] = []
+
+    async def refresh(
+        _self: DeterministicRealtimeSessionCoordinator,
+        *,
+        reason: DynamicContextBuildReason = DynamicContextBuildReason.CANVAS_ACTIVATED,
+    ) -> None:
+        builds.append((_self.dialogue_frame.revision, reason))
+
+    coordinator._refresh_canvas_context = MethodType(refresh, coordinator)  # type: ignore[method-assign]
+    return builds
+
+
+async def test_post_delivery_capture_updates_dialogue_frame_and_refreshes_context() -> None:
+    provider = DeterministicRealtimePlanProvider()
+    provider.canned_capture_results = [_capture_result("Moon")]
+    coordinator = _bare_coordinator(realtime=provider)
+    builds = _record_context_refreshes(coordinator)
+
+    await coordinator._run_memory_commit(payload=_payload(turn_id="turn-1"))
+
+    assert coordinator.dialogue_frame.active_topics == ("Moon",)
+    assert coordinator.dialogue_frame.revision == 1
+    assert len(provider.captured_evidences) == 1
+    assert provider.captured_evidences[0].source_turn_id == "turn-1"
+    assert provider.captured_evidences[0].child_utterance == "Tell me more."
+    assert provider.captured_evidences[0].spoken_response_prefix == "Here is more."
+    assert not provider.captured_evidences[0].interrupted
+    assert builds == [(1, DynamicContextBuildReason.TURN_COMMITTED)]
+
+
+async def test_canvas_references_require_exact_canonical_retained_revision() -> None:
+    provider = DeterministicRealtimePlanProvider()
+    provider.canned_capture_results = [
+        _capture_result("Moon", canvas=("scene-moon", 2))
+    ]
+    coordinator = _bare_coordinator(
+        workspace=_Workspace({"scene-moon": 3}), realtime=provider
+    )
+    builds = _record_context_refreshes(coordinator)
+
+    await coordinator._run_memory_commit(payload=_payload(turn_id="turn-1"))
+
+    # Invalid canvas reference caused proposal rejection; frame remains default
+    assert coordinator.dialogue_frame == DialogueFrame()
+    assert builds == []
+
+
+async def test_schedule_captures_settled_outcomes_without_cross_turn_leak() -> None:
+    coordinator = _bare_coordinator(start_memory_worker=True)
+    coordinator._turn_occurred_at = datetime(2026, 9, 8, tzinfo=UTC)
+    coordinator._turn_canvas_interaction_input = None
+    coordinator._child_text = "Tell me about the Moon."
+    coordinator._child_text_source = ChildTurnTextSource.TRANSCRIPT
+    coordinator._record_tool_outcome(
+        tool_name="get_current_time",
+        call_id="call_time_1",
+        outcome="available",
+    )
+    captured: list[_CapturedMemoryCommit] = []
+
+    async def capture(
+        _self: DeterministicRealtimeSessionCoordinator,
+        *,
+        payload: _CapturedMemoryCommit,
+    ) -> None:
+        captured.append(payload)
+
+    coordinator._run_memory_commit = MethodType(capture, coordinator)  # type: ignore[method-assign]
+    coordinator._schedule_memory_commit(
+        turn_id="turn-1",
+        plan=_TurnResult(segments=(), child_turn_summary="Discussed the Moon."),
+        delivered_sample_count=24_000,
+        delivered_text="The Moon orbits Earth.",
+        terminal=DeliveredTurnTerminal.COMPLETED,
+    )
+    await coordinator._memory_commit_queue.join()
+
+    assert captured[0].turn_id == "turn-1"
+    assert len(captured[0].settled_tool_outcomes) == 1
+    assert captured[0].settled_tool_outcomes[0].tool_name == "get_current_time"
+    assert not captured[0].interrupted
+    # Settled tool outcomes are preserved per turn and cleared on transition
+    coordinator._harness = cast(Any, SimpleNamespace(prompt_version="1", tool_contract_version="1"))
+    coordinator._terminal = True
+    await coordinator._prepare_next_turn()
+    assert coordinator._turn_settled_tool_outcomes == []
+    coordinator._memory_commit_queue.put_nowait(coordinator._memory_commit_terminal)
+    if coordinator._memory_commit_worker_task is not None:
+        await coordinator._memory_commit_worker_task
+
+
 async def test_delivered_turn_precedes_frame_and_first_refresh_sees_new_frame() -> None:
+    provider = DeterministicRealtimePlanProvider()
+    provider.canned_capture_results = [_capture_result("Moon")]
     memory = DevelopmentAuthoritativeMemoryStore()
-    coordinator = _bare_coordinator(memory=memory)
+    coordinator = _bare_coordinator(memory=memory, realtime=provider)
     coordinator._latest_memory_commit_sequence = 1
     observed_revisions: list[int] = []
 
     async def observe_refresh(
         _self: DeterministicRealtimeSessionCoordinator,
         *,
-        payload: _CapturedMemoryCommit,
-        turn: object,
-        force_context_refresh: bool = False,
+        reason: DynamicContextBuildReason,
     ) -> None:
-        del payload, turn, force_context_refresh
+        assert reason == DynamicContextBuildReason.TURN_COMMITTED
         observed_revisions.append(coordinator.dialogue_frame.revision)
 
-    coordinator._refresh_warm_memory = MethodType(  # type: ignore[method-assign]
+    coordinator._refresh_canvas_context = MethodType(  # type: ignore[method-assign]
         observe_refresh, coordinator
     )
-    await coordinator._run_memory_commit(
-        payload=_payload(turn_id="turn-1", update=_update("Moon"))
-    )
+    await coordinator._run_memory_commit(payload=_payload(turn_id="turn-1"))
 
     snapshot = await memory.load_snapshot(
-        subject="child:frame", age_band="middleChildhood"
+        subject="child:frame", age_band=AgeBand.MIDDLE_CHILDHOOD
     )
     assert [turn.turn_id for turn in snapshot.delivered_turns] == ["turn-1"]
     assert snapshot.dialogue_frame.revision == 1
     assert observed_revisions == [1]
 
 
-async def test_stale_frame_does_not_erase_later_delivered_turn_or_kill_refresh() -> (
-    None
-):
+async def test_stale_frame_does_not_erase_later_delivered_turn_or_kill_refresh() -> None:
     memory = DevelopmentAuthoritativeMemoryStore()
     await memory.commit_delivered_turn(
         subject="child:frame",
@@ -247,50 +296,52 @@ async def test_stale_frame_does_not_erase_later_delivered_turn_or_kill_refresh()
         subject="child:frame",
         expected_reset_revision=0,
         source_turn_id="turn-a",
-        update=_update("Moon"),
+        update=DialogueFrameUpdate.model_validate(
+            {"baseRevision": 0, "frame": {"activeTopics": ["Moon"]}}
+        ),
     )
-    coordinator = _bare_coordinator(memory=memory)
+
+    provider = DeterministicRealtimePlanProvider()
+    provider.canned_capture_results = [_capture_result("Earth")]
+    coordinator = _bare_coordinator(memory=memory, realtime=provider)
     assert coordinator.dialogue_frame == DialogueFrame()
     refreshed: list[str] = []
 
     async def refresh(
         _self: DeterministicRealtimeSessionCoordinator,
         *,
-        payload: _CapturedMemoryCommit,
-        turn: object,
-        force_context_refresh: bool = False,
+        reason: DynamicContextBuildReason,
     ) -> None:
-        del turn, force_context_refresh
-        refreshed.append(payload.turn_id)
+        assert reason == DynamicContextBuildReason.TURN_COMMITTED
+        del _self
+        refreshed.append(str(reason))
 
-    coordinator._refresh_warm_memory = MethodType(refresh, coordinator)  # type: ignore[method-assign]
-    await coordinator._run_memory_commit(
-        payload=_payload(turn_id="turn-b", update=_update("Earth", base_revision=0))
-    )
+    coordinator._refresh_canvas_context = MethodType(refresh, coordinator)  # type: ignore[method-assign]
+    await coordinator._run_memory_commit(payload=_payload(turn_id="turn-b"))
 
     snapshot = await memory.load_snapshot(
-        subject="child:frame", age_band="middleChildhood"
+        subject="child:frame", age_band=AgeBand.MIDDLE_CHILDHOOD
     )
     assert {turn.turn_id for turn in snapshot.delivered_turns} == {"turn-a", "turn-b"}
     assert snapshot.dialogue_frame.active_topics == ("Moon",)
     assert coordinator.dialogue_frame.revision == 1
     assert coordinator.dialogue_frame.active_topics == ("Moon",)
-    assert refreshed == ["turn-b"]
+    assert refreshed == [str(DynamicContextBuildReason.TURN_COMMITTED)]
 
 
-async def test_memory_reset_clears_staged_and_current_frame() -> None:
+async def test_memory_reset_clears_settled_outcomes_and_current_frame() -> None:
     coordinator = _bare_coordinator()
     coordinator._dialogue_frame = DialogueFrame.model_validate(
         {"revision": 2, "activeTopics": ["Moon"]}
     )
-    coordinator.stage_dialogue_frame_update(
-        turn_id="turn-1", update=_update("Earth", base_revision=2)
+    coordinator._record_tool_outcome(
+        tool_name="get_current_time", call_id="c1", outcome="available"
     )
 
     await coordinator.memory_reset(reset_revision=1)
 
     assert coordinator.dialogue_frame == DialogueFrame()
-    assert coordinator._staged_semantic_memory_proposal is None
+    assert coordinator._turn_settled_tool_outcomes == []
 
 
 class _FrameFailingMemory(DevelopmentAuthoritativeMemoryStore):
@@ -299,83 +350,56 @@ class _FrameFailingMemory(DevelopmentAuthoritativeMemoryStore):
         raise RuntimeError("injected DialogueFrame failure")
 
 
-async def test_optional_frame_failure_preserves_turn_and_post_commit_refresh() -> None:
+async def test_optional_frame_failure_preserves_turn_without_context_refresh() -> None:
     memory = _FrameFailingMemory()
-    coordinator = _bare_coordinator(memory=memory)
+    provider = DeterministicRealtimePlanProvider()
+    provider.canned_capture_results = [_capture_result("Moon")]
+    coordinator = _bare_coordinator(memory=memory, realtime=provider)
     refreshed: list[str] = []
 
     async def refresh(
         _self: DeterministicRealtimeSessionCoordinator,
         *,
-        payload: _CapturedMemoryCommit,
-        turn: object,
-        force_context_refresh: bool = False,
+        reason: DynamicContextBuildReason,
     ) -> None:
-        del turn, force_context_refresh
-        refreshed.append(payload.turn_id)
+        del _self, reason
+        refreshed.append("unexpected")
 
-    coordinator._refresh_warm_memory = MethodType(refresh, coordinator)  # type: ignore[method-assign]
-    await coordinator._run_memory_commit(
-        payload=_payload(turn_id="turn-1", update=_update("Moon"))
-    )
+    coordinator._refresh_canvas_context = MethodType(refresh, coordinator)  # type: ignore[method-assign]
+    await coordinator._run_memory_commit(payload=_payload(turn_id="turn-1"))
 
     snapshot = await memory.load_snapshot(
-        subject="child:frame", age_band="middleChildhood"
+        subject="child:frame", age_band=AgeBand.MIDDLE_CHILDHOOD
     )
     assert [turn.turn_id for turn in snapshot.delivered_turns] == ["turn-1"]
     assert snapshot.dialogue_frame == DialogueFrame()
-    assert refreshed == ["turn-1"]
+    assert refreshed == []
 
 
-class _WarmSearchFailingMemory(DevelopmentAuthoritativeMemoryStore):
-    async def search_memory_candidates(self, **kwargs):  # type: ignore[no-untyped-def]
-        del kwargs
-        raise RuntimeError("injected optional warm-memory failure")
-
-
-def _record_context_refreshes(
-    coordinator: DeterministicRealtimeSessionCoordinator,
-) -> list[tuple[int, DynamicContextBuildReason]]:
-    builds: list[tuple[int, DynamicContextBuildReason]] = []
-
-    async def refresh(
-        _self: DeterministicRealtimeSessionCoordinator,
-        *,
-        reason: DynamicContextBuildReason = DynamicContextBuildReason.CANVAS_ACTIVATED,
-    ) -> None:
-        builds.append((_self.dialogue_frame.revision, reason))
-
-    coordinator._refresh_canvas_context = MethodType(refresh, coordinator)  # type: ignore[method-assign]
-    return builds
-
-
-async def test_successful_warm_search_requests_one_context_build() -> None:
-    memory = DevelopmentAuthoritativeMemoryStore()
-    coordinator = _bare_coordinator(memory=memory)
-    coordinator._warm_refresh_revision = 1
+async def test_frame_change_requests_one_context_build() -> None:
+    provider = DeterministicRealtimePlanProvider()
+    provider.canned_capture_results = [_capture_result("Moon")]
+    coordinator = _bare_coordinator(realtime=provider)
     builds = _record_context_refreshes(coordinator)
 
-    await coordinator._run_memory_commit(
-        payload=_payload(turn_id="turn-1", update=_update("Moon"))
-    )
+    await coordinator._run_memory_commit(payload=_payload(turn_id="turn-1"))
 
     assert builds == [(1, DynamicContextBuildReason.TURN_COMMITTED)]
 
 
-async def test_failed_warm_search_still_builds_new_durable_frame_once() -> None:
-    memory = _WarmSearchFailingMemory()
-    coordinator = _bare_coordinator(memory=memory)
-    coordinator._warm_refresh_revision = 1
+async def test_frame_change_preserves_bootstrap_references_and_builds_once() -> None:
+    provider = DeterministicRealtimePlanProvider()
+    provider.canned_capture_results = [_capture_result("Moon")]
+    memory = DevelopmentAuthoritativeMemoryStore()
+    coordinator = _bare_coordinator(memory=memory, realtime=provider)
     existing_warm_references = (object(),)
     coordinator._warm_memories = existing_warm_references  # type: ignore[assignment]
     builds = _record_context_refreshes(coordinator)
 
-    await coordinator._run_memory_commit(
-        payload=_payload(turn_id="turn-1", update=_update("Moon"))
-    )
+    await coordinator._run_memory_commit(payload=_payload(turn_id="turn-1"))
 
     snapshot = await memory.load_snapshot(
-        subject="child:frame", age_band="middleChildhood"
+        subject="child:frame", age_band=AgeBand.MIDDLE_CHILDHOOD
     )
     assert [turn.turn_id for turn in snapshot.delivered_turns] == ["turn-1"]
     assert snapshot.dialogue_frame.revision == 1
@@ -403,16 +427,16 @@ async def test_reset_epoch_fence_prevents_old_frame_resurrection() -> None:
         memory_id=None,
     )
     await memory.reset_conversation(subject="child:frame")
-    coordinator = _bare_coordinator(memory=memory)
+    provider = DeterministicRealtimePlanProvider()
+    provider.canned_capture_results = [_capture_result("Old topic")]
+    coordinator = _bare_coordinator(memory=memory, realtime=provider)
     coordinator._memory_reset_revision = 1
 
-    decision = await coordinator._apply_dialogue_frame_update(
-        payload=_payload(turn_id="turn-1", update=_update("Old topic"))
-    )
+    await coordinator._run_memory_commit(payload=_payload(turn_id="turn-1"))
 
     snapshot = await memory.load_snapshot(
-        subject="child:frame", age_band="middleChildhood"
+        subject="child:frame", age_band=AgeBand.MIDDLE_CHILDHOOD
     )
-    assert decision is None
     assert snapshot.reset_revision == 1
     assert snapshot.dialogue_frame == DialogueFrame()
+    assert coordinator.dialogue_frame == DialogueFrame()

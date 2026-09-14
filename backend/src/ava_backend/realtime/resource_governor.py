@@ -102,23 +102,20 @@ class ResourceGovernor:
         self,
         *,
         max_recovery_attempts: int,
-        max_recovery_seconds: float,
         fallback_wait_seconds: float,
         monotonic_clock: Callable[[], float] = monotonic,
         wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         if not 1 <= max_recovery_attempts <= 10:
             raise ValueError("max_recovery_attempts must be between 1 and 10")
-        if not 1 <= max_recovery_seconds <= 300:
-            raise ValueError("max_recovery_seconds must be between 1 and 300")
         if not 0.05 <= fallback_wait_seconds <= 30:
             raise ValueError("fallback_wait_seconds must be between 0.05 and 30")
         self._max_recovery_attempts = max_recovery_attempts
-        self._max_recovery_seconds = float(max_recovery_seconds)
         self._fallback_wait_seconds = float(fallback_wait_seconds)
         self._monotonic_clock = monotonic_clock
         self._wall_clock = wall_clock
         self._reservation: _TurnReservation | None = None
+        self._capture_reservation: _TurnReservation | None = None
         self._latest_actual_input_tokens: int | None = None
         self._latest_actual_output_tokens: int | None = None
         self._state = ResourceGovernorState.PRESSURE
@@ -147,18 +144,12 @@ class ResourceGovernor:
         input_growth_token_limits: tuple[int, ...] = (),
         initial_input_growth_tokens: int = 0,
     ) -> LogicalTurnEstimate:
-        if not output_token_limits or len(output_token_limits) > 3:
-            raise ValueError(
-                "a logical turn must reserve between one and three responses"
-            )
+        if len(output_token_limits) != 1:
+            raise ValueError("resource admission must reserve exactly one response")
         if any(limit < 1 for limit in output_token_limits):
             raise ValueError("response output token limits must be positive")
-        if not input_growth_token_limits:
-            input_growth_token_limits = (0,) * (len(output_token_limits) - 1)
-        if len(input_growth_token_limits) != len(output_token_limits) - 1:
-            raise ValueError(
-                "input growth must describe each possible response transition"
-            )
+        if input_growth_token_limits:
+            raise ValueError("concrete response admission cannot reserve future input growth")
         if initial_input_growth_tokens < 0 or any(
             growth < 0 for growth in input_growth_token_limits
         ):
@@ -177,12 +168,7 @@ class ResourceGovernor:
                 + (calibrated_output or 0)
                 + initial_input_growth_tokens
             )
-            total = 0
-            for index, output_limit in enumerate(output_token_limits):
-                total += estimated_input + output_limit
-                if index < len(input_growth_token_limits):
-                    estimated_input += output_limit + input_growth_token_limits[index]
-            estimated_tokens = total
+            estimated_tokens = estimated_input + output_token_limits[0]
         return LogicalTurnEstimate(
             estimated_tokens=estimated_tokens,
             estimated_responses=len(output_token_limits),
@@ -219,7 +205,8 @@ class ResourceGovernor:
             input_growth_token_limits=input_growth_token_limits,
             initial_input_growth_tokens=initial_input_growth_tokens,
         )
-        reservation = self._reservation
+        is_capture = turn_id.startswith("capture_")
+        reservation = self._capture_reservation if is_capture else self._reservation
         if reservation is not None:
             if reservation.turn_id != turn_id:
                 decision = self._decision(
@@ -231,19 +218,21 @@ class ResourceGovernor:
                 )
                 self._note_deferred(turn_id=turn_id, reason=decision.reason)
                 return decision
-            if len(output_token_limits) > reservation.requests:
-                raise ValueError(
-                    "logical turn exceeded its reserved provider response chain"
-                )
-            # The reservation owns the logical budget and response-chain bound;
-            # it is not provider-held future quota. Rebase it to the work now
-            # requested, then evaluate the latest provider snapshot below.
+            # A completed concrete response reconciles this same-turn reservation
+            # to zero. Rebase it atomically only when the next actual response
+            # exists; retries re-admit the same concrete estimate in place.
             reservation.tokens = estimate.estimated_tokens or 0
             reservation.requests = estimate.estimated_responses
             reservation.estimate = estimate
 
         token_remaining = self._effective_remaining(tpm)
         request_remaining = self._effective_remaining(rpm)
+        other_reservation = self._reservation if is_capture else self._capture_reservation
+        if other_reservation is not None:
+            if token_remaining is not None:
+                token_remaining = max(0, token_remaining - other_reservation.tokens)
+            if request_remaining is not None:
+                request_remaining = max(0, request_remaining - other_reservation.requests)
         token_insufficient = token_remaining is not None and (
             token_remaining <= 0
             if estimate.estimated_tokens is None
@@ -296,12 +285,16 @@ class ResourceGovernor:
         if reserved_tokens is None:
             reserved_tokens = max(0, token_remaining or 0)
         if reservation is None:
-            self._reservation = _TurnReservation(
+            new_reservation = _TurnReservation(
                 turn_id=turn_id,
                 tokens=reserved_tokens,
                 requests=estimate.estimated_responses,
                 estimate=estimate,
             )
+            if is_capture:
+                self._capture_reservation = new_reservation
+            else:
+                self._reservation = new_reservation
         else:
             reservation.tokens = reserved_tokens
             reservation.requests = estimate.estimated_responses
@@ -321,7 +314,11 @@ class ResourceGovernor:
         self._require_open_turn_id(turn_id)
         if not provider_response_id.strip():
             raise ValueError("provider_response_id cannot be empty")
-        reservation = self._reservation
+        reservation = (
+            self._capture_reservation
+            if turn_id.startswith("capture_")
+            else self._reservation
+        )
         if reservation is None or reservation.turn_id != turn_id:
             raise ValueError("provider response has no matching resource reservation")
         if (
@@ -348,7 +345,11 @@ class ResourceGovernor:
         input_tokens: int,
         output_tokens: int,
     ) -> None:
-        reservation = self._reservation
+        reservation = (
+            self._capture_reservation
+            if turn_id.startswith("capture_")
+            else self._reservation
+        )
         if reservation is None or reservation.turn_id != turn_id:
             raise ValueError("response reconciliation has no matching reservation")
         if reservation.provider_response_id != provider_response_id:
@@ -388,11 +389,20 @@ class ResourceGovernor:
     def release_turn(self, *, turn_id: str) -> bool:
         if not turn_id.strip():
             raise ValueError("turn_id cannot be empty")
-        released = (
-            self._reservation is not None and self._reservation.turn_id == turn_id
-        )
-        if released:
-            self._reservation = None
+        is_capture = turn_id.startswith("capture_")
+        if is_capture:
+            released = (
+                self._capture_reservation is not None
+                and self._capture_reservation.turn_id == turn_id
+            )
+            if released:
+                self._capture_reservation = None
+        else:
+            released = (
+                self._reservation is not None and self._reservation.turn_id == turn_id
+            )
+            if released:
+                self._reservation = None
         if self._deferred_turn_id == turn_id:
             self._deferred_turn_id = None
             self._deferred_episode = None
@@ -407,7 +417,12 @@ class ResourceGovernor:
 
     def mark_rate_limited(self, *, turn_id: str) -> bool:
         self._require_open_turn_id(turn_id)
-        reservation = self._reservation
+        is_capture = turn_id.startswith("capture_")
+        reservation = (
+            self._capture_reservation
+            if is_capture
+            else self._reservation
+        )
         if reservation is None or reservation.turn_id != turn_id:
             raise ValueError("rate-limited turn has no matching resource reservation")
         # The rejected provider response is terminal. The same logical-turn
@@ -423,9 +438,11 @@ class ResourceGovernor:
         started = self._recovery_started_at
         assert started is not None
         within_attempts = self._recovery_attempt <= self._max_recovery_attempts
-        within_horizon = now - started <= self._max_recovery_seconds
-        if not within_attempts or not within_horizon:
-            self._reservation = None
+        if not within_attempts:
+            if is_capture:
+                self._capture_reservation = None
+            else:
+                self._reservation = None
             self._deferred_turn_id = None
             self._deferred_episode = None
             self._state = ResourceGovernorState.PROVIDER_UNAVAILABLE
@@ -457,11 +474,7 @@ class ResourceGovernor:
         started = self._recovery_started_at
         if started is None:
             raise ValueError("recovery wait requested outside a recovery lifecycle")
-        horizon_remaining = max(
-            0.0,
-            self._max_recovery_seconds - (self._monotonic_clock() - started),
-        )
-        return min(provider_wait, horizon_remaining)
+        return provider_wait
 
     def snapshot(
         self,
@@ -469,15 +482,13 @@ class ResourceGovernor:
         tpm: RateLimitWindow | None,
         rpm: RateLimitWindow | None,
     ) -> ResourceGovernorSnapshot:
-        reservation = self._reservation
+        total_tokens = 0
+        total_requests = 0
+        for res in (self._reservation, self._capture_reservation):
+            if res is not None:
+                total_tokens += res.tokens
+                total_requests += res.requests
         estimate = self._last_decision.estimate if self._last_decision else None
-        recovery_remaining: float | None = None
-        if self._recovery_started_at is not None:
-            recovery_remaining = max(
-                0.0,
-                self._max_recovery_seconds
-                - (self._monotonic_clock() - self._recovery_started_at),
-            )
         return ResourceGovernorSnapshot(
             state=self._state,
             admission_decision=(
@@ -488,8 +499,8 @@ class ResourceGovernor:
             ),
             provider_tpm_remaining=tpm.remaining if tpm is not None else None,
             provider_rpm_remaining=rpm.remaining if rpm is not None else None,
-            local_reserved_tokens=reservation.tokens if reservation else 0,
-            local_reserved_requests=reservation.requests if reservation else 0,
+            local_reserved_tokens=total_tokens,
+            local_reserved_requests=total_requests,
             estimated_logical_turn_tokens=(
                 estimate.estimated_tokens if estimate is not None else None
             ),
@@ -498,7 +509,7 @@ class ResourceGovernor:
             ),
             deferred_turn_id=self._deferred_turn_id,
             recovery_attempt=self._recovery_attempt,
-            recovery_deadline_seconds_remaining=recovery_remaining,
+            recovery_deadline_seconds_remaining=None,
             rate_limit_recovery_count=self._rate_limit_recovery_count,
             resource_deferral_count=self._resource_deferral_count,
         )
@@ -506,6 +517,7 @@ class ResourceGovernor:
     def close(self) -> None:
         self._closed = True
         self._reservation = None
+        self._capture_reservation = None
         self._deferred_turn_id = None
         self._deferred_episode = None
         self._clear_recovery()

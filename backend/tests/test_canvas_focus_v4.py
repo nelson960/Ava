@@ -24,6 +24,9 @@ from ava_backend.canvas.svg_specialist import (
 )
 from ava_backend.canvas.svg_workspace import (
     ActiveSvgCanvasScene,
+    CanvasSceneSelector,
+    CanvasWorkspaceManifest,
+    CanvasWorkspaceManifestScene,
     SvgCanvasWorkspace,
     SvgCanvasWorkspaceError,
 )
@@ -50,6 +53,7 @@ from ava_backend.realtime.svg_canvas_jobs import SvgCanvasJobCoordinator
 from ava_backend.realtime.tool_contract import (
     InteractiveCanvasRequest,
     InteractiveCanvasToolStatusV4,
+    ManageCanvasPresentationAction,
     RealtimeCanvasToolCall,
 )
 from ava_backend.auth import AuthenticatedClient, RequestAuthenticator
@@ -926,6 +930,92 @@ async def test_real_coordinator_focus_canvas_emits_no_presentation_or_turn_or_me
         await coordinator.close()
 
 
+@pytest.mark.asyncio
+async def test_title_presentation_selector_logs_canonical_resolution(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    (
+        coordinator,
+        _realtime,
+        _canvas_events,
+        _memory,
+        _specialist,
+        jobs,
+    ) = await _create_real_coordinator()
+    try:
+        document = SvgDocumentValidator(SvgValidationLimits()).validate(VALID_SVG)
+        scene = ActiveSvgCanvasScene(
+            generation_id="gen-title-diagnostic",
+            source_turn_id="turn-title-diagnostic",
+            scene_id="scene-title-diagnostic",
+            revision=1,
+            document=document,
+            first_rendered_sample=0,
+        )
+        manifest_scene = CanvasWorkspaceManifestScene(
+            scene_id=scene.scene_id,
+            scene_revision=scene.revision,
+            generation_id=scene.generation_id,
+            source_turn_id=scene.source_turn_id,
+            svg_sha256=document.svg_sha256,
+            manifest_sha256=document.manifest_sha256,
+            svg_byte_length=len(document.svg_bytes),
+            manifest_byte_length=len(document.manifest_bytes),
+            renderer_capability_version=str(
+                document.manifest["rendererCapabilityVersion"]
+            ),
+            validator_version=str(document.manifest["validatorVersion"]),
+            manifest_version=str(document.manifest["manifestVersion"]),
+            creation_sequence=1,
+            modification_sequence=1,
+            title=document.title,
+            summary=document.description,
+        )
+        jobs.state.workspace.adopt_manifest(
+            CanvasWorkspaceManifest(
+                protocol_version=4,
+                workspace_epoch=1,
+                workspace_revision=7,
+                next_creation_sequence=2,
+                next_modification_sequence=2,
+                focused_scene_id=scene.scene_id,
+                scenes=(manifest_scene,),
+            )
+        )
+        jobs.state.workspace.restore_focused(scene)
+
+        caplog.set_level(logging.INFO, logger="ava_backend.realtime_coordinator")
+        execution = asyncio.create_task(
+            coordinator._execute_canvas_presentation(
+                action=ManageCanvasPresentationAction.SHOW,
+                selector=CanvasSceneSelector.TITLE,
+                position=None,
+                title="  CAFÉ   CLOUD ☁️ ",
+            )
+        )
+        await asyncio.sleep(0)
+
+        record = next(
+            item
+            for item in caplog.records
+            if item.getMessage().startswith(
+                "manage_canvas_presentation_selector_resolved"
+            )
+        )
+        context = record.ava_context  # type: ignore[attr-defined]
+        assert context["selector"] == "title"
+        assert context["requestedNormalizedTitle"] == "café cloud ☁️"
+        assert context["resolvedCanonicalTitle"] == "Café cloud ☁️"
+        assert context["resolvedPosition"] == 1
+        assert context["workspaceRevision"] == 7
+        assert "contextBuildId" in context
+
+        execution.cancel()
+        await asyncio.gather(execution, return_exceptions=True)
+    finally:
+        await coordinator.close()
+
+
 # Contract I: after runtime focus to retained Scene A, a typed Canvas interaction against A succeeds
 @pytest.mark.asyncio
 async def test_real_coordinator_interaction_against_retained_scene_succeeds() -> None:
@@ -959,6 +1049,7 @@ async def test_real_coordinator_interaction_against_retained_scene_succeeds() ->
                 "event": "canvasInteraction",
                 "sceneId": scene.scene_id,
                 "sceneRevision": scene.revision,
+                "focusRevision": 1,
                 "interactionRevision": 1,
                 "svgSha256": scene.document.svg_sha256,
                 "manifestSha256": scene.document.manifest_sha256,
@@ -978,9 +1069,9 @@ async def test_real_coordinator_interaction_against_retained_scene_succeeds() ->
         await coordinator.close()
 
 
-# Contract J: after runtime focus to retained B revision 3, reviseFocused uses B3 as base and produces/stages B revision 4
+# Contract J: an exact retained B revision 3 target produces/stages B revision 4.
 @pytest.mark.asyncio
-async def test_real_coordinator_revise_focused_uses_retained_base_and_stages_rev4() -> (
+async def test_real_coordinator_exact_revision_uses_retained_base_and_stages_rev4() -> (
     None
 ):
     (
@@ -1011,9 +1102,12 @@ async def test_real_coordinator_revise_focused_uses_retained_base_and_stages_rev
             call_id="call-revise-1",
             request=InteractiveCanvasRequest.model_validate(
                 {
-                    "operation": "reviseFocused",
+                    "operation": "revise",
+                    "selector": "current",
                     "brief": "Add rain droplets falling from the cloud.",
                     "interactionMode": "select",
+                    "continuousControl": "none",
+                    "completion": "needsResultReasoning",
                 }
             ),
         )
@@ -1027,6 +1121,7 @@ async def test_real_coordinator_revise_focused_uses_retained_base_and_stages_rev
             source_turn_id="turn-real-coord",
             call=tool_call,
             complete_tool=_record_completion,
+            resolved_target_scene_id=scene_b3.scene_id,
         )
 
         assert output.status == InteractiveCanvasToolStatusV4.ACCEPTED
@@ -1479,10 +1574,9 @@ async def test_post_install_infallible_commit_cannot_produce_split_brain() -> No
         assert jobs.state.focused_scene == scene_b
         assert jobs.state.workspace.current == scene_b
         assert coordinator.harness is not None
-        assert (
-            '<active_visual scene_id="scene-a"' not in coordinator.harness.instructions
-        )
-        assert '<visual scene_id="scene-b"' in coordinator.harness.instructions
+        assert "scene-a" not in coordinator.harness.instructions
+        assert "scene-b" not in coordinator.harness.instructions
+        assert "Second rain cloud" in coordinator.harness.instructions
     finally:
         await coordinator.close()
 
@@ -1720,9 +1814,8 @@ async def test_focus_canvas_converges_to_b_when_readiness_changes_after_provider
         assert jobs.state.focused_scene == scene_b
         assert jobs.state.workspace.current == scene_b
         assert coordinator.harness is not None
-        assert (
-            '<active_visual scene_id="scene-a"' not in coordinator.harness.instructions
-        )
-        assert '<visual scene_id="scene-b"' in coordinator.harness.instructions
+        assert "scene-a" not in coordinator.harness.instructions
+        assert "scene-b" not in coordinator.harness.instructions
+        assert "Second rain cloud" in coordinator.harness.instructions
     finally:
         await coordinator.close()

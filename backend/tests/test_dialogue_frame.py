@@ -9,6 +9,7 @@ from ava_backend.realtime.memory import (
     MAX_DIALOGUE_FRAME_UTF8_BYTES,
     DevelopmentAuthoritativeMemoryStore,
     DialogueFrame,
+    DialogueFrameCanvasReference,
     DialogueFrameSourceTurnMissingError,
     DialogueFrameState,
     DialogueFrameUpdate,
@@ -87,6 +88,13 @@ def test_empty_semantic_item_is_rejected(value: str) -> None:
         DialogueFrameState.model_validate({"activeTopics": [value]})
 
 
+def test_structurally_invalid_semantic_items_are_rejected() -> None:
+    with pytest.raises(ValidationError):
+        DialogueFrameState.model_validate({"activeTopics": [123]})
+    with pytest.raises(ValidationError):
+        DialogueFrameState.model_validate({"activeTopics": 123})
+
+
 def test_semantic_item_length_and_list_count_are_bounded() -> None:
     with pytest.raises(ValidationError):
         DialogueFrameState.model_validate({"activeTopics": ["x" * 161]})
@@ -120,6 +128,10 @@ def test_case_normalized_duplicates_are_rejected_without_semantic_merging() -> N
 
 
 def test_canvas_reference_and_update_revision_bounds_are_enforced() -> None:
+    with pytest.raises(ValidationError):
+        DialogueFrameCanvasReference.model_validate(
+            {"sceneId": "scene-a", "sceneRevision": 0, "relation": "Shown"}
+        )
     with pytest.raises(ValidationError):
         DialogueFrameState.model_validate(
             {

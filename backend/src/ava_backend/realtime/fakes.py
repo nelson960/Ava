@@ -14,17 +14,23 @@ from .delivery import (
 from .harness import RealtimeHarness
 from .plan import AvaTurnPlan
 from .speech_contract import SpeechAlignment, SpeechPhrase
+from .memory import (
+    SemanticCaptureDisposition,
+    SemanticCaptureFunctionArguments,
+)
 from .provider_session import (
     NegotiatedRealtimeCall,
     RealtimeContextInstallationStatus,
     RealtimeProviderInputEvent,
     RealtimeProviderTurnEvent,
+    RealtimeProviderUnavailableError,
+    SemanticCaptureEvidence,
     validate_sdp,
 )
 from .tool_contract import (
+    InteractiveCanvasCancellationRequest,
     InteractiveCanvasCancellationToolOutputV4,
     InteractiveCanvasRequest,
-    InteractiveCanvasToolOutput,
     InteractiveCanvasToolOutputV4,
     RealtimeCancelCanvasToolCall,
     RealtimeCanvasToolCall,
@@ -97,7 +103,7 @@ class DeterministicRealtimePlanProvider:
 
     def __init__(
         self,
-        plan: AvaTurnPlan,
+        plan: AvaTurnPlan | None = None,
         *,
         child_text: str | None = "Deterministic child turn.",
         canvas_brief: str | None = None,
@@ -106,6 +112,25 @@ class DeterministicRealtimePlanProvider:
         wait_for_canvas_interaction_response: bool = False,
         chunk_sizes: Iterable[int] = (17, 5, 43, 2),
     ) -> None:
+        if plan is None:
+            plan = AvaTurnPlan.model_validate(
+                {
+                    "segments": [
+                        {
+                            "id": "seg_1",
+                            "speech": "Default deterministic response.",
+                            "delivery": "warm",
+                            "expression": "neutral",
+                            "gaze": "child",
+                            "motionIntent": "none",
+                            "canvasCues": [],
+                        }
+                    ],
+                    "memoryProposal": None,
+                    "childTurnSummary": "Default turn summary.",
+                    "canvasDecision": {"complexity": "none", "specialistBrief": None},
+                }
+            )
         normalized_child_text = child_text.strip() if child_text is not None else None
         if normalized_child_text is not None and (
             not normalized_child_text or len(normalized_child_text) > 2_000
@@ -127,6 +152,8 @@ class DeterministicRealtimePlanProvider:
                     "operation": "new",
                     "brief": canvas_brief,
                     "interactionMode": "explore",
+                    "continuousControl": "none",
+                    "completion": "needsResultReasoning",
                 }
             )
             if canvas_brief is not None
@@ -148,8 +175,7 @@ class DeterministicRealtimePlanProvider:
         self.cancelled_turn_ids: list[str] = []
         self.completed_canvas_outputs: list[
             (
-                InteractiveCanvasToolOutput
-                | InteractiveCanvasToolOutputV4
+                InteractiveCanvasToolOutputV4
                 | InteractiveCanvasCancellationToolOutputV4
             )
         ] = []
@@ -178,6 +204,11 @@ class DeterministicRealtimePlanProvider:
         self.defer_acknowledgement = False
         self.context_changed = asyncio.Event()
         self.requested_child_responses: list[tuple[str, str]] = []
+        self.captured_evidences: list[SemanticCaptureEvidence] = []
+        self.canned_capture_results: list[
+            SemanticCaptureFunctionArguments | BaseException
+        ] = []
+        self.capture_gate: asyncio.Event | None = None
         self.closed = False
 
     @property
@@ -400,7 +431,12 @@ class DeterministicRealtimePlanProvider:
             ):
                 self._pending_call_id = "call_canvas_fake_0001"
                 if self._cancel_pending_canvas:
-                    yield RealtimeCancelCanvasToolCall(call_id=self._pending_call_id)
+                    yield RealtimeCancelCanvasToolCall(
+                        call_id=self._pending_call_id,
+                        request=InteractiveCanvasCancellationRequest.model_validate(
+                            {"completion": "needsResultReasoning"}
+                        ),
+                    )
                 elif self._rejected_canvas_reason is None:
                     request = self._canvas_request
                     if request is None:  # guarded by the enclosing condition
@@ -425,8 +461,7 @@ class DeterministicRealtimePlanProvider:
         turn_id: str,
         call_id: str,
         output: (
-            InteractiveCanvasToolOutput
-            | InteractiveCanvasToolOutputV4
+            InteractiveCanvasToolOutputV4
             | InteractiveCanvasCancellationToolOutputV4
         ),
     ) -> None:
@@ -541,6 +576,25 @@ class DeterministicRealtimePlanProvider:
         if turn_id not in self.cancelled_turn_ids:
             self.cancelled_turn_ids.append(turn_id)
             self._interaction_response_readiness_changed.set()
+
+    async def capture_semantic_memory(
+        self,
+        *,
+        evidence: SemanticCaptureEvidence,
+    ) -> SemanticCaptureFunctionArguments:
+        if self.closed:
+            raise RealtimeProviderUnavailableError("provider session is closed")
+        self.captured_evidences.append(evidence)
+        if self.capture_gate is not None:
+            await self.capture_gate.wait()
+        if self.canned_capture_results:
+            result = self.canned_capture_results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+        return SemanticCaptureFunctionArguments(
+            disposition=SemanticCaptureDisposition.NO_CHANGE
+        )
 
     async def close(self) -> None:
         self.closed = True

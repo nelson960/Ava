@@ -23,6 +23,9 @@ from ..canvas.svg_document import (
     SvgDraftSafetyValidator,
     SvgValidationFeedback,
     SvgValidationLimits,
+    ValidatedSvgDocument,
+    validate_svg_binding_continuity,
+    validate_svg_request_document_agreement,
 )
 from ..canvas.svg_progress import ProgressiveSvgDraftBuilder
 from ..canvas.svg_specialist import (
@@ -186,6 +189,9 @@ class OpenAISvgCanvasSpecialist:
             generation_started_at + self._settings.openai_canvas_overall_timeout_seconds
         )
         try:
+            base_document: ValidatedSvgDocument | None = None
+            if request.current_svg is not None:
+                base_document = self._validator.validate(request.current_svg)
             for attempt in range(self._settings.openai_canvas_max_quality_repairs + 1):
                 if attempt > 0:
                     self._log(
@@ -295,16 +301,13 @@ class OpenAISvgCanvasSpecialist:
                             "Responses text deltas do not match terminal output text",
                         )
                     document = self._validator.validate(svg_text)
-                    if document.interaction_mode.value != request.interaction_mode:
-                        raise SvgDocumentValidationError(
-                            "interactionModeMismatch",
-                            "validated SVG interaction mode does not match the request",
-                            category=None,
-                            attribute="data-ava-interaction-mode",
-                            observed_value=document.interaction_mode.value,
-                            limit_name="requestedInteractionMode",
-                            limit_value=str(request.interaction_mode),
-                        )
+                    validate_svg_request_document_agreement(
+                        document,
+                        interaction_mode=str(request.interaction_mode),
+                        continuous_control=str(request.continuous_control),
+                    )
+                    if base_document is not None:
+                        validate_svg_binding_continuity(base_document, document)
                 except _ResponseShapeError as error:
                     self._log(
                         "validationCompleted",
@@ -1181,12 +1184,16 @@ _REPAIRABLE_VALIDATION_CODES = frozenset(
     {
         "attributeForbidden",
         "bindingElementMissingId",
+        "bindingContinuityReuseMismatch",
+        "bindingContinuityTargetMismatch",
         "bindingMetadataWithoutBinding",
         "bindingStepInvalid",
         "bindingTargetMissing",
         "duplicateBinding",
         "duplicateId",
         "elementForbidden",
+        "continuousControlMismatch",
+        "continuousControlMissing",
         "identifierInvalid",
         "interactionModeBindingsInvalid",
         "interactionModeInvalid",

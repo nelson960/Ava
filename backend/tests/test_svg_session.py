@@ -38,6 +38,58 @@ def _generation(
     )
 
 
+def _continuous_control_generation(
+    *kinds: str,
+    generation_id: str = "generation_controls",
+) -> SvgCanvasSpecialistGeneration:
+    tracks = "".join(
+        f'<path id="track_{index}" d="M 40 {index * 80} L 360 {index * 80}"/>'
+        for index, _kind in enumerate(kinds, start=1)
+    )
+    controls = "".join(
+        (
+            f'<g id="handle_{index}" aria-label="Control {index}" '
+            f'data-ava-control="control_{index}" data-ava-control-kind="{kind}" '
+            f'data-ava-track="track_{index}" '
+            'data-ava-checkpoints="0=begin;1=end">'
+            f'<circle cx="40" cy="{index * 80}" r="12"/></g>'
+        )
+        for index, kind in enumerate(kinds, start=1)
+    )
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" '
+        'data-ava-interaction-mode="explore">'
+        "<title>Continuous controls</title>"
+        "<desc>Validated local controls.</desc>"
+        f"{tracks}{controls}"
+        '<g id="start" data-ava-binding="begin" data-ava-target="start" '
+        'aria-label="Initial state"><text x="20" y="260">Start</text></g>'
+        '<g id="finish" data-ava-binding="end" data-ava-target="finish" '
+        'aria-label="Final state"><text x="320" y="260">End</text></g>'
+        "</svg>"
+    )
+    return SvgCanvasSpecialistGeneration(
+        generation_id=generation_id,
+        document=SvgDocumentValidator().validate(svg),
+    )
+
+
+def _presented_context(
+    generation: SvgCanvasSpecialistGeneration,
+    *,
+    pending_visual: str = "",
+) -> str:
+    state = SvgCanvasSessionState()
+    _prepare_and_schedule(state, generation)
+    state.mark_presented(
+        generation_id=generation.generation_id,
+        svg_sha256=generation.document.svg_sha256,
+        manifest_sha256=generation.document.manifest_sha256,
+        first_rendered_sample=4_800,
+    )
+    return state.render_realtime_context(pending_visual=pending_visual)
+
+
 def _prepare_and_schedule(
     state: SvgCanvasSessionState,
     generation: SvgCanvasSpecialistGeneration,
@@ -96,9 +148,9 @@ def test_preload_ack_does_not_activate_candidate() -> None:
     assert state.active is None
     assert (
         state.render_realtime_context()
-        == '<canvas_context trust="untrusted_model_generated_data">'
+        == '<canvas_context trust="backend_semantic_canvas_metadata">'
         '<canvas_presentation trust="validated_current_state" visible="false"/>'
-        '<canvas_workspace synchronized="false"/>'
+        '<canvas retained_count="0" focused_position="none"/>'
         "</canvas_context>"
     )
 
@@ -191,10 +243,12 @@ def test_only_declared_binding_can_cross_control_channel() -> None:
         manifest_sha256=generation.document.manifest_sha256,
         first_rendered_sample=4_800,
     )
+    assert state.focus_revision == 0
 
     recorded = state.record_interaction(
         scene_id=active.scene_id,
         scene_revision=active.revision,
+        focus_revision=state.focus_revision,
         interaction_revision=1,
         svg_sha256=generation.document.svg_sha256,
         manifest_sha256=generation.document.manifest_sha256,
@@ -209,6 +263,7 @@ def test_only_declared_binding_can_cross_control_channel() -> None:
         state.record_interaction(
             scene_id=active.scene_id,
             scene_revision=active.revision,
+            focus_revision=state.focus_revision,
             interaction_revision=2,
             svg_sha256=generation.document.svg_sha256,
             manifest_sha256=generation.document.manifest_sha256,
@@ -217,7 +272,47 @@ def test_only_declared_binding_can_cross_control_channel() -> None:
     assert raised.value.code is SvgCanvasStateErrorCode.BINDING_UNKNOWN
 
 
-def test_realtime_context_is_escaped_and_explicitly_untrusted() -> None:
+def test_interaction_focus_revision_mismatch_rejects_without_mutation() -> None:
+    state = SvgCanvasSessionState()
+    generation = _generation()
+    _prepare_and_schedule(state, generation)
+    active = state.mark_presented(
+        generation_id=generation.generation_id,
+        svg_sha256=generation.document.svg_sha256,
+        manifest_sha256=generation.document.manifest_sha256,
+        first_rendered_sample=4_800,
+    )
+    state.focus_retained(active, focus_revision=3)
+    state.set_presentation_visible(True)
+
+    with pytest.raises(SvgCanvasStateError) as raised:
+        state.record_interaction(
+            scene_id=active.scene_id,
+            scene_revision=active.revision,
+            focus_revision=1,
+            interaction_revision=1,
+            svg_sha256=generation.document.svg_sha256,
+            manifest_sha256=generation.document.manifest_sha256,
+            binding_id="select_cloud",
+        )
+
+    assert raised.value.code is SvgCanvasStateErrorCode.FOCUS_REVISION_MISMATCH
+    assert state.last_interaction is None
+    assert state.workspace.last_interaction is None
+
+    recorded = state.record_interaction(
+        scene_id=active.scene_id,
+        scene_revision=active.revision,
+        focus_revision=3,
+        interaction_revision=1,
+        svg_sha256=generation.document.svg_sha256,
+        manifest_sha256=generation.document.manifest_sha256,
+        binding_id="select_cloud",
+    )
+    assert recorded.interaction_revision == 1
+
+
+def test_realtime_context_is_escaped_and_semantically_projected() -> None:
     state = SvgCanvasSessionState()
     generation = _generation()
     _prepare_and_schedule(state, generation)
@@ -230,6 +325,7 @@ def test_realtime_context_is_escaped_and_explicitly_untrusted() -> None:
     state.record_interaction(
         scene_id=active.scene_id,
         scene_revision=active.revision,
+        focus_revision=state.focus_revision,
         interaction_revision=1,
         svg_sha256=generation.document.svg_sha256,
         manifest_sha256=generation.document.manifest_sha256,
@@ -238,14 +334,70 @@ def test_realtime_context_is_escaped_and_explicitly_untrusted() -> None:
 
     context = state.render_realtime_context()
 
-    assert 'trust="untrusted_model_generated_data"' in context
-    assert "<active_visual" in context
+    assert 'trust="backend_semantic_canvas_metadata"' in context
+    assert "<focused_scene" in context
     assert active.generation_id not in context
-    assert f'scene_id="{active.scene_id}"' in context
+    assert active.scene_id not in context
     assert active.document.svg_sha256 not in context
     assert "Cloud &amp; rain" in context
     assert "&lt;gently&gt;" in context
     assert "<target>Rain cloud</target>" in context
+
+
+@pytest.mark.parametrize("interaction_mode", ["none", "explore"])
+def test_realtime_context_reports_no_continuous_controls(
+    interaction_mode: str,
+) -> None:
+    binding = (
+        '<g id="part" data-ava-binding="inspect" data-ava-target="part" '
+        'aria-label="Inspect part"><circle cx="100" cy="100" r="20"/></g>'
+        if interaction_mode == "explore"
+        else ""
+    )
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 200" '
+        f'data-ava-interaction-mode="{interaction_mode}">'
+        "<title>Static state</title><desc>No continuous controls.</desc>"
+        f"{binding}"
+        "</svg>"
+    )
+    generation = SvgCanvasSpecialistGeneration(
+        generation_id=f"generation_{interaction_mode}",
+        document=SvgDocumentValidator().validate(svg),
+    )
+
+    context = _presented_context(generation)
+
+    assert '<continuous_controls kinds="none"/>' in context
+
+
+@pytest.mark.parametrize("kind", ["drag", "slider", "timeline"])
+def test_realtime_context_reports_exact_continuous_control_kind(kind: str) -> None:
+    context = _presented_context(_continuous_control_generation(kind))
+
+    assert f'<continuous_controls kinds="{kind}"/>' in context
+
+
+def test_realtime_context_reports_legacy_mixed_control_kinds_deterministically() -> (
+    None
+):
+    generation = _continuous_control_generation("slider", "drag")
+
+    context = _presented_context(generation)
+
+    assert '<continuous_controls kinds="drag,slider"/>' in context
+
+
+def test_realtime_continuous_control_context_remains_bounded() -> None:
+    pending_visual = f'<pending_visual>{"x" * 1_500}</pending_visual>'
+
+    context = _presented_context(
+        _continuous_control_generation("timeline"),
+        pending_visual=pending_visual,
+    )
+
+    assert '<continuous_controls kinds="timeline"/>' in context
+    assert len(context) <= 2_400
 
 
 def test_steps_interaction_records_typed_step_and_preserves_scene_identity() -> None:
@@ -273,6 +425,7 @@ def test_steps_interaction_records_typed_step_and_preserves_scene_identity() -> 
     recorded = state.record_interaction(
         scene_id=active.scene_id,
         scene_revision=active.revision,
+        focus_revision=state.focus_revision,
         interaction_revision=1,
         svg_sha256=generation.document.svg_sha256,
         manifest_sha256=generation.document.manifest_sha256,
@@ -325,6 +478,7 @@ def test_reportable_interaction_enters_realtime_canvas_context() -> None:
     state.record_interaction(
         scene_id=active.scene_id,
         scene_revision=active.revision,
+        focus_revision=state.focus_revision,
         interaction_revision=1,
         svg_sha256=generation.document.svg_sha256,
         manifest_sha256=generation.document.manifest_sha256,
@@ -356,6 +510,7 @@ def test_interaction_context_survives_session_state_replacement() -> None:
     recorded = state.record_interaction(
         scene_id=active.scene_id,
         scene_revision=active.revision,
+        focus_revision=state.focus_revision,
         interaction_revision=1,
         svg_sha256=generation.document.svg_sha256,
         manifest_sha256=generation.document.manifest_sha256,
@@ -382,6 +537,7 @@ def test_new_canvas_revision_clears_stale_interaction_context() -> None:
     state.record_interaction(
         scene_id=active.scene_id,
         scene_revision=active.revision,
+        focus_revision=state.focus_revision,
         interaction_revision=1,
         svg_sha256=first.document.svg_sha256,
         manifest_sha256=first.document.manifest_sha256,
@@ -403,7 +559,7 @@ def test_new_canvas_revision_clears_stale_interaction_context() -> None:
     assert "<last_interaction>" not in state.render_realtime_context()
 
 
-def test_session_state_with_inherit_focus_false_does_not_mutate_or_read_shared_workspace() -> (
+def test_session_state_derives_focus_from_shared_workspace() -> (
     None
 ):
     workspace = SvgCanvasWorkspace()
@@ -422,9 +578,10 @@ def test_session_state_with_inherit_focus_false_does_not_mutate_or_read_shared_w
     state_b = SvgCanvasSessionState(workspace=workspace, inherit_focus=False)
     # Session A is completely unaffected:
     assert state_a.active is active_a
-    # Session B starts with no active focus:
+    # Session B derives the one canonical workspace focus but remains hidden.
+    assert state_b.focused_scene is active_a
     assert state_b.active is None
-    assert "<active_visual" not in state_b.render_realtime_context()
+    assert "<focused_scene" in state_b.render_realtime_context()
 
     # Session B restores the scene:
     state_b.restore_focused(active_a)
