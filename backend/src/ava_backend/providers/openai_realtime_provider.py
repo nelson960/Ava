@@ -84,6 +84,8 @@ from ..realtime.tool_contract import (
     RealtimeSpeechTextDelta,
     RejectedUtilityToolOutputV4,
     SearchMemoryRequest,
+    SearchMemoryToolOutputV4,
+    SearchMemoryToolStatus,
 )
 from ..realtime.turn_parser import StreamingSpeechParser, StreamingTurnParseError
 
@@ -507,6 +509,8 @@ class _OpenAIRealtimeEventChannel:
         self._completed_canvas_control_tools: dict[str, _CompletedCanvasTool] = {}
         self._pending_utility_call_id: str | None = None
         self._completed_utility_call_ids: set[str] = set()
+        self._search_reformulation_available: bool = False
+        self._second_search_active: bool = False
         self.last_usage: OpenAIRealtimeUsage | None = None
         self.last_response_id: str | None = None
         self.last_first_delta_ms: float | None = None
@@ -1106,6 +1110,8 @@ class _OpenAIRealtimeEventChannel:
         self.last_completed_ms = None
         self._received_event_count = 0
         self._semantic_response_count = 0
+        self._search_reformulation_available = False
+        self._second_search_active = False
 
         response_completed = False
         try:
@@ -1638,26 +1644,45 @@ class _OpenAIRealtimeEventChannel:
         if on_result_created is not None:
             on_result_created()
         rejected = isinstance(output, RejectedUtilityToolOutputV4)
-        response: dict[str, object] = {
-            "conversation": "auto",
-            "output_modalities": ["text"],
-            "tool_choice": "none" if rejected else "auto",
-            "parallel_tool_calls": False,
-            "max_output_tokens": min(
-                _CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS,
-                self._max_output_tokens,
-            ),
-        }
-        if not rejected:
-            response["tools"] = [
-                tool
-                for tool in harness.tools
-                if tool.get("name")
-                in {
+        if not self._second_search_active:
+            self._search_reformulation_available = (
+                isinstance(output, SearchMemoryToolOutputV4)
+                and output.status == SearchMemoryToolStatus.NO_MATCHES
+            )
+            response: dict[str, object] = {
+                "conversation": "auto",
+                "output_modalities": ["text"],
+                "tool_choice": "none" if rejected else "auto",
+                "parallel_tool_calls": False,
+                "max_output_tokens": min(
+                    _CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS,
+                    self._max_output_tokens,
+                ),
+            }
+            if not rejected:
+                allowed_names = {
                     INTERACTIVE_CANVAS_TOOL_NAME,
                     CANCEL_INTERACTIVE_CANVAS_TOOL_NAME,
                 }
-            ]
+                if self._search_reformulation_available:
+                    allowed_names.add(SEARCH_MEMORY_TOOL_NAME)
+                response["tools"] = [
+                    tool
+                    for tool in harness.tools
+                    if tool.get("name") in allowed_names
+                ]
+        else:
+            self._search_reformulation_available = False
+            response = {
+                "conversation": "auto",
+                "output_modalities": ["text"],
+                "tool_choice": "none",
+                "parallel_tool_calls": False,
+                "max_output_tokens": min(
+                    _CANVAS_TOOL_CONTINUATION_PREFERRED_MAX_OUTPUT_TOKENS,
+                    self._max_output_tokens,
+                ),
+            }
         continuation_created = await self._create_response(
             turn_id=turn_id,
             response_kind="utilityContinuation",
@@ -4119,7 +4144,16 @@ class _OpenAIRealtimeEventChannel:
                                 return
                         else:
                             utility_kind = RealtimeUtilityToolKind(completed_name)
-                            repeated_or_cross_utility = utility_called
+                            if (
+                                utility_called
+                                and self._search_reformulation_available
+                                and completed_name == SEARCH_MEMORY_TOOL_NAME
+                            ):
+                                self._search_reformulation_available = False
+                                self._second_search_active = True
+                                repeated_or_cross_utility = False
+                            else:
+                                repeated_or_cross_utility = utility_called
                             utility_rejected = repeated_or_cross_utility
                             utility_request: SearchMemoryRequest | GetCurrentTimeRequest
                             if not utility_rejected:
@@ -4815,8 +4849,10 @@ def build_semantic_capture_tool() -> dict[str, Any]:
         "name": RECORD_SEMANTIC_TURN_CAPTURE_TOOL_NAME,
         "description": (
             "Record semantic capture decision for the settled turn. "
+            "'dialogueFrame' and 'journalEvents' are top-level sibling fields; "
+            "journalEvents must never be nested inside dialogueFrame. "
             "Emit disposition 'noChange' if working DialogueFrame and durable SemanticJournal are unchanged, "
-            "or 'changed' with full replacement dialogueFrame and/or journalEvents drafts."
+            "or 'changed' with full replacement dialogueFrame and/or up to 4 journalEvents drafts."
         ),
         "parameters": parameters,
     }
@@ -4856,6 +4892,7 @@ def build_semantic_capture_instructions(evidence: SemanticCaptureEvidence) -> st
             "3. If durable user preferences, facts, commitments, or canvas references emerged, provide 1 to 4 journalEvents drafts.",
             "Retrieved search_memory references are historical evidence, not new child assertions. Retrieval alone must not create a new Journal fact. Only current-turn evidence establishing a new or changed fact, preference, commitment or Canvas relation warrants a new event.",
             "4. If both frame and journal changed, include both. If neither changed, emit 'noChange'.",
+            "5. Sibling field requirement: 'dialogueFrame' and 'journalEvents' are top-level sibling fields directly on the tool arguments object (e.g., {'disposition': 'changed', 'dialogueFrame': {...}, 'journalEvents': [...]}). You must NEVER nest 'journalEvents' inside 'dialogueFrame'.",
         ]
     )
     return "\n".join(lines)

@@ -3004,7 +3004,20 @@ async def test_search_memory_continuation_exposes_only_terminal_canvas_tools() -
             await channel.complete_utility_tool(
                 turn_id="turn-memory-tool",
                 call_id=event.call_id,
-                output=SearchMemoryToolOutputV4(status="noMatches"),
+                output=SearchMemoryToolOutputV4.model_validate(
+                    {
+                        "status": "available",
+                        "references": [
+                            {
+                                "sourceKind": "episode",
+                                "startedAt": None,
+                                "endedAt": None,
+                                "timezoneIds": [],
+                                "text": "Saturn has rings.",
+                            }
+                        ],
+                    }
+                ),
                 harness=_harness(),
             )
 
@@ -3207,6 +3220,88 @@ async def test_repeated_or_cross_utility_gets_one_rejection_then_no_tools() -> N
     ]
     assert continuations[-1]["tool_choice"] == "none"
     assert "tools" not in continuations[-1]
+
+
+@pytest.mark.asyncio
+async def test_search_memory_reformulation_offers_search_once_then_removes_search_tool() -> None:
+    channel, socket = _channel(
+        [
+            *_canvas_response_events(
+                arguments=json.dumps({"query": "telescope"}),
+                function_name=SEARCH_MEMORY_TOOL_NAME,
+                call_id="call_search_1",
+                preamble="",
+            ),
+            *_canvas_response_events(
+                arguments=json.dumps({"query": "old telescope"}),
+                function_name=SEARCH_MEMORY_TOOL_NAME,
+                response_id=CONTINUATION_RESPONSE_ID,
+                call_id="call_search_2",
+                preamble="",
+            ),
+            *_text_response_events(
+                response_id="resp_after_second_search",
+                text="I found the old telescope.",
+            ),
+        ]
+    )
+
+    received = []
+    async for event in channel.stream_turn(
+        harness=_harness(),
+        turn_id="turn-utility-reformulation",
+    ):
+        received.append(event)
+        if isinstance(event, RealtimeSearchMemoryToolCall):
+            if event.call_id == "call_search_1":
+                await channel.complete_utility_tool(
+                    turn_id="turn-utility-reformulation",
+                    call_id=event.call_id,
+                    output=SearchMemoryToolOutputV4(status="noMatches"),
+                    harness=_harness(),
+                )
+            elif event.call_id == "call_search_2":
+                await channel.complete_utility_tool(
+                    turn_id="turn-utility-reformulation",
+                    call_id=event.call_id,
+                    output=SearchMemoryToolOutputV4.model_validate(
+                        {
+                            "status": "available",
+                            "references": [
+                                {
+                                    "sourceKind": "episode",
+                                    "startedAt": None,
+                                    "endedAt": None,
+                                    "timezoneIds": [],
+                                    "text": "Old telescope.",
+                                }
+                            ],
+                        }
+                    ),
+                    harness=_harness(),
+                )
+
+    assert [type(event) for event in received] == [
+        RealtimeSearchMemoryToolCall,
+        RealtimeSearchMemoryToolCall,
+        RealtimeSpeechTextDelta,
+    ]
+    continuations = [
+        sent["response"]
+        for sent in socket.sent
+        if sent.get("type") == "response.create"
+    ]
+    assert len(continuations) == 2
+    tool_names_1 = [tool["name"] for tool in continuations[0].get("tools", ())]
+    assert SEARCH_MEMORY_TOOL_NAME in tool_names_1
+    assert INTERACTIVE_CANVAS_TOOL_NAME in tool_names_1
+
+    assert continuations[1]["tool_choice"] == "none"
+    tool_names_2 = [tool["name"] for tool in continuations[1].get("tools", ())]
+    assert SEARCH_MEMORY_TOOL_NAME not in tool_names_2
+    assert INTERACTIVE_CANVAS_TOOL_NAME not in tool_names_2
+    assert CANCEL_INTERACTIVE_CANVAS_TOOL_NAME not in tool_names_2
+    assert len(tool_names_2) == 0
 
 
 @pytest.mark.asyncio

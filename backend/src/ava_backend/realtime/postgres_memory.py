@@ -249,7 +249,7 @@ class PostgresAuthoritativeMemoryStore:
         turn: DeliveredConversationTurn,
         occurred_at: datetime | None = None,
         timezone_id: str = "UTC",
-    ) -> None:
+    ) -> int:
         normalized_subject = _validate_subject(subject)
         validated_expected_reset_revision = _validate_reset_revision(
             expected_reset_revision,
@@ -293,7 +293,12 @@ class PostgresAuthoritativeMemoryStore:
                         raise PostgresMemoryStoreError(
                             "turn sequence owner disappeared"
                         )
-                    turn_sequence = sequence_row["last_turn_sequence"]
+                    raw_sequence = sequence_row["last_turn_sequence"]
+                    if not isinstance(raw_sequence, int):
+                        raise PostgresMemoryStoreError(
+                            "unexpected non-integer turn sequence from database"
+                        )
+                    turn_sequence = raw_sequence
                     await connection.execute(
                         """
                         insert into ava_private.turn_receipts (subject, turn_id)
@@ -357,7 +362,7 @@ class PostgresAuthoritativeMemoryStore:
                 raise ValueError(
                     f"delivered turn {validated_turn.turn_id!r} is already committed"
                 ) from error
-        return None
+        return turn_sequence
 
     async def apply_dialogue_frame_update(
         self,

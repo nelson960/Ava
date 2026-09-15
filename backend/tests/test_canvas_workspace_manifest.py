@@ -995,6 +995,11 @@ def test_semantic_selector_resolution_uses_manifest_order_and_fails_closed() -> 
     workspace.adopt_manifest(_manifest(scenes))
     workspace.restore_focused(scenes[1])
 
+    assert workspace.resolve_scene_selector(CanvasSceneSelector.CURRENT).position == 2
+    assert (
+        workspace.resolve_scene_selector(CanvasSceneSelector.CURRENT).scene
+        == workspace.manifest_scenes[1]
+    )
     assert workspace.resolve_scene_selector(CanvasSceneSelector.NEXT).position == 3
     assert workspace.resolve_scene_selector(CanvasSceneSelector.PREVIOUS).position == 1
     assert workspace.resolve_scene_selector(CanvasSceneSelector.FIRST).position == 1

@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from ava_backend.realtime.memory import (
+    AgeBand,
     AuthoritativeMemorySnapshot,
     ChildTurnTextSource,
     ConversationEpisode,
@@ -480,14 +481,48 @@ def test_tool_envelope_rejects_extra_exchanges_missing_request_and_private_ids()
     None
 ):
     payload = _turn().model_dump(by_alias=True)
-    search = {
+    search_no_matches = {
         "tool": "search_memory",
         "request": {"query": "telescopes"},
         "result": {"status": "noMatches"},
     }
+    search_available = {
+        "tool": "search_memory",
+        "request": {"query": "telescopes"},
+        "result": {
+            "status": "available",
+            "references": [
+                {
+                    "sourceKind": "rawEvent",
+                    "startedAt": "2026-03-01T10:00:00Z",
+                    "endedAt": "2026-03-01T10:00:00Z",
+                    "timezoneIds": ["UTC"],
+                    "text": "Historical telescope",
+                }
+            ],
+        },
+    }
+    search_rejected = {
+        "tool": "search_memory",
+        "request": None,
+        "result": {"status": "rejected", "reason": "invalid_search"},
+    }
+    search_unavailable = {
+        "tool": "search_memory",
+        "request": {"query": "telescopes"},
+        "result": {"status": "unavailable", "reason": "temporarily unavailable"},
+    }
+    # Chain rejections:
+    # - Two settled searches -> third semantic exchange rejected by max_length=2
+    # - search(available) -> search rejected
+    # - first search failed/rejected -> second search rejected
+    # - missing request on non-rejected call
+    # - internal generationId leaked on canvas
     for exchanges in (
-        [search, search, search],
-        [search, search],
+        [search_no_matches, search_available, search_no_matches],
+        [search_available, search_no_matches],
+        [search_rejected, search_no_matches],
+        [search_unavailable, search_no_matches],
         [{"tool": "search_memory", "request": None, "result": {"status": "noMatches"}}],
         [
             {
@@ -507,6 +542,39 @@ def test_tool_envelope_rejects_extra_exchanges_missing_request_and_private_ids()
             DeliveredConversationTurn.model_validate(
                 {**payload, "toolExchanges": exchanges}
             )
+
+    # search(noMatches) -> search(available) accepted
+    legal_reformulation = DeliveredConversationTurn.model_validate(
+        {**payload, "toolExchanges": [search_no_matches, search_available]}
+    )
+    assert len(legal_reformulation.tool_exchanges) == 2
+
+
+@pytest.mark.asyncio
+async def test_development_memory_store_commit_returns_exact_assigned_turn_sequence() -> None:
+    store = DevelopmentAuthoritativeMemoryStore()
+    turn1 = _turn(turn_id="turn-seq-1")
+    turn2 = _turn(turn_id="turn-seq-2")
+
+    seq1 = await store.commit_delivered_turn(
+        subject="child:seq_test",
+        expected_reset_revision=0,
+        turn=turn1,
+    )
+    assert seq1 == 1
+
+    seq2 = await store.commit_delivered_turn(
+        subject="child:seq_test",
+        expected_reset_revision=0,
+        turn=turn2,
+    )
+    assert seq2 == 2
+
+    snapshot = await store.load_snapshot(
+        subject="child:seq_test",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+    )
+    assert [turn.turn_sequence for turn in snapshot.delivered_turns] == [1, 2]
 
 
 def test_delivered_turn_requires_audio_and_text_to_agree() -> None:

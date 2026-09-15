@@ -271,7 +271,7 @@ def test_harness_exposes_bounded_semantic_canvas_actions() -> None:
         == parameters["properties"]["completion"]["description"]
     )
     presentation_desc = presentation["description"]
-    assert "one semantic action" in presentation_desc
+    assert "one semantic action" in presentation_desc.lower()
     assert "hide" in presentation_desc
     assert "semantic" in presentation_desc
     assert "scene_id" not in presentation_desc
@@ -666,3 +666,52 @@ def test_context_limits_fail_loudly() -> None:
     invalid["deliveredTurns"][0]["deliveredSampleCount"] = 0
     with pytest.raises(ValueError, match="positive"):
         AuthoritativeMemorySnapshot.model_validate(invalid)
+
+
+def test_historical_memory_and_time_rendered_contract_communicates_all_required_invariants() -> None:
+    harness = _harness()
+    historical_layer = next(
+        layer.content for layer in PROMPT_LAYERS if layer.name == "historical_memory_and_time"
+    )
+    normalized = " ".join(historical_layer.split())
+
+    # 1. Ordinary/current context includes native current conversation, recent reconstructed context, and DialogueFrame
+    assert "Distinguish native current conversation" in normalized
+    assert "recent reconstructed context" in normalized
+    assert "current DialogueFrame" in normalized
+
+    # 2. Historical memory should be searched before claiming inability to remember when evidence is absent
+    assert (
+        "When the child asks about prior conversation absent from live context or current DialogueFrame, "
+        "call search_memory before stating Ava does not know or cannot remember; "
+        "never claim lack of memory before attempting a historical search."
+    ) in normalized
+
+    # 3. Search query should be concise semantic subject/fact/entity rather than the whole conversational question
+    assert (
+        'Query must represent the concise semantic subject or entity (e.g. "old telescope"), '
+        "not a verbatim question."
+    ) in normalized
+
+    # 4. Exactly one additional reformulated search is allowed after noMatches
+    assert (
+        "If search_memory returns noMatches and historical evidence is still needed, "
+        "Ava may make at most ONE additional search_memory call with a different concise query."
+    ) in normalized
+
+    # 5. Apart from that one reformulation, repeated/cross-utility lookup is forbidden
+    assert (
+        "Apart from that one reformulation, do not repeat utility lookups or mix utility kinds in one child turn."
+    ) in normalized
+
+    # 6. fromDate and toDate are local dates in session timezone
+    search_tool = next(t for t in harness.tools if t["name"] == "search_memory")
+    properties = search_tool["parameters"]["properties"]
+    assert properties["fromDate"]["description"] == (
+        "Optional inclusive local date in session timezone."
+    )
+    assert properties["toDate"]["description"] == (
+        "Optional inclusive local date in session timezone."
+    )
+    assert "Concise semantic subject/fact/entity" in properties["query"]["description"]
+    assert "do not copy the full question" in properties["query"]["description"]

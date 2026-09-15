@@ -387,6 +387,25 @@ class _UtilityRealtimeProvider(DeterministicRealtimePlanProvider):
         yield RealtimeSpeechTextDelta(delta="I found the grounded answer.")
 
 
+class _MultiStepUtilityRealtimeProvider(DeterministicRealtimePlanProvider):
+    def __init__(
+        self,
+        plan: AvaTurnPlan,
+        *,
+        calls: list[RealtimeProviderTurnEvent],
+        final_speech: str = "I found the grounded answer.",
+    ) -> None:
+        super().__init__(plan)
+        self.calls = calls
+        self.final_speech = final_speech
+
+    async def _stream(self) -> AsyncIterator[RealtimeProviderTurnEvent]:
+        self.turn_stream_started.set()
+        for call in self.calls:
+            yield call
+        yield RealtimeSpeechTextDelta(delta=self.final_speech)
+
+
 class _InteractionThenChildRealtimeProvider(DeterministicRealtimePlanProvider):
     """Wait for an interaction response on turn one, then serve child turn two."""
 
@@ -1368,6 +1387,7 @@ async def test_search_memory_tool_uses_coordinator_subject_and_dst_date_bounds(
         "resultSourceKinds": ["episode"],
         "resultSourceIds": ["episode-grounded-clock"],
         "status": "available",
+        "searchOrder": "bestMatch",
     }
     assert "SEARCH_QUERY_CONTENT_SENTINEL" not in caplog.text
     await coordinator.close()
@@ -1676,6 +1696,247 @@ async def test_search_memory_empty_failure_and_reversed_dates_are_safe_tool_resu
     assert telemetry["resultSourceIds"] == []
     assert telemetry["queryCharCount"] == len(str(search_request["query"]))
     assert str(search_request["query"]) not in caplog.text
+    await coordinator.close()
+
+
+async def test_search_memory_two_step_reformulation_success(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="ava_backend.realtime_coordinator")
+    memory = DevelopmentAuthoritativeMemoryStore()
+    when = datetime(2026, 8, 31, 6, 30, tzinfo=UTC)
+    await memory.commit_delivered_turn(
+        subject="child:coordinator",
+        expected_reset_revision=0,
+        turn=DeliveredConversationTurn.model_validate(
+            {
+                "turnId": "turn-historical-1",
+                "childText": "I built a cobalt telescope.",
+                "avaDeliveredText": "You built a cobalt telescope.",
+                "deliveredSampleCount": 24000,
+                "childTurnSummary": "Discussed the cobalt telescope.",
+                "terminal": "completed",
+            }
+        ),
+        occurred_at=when,
+        timezone_id="UTC",
+    )
+    provider = _MultiStepUtilityRealtimeProvider(
+        _plan(),
+        calls=[
+            RealtimeSearchMemoryToolCall(
+                call_id="call_search_1",
+                request=SearchMemoryRequest.model_validate(
+                    {"query": "nonexistent artifact"}
+                ),
+            ),
+            RealtimeSearchMemoryToolCall(
+                call_id="call_search_2",
+                request=SearchMemoryRequest.model_validate(
+                    {"query": "cobalt telescope"}
+                ),
+            ),
+        ],
+        final_speech="I found the cobalt telescope on my second search.",
+    )
+    coordinator, _, _, _ = _coordinator(
+        realtime=provider,
+        memory=memory,
+        current_time_factory=lambda: when,
+    )
+    await _ready(coordinator)
+
+    events = await _complete_delivered_turn(coordinator)
+    assert isinstance(events[-1], TurnCompletedEventV4)
+
+    search_records = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("realtime_semantic_tool_completed")
+        and record.ava_context.get("toolKind") == "search_memory"
+    ]
+    assert len(search_records) == 2
+    assert search_records[0].ava_context["step"] == 1
+    assert search_records[0].ava_context["status"] == "noMatches"
+    assert search_records[0].ava_context["resultCount"] == 0
+    assert search_records[0].ava_context["searchOrder"] == "bestMatch"
+
+    assert search_records[1].ava_context["step"] == 2
+    assert search_records[1].ava_context["status"] == "available"
+    assert search_records[1].ava_context["resultCount"] == 1
+    assert search_records[1].ava_context["searchOrder"] == "bestMatch"
+
+    await coordinator.close()
+    commit_record = next(
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("memory_commit_completed")
+    )
+    assert commit_record.ava_context["turnSequence"] == 2
+
+    snapshot = await memory.load_snapshot(
+        subject="child:coordinator",
+        age_band=AgeBand.MIDDLE_CHILDHOOD,
+    )
+    last_turn = snapshot.delivered_turns[-1]
+    assert len(last_turn.tool_exchanges) == 2
+    assert last_turn.tool_exchanges[0].tool == "search_memory"
+    assert last_turn.tool_exchanges[0].result.status == "noMatches"
+    assert last_turn.tool_exchanges[1].tool == "search_memory"
+    assert last_turn.tool_exchanges[1].result.status == "available"
+
+
+async def test_search_memory_second_call_rejected_if_first_succeeded() -> None:
+    memory = DevelopmentAuthoritativeMemoryStore()
+    when = datetime(2026, 8, 31, 6, 30, tzinfo=UTC)
+    await memory.commit_delivered_turn(
+        subject="child:coordinator",
+        expected_reset_revision=0,
+        turn=DeliveredConversationTurn.model_validate(
+            {
+                "turnId": "turn-historical-1",
+                "childText": "I built a cobalt telescope.",
+                "avaDeliveredText": "You built a cobalt telescope.",
+                "deliveredSampleCount": 24000,
+                "childTurnSummary": "Discussed the cobalt telescope.",
+                "terminal": "completed",
+            }
+        ),
+        occurred_at=when,
+        timezone_id="UTC",
+    )
+    provider = _MultiStepUtilityRealtimeProvider(
+        _plan(),
+        calls=[
+            RealtimeSearchMemoryToolCall(
+                call_id="call_search_1",
+                request=SearchMemoryRequest.model_validate(
+                    {"query": "cobalt telescope"}
+                ),
+            ),
+            RealtimeSearchMemoryToolCall(
+                call_id="call_search_2",
+                request=SearchMemoryRequest.model_validate(
+                    {"query": "another query"}
+                ),
+            ),
+        ],
+    )
+    coordinator, _, _, _ = _coordinator(
+        realtime=provider,
+        memory=memory,
+        current_time_factory=lambda: when,
+    )
+    await _ready(coordinator)
+
+    events = await _complete_delivered_turn(coordinator)
+    assert isinstance(events[-1], TurnFailedEventV4)
+    assert events[-1].failure.code == SpeechFailureCode.MODEL_INVALID
+    assert "Realtime utility tool violated the bounded turn chain" in events[-1].failure.message
+    await coordinator.close()
+
+
+async def test_search_memory_third_call_always_rejected() -> None:
+    memory = DevelopmentAuthoritativeMemoryStore()
+    provider = _MultiStepUtilityRealtimeProvider(
+        _plan(),
+        calls=[
+            RealtimeSearchMemoryToolCall(
+                call_id="call_search_1",
+                request=SearchMemoryRequest.model_validate(
+                    {"query": "nonexistent 1"}
+                ),
+            ),
+            RealtimeSearchMemoryToolCall(
+                call_id="call_search_2",
+                request=SearchMemoryRequest.model_validate(
+                    {"query": "nonexistent 2"}
+                ),
+            ),
+            RealtimeSearchMemoryToolCall(
+                call_id="call_search_3",
+                request=SearchMemoryRequest.model_validate(
+                    {"query": "nonexistent 3"}
+                ),
+            ),
+        ],
+    )
+    coordinator, _, _, _ = _coordinator(realtime=provider, memory=memory)
+    await _ready(coordinator)
+
+    events = await _complete_delivered_turn(coordinator)
+    assert isinstance(events[-1], TurnFailedEventV4)
+    assert events[-1].failure.code == SpeechFailureCode.MODEL_INVALID
+    assert "Realtime utility tool violated the bounded turn chain" in events[-1].failure.message
+    await coordinator.close()
+
+
+@pytest.mark.parametrize(
+    ("first_call", "second_call"),
+    [
+        (
+            RealtimeGetCurrentTimeToolCall(
+                call_id="call_time_1",
+                request=GetCurrentTimeRequest.model_validate({}),
+            ),
+            RealtimeSearchMemoryToolCall(
+                call_id="call_search_2",
+                request=SearchMemoryRequest.model_validate({"query": "cobalt"}),
+            ),
+        ),
+        (
+            RealtimeSearchMemoryToolCall(
+                call_id="call_search_1",
+                request=SearchMemoryRequest.model_validate({"query": "nonexistent"}),
+            ),
+            RealtimeGetCurrentTimeToolCall(
+                call_id="call_time_2",
+                request=GetCurrentTimeRequest.model_validate({}),
+            ),
+        ),
+    ],
+)
+async def test_cross_utility_calls_rejected(
+    first_call: RealtimeProviderTurnEvent,
+    second_call: RealtimeProviderTurnEvent,
+) -> None:
+    memory = DevelopmentAuthoritativeMemoryStore()
+    provider = _MultiStepUtilityRealtimeProvider(
+        _plan(),
+        calls=[first_call, second_call],
+    )
+    coordinator, _, _, _ = _coordinator(realtime=provider, memory=memory)
+    await _ready(coordinator)
+
+    events = await _complete_delivered_turn(coordinator)
+    assert isinstance(events[-1], TurnFailedEventV4)
+    assert events[-1].failure.code == SpeechFailureCode.MODEL_INVALID
+    assert "Realtime utility tool violated the bounded turn chain" in events[-1].failure.message
+    await coordinator.close()
+
+
+async def test_search_memory_second_call_rejected_if_first_failed() -> None:
+    memory = DevelopmentAuthoritativeMemoryStore()
+    provider = _MultiStepUtilityRealtimeProvider(
+        _plan(),
+        calls=[
+            RealtimeSearchMemoryToolCall(
+                call_id="call_search_1",
+                request=SearchMemoryRequest.model_validate({"query": "???"}),
+            ),
+            RealtimeSearchMemoryToolCall(
+                call_id="call_search_2",
+                request=SearchMemoryRequest.model_validate({"query": "cobalt"}),
+            ),
+        ],
+    )
+    coordinator, _, _, _ = _coordinator(realtime=provider, memory=memory)
+    await _ready(coordinator)
+
+    events = await _complete_delivered_turn(coordinator)
+    assert isinstance(events[-1], TurnFailedEventV4)
+    assert events[-1].failure.code == SpeechFailureCode.MODEL_INVALID
+    assert "Realtime utility tool violated the bounded turn chain" in events[-1].failure.message
     await coordinator.close()
 
 

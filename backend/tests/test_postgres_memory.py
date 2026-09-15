@@ -1560,3 +1560,94 @@ async def test_postgres_durable_sequence_restart_reset_and_retention() -> None:
         ]
     finally:
         await store.close()
+
+
+async def test_postgres_commit_delivered_turn_returns_exact_persisted_authoritative_sequence() -> (
+    None
+):
+    assert TEST_DATABASE_URL is not None
+    store = PostgresAuthoritativeMemoryStore(TEST_DATABASE_URL)
+    subject = f"test:turn-seq-proof-{uuid4()}"
+    when = datetime(2026, 9, 15, tzinfo=UTC)
+    await store.open()
+    try:
+        # 1. Commit a valid delivered turn and receive returned sequence
+        turn_1 = _turn(1)
+        returned_seq_1 = await store.commit_delivered_turn(
+            subject=subject,
+            expected_reset_revision=0,
+            turn=turn_1,
+            occurred_at=when,
+            timezone_id="UTC",
+        )
+        assert isinstance(returned_seq_1, int)
+
+        # 2. Read the stored turn / authoritative timeline state from DB
+        async with await AsyncConnection.connect(TEST_DATABASE_URL) as connection:
+            cursor = await connection.execute(
+                "select turn_sequence from ava_private.delivered_turns where subject = %s and turn_id = %s",
+                (subject, turn_1.turn_id),
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            persisted_seq_1 = row[0]
+
+            cursor = await connection.execute(
+                "select last_turn_sequence from ava_private.memory_state where subject = %s",
+                (subject,),
+            )
+            state_row = await cursor.fetchone()
+            assert state_row is not None
+            state_last_seq_1 = state_row[0]
+
+        # 3. Prove returned sequence == sequence actually persisted for that turn
+        assert returned_seq_1 == persisted_seq_1
+        assert returned_seq_1 == state_last_seq_1
+        assert returned_seq_1 == 1
+
+        snapshot_1 = await store.load_snapshot(
+            subject=subject, age_band=AgeBand.MIDDLE_CHILDHOOD
+        )
+        assert len(snapshot_1.delivered_turns) == 1
+        assert snapshot_1.delivered_turns[0].turn_id == turn_1.turn_id
+        assert snapshot_1.delivered_turns[0].turn_sequence == returned_seq_1
+
+        # 4. Commit another turn
+        turn_2 = _turn(2)
+        returned_seq_2 = await store.commit_delivered_turn(
+            subject=subject,
+            expected_reset_revision=0,
+            turn=turn_2,
+            occurred_at=when + timedelta(seconds=10),
+            timezone_id="UTC",
+        )
+        assert isinstance(returned_seq_2, int)
+
+        # 5. Prove sequence advances according to existing authoritative DB allocation
+        async with await AsyncConnection.connect(TEST_DATABASE_URL) as connection:
+            cursor = await connection.execute(
+                "select turn_sequence from ava_private.delivered_turns where subject = %s and turn_id = %s",
+                (subject, turn_2.turn_id),
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            persisted_seq_2 = row[0]
+
+            cursor = await connection.execute(
+                "select last_turn_sequence from ava_private.memory_state where subject = %s",
+                (subject,),
+            )
+            state_row = await cursor.fetchone()
+            assert state_row is not None
+            state_last_seq_2 = state_row[0]
+
+        assert returned_seq_2 == persisted_seq_2
+        assert returned_seq_2 == state_last_seq_2
+        assert returned_seq_2 == returned_seq_1 + 1 == 2
+
+        snapshot_2 = await store.load_snapshot(
+            subject=subject, age_band=AgeBand.MIDDLE_CHILDHOOD
+        )
+        assert [t.turn_sequence for t in snapshot_2.delivered_turns] == [1, 2]
+    finally:
+        await store.close()

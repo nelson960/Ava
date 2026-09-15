@@ -131,6 +131,7 @@ from .tool_contract import (
     ManageCanvasPresentationRequest,
     ManageCanvasPresentationStatus,
     ManageCanvasPresentationToolOutputV4,
+    MemorySearchOrder,
     RealtimeGetCurrentTimeToolCall,
     RealtimeManageCanvasPresentationToolCall,
     RealtimeRejectedManageCanvasPresentationToolCall,
@@ -2887,7 +2888,9 @@ class DeterministicRealtimeSessionCoordinator:
                         RealtimeUtilityToolKind.SEARCH_MEMORY,
                         state=state,
                     )
-                    await self._run_search_memory_tool(event)
+                    await self._run_search_memory_tool(
+                        event, step=state.tool_steps_used
+                    )
                     continue
                 if isinstance(event, RealtimeGetCurrentTimeToolCall):
                     for segment in parser.finish_response_chunk():
@@ -2896,7 +2899,9 @@ class DeterministicRealtimeSessionCoordinator:
                         RealtimeUtilityToolKind.GET_CURRENT_TIME,
                         state=state,
                     )
-                    await self._run_get_current_time_tool(event)
+                    await self._run_get_current_time_tool(
+                        event, step=state.tool_steps_used
+                    )
                     continue
                 if isinstance(event, RealtimeRejectedCanvasToolCall):
                     for segment in parser.finish_response_chunk():
@@ -2925,7 +2930,8 @@ class DeterministicRealtimeSessionCoordinator:
                         tool_name=INTERACTIVE_CANVAS_TOOL_NAME,
                         request=None,
                         result=InteractiveCanvasCancellationToolOutputV4(
-                            status="rejected", reason=CANVAS_MODEL_SAFE_REJECTION_REASON
+                            status="rejected",
+                            reason=CANVAS_MODEL_SAFE_REJECTION_REASON,
                         ),
                     )
                     await self._canvas_events.tool_call_rejected(
@@ -3049,6 +3055,26 @@ class DeterministicRealtimeSessionCoordinator:
         finally:
             updates.put_nowait(None)
 
+    def _first_search_allows_reformulation(
+        self,
+        tool_kind: RealtimeUtilityToolKind,
+        *,
+        state: _PlanningState,
+    ) -> bool:
+        if (
+            state.tool_steps_used != 1
+            or tool_kind != RealtimeUtilityToolKind.SEARCH_MEMORY
+            or state.utility_tool_kind != RealtimeUtilityToolKind.SEARCH_MEMORY
+            or len(self._turn_tool_exchanges) != 1
+        ):
+            return False
+        first_exchange = self._turn_tool_exchanges[0]
+        return (
+            first_exchange.tool == SEARCH_MEMORY_TOOL_NAME
+            and isinstance(first_exchange.result, SearchMemoryToolOutputV4)
+            and first_exchange.result.status == SearchMemoryToolStatus.NO_MATCHES
+        )
+
     def _claim_utility(
         self,
         tool_kind: RealtimeUtilityToolKind,
@@ -3056,15 +3082,22 @@ class DeterministicRealtimeSessionCoordinator:
         state: _PlanningState,
     ) -> None:
         if (
-            state.tool_steps_used != 0
-            or state.utility_tool_kind is not None
-            or state.canvas_terminal_used
+            state.canvas_terminal_used
+            or state.tool_steps_used >= MAX_SEMANTIC_TOOL_EXCHANGES
         ):
             raise StreamingTurnParseError(
                 "Realtime utility tool violated the bounded turn chain"
             )
-        state.tool_steps_used = 1
-        state.utility_tool_kind = tool_kind
+        if state.tool_steps_used == 0:
+            state.tool_steps_used = 1
+            state.utility_tool_kind = tool_kind
+            return
+        if self._first_search_allows_reformulation(tool_kind, state=state):
+            state.tool_steps_used = 2
+            return
+        raise StreamingTurnParseError(
+            "Realtime utility tool violated the bounded turn chain"
+        )
 
     def _claim_rejected_utility(
         self,
@@ -3079,9 +3112,16 @@ class DeterministicRealtimeSessionCoordinator:
             raise StreamingTurnParseError(
                 "Realtime rejected utility exceeded the bounded turn chain"
             )
-        state.tool_steps_used += 1
-        if state.utility_tool_kind is None:
+        if state.tool_steps_used == 0:
+            state.tool_steps_used = 1
             state.utility_tool_kind = call.tool_kind
+            return
+        if self._first_search_allows_reformulation(call.tool_kind, state=state):
+            state.tool_steps_used = 2
+            return
+        raise StreamingTurnParseError(
+            "Realtime rejected utility exceeded the bounded turn chain"
+        )
 
     def _claim_canvas(self, call_id: str, *, state: _PlanningState) -> None:
         if (
@@ -3103,6 +3143,8 @@ class DeterministicRealtimeSessionCoordinator:
     async def _run_search_memory_tool(
         self,
         call: RealtimeSearchMemoryToolCall,
+        *,
+        step: int = 1,
     ) -> None:
         output: SearchMemoryToolOutputV4
         candidates: list[MemorySearchCandidate] = []
@@ -3128,10 +3170,11 @@ class DeterministicRealtimeSessionCoordinator:
         except Exception as error:
             LOGGER.warning(
                 "realtime_semantic_tool_failed session_id=%s turn_id=%s "
-                "tool_kind=%s step=1 error_type=%s",
+                "tool_kind=%s step=%d error_type=%s",
                 self._session_id,
                 self._turn_id,
                 RealtimeUtilityToolKind.SEARCH_MEMORY,
+                step,
                 type(error).__name__,
             )
             output = SearchMemoryToolOutputV4(
@@ -3161,15 +3204,17 @@ class DeterministicRealtimeSessionCoordinator:
         )
         result_source_kinds = [str(candidate.source_kind) for candidate in candidates]
         result_source_ids = [candidate.source_id for candidate in candidates]
+        order_str = MemorySearchOrder(call.request.order).value
         LOGGER.info(
             "realtime_semantic_tool_completed session_id=%s turn_id=%s "
-            "tool_call_id=%s tool_kind=%s step=1 query_char_count=%d "
+            "tool_call_id=%s tool_kind=%s step=%d query_char_count=%d "
             "has_from_date=%s has_to_date=%s raw_candidate_count=%d "
-            "result_count=%d result_source_kinds=%s result_source_ids=%s status=%s",
+            "result_count=%d result_source_kinds=%s result_source_ids=%s status=%s search_order=%s",
             self._session_id,
             self._turn_id,
             call.call_id,
             RealtimeUtilityToolKind.SEARCH_MEMORY,
+            step,
             len(call.request.query),
             call.request.from_date is not None,
             call.request.to_date is not None,
@@ -3178,13 +3223,14 @@ class DeterministicRealtimeSessionCoordinator:
             result_source_kinds,
             result_source_ids,
             output.status,
+            order_str,
             extra={
                 "ava_context": {
                     "sessionId": self._session_id,
                     "turnId": self._turn_id,
                     "toolCallId": call.call_id,
                     "toolKind": str(RealtimeUtilityToolKind.SEARCH_MEMORY),
-                    "step": 1,
+                    "step": step,
                     "queryCharCount": len(call.request.query),
                     "hasFromDate": call.request.from_date is not None,
                     "hasToDate": call.request.to_date is not None,
@@ -3193,6 +3239,7 @@ class DeterministicRealtimeSessionCoordinator:
                     "resultSourceKinds": result_source_kinds,
                     "resultSourceIds": result_source_ids,
                     "status": str(output.status),
+                    "searchOrder": order_str,
                 }
             },
         )
@@ -3200,6 +3247,8 @@ class DeterministicRealtimeSessionCoordinator:
     async def _run_get_current_time_tool(
         self,
         call: RealtimeGetCurrentTimeToolCall,
+        *,
+        step: int = 1,
     ) -> None:
         now = self._current_time_factory()
         if now.tzinfo is None:
@@ -3228,10 +3277,11 @@ class DeterministicRealtimeSessionCoordinator:
         )
         LOGGER.info(
             "realtime_semantic_tool_completed session_id=%s turn_id=%s "
-            "tool_kind=%s step=1 result_count=1",
+            "tool_kind=%s step=%d result_count=1",
             self._session_id,
             self._turn_id,
             RealtimeUtilityToolKind.GET_CURRENT_TIME,
+            step,
         )
 
     async def _run_canvas_tool(
@@ -4700,7 +4750,7 @@ class DeterministicRealtimeSessionCoordinator:
                 child_text_source=child_text_source,
             )
             commit_started = monotonic()
-            await self._memory.commit_delivered_turn(
+            turn_sequence = await self._memory.commit_delivered_turn(
                 subject=self._subject,
                 expected_reset_revision=payload.expected_reset_revision,
                 turn=turn,
@@ -4712,9 +4762,10 @@ class DeterministicRealtimeSessionCoordinator:
             commit_duration_ms = max(0.0, (monotonic() - commit_started) * 1000)
             LOGGER.info(
                 "memory_commit_completed session_id=%s turn_id=%s "
-                "reset_revision=%d input_kind=%s duration_ms=%.2f",
+                "turn_sequence=%d reset_revision=%d input_kind=%s duration_ms=%.2f",
                 self._session_id,
                 payload.turn_id,
+                turn_sequence,
                 payload.expected_reset_revision,
                 turn.input_kind,
                 commit_duration_ms,
@@ -4722,6 +4773,7 @@ class DeterministicRealtimeSessionCoordinator:
                     "ava_context": {
                         "sessionId": self._session_id,
                         "turnId": payload.turn_id,
+                        "turnSequence": turn_sequence,
                         "resetRevision": payload.expected_reset_revision,
                         "inputKind": str(turn.input_kind),
                         "durationMs": commit_duration_ms,

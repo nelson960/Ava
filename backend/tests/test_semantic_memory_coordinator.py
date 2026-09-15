@@ -7,6 +7,7 @@ from types import MethodType, SimpleNamespace
 from typing import cast
 
 import pytest
+from pydantic import ValidationError
 from ava_backend.realtime.memory import (
     SemanticToolExchange,
     CanvasPresentationExchange,
@@ -43,6 +44,10 @@ from ava_backend.realtime.memory import (
     SemanticJournalCanvasReference,
     SemanticJournalEventFamily,
     SemanticMemoryProposal,
+)
+from ava_backend.providers.openai_realtime_provider import (
+    build_semantic_capture_instructions,
+    build_semantic_capture_tool,
 )
 from ava_backend.realtime.provider_session import (
     SemanticCaptureEvidence,
@@ -1080,3 +1085,78 @@ async def test_semantic_capture_valid_journal_survives_overlong_frame_item() -> 
     receipts = memory._semantic_memory_receipts.get("child:semantic", {})
     assert "turn-1" in receipts
     assert receipts["turn-1"].resulting_frame_revision == 0
+
+
+def test_semantic_capture_output_contract_enforces_top_level_siblings_without_auto_repair() -> (
+    None
+):
+    valid_payload = {
+        "disposition": "changed",
+        "dialogueFrame": {
+            "activeGoals": ["learning about stars"],
+        },
+        "journalEvents": [
+            {
+                "family": "userPreference",
+                "semanticKey": "astronomy",
+                "summary": "Interested in astronomy.",
+            }
+        ],
+    }
+    validated = SemanticCaptureFunctionArguments.model_validate(valid_payload)
+    assert validated.dialogue_frame is not None
+    assert len(validated.journal_events) == 1
+
+    # Malformed: journalEvents nested inside dialogueFrame (extra fields forbidden)
+    nested_in_frame = {
+        "disposition": "changed",
+        "dialogueFrame": {
+            "activeGoals": ["learning about stars"],
+            "journalEvents": [
+                {
+                    "family": "userPreference",
+                    "semanticKey": "astronomy",
+                    "summary": "Interested in astronomy.",
+                }
+            ],
+        },
+        "journalEvents": [],
+    }
+    with pytest.raises(ValidationError):
+        SemanticCaptureFunctionArguments.model_validate(nested_in_frame)
+
+    # Malformed: dialogueFrame nested inside journalEvents
+    nested_in_journal = {
+        "disposition": "changed",
+        "dialogueFrame": None,
+        "journalEvents": [
+            {
+                "family": "userPreference",
+                "semanticKey": "astronomy",
+                "summary": "Interested in astronomy.",
+                "dialogueFrame": {"activeGoals": ["learning about stars"]},
+            }
+        ],
+    }
+    with pytest.raises(ValidationError):
+        SemanticCaptureFunctionArguments.model_validate(nested_in_journal)
+
+
+def test_semantic_capture_prompt_and_tool_schema_enforce_sibling_guidance() -> None:
+    tool = build_semantic_capture_tool()
+    desc = tool["description"]
+    assert "top-level sibling fields" in desc
+    assert "never be nested inside dialogueFrame" in desc
+    assert "up to 4 journalEvents drafts" in desc
+
+    evidence = SemanticCaptureEvidence(
+        source_turn_id="turn-test",
+        current_frame=DialogueFrameState(),
+        child_utterance="I like stars",
+        spoken_response_prefix="Stars are beautiful",
+        interrupted=False,
+        tool_exchanges=(),
+    )
+    instructions = build_semantic_capture_instructions(evidence)
+    assert "top-level sibling fields" in instructions
+    assert "NEVER nest 'journalEvents' inside 'dialogueFrame'" in instructions

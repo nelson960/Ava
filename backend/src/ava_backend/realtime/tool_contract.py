@@ -253,17 +253,15 @@ class SearchMemoryRequest(RealtimeProtocolModel):
         description="Semantic historical order.",
     )
     query: Annotated[NonEmptyText, StringConstraints(max_length=500)] = Field(
-        description=(
-            "Historical detail absent from live conversation and supplied references."
-        )
+        description="Concise semantic subject/fact/entity; do not copy the full question."
     )
     from_date: date | None = Field(
         default=None,
-        description="Optional inclusive local calendar date in the child's timezone.",
+        description="Optional inclusive local date in session timezone.",
     )
     to_date: date | None = Field(
         default=None,
-        description="Optional inclusive local calendar date in the child's timezone.",
+        description="Optional inclusive local date in session timezone.",
     )
 
 

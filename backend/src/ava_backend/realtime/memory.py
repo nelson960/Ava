@@ -216,14 +216,21 @@ class DeliveredConversationTurn(RealtimeProtocolModel):
                 raise ValueError(
                     "only rejected malformed calls may omit the semantic request"
                 )
-            if index and (
-                self.tool_exchanges[index - 1].tool
-                not in {"search_memory", "get_current_time"}
-                or exchange.tool in {"search_memory", "get_current_time"}
-            ):
-                raise ValueError(
-                    "tool exchanges must follow the utility then terminal Canvas chain"
-                )
+            if index:
+                predecessor = self.tool_exchanges[index - 1]
+                if predecessor.tool not in {"search_memory", "get_current_time"}:
+                    raise ValueError(
+                        "tool exchanges must follow the utility then terminal Canvas chain"
+                    )
+                if exchange.tool in {"search_memory", "get_current_time"}:
+                    if not (
+                        predecessor.tool == "search_memory"
+                        and getattr(predecessor.result, "status", None) == "noMatches"
+                        and exchange.tool == "search_memory"
+                    ):
+                        raise ValueError(
+                            "tool exchanges must follow the utility then terminal Canvas chain"
+                        )
         if self.input_kind == DeliveredInputKind.SPEECH:
             if self.child_text is None or self.child_text_source is None:
                 raise ValueError("speech input requires childText and childTextSource")
@@ -742,9 +749,21 @@ class SemanticCaptureFunctionArguments(RealtimeProtocolModel):
         use_enum_values=True,
     )
     disposition: SemanticCaptureDisposition
-    dialogue_frame: DialogueFrameState | None = None
+    dialogue_frame: DialogueFrameState | None = Field(
+        default=None,
+        description=(
+            "Complete replacement working DialogueFrame. This is a top-level sibling "
+            "field alongside journalEvents; journalEvents must never be nested inside "
+            "dialogueFrame."
+        ),
+    )
     journal_events: tuple[SemanticCaptureJournalDraft, ...] = Field(
-        default=(), max_length=MAX_SEMANTIC_JOURNAL_EVENTS_PER_PROPOSAL
+        default=(),
+        max_length=MAX_SEMANTIC_JOURNAL_EVENTS_PER_PROPOSAL,
+        description=(
+            "Up to 4 durable Journal event drafts. This is a top-level sibling field "
+            "alongside dialogueFrame; never nest journalEvents inside dialogueFrame."
+        ),
     )
 
     @model_validator(mode="before")
@@ -1116,7 +1135,7 @@ class AuthoritativeMemoryStore(Protocol):
         turn: DeliveredConversationTurn,
         occurred_at: datetime | None = None,
         timezone_id: str = "UTC",
-    ) -> None: ...
+    ) -> int: ...
 
     async def apply_dialogue_frame_update(
         self,
@@ -1451,7 +1470,7 @@ class DevelopmentAuthoritativeMemoryStore:
         turn: DeliveredConversationTurn,
         occurred_at: datetime | None = None,
         timezone_id: str = "UTC",
-    ) -> None:
+    ) -> int:
         normalized_subject = _validate_subject(subject)
         validated_expected_reset_revision = _validate_reset_revision(
             expected_reset_revision,
@@ -1479,6 +1498,7 @@ class DevelopmentAuthoritativeMemoryStore:
                     f"delivered turn {validated_turn.turn_id!r} is already committed"
                 )
             turns = self._turns[normalized_subject]
+            turn_sequence = len(turns) + 1
             turns.append(
                 StoredDeliveredConversationEvent(
                     occurred_at=normalized_occurred_at,
@@ -1486,14 +1506,14 @@ class DevelopmentAuthoritativeMemoryStore:
                     turn=StoredDeliveredConversationTurn(
                         **validated_turn.model_dump(by_alias=True),
                         resetRevision=current_reset_revision,
-                        turnSequence=len(turns) + 1,
+                        turnSequence=turn_sequence,
                         occurredAt=normalized_occurred_at,
                         timezoneId=validated_timezone_id,
                     ),
                 )
             )
             self._committed_turn_ids[normalized_subject].add(validated_turn.turn_id)
-        return None
+        return turn_sequence
 
     async def apply_dialogue_frame_update(
         self,

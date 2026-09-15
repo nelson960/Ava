@@ -41,6 +41,7 @@ from ava_backend.realtime.coordinator_v4 import (
 )
 from ava_backend.realtime.events_v4 import (
     AVA_CLIENT_EVENT_ADAPTER_V4,
+    CanvasPresentationAcknowledgedEventV4,
 )
 from ava_backend.realtime.fakes import (
     DETERMINISTIC_AUDIO_OFFER_SDP,
@@ -54,6 +55,7 @@ from ava_backend.realtime.tool_contract import (
     InteractiveCanvasRequest,
     InteractiveCanvasToolStatusV4,
     ManageCanvasPresentationAction,
+    ManageCanvasPresentationStatus,
     RealtimeCanvasToolCall,
 )
 from ava_backend.auth import AuthenticatedClient, RequestAuthenticator
@@ -1817,5 +1819,213 @@ async def test_focus_canvas_converges_to_b_when_readiness_changes_after_provider
         assert "scene-a" not in coordinator.harness.instructions
         assert "scene-b" not in coordinator.harness.instructions
         assert "Second rain cloud" in coordinator.harness.instructions
+    finally:
+        await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_reopen_and_show_first_preserves_canonical_position_and_bounds() -> None:
+    (
+        coordinator,
+        _realtime,
+        _canvas_events,
+        _memory,
+        _specialist,
+        jobs,
+    ) = await _create_real_coordinator()
+    try:
+        validator = SvgDocumentValidator(SvgValidationLimits())
+        scenes: list[ActiveSvgCanvasScene] = []
+        for i in range(1, 11):
+            doc = validator.validate(
+                f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" '
+                f'data-ava-interaction-mode="none">'
+                f'<title>Diagram {i}</title><desc>Summary {i}</desc>'
+                f'<circle id="dot-{i}" cx="50" cy="50" r="20"/></svg>'
+            )
+            scenes.append(
+                ActiveSvgCanvasScene(
+                    generation_id=f"gen-{i}",
+                    source_turn_id=f"turn-{i}",
+                    scene_id=f"scene-{i}",
+                    revision=1,
+                    document=doc,
+                    first_rendered_sample=0,
+                )
+            )
+
+        workspace = jobs.state.workspace
+        manifest = CanvasWorkspaceManifest(
+            protocol_version=4,
+            workspace_epoch=7,
+            workspace_revision=1,
+            next_creation_sequence=11,
+            next_modification_sequence=1,
+            focused_scene_id=scenes[3].scene_id,
+            scenes=tuple(
+                CanvasWorkspaceManifestScene(
+                    scene_id=s.scene_id,
+                    scene_revision=s.revision,
+                    generation_id=s.generation_id,
+                    source_turn_id=s.source_turn_id,
+                    svg_sha256=s.document.svg_sha256,
+                    manifest_sha256=s.document.manifest_sha256,
+                    svg_byte_length=len(s.document.svg_bytes),
+                    manifest_byte_length=len(s.document.manifest_bytes),
+                    renderer_capability_version=s.document.manifest[
+                        "rendererCapabilityVersion"
+                    ],
+                    validator_version=s.document.manifest["validatorVersion"],
+                    manifest_version=s.document.manifest["manifestVersion"],
+                    creation_sequence=idx + 1,
+                    modification_sequence=None,
+                    title=s.document.title,
+                    summary=s.document.description,
+                )
+                for idx, s in enumerate(scenes)
+            ),
+        )
+        workspace.adopt_manifest(manifest)
+        jobs.state.restore_focused(scenes[3])
+        for s in scenes:
+            workspace.hydrate_retained(s)
+
+        # Baseline: retained_count = 10, focused_position = 4, visible = false
+        assert len(workspace.manifest_scenes) == 10
+        assert (
+            workspace.resolve_scene_selector(CanvasSceneSelector.CURRENT).position == 4
+        )
+        assert jobs.state.presentation_visible is False
+
+        # Execute showCurrent -> verify focused_position == 4, visible == true
+        cmd_task = asyncio.create_task(
+            coordinator._execute_canvas_presentation(
+                action=ManageCanvasPresentationAction.SHOW,
+                selector=CanvasSceneSelector.CURRENT,
+                position=None,
+                title=None,
+            )
+        )
+        await asyncio.sleep(0)
+        command_id = next(iter(coordinator._pending_presentation_commands.keys()))
+        await coordinator._handle_client_presentation_acknowledged(
+            CanvasPresentationAcknowledgedEventV4.model_validate(
+                {
+                    "protocolVersion": 4,
+                    "event": "canvasPresentationAcknowledged",
+                    "sessionId": coordinator._session_id,
+                    "sequence": 1,
+                    "commandId": command_id,
+                    "applied": True,
+                    "sceneId": scenes[3].scene_id,
+                    "focusRevision": jobs.state.focus_revision + 1,
+                }
+            )
+        )
+        output, _, _ = await cmd_task
+        assert output.status == ManageCanvasPresentationStatus.ACCEPTED
+        assert jobs.state.presentation_visible is True
+        assert (
+            workspace.resolve_scene_selector(CanvasSceneSelector.CURRENT).position == 4
+        )
+
+        # Restore canonical state -> showCurrent -> verify focused_position == 4, visible == true
+        jobs.state.restore_focused(scenes[3])
+        assert jobs.state.presentation_visible is False
+        assert (
+            workspace.resolve_scene_selector(CanvasSceneSelector.CURRENT).position == 4
+        )
+
+        cmd_task2 = asyncio.create_task(
+            coordinator._execute_canvas_presentation(
+                action=ManageCanvasPresentationAction.SHOW,
+                selector=CanvasSceneSelector.CURRENT,
+                position=None,
+                title=None,
+            )
+        )
+        await asyncio.sleep(0)
+        command_id2 = next(iter(coordinator._pending_presentation_commands.keys()))
+        await coordinator._handle_client_presentation_acknowledged(
+            CanvasPresentationAcknowledgedEventV4.model_validate(
+                {
+                    "protocolVersion": 4,
+                    "event": "canvasPresentationAcknowledged",
+                    "sessionId": coordinator._session_id,
+                    "sequence": 2,
+                    "commandId": command_id2,
+                    "applied": True,
+                    "sceneId": scenes[3].scene_id,
+                    "focusRevision": jobs.state.focus_revision + 1,
+                }
+            )
+        )
+        output2, _, _ = await cmd_task2
+        assert output2.status == ManageCanvasPresentationStatus.ACCEPTED
+        assert jobs.state.presentation_visible is True
+        assert (
+            workspace.resolve_scene_selector(CanvasSceneSelector.CURRENT).position == 4
+        )
+
+        # Execute showFirst -> verify focused_position == 1
+        cmd_task3 = asyncio.create_task(
+            coordinator._execute_canvas_presentation(
+                action=ManageCanvasPresentationAction.SHOW,
+                selector=CanvasSceneSelector.FIRST,
+                position=None,
+                title=None,
+            )
+        )
+        await asyncio.sleep(0)
+        command_id3 = next(iter(coordinator._pending_presentation_commands.keys()))
+        await coordinator._handle_client_presentation_acknowledged(
+            CanvasPresentationAcknowledgedEventV4.model_validate(
+                {
+                    "protocolVersion": 4,
+                    "event": "canvasPresentationAcknowledged",
+                    "sessionId": coordinator._session_id,
+                    "sequence": 3,
+                    "commandId": command_id3,
+                    "applied": True,
+                    "sceneId": scenes[0].scene_id,
+                    "focusRevision": jobs.state.focus_revision + 1,
+                }
+            )
+        )
+        output3, _, _ = await cmd_task3
+        assert output3.status == ManageCanvasPresentationStatus.ACCEPTED
+        assert jobs.state.presentation_visible is True
+        assert (
+            workspace.resolve_scene_selector(CanvasSceneSelector.CURRENT).position == 1
+        )
+
+        # Prove hidden Canvas context distinguishes absent canvas ("") from retained but hidden
+        empty_state = SvgCanvasSessionState()
+        assert empty_state.render_realtime_context() == ""
+
+        # Set back to retained but hidden at position 4
+        jobs.state.restore_focused(scenes[3])
+        assert jobs.state.presentation_visible is False
+        assert (
+            workspace.resolve_scene_selector(CanvasSceneSelector.CURRENT).position == 4
+        )
+
+        hidden_context = jobs.state.render_realtime_context()
+        assert hidden_context != ""
+        assert 'visible="false"' in hidden_context
+        assert 'focused_position="4"' in hidden_context
+        assert 'retained_count="10"' in hidden_context
+        assert scenes[3].document.title in hidden_context
+        for forbidden in (
+            scenes[3].scene_id,
+            scenes[0].scene_id,
+            "sceneRevision",
+            "svgSha256",
+            "manifestSha256",
+            command_id,
+            command_id2,
+            command_id3,
+        ):
+            assert forbidden not in hidden_context
     finally:
         await coordinator.close()
